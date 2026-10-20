@@ -1,0 +1,12 @@
+# Local development overrides (auto-loaded by `docker compose`; not used in production,
+# where deploy.sh runs `docker compose -f docker-compose.yml`).
+
+services:
+  monitor:
+    restart: "no"
+  worker:
+    restart: "no"
+  review:
+    restart: "no"
+    ports:
+      - "127.0.0.1:8000:8000"

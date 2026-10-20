@@ -1,0 +1,63 @@
+# Creators and pipeline settings. Validate with: uv run clipper check-config
+# channel_id / user_id are filled in by `clipper resolve` (CLP-22); handles are for humans.
+
+settings:
+  poll_interval_youtube_minutes: 10
+  poll_interval_twitch_minutes: 5
+  first_run_mode: baseline        # baseline = mark existing as seen, clip only new uploads
+  lookback_days: 7
+  min_duration_seconds: 300       # excludes Shorts (now up to 3 min)
+  clip_min_seconds: 20
+  clip_max_seconds: 60
+  max_clips_per_source: 3
+  max_clips_per_stream: 10
+  max_source_hours_per_day: 24
+  daily_llm_usd_cap: 10.0
+  daily_transcribe_usd_cap: 5.0
+  disk_budget_gb: 150
+  media_retention_hours: 48
+  review_expiry_days: 7
+
+creators:
+  # --- Global ---
+  - name: MrBeast
+    region: global
+    tags: [challenge, entertainment]
+    youtube:
+      handle: "@MrBeast"
+
+  - name: IShowSpeed
+    region: global
+    tags: [streamer, irl, sports]
+    youtube:
+      handle: "@IShowSpeed"
+
+  - name: Kai Cenat
+    region: global
+    tags: [streamer]
+    twitch:
+      login: kaicenat
+    youtube:
+      handle: "@KaiCenat"
+
+  # --- Philippines ---
+  - name: Raffy Tulfo in Action
+    region: ph
+    language: tl
+    tags: [public-service, news]
+    youtube:
+      handle: "@RaffyTulfoInAction"
+
+  - name: Ivana Alawi
+    region: ph
+    language: tl
+    tags: [vlog, lifestyle]
+    youtube:
+      handle: "@IvanaAlawi"
+
+  - name: Cong TV
+    region: ph
+    language: tl
+    tags: [vlog, comedy]
+    youtube:
+      handle: "@CongTV"

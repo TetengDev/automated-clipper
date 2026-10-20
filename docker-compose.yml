@@ -1,0 +1,68 @@
+# Production-shaped stack. Local tweaks live in docker-compose.override.yml.
+# caddy (HTTPS + basic_auth) is added in S6 (CLP-40).
+#
+# Host dirs ./data and ./output must be writable by uid 10001 (the image user):
+#   sudo chown -R 10001:10001 data output
+# Bcrypt hashes contain '$'. Compose interpolates unquoted env_file values, so wrap them
+# in single quotes in .env: REVIEW_PASSWORD_HASH='$2b$12$...'
+
+x-clipper: &clipper
+  image: ${CLIPPER_IMAGE:-clipper}:${CLIPPER_IMAGE_TAG:-local}
+  build: .
+  # Each service only reads the secrets it needs via Secrets.require(); per-service env
+  # splitting is revisited when services gain real secret consumers (CLP-12/18/24).
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    CLIPPER_CONFIG: /app/config/creators.yaml
+    CLIPPER_DB: /app/data/state.db
+  volumes:
+    - ./config:/app/config:ro
+    - ./data:/app/data
+    - ./output:/app/output
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 512
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+x-after-migrate: &after-migrate
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  migrate:
+    <<: *clipper
+    command: ["migrate"]
+    restart: "no"
+
+  monitor:
+    <<: [*clipper, *after-migrate]
+    command: ["run-monitor"]
+    mem_limit: 512m
+    cpus: 1
+
+  worker:
+    <<: [*clipper, *after-migrate]
+    command: ["run-worker"]
+    mem_limit: 8g
+    cpus: 6
+
+  review:
+    <<: [*clipper, *after-migrate]
+    command: ["run-review"]
+    mem_limit: 512m
+    cpus: 1
+    expose:
+      - "8000"

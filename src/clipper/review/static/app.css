@@ -89,3 +89,44 @@ button.link {
   text-decoration: underline;
 }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.count { font-size: 0.85em; font-weight: 400; }
+.tabs { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+.tabs a { padding: 0.25rem 0.75rem; border: 1px solid var(--border); border-radius: 999px; text-decoration: none; }
+.tabs a[aria-current="page"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.filters { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-end; margin-bottom: 1rem; }
+.filters label { display: flex; flex-direction: column; font-size: 0.875rem; gap: 0.25rem; }
+select, input[type="number"] {
+  min-height: 44px;
+  padding: 0.5rem;
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }
+.clip-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  color: inherit;
+  text-decoration: none;
+}
+.thumb { width: 100%; aspect-ratio: 9 / 16; max-height: 320px; object-fit: cover; background: var(--border); }
+.meta { display: flex; flex-direction: column; gap: 0.25rem; padding: 0.75rem; font-size: 0.9rem; }
+.badge { align-self: flex-start; font-size: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 999px; background: var(--bg); border: 1px solid var(--border); }
+.more { grid-column: 1 / -1; }
+.clip-nav { display: flex; justify-content: space-between; margin-bottom: 1rem; }
+.clip-nav span { display: flex; gap: 1rem; }
+.clip { display: grid; gap: 1.5rem; }
+@media (min-width: 760px) { .clip { grid-template-columns: minmax(0, 360px) 1fr; } }
+.player { width: 100%; max-height: 80vh; aspect-ratio: 9 / 16; background: #000; border-radius: var(--radius); }
+.details h2 { font-size: 1.1rem; margin: 1.25rem 0 0.5rem; }
+.caption { white-space: pre-wrap; }
+.actions { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; }
+.reject { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+button.danger { background: var(--error); }
+.versions, .history { padding-left: 1.25rem; font-size: 0.9rem; }

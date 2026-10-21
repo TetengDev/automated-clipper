@@ -1,5 +1,16 @@
-{# Partial (HTMX-swappable): never consumes flashes. #}
+{# Partial (HTMX-swappable): never consumes flashes. Optional `status_value`, `flt`. #}
+{% set status_value = status_value | default("pending_review") %}
 <section class="card empty" id="queue">
+  {% if status_value == "pending_review" %}
   <p>No clips waiting for review.</p>
+  {% elif status_value == "all" %}
+  <p>No clips yet.</p>
+  {% else %}
+  <p>No {{ status_value | replace("_", " ") }} clips.</p>
+  {% endif %}
+  {% if flt is defined and (flt.creator or flt.min_score is not none) %}
+  <p class="muted">Nothing matches the current creator / score filters.</p>
+  {% else %}
   <p class="muted">New clips appear here once the worker renders them.</p>
+  {% endif %}
 </section>

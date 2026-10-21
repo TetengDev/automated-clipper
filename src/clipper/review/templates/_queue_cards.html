@@ -1,0 +1,20 @@
+{# Partial (HTMX-swappable): cards plus the "load more" button; never consumes flashes. #}
+{% for card in cards %}
+<a class="clip-card" href="/clip/{{ card.id }}" data-clip-id="{{ card.id }}">
+  {% if card.has_thumb %}
+  <img class="thumb" src="/media/clip/{{ card.id }}/{{ card.version }}/thumb" alt="" loading="lazy">
+  {% else %}
+  <div class="thumb placeholder" aria-hidden="true"></div>
+  {% endif %}
+  <div class="meta">
+    <strong class="title">{{ card.title or "Untitled clip" }}</strong>
+    <span>{{ card.creator }} · {{ "%d" % card.duration_s }}s · score {{ "%.1f" % card.score if card.score is not none else "–" }}</span>
+    {% if card.source_title %}<span class="muted">{{ card.source_title }}</span>{% endif %}
+    <span class="badge status-{{ card.status }}">{{ card.status | replace("_", " ") }}</span>
+  </div>
+</a>
+{% endfor %}
+{% if next_page_url %}
+<button type="button" class="more" hx-get="{{ next_page_url }}" hx-target="this"
+        hx-swap="outerHTML">Load more</button>
+{% endif %}

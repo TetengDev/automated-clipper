@@ -51,6 +51,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "CLIPPER_DB",
         "RCLONE_REMOTE",
         "CLIPPER_MEDIA_DIR",
+        "CLIPPER_OUTPUT_DIR",
         "CLIPPER_WORKER_ID",
         "CLIPPER_FORWARDED_ALLOW_IPS",
         "CLIPPER_DEV",

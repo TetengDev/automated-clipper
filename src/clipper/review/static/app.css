@@ -1,0 +1,91 @@
+/* Minimal mobile-first styles for the review app (usable from 320px up). */
+:root {
+  --bg: #f6f7f9;
+  --fg: #16181d;
+  --muted: #5d6470;
+  --card: #ffffff;
+  --border: #d9dde3;
+  --accent: #2357d9;
+  --accent-fg: #ffffff;
+  --error: #b42318;
+  --ok-bg: #e7f5ec;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111317;
+    --fg: #e8eaee;
+    --muted: #9aa2ae;
+    --card: #1b1e24;
+    --border: #2d323b;
+    --accent: #6f95ff;
+    --accent-fg: #0b0d10;
+    --error: #ff8a80;
+    --ok-bg: #16301f;
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+a { color: var(--accent); }
+h1 { font-size: 1.5rem; margin: 0 0 1rem; }
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 700; text-decoration: none; color: var(--fg); }
+.nav { display: flex; align-items: center; gap: 1rem; }
+.container { max-width: 960px; margin: 0 auto; padding: 1rem; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+}
+.narrow { max-width: 400px; margin: 2rem auto; }
+.stack { display: flex; flex-direction: column; gap: 0.5rem; }
+.inline { display: inline; margin: 0; }
+.empty { text-align: center; padding: 2.5rem 1rem; }
+.muted { color: var(--muted); }
+.flash { background: var(--ok-bg); border-radius: var(--radius); padding: 0.75rem 1rem; }
+.error { color: var(--error); margin: 0 0 0.75rem; }
+input[type="password"], input[type="text"] {
+  width: 100%;
+  min-height: 44px;
+  padding: 0.5rem 0.75rem;
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+button {
+  min-height: 44px;
+  padding: 0.5rem 1rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--accent-fg);
+  background: var(--accent);
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+button.link {
+  min-height: auto;
+  padding: 0;
+  color: var(--accent);
+  background: none;
+  font-weight: 400;
+  text-decoration: underline;
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

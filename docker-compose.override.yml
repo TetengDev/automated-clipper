@@ -8,5 +8,7 @@ services:
     restart: "no"
   review:
     restart: "no"
+    # Plain HTTP on localhost: drop the Secure cookie flag (and HSTS) for local dev only.
+    command: ["run-review", "--insecure-cookies"]
     ports:
       - "127.0.0.1:8000:8000"

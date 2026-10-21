@@ -12,9 +12,17 @@ from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
+from pydantic import ValidationError
 
 from clipper import jobs
-from clipper.config import CREATOR_NAME_PATTERN, DEFAULT_CONFIG_PATH, ConfigError, load_config
+from clipper.config import (
+    CREATOR_NAME_PATTERN,
+    DEFAULT_CONFIG_PATH,
+    ConfigError,
+    MissingSecretError,
+    Secrets,
+    load_config,
+)
 from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version, migrate
 from clipper.jobs.worker import (
     DEFAULT_MEDIA_ROOT,
@@ -165,9 +173,77 @@ def run_worker(
 
 
 @app.command("run-review")
-def run_review() -> None:
+def run_review(
+    ctx: typer.Context,
+    host: Annotated[str, typer.Option(help="Interface to bind.")] = "0.0.0.0",  # noqa: S104
+    port: Annotated[int, typer.Option(help="Port to listen on.")] = 8000,
+    insecure_cookies: Annotated[
+        bool,
+        typer.Option(
+            "--insecure-cookies",
+            help="Drop the Secure cookie flag (plain-HTTP local development only).",
+        ),
+    ] = False,
+    forwarded_allow_ips: Annotated[
+        str,
+        typer.Option(
+            envvar="CLIPPER_FORWARDED_ALLOW_IPS",
+            help="Comma-separated proxy IPs whose X-Forwarded-For is trusted ('*' refused).",
+        ),
+    ] = "127.0.0.1",
+) -> None:
     """Serve the clip review web app."""
-    _not_implemented("CLP-18")
+    import uvicorn
+
+    from clipper.review.app import create_app
+
+    if any(part.strip() == "*" for part in forwarded_allow_ips.split(",")):
+        _fail("run-review: --forwarded-allow-ips must list proxy IPs explicitly, not '*'")
+    try:
+        secrets = Secrets()
+        application = create_app(
+            password_hash=secrets.require("REVIEW_PASSWORD_HASH"),
+            session_secret=secrets.require("SESSION_SECRET"),
+            db_path=_app(ctx).db_path,
+            secure_cookies=not insecure_cookies,
+        )
+    except (MissingSecretError, ValidationError, ValueError) as exc:
+        _fail(f"run-review: {exc}")
+    uvicorn.run(
+        application,
+        host=host,
+        port=port,
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded_allow_ips,
+    )
+
+
+@app.command("hash-password")
+def hash_password() -> None:
+    """Prompt for the review password and print its bcrypt hash for REVIEW_PASSWORD_HASH."""
+    import bcrypt
+
+    from clipper.review.app import BCRYPT_MAX_BYTES
+
+    password = typer.prompt(
+        "Review password",
+        hide_input=True,
+        confirmation_prompt=True,
+        default="",
+        show_default=False,
+    )
+    raw = password.encode("utf-8")
+    if not raw:
+        _fail("password must not be empty")
+    if len(raw) > BCRYPT_MAX_BYTES:
+        _fail(f"password must be at most {BCRYPT_MAX_BYTES} bytes (bcrypt limit)")
+    hashed = bcrypt.hashpw(raw, bcrypt.gensalt()).decode("ascii")
+    typer.echo(hashed)
+    typer.echo(
+        "Add it to .env wrapped in single quotes, because Docker Compose interpolates '$':\n"
+        "  REVIEW_PASSWORD_HASH='<hash>'",
+        err=True,
+    )
 
 
 @app.command("enqueue")

@@ -453,10 +453,12 @@ def test_hash_password_cli_rejects_empty_and_overlong() -> None:
 
 def test_run_review_help() -> None:
     result = runner.invoke(cli_app, ["run-review", "--help"])
+    # Typer forces Rich colour under CI, which splits option names with escape codes.
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
 
     assert result.exit_code == 0
-    assert "--host" in result.output
-    assert "--port" in result.output
+    assert "--host" in output
+    assert "--port" in output
 
 
 def test_run_review_missing_secrets_fails_cleanly(

@@ -148,7 +148,15 @@ def run_process(
         proc.communicate()
         raise
     # The leader exited; sweep anything it left running in its group (Chrome helpers etc.).
-    _kill_group(proc)
+    # Residual risk: once every member is gone the pgid could in theory be reused by an
+    # unrelated new group before we signal it. The window is microseconds and the probe
+    # below skips the kill when the group no longer exists, which is the common case.
+    try:
+        os.killpg(proc.pid, 0)
+    except (ProcessLookupError, PermissionError):
+        pass
+    else:
+        _kill_group(proc)
     return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
 
 
@@ -168,7 +176,8 @@ def _sigterm_as_exit() -> Iterator[None]:
     try:
         yield
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        # None means the old handler wasn't installed from Python; fall back to default.
+        signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
 
 
 def child_env(tmp_dir: Path) -> dict[str, str]:
@@ -424,12 +433,12 @@ def _publish(moves: Sequence[tuple[Path, Path]]) -> None:
     done: list[Path] = []
     try:
         for staged, final in moves:
+            done.append(final)  # before replace: a rename that half-happened is undone too
             os.replace(staged, final)
-            done.append(final)
     except BaseException:
         for final in done:
             with contextlib.suppress(OSError):
-                final.unlink()
+                final.unlink(missing_ok=True)
         raise
 
 

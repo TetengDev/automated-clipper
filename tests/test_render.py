@@ -497,8 +497,9 @@ def test_run_process_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert p.kwargs["cwd"] == Path("/w")
     assert "shell" not in p.kwargs
     assert (proc.returncode, proc.stdout, proc.stderr) == (0, "out", "err tail")
-    # Leftover group members (e.g. a daemonized Chrome helper) are swept after exit.
-    assert killed == [(4242, signal.SIGKILL)]
+    # Leftover group members (e.g. a daemonized Chrome helper) are swept after exit:
+    # probe with signal 0 first, then SIGKILL.
+    assert killed == [(4242, 0), (4242, signal.SIGKILL)]
 
 
 def test_run_process_kills_group_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -609,3 +610,51 @@ def test_partial_publish_is_rolled_back(
         _render(media_root, render_dir, tmp_path, FakeRunner())
     assert calls == ["clip.jpg", "clip.mp4"]
     assert list((tmp_path / "out").iterdir()) == []  # the published thumbnail was removed
+
+
+def test_run_process_skips_sweep_when_group_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[int] = []
+
+    def killpg(pid: int, sig: int) -> None:
+        sent.append(sig)
+        raise ProcessLookupError
+
+    monkeypatch.setattr(render.os, "killpg", killpg)
+    render.run_process(["x"], timeout=1, popen=FakePopen)
+    assert sent == [0]  # probe only; no SIGKILL to a group that no longer exists
+
+
+def test_sigterm_restores_default_when_previous_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[Any] = []
+
+    def fake_signal(signum: int, handler: Any) -> Any:
+        calls.append(handler)
+        return None  # handler was installed outside Python
+
+    monkeypatch.setattr(render.signal, "signal", fake_signal)
+    with render._sigterm_as_exit():
+        pass
+    assert calls == [render._raise_system_exit, signal.SIG_DFL]
+
+
+def test_publish_rollback_covers_partial_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replace that fails after creating the target still gets rolled back."""
+    staged = [tmp_path / f"s{i}" for i in range(3)]
+    finals = [tmp_path / f"f{i}" for i in range(3)]
+    for f in staged:
+        f.write_text("x")
+    real_replace = os.replace
+
+    def replace(src: Any, dst: Any) -> None:
+        real_replace(src, dst)
+        if Path(dst) == finals[1]:
+            raise OSError("fsync failed after rename")
+
+    monkeypatch.setattr(render.os, "replace", replace)
+    with pytest.raises(OSError, match="fsync"):
+        render._publish(list(zip(staged, finals, strict=True)))
+    assert not finals[0].exists()
+    assert not finals[1].exists()
+    assert not finals[2].exists()

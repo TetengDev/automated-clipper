@@ -241,3 +241,53 @@ def test_cap_timeout_shrinks_each_call() -> None:
     runner = Recorder(ok(json.dumps({"id": "x"})))
     YtDlp(runner=runner, cap_timeout=lambda t: min(t, 7.0)).probe(URL)
     assert runner.calls[0][1] == 7.0
+
+
+# --- second review pass ----------------------------------------------------------------------
+
+
+def test_run_command_returns_when_a_grandchild_holds_the_pipes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ytdlp, "PUMP_JOIN_TIMEOUT_S", 0.5)
+    # The child exits at once; its grandchild inherits stdout/stderr and sleeps for 30 s.
+    code = (
+        "import subprocess, sys;"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']);"
+        "print('parent done')"
+    )
+    start = time.monotonic()
+    result = run_command([sys.executable, "-c", code], 30)
+    assert time.monotonic() - start < 5.0
+    assert result.returncode == 0 and result.stdout == "parent done\n"
+
+
+def test_run_command_survives_a_raising_line_callback(caplog: pytest.LogCaptureFixture) -> None:
+    calls: list[str] = []
+
+    def explode(line: str) -> None:
+        calls.append(line)
+        raise ValueError("bad handler")
+
+    code = "import sys\nfor i in range(5000): print('x' * 50, file=sys.stderr)"
+    result = run_command([sys.executable, "-c", code], 30, on_stderr_line=explode)
+    assert result.returncode == 0
+    assert len(calls) == 1  # handler disabled after its first failure, pipe still drained
+    assert result.stderr.endswith("x" * 50 + "\n")
+    assert "stderr line handler failed" in caplog.text
+
+
+def test_run_command_caps_line_length() -> None:
+    lines: list[str] = []
+    code = "import sys; sys.stderr.write('y' * 200000 + '\\n')"
+    run_command([sys.executable, "-c", code], 30, on_stderr_line=lines.append)
+    assert max(len(line) for line in lines) <= ytdlp.LINE_LIMIT_BYTES
+    assert sum(len(line) for line in lines) == 200001
+
+
+def test_tail_keeps_the_last_bytes_without_shifting() -> None:
+    tail = ytdlp._Tail(10)
+    for chunk in (b"abcdef", b"ghij", b"klmnop"):
+        tail.add(chunk)
+    assert tail.text() == "ghijklmnop"
+    assert len(tail.chunks) == 2

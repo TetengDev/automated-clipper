@@ -381,7 +381,7 @@ def test_existing_clip_for_a_different_section_is_redownloaded(tmp_path: Path) -
     _setup(tmp_path, [_clip(1, 5.0, 8.0)])
     fc.fetch_clips(_job(), _ctx(tmp_path), runner=FakeYtdlp())
     sidecar = json.loads((tmp_path / "clips/1/.section.json").read_text())
-    assert sidecar == {"start": 3.0, "end": 10.0, "url": CANONICAL}
+    assert sidecar == {"start": 3.0, "end": 10.0, "url": CANONICAL, "format": fc.FORMAT}
 
     # Highlights changed (e.g. selection re-run): clip 1 now means another moment.
     (tmp_path / "sections.json").unlink()
@@ -435,3 +435,16 @@ def test_stage_budget_exhausted_is_retryable(
         fc.fetch_clips(_job(), _ctx(tmp_path), runner=FakeYtdlp())
     assert not isinstance(exc.value, PermanentError)
     assert not (tmp_path / "sections.json").exists()
+
+
+def test_clip_downloaded_with_another_format_is_redownloaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup(tmp_path, [_clip(1, 5.0, 8.0)])
+    fc.fetch_clips(_job(), _ctx(tmp_path), runner=FakeYtdlp())
+    (tmp_path / "sections.json").unlink()
+    monkeypatch.setattr(fc, "FORMAT", "bv*[height<=720]+ba/b[height<=720]")
+    again = FakeYtdlp()
+    fc.fetch_clips(_job(), _ctx(tmp_path), runner=again)
+    assert len(again.calls) == 1
+    assert again.calls[0][again.calls[0].index("-f") + 1] == "bv*[height<=720]+ba/b[height<=720]"

@@ -25,6 +25,10 @@ stream path reaches this stage only after `waiting_vod`. Sources longer than
 The whole run shares one `Deadline` (100 min, inside the 2 h lease): every yt-dlp/ffmpeg
 call's timeout is shrunk to what is left, and running out is a retryable `StageTimeout`.
 
+If the worker is SIGKILLed mid-download, `.info.tmp.json` (probe metadata incl. signed
+format URLs, which expire within hours) stays in the media dir until the next attempt
+overwrites and removes it, or retention cleanup deletes the dir.
+
 Optional env: CLIPPER_YTDLP_COOKIES (path to a cookies.txt), CLIPPER_YTDLP_PROXY.
 """
 
@@ -47,6 +51,7 @@ from clipper.pipeline.common import (
     MediaError,
     default_runner,
     ffprobe_duration,
+    first_seen,
     run_media,
     settings_for,
     write_json_atomic,
@@ -70,6 +75,7 @@ PEAK_MIN_SPACING_S = 30.0
 SILENCE_LUFS = -70.0
 NOT_READY_RETRY = timedelta(minutes=30)
 NOT_READY_MAX_AGE = timedelta(hours=48)
+NOT_READY_MARKER = ".not_ready_since"
 NOT_READY_LIVE_STATUSES = frozenset({"is_live", "is_upcoming", "post_live"})
 WAS_LIVE_STATUSES = frozenset({"is_live", "was_live", "post_live"})
 
@@ -80,9 +86,13 @@ class SourceNotReady(Deferred):
     """The source is live, upcoming, or still being processed; try again later."""
 
 
-def _not_ready(job: Job, now: datetime, live_status: object) -> Exception:
+def _not_ready(media_dir: Path, now: datetime, live_status: object) -> Exception:
+    """Deferred, until the source has been not-ready for NOT_READY_MAX_AGE in this stage
+    (counted from the first not-ready probe, not job creation: a stream may have waited
+    in `waiting_vod` for days before getting here)."""
     reason = f"source is not a finished video yet (live_status={live_status})"
-    if job.created_at is not None and now - job.created_at > NOT_READY_MAX_AGE:
+    since = first_seen(media_dir / NOT_READY_MARKER, now)
+    if now - since > NOT_READY_MAX_AGE:
         hours = NOT_READY_MAX_AGE.total_seconds() / 3600
         return PermanentError(f"{reason} after {hours:.0f} h; giving up")
     return SourceNotReady(now + NOT_READY_RETRY, reason)
@@ -106,7 +116,8 @@ def fetch_audio(
     info = ytdlp.probe(url)
     live_status = info.get("live_status")
     if live_status in NOT_READY_LIVE_STATUSES or info.get("is_live") is True:
-        raise _not_ready(job, ctx.clock(), live_status)
+        raise _not_ready(media_dir, ctx.clock(), live_status)
+    (media_dir / NOT_READY_MARKER).unlink(missing_ok=True)
     duration = _positive_float(info.get("duration"))
     if duration is not None:
         _check_duration(duration, settings)

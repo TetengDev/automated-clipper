@@ -11,17 +11,24 @@ Error mapping (from yt-dlp's stderr):
 - anything else -> `YtDlpError` (retryable) carrying a redacted tail of stderr.
 
 Callers pass only URLs built by `clipper.urls.canonical_url`, never raw user input.
+
+Known exposure (accepted): the proxy URL, credentials included, is a yt-dlp argument, so
+it is visible in the process list inside the container. It never reaches logs or the DB
+(see `proxy_secrets`).
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
 import re
 import signal
 import subprocess
 import sys
 import threading
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,9 +38,13 @@ from urllib.parse import quote, unquote, urlsplit
 from clipper.jobs.stages import PermanentError
 from clipper.redact import MASK, redact
 
+logger = logging.getLogger(__name__)
+
 PROBE_TIMEOUT_S = 120.0
 DOWNLOAD_TIMEOUT_S = 90 * 60.0
 STDERR_TAIL_CHARS = 500
+REDACT_WINDOW_CHARS = 4096
+"""Only this much text (the end) is ever passed to `redact`: bounded work per error."""
 COOKIES_ENV = "CLIPPER_YTDLP_COOKIES"
 PROXY_ENV = "CLIPPER_YTDLP_PROXY"
 AUDIO_MAX_FILESIZE = "4G"
@@ -41,6 +52,11 @@ SECTION_MAX_FILESIZE = "2G"
 STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
 """yt-dlp's probe JSON is often several MB; anything bigger is cut (and fails to parse)."""
 STDERR_LIMIT_BYTES = 64 * 1024
+LINE_LIMIT_BYTES = 64 * 1024
+"""`on_stderr_line` gets at most this much per call; longer lines arrive in pieces."""
+PUMP_JOIN_TIMEOUT_S = 5.0
+"""How long to wait for output after the child exits before killing its process group
+(a grandchild that inherited the pipes would otherwise keep us waiting forever)."""
 """Only the last 64 KB of stderr are kept; stream lines with `on_stderr_line` for more."""
 CHILD_ENV_ALLOWLIST = (
     "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "XDG_CACHE_HOME",
@@ -91,19 +107,22 @@ def child_env() -> dict[str, str]:
 
 
 class _Tail:
-    """Keeps the last `limit` bytes written to it."""
+    """Keeps (at least) the last `limit` bytes written to it, as a deque of chunks so a
+    large buffer is never shifted byte by byte."""
 
     def __init__(self, limit: int) -> None:
         self.limit = limit
-        self.buf = bytearray()
+        self.chunks: deque[bytes] = deque()
+        self.size = 0
 
     def add(self, data: bytes) -> None:
-        self.buf += data
-        if len(self.buf) > self.limit:
-            del self.buf[: len(self.buf) - self.limit]
+        self.chunks.append(data)
+        self.size += len(data)
+        while self.chunks and self.size - len(self.chunks[0]) >= self.limit:
+            self.size -= len(self.chunks.popleft())
 
     def text(self) -> str:
-        return self.buf.decode("utf-8", errors="replace")
+        return b"".join(self.chunks)[-self.limit :].decode("utf-8", errors="replace")
 
 
 def _pump(stream: IO[bytes], tail: _Tail, on_line: Callable[[str], None] | None) -> None:
@@ -112,9 +131,17 @@ def _pump(stream: IO[bytes], tail: _Tail, on_line: Callable[[str], None] | None)
             for chunk in iter(lambda: stream.read(65536), b""):
                 tail.add(chunk)
             return
-        for raw in stream:
+        broken = False
+        while raw := stream.readline(LINE_LIMIT_BYTES):
             tail.add(raw)
-            on_line(raw.decode("utf-8", errors="replace"))
+            if broken:
+                continue
+            try:
+                on_line(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                # Keep draining: a stalled pipe would block the child.
+                logger.exception("stderr line handler failed; ignoring further lines")
+                broken = True
 
 
 def _kill_group(proc: subprocess.Popen[bytes]) -> None:
@@ -123,6 +150,22 @@ def _kill_group(proc: subprocess.Popen[bytes]) -> None:
     except (ProcessLookupError, PermissionError):
         proc.kill()
     proc.wait()
+
+
+def _finish_pumps(proc: subprocess.Popen[bytes], pumps: Sequence[threading.Thread]) -> None:
+    """Wait for the output readers; if something still holds the pipes after the child is
+    gone, kill the rest of its process group and give the readers a last chance. A reader
+    that is still blocked after that is a daemon thread and is abandoned (closing a pipe
+    under a blocked reader is not safe)."""
+    for pump in pumps:
+        pump.join(PUMP_JOIN_TIMEOUT_S)
+    if any(p.is_alive() for p in pumps):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        for pump in pumps:
+            pump.join(PUMP_JOIN_TIMEOUT_S)
+        if any(p.is_alive() for p in pumps):
+            logger.warning("%s: output pipe still held open; not waiting", Path(proc.args[0]).name)
 
 
 def run_command(
@@ -153,14 +196,12 @@ def run_command(
         proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         _kill_group(proc)
-        for pump in pumps:
-            pump.join()
+        _finish_pumps(proc, pumps)
         raise CommandTimeout(f"{Path(args[0]).name} timed out after {timeout_s:.0f}s") from None
     except BaseException:
         _kill_group(proc)
         raise
-    for pump in pumps:
-        pump.join()
+    _finish_pumps(proc, pumps)
     return RunResult(proc.returncode, out.text(), err.text())
 
 
@@ -194,7 +235,7 @@ def _tail(stderr: str, secrets: Sequence[str] = ()) -> str:
     for secret in secrets:
         if secret:
             text = text.replace(secret, MASK)
-    text = redact(text)
+    text = redact(text[-REDACT_WINDOW_CHARS:])
     return text[-STDERR_TAIL_CHARS:] if len(text) > STDERR_TAIL_CHARS else text
 
 

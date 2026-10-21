@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 import tempfile
 import threading
@@ -35,6 +36,7 @@ from tenacity import (
     Retrying,
     retry_if_exception_type,
     stop_after_attempt,
+    stop_after_delay,
     wait_exponential_jitter,
 )
 
@@ -43,6 +45,8 @@ from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
 from clipper.pipeline.common import (
     PROTOCOL_WHITELIST,
+    REDACT_WINDOW_CHARS,
+    Deadline,
     MediaError,
     NoDuration,
     creator_for,
@@ -63,6 +67,9 @@ CACHE_DIR = ".transcribe"
 WORK_PREFIX = ".transcribe-"
 
 CUT_TIMEOUT_S = 10 * 60.0
+CHUNK_CALL_TIMEOUT_S = 15 * 60.0
+"""Upper bound for one chunk's Groq call incl. retries; shrunk to the stage's Deadline."""
+_LANGUAGE_CODE = re.compile(r"^[a-z]{2,3}(-[a-z]{2,4})?$")
 
 CHUNK_SECONDS = 600.0
 OVERLAP_SECONDS = 2.0
@@ -156,13 +163,23 @@ class Transcriber(Protocol):
     provider: str
     model: str
 
-    def transcribe(self, audio: Path, *, language: str | None) -> ChunkTranscript: ...
+    def transcribe(
+        self, audio: Path, *, language: str | None, timeout_s: float | None = None
+    ) -> ChunkTranscript:
+        """`timeout_s` bounds the whole call including retries. A response that was billed
+        but cannot be used raises `BilledChunkError`."""
+        ...
 
     def cost_usd(self, chunk_seconds: Sequence[float]) -> float:
         """What transcribing chunks of these lengths costs (0 for a local model)."""
         ...
 
     def billed_seconds(self, chunk_seconds: Sequence[float]) -> float: ...
+
+
+class BilledChunkError(RuntimeError):
+    """The provider answered (and billed) but the result is unusable. Retryable at the
+    job level; the chunk still counts as paid."""
 
 
 class _Retryable(Exception):
@@ -186,7 +203,7 @@ def _error_detail(response: httpx.Response) -> str:
         message = response.json()["error"]["message"]
     except (ValueError, KeyError, TypeError):
         message = response.text
-    return redact(str(message))[:200]
+    return redact(str(message)[:REDACT_WINDOW_CHARS])[:200]
 
 
 @dataclass
@@ -220,26 +237,52 @@ class GroqTranscriber:
             return exc.retry_after
         return wait_exponential_jitter(initial=1, max=30)(state)
 
-    def transcribe(self, audio: Path, *, language: str | None) -> ChunkTranscript:
+    def _timeout(self, timeout_s: float | None) -> httpx.Timeout:
+        if timeout_s is None:
+            return self.timeout
+        t = self.timeout
+        return httpx.Timeout(
+            connect=min(t.connect or timeout_s, timeout_s),
+            read=min(t.read or timeout_s, timeout_s),
+            write=min(t.write or timeout_s, timeout_s),
+            pool=min(t.pool or timeout_s, timeout_s),
+        )
+
+    def transcribe(
+        self, audio: Path, *, language: str | None, timeout_s: float | None = None
+    ) -> ChunkTranscript:
         size = audio.stat().st_size
         if size > GROQ_MAX_UPLOAD_BYTES:
             raise PermanentError(f"audio chunk is {size} bytes, over Groq's upload limit")
+        stop = stop_after_attempt(self.max_attempts)
+        if timeout_s is not None:
+            stop = stop | stop_after_delay(timeout_s)
         retrying = Retrying(
             retry=retry_if_exception_type(_Retryable),
-            stop=stop_after_attempt(self.max_attempts),
+            stop=stop,
             wait=self._wait,
             sleep=self.sleep,
             reraise=True,
         )
-        client = self.client or httpx.Client(timeout=self.timeout)
+        timeout = self._timeout(timeout_s)
+        client = self.client or httpx.Client(timeout=timeout)
         try:
-            body = retrying(self._post, client, audio, language)
+            body = retrying(self._post, client, audio, language, timeout)
         finally:
             if self.client is None:
                 client.close()
-        return _parse_verbose_json(body)
+        try:
+            return _parse_verbose_json(body)
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise BilledChunkError(f"Groq response unusable: {type(exc).__name__}") from None
 
-    def _post(self, client: httpx.Client, audio: Path, language: str | None) -> dict[str, Any]:
+    def _post(
+        self,
+        client: httpx.Client,
+        audio: Path,
+        language: str | None,
+        timeout: httpx.Timeout | None = None,
+    ) -> dict[str, Any]:
         data: dict[str, Any] = {
             "model": self.model,
             "response_format": "verbose_json",
@@ -255,7 +298,7 @@ class GroqTranscriber:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     data=data,
                     files={"file": (audio.name, fh, "audio/flac")},
-                    timeout=self.timeout,
+                    timeout=timeout or self.timeout,
                 )
         except httpx.TransportError as exc:
             # Message only names the error type: some transports echo request details.
@@ -267,12 +310,13 @@ class GroqTranscriber:
             raise _Retryable(f"Groq HTTP {status}", _retry_after(response))
         if status >= 400:
             raise PermanentError(f"Groq HTTP {status}: {_error_detail(response)}")
+        # A 2xx is billed: never re-send it within this call; the job retry reuses paid chunks.
         try:
             body = response.json()
         except ValueError:
-            raise _Retryable("Groq returned a non-JSON response") from None
+            raise BilledChunkError("Groq returned a non-JSON response") from None
         if not isinstance(body, dict):
-            raise _Retryable("Groq returned an unexpected response")
+            raise BilledChunkError("Groq returned an unexpected response")
         return body
 
 
@@ -292,8 +336,10 @@ def _parse_verbose_json(body: dict[str, Any]) -> ChunkTranscript:
 
 
 def normalize_language(value: str) -> str:
+    """ISO-639 code (`en`, `tl`, `pt-br`) or "unknown"; never free text from the API."""
     key = value.strip().lower()
-    return _LANGUAGE_CODES.get(key, key)
+    code = _LANGUAGE_CODES.get(key, key)
+    return code if _LANGUAGE_CODE.fullmatch(code) else "unknown"
 
 
 # --------------------------------------------------------------------------- chunking
@@ -325,7 +371,9 @@ def probe_duration(audio: Path) -> float:
         raise PermanentError(f"cannot read the duration of {audio.name}") from None
 
 
-def cut_chunk(audio: Path, chunk: Chunk, out_dir: Path) -> Path:
+def cut_chunk(
+    audio: Path, chunk: Chunk, out_dir: Path, *, timeout_s: float = CUT_TIMEOUT_S
+) -> Path:
     out = out_dir / f"chunk_{chunk.index:04d}.flac"
     args = [
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
@@ -333,7 +381,7 @@ def cut_chunk(audio: Path, chunk: Chunk, out_dir: Path) -> Path:
         *PROTOCOL_WHITELIST, "-i", str(audio),
         "-ac", "1", "-ar", "16000", "-c:a", "flac", str(out),
     ]  # fmt: skip
-    run_media(args, CUT_TIMEOUT_S, f"ffmpeg cutting chunk {chunk.index}")
+    run_media(args, timeout_s, f"ffmpeg cutting chunk {chunk.index}")
     if not out.is_file():
         raise MediaError(f"ffmpeg cutting chunk {chunk.index} produced no file")
     return out
@@ -342,9 +390,29 @@ def cut_chunk(audio: Path, chunk: Chunk, out_dir: Path) -> Path:
 # --------------------------------------------------------------------------- chunk cache
 
 
-def _cache_path(cache_dir: Path, chunk: Chunk, backend: Transcriber, language: str | None) -> Path:
+def audio_fingerprint(audio: Path) -> tuple[int, int]:
+    """Size and mtime: a re-fetched audio file invalidates every cached chunk."""
+    st = audio.stat()
+    return st.st_size, st.st_mtime_ns
+
+
+def _cache_path(
+    cache_dir: Path,
+    chunk: Chunk,
+    backend: Transcriber,
+    language: str | None,
+    fingerprint: tuple[int, int],
+) -> Path:
     key = json.dumps(
-        [chunk.index, chunk.offset, chunk.duration, backend.provider, backend.model, language]
+        [
+            chunk.index,
+            chunk.offset,
+            chunk.duration,
+            backend.provider,
+            backend.model,
+            language,
+            *fingerprint,
+        ]
     )
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
     return cache_dir / f"{chunk.index:04d}-{digest}.json"
@@ -464,19 +532,26 @@ def transcribe(
 
     backend = transcriber if transcriber is not None else default_transcriber()
     language = creator_language(job, ctx)
+    fingerprint = audio_fingerprint(audio)
+    deadline = Deadline()
     for stale in ctx.media_dir.glob(f"{WORK_PREFIX}*"):  # chunk audio of a killed run
         shutil.rmtree(stale, ignore_errors=True)
     cache_dir = ctx.media_dir / CACHE_DIR
     cache_dir.mkdir(exist_ok=True)
-    cached = {c.index: _load_chunk(_cache_path(cache_dir, c, backend, language)) for c in chunks}
+    cached = {
+        c.index: _load_chunk(_cache_path(cache_dir, c, backend, language, fingerprint))
+        for c in chunks
+    }
     todo = [c for c in chunks if cached[c.index] is None]
     results: dict[int, ChunkTranscript] = {i: r for i, r in cached.items() if r is not None}
     if todo:
-        _transcribe_chunks(job, ctx, audio, todo, backend, language, cache_dir, max_concurrency)
+        _transcribe_chunks(
+            job, ctx, audio, todo, backend, language, cache_dir, max_concurrency, deadline
+        )
         results.update(
             (c.index, r)
             for c in todo
-            if (r := _load_chunk(_cache_path(cache_dir, c, backend, language)))
+            if (r := _load_chunk(_cache_path(cache_dir, c, backend, language, fingerprint)))
         )
     ordered = [(c, results[c.index]) for c in chunks]
 
@@ -510,10 +585,14 @@ def _transcribe_chunks(
     language: str | None,
     cache_dir: Path,
     max_concurrency: int,
+    deadline: Deadline,
 ) -> None:
     """Transcribe `chunks`, caching each result as soon as it is paid for. The estimate is
     reserved against the daily cap first; the row is settled to what was billed, also
-    when a later chunk fails."""
+    when a later chunk fails. Every chunk's ffmpeg and API timeouts are shrunk to what is
+    left of the stage `deadline`; running out raises `StageTimeout` (retryable, and the
+    retry resumes from the cached chunks)."""
+    fingerprint = audio_fingerprint(audio)
     done: list[Chunk] = []
     lock = threading.Lock()
     with reserve_spend(
@@ -529,11 +608,18 @@ def _transcribe_chunks(
         work_dir = Path(tempfile.mkdtemp(dir=ctx.media_dir, prefix=WORK_PREFIX))
 
         def run(chunk: Chunk) -> None:
-            path = cut_chunk(audio, chunk, work_dir)
-            result = backend.transcribe(path, language=language)
+            path = cut_chunk(audio, chunk, work_dir, timeout_s=deadline.timeout(CUT_TIMEOUT_S))
+            try:
+                result = backend.transcribe(
+                    path, language=language, timeout_s=deadline.timeout(CHUNK_CALL_TIMEOUT_S)
+                )
+            except BilledChunkError:
+                with lock:
+                    done.append(chunk)
+                raise
             with lock:
                 done.append(chunk)
-            _save_chunk(_cache_path(cache_dir, chunk, backend, language), result)
+            _save_chunk(_cache_path(cache_dir, chunk, backend, language, fingerprint), result)
             path.unlink(missing_ok=True)
 
         try:

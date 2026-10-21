@@ -13,7 +13,7 @@ there when rendering.
 
 yt-dlp runs through the shared `clipper.pipeline.ytdlp.YtDlp` wrapper (same error mapping,
 cookies/proxy env and redaction as `fetching_audio`). Each kept clip has a sidecar
-`clips/<rank>/.section.json` ({"start", "end", "url"}): an existing source.mp4 is only
+`clips/<rank>/.section.json` ({"start", "end", "url", "format"}): an existing source.mp4 is only
 reused if its sidecar matches the section wanted now (highlights can change between runs).
 All calls share one 100 min `Deadline`; running out is a retryable `StageTimeout`.
 """
@@ -140,7 +140,7 @@ def _probe(path: Path, runner: Runner, deadline: Deadline) -> _Probe | None:
 
 
 def _sidecar(url: str, section: tuple[float, float]) -> dict[str, object]:
-    return {"start": section[0], "end": section[1], "url": url}
+    return {"start": section[0], "end": section[1], "url": url, "format": FORMAT}
 
 
 def _reusable(

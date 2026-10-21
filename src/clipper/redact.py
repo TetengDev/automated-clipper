@@ -20,7 +20,11 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(\bbearer\s+)[\w.~+/=-]+", re.IGNORECASE), rf"\1{MASK}"),
     (re.compile(r"(?<![A-Za-z0-9])(?:sk-|gsk_)[\w-]{8,}"), MASK),
     # user:password@ in any URL (proxies, remotes); keeps the scheme and host.
-    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1***@"),
+    # Scheme length is bounded and anchored by a lookbehind so the scan stays linear.
+    (
+        re.compile(r"(?i)((?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}://)[^/\s:@]+:[^/\s@]+@"),
+        r"\1***@",
+    ),
 )
 
 

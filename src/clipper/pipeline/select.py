@@ -72,7 +72,10 @@ MAX_WINDOWS = 40
 MAX_SNAP_S = 3.0
 """Snapping to word boundaries may move a boundary at most this far; else the clip is dropped."""
 MAX_TITLE_CHARS = 300
+MAX_LANGUAGE_CHARS = 16
 CREDIT_RETRY = timedelta(hours=1)
+CREDIT_MAX_WAIT = timedelta(hours=48)
+CREDIT_MARKER = ".credit_deferred_since"
 CACHE_DIR = ".select"
 FIELD_LIMITS = {"hook": 120, "title": 100, "caption": 2200, "reason": 500}
 MAX_HASHTAGS = 10
@@ -335,7 +338,8 @@ def build_user_prompt(
 
 def build_system(creator: str, language: str | None, tags: Sequence[str]) -> list[dict[str, Any]]:
     """Static instructions first (cached), then the per-creator style block (cached too)."""
-    style = f"Creator: {creator}\nVideo language: {language or 'unknown'}"
+    language = strip_control(language or "")[:MAX_LANGUAGE_CHARS] or "unknown"
+    style = f"Creator: {creator}\nVideo language: {language}"
     if tags:
         style += f"\nCreator style tags: {', '.join(tags)}"
     return [
@@ -483,11 +487,26 @@ def _parse_reply(message: Any) -> list[Candidate]:
     return _Reply.model_validate_json(text).clips
 
 
+def _no_credit(ctx: StageContext) -> Exception:
+    """Deferred an hour at a time, for at most CREDIT_MAX_WAIT since the first deferral."""
+    now = ctx.clock()
+    since = common.first_seen(ctx.media_dir / CREDIT_MARKER, now)
+    if now - since > CREDIT_MAX_WAIT:
+        hours = CREDIT_MAX_WAIT.total_seconds() / 3600
+        return PermanentError(f"Anthropic credit balance too low for {hours:.0f} h; giving up")
+    logger.warning(
+        "Anthropic credit balance too low (since %s); deferring this job by %s",
+        since.isoformat(),
+        CREDIT_RETRY,
+    )
+    return Deferred(now + CREDIT_RETRY, "Anthropic credit balance too low")
+
+
 def _call(
-    client: anthropic.Anthropic, system: list[dict[str, Any]], prompt: str, now: datetime
+    client: anthropic.Anthropic, system: list[dict[str, Any]], prompt: str, ctx: StageContext
 ) -> Any:
     try:
-        return client.messages.create(
+        message = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             system=system,
@@ -498,12 +517,14 @@ def _call(
         raise PermanentError(f"Anthropic rejected the credentials ({exc.status_code})") from None
     except anthropic.BadRequestError as exc:
         if "credit balance" in str(exc).lower():
-            raise Deferred(now + CREDIT_RETRY, "Anthropic credit balance too low") from None
+            raise _no_credit(ctx) from None
         raise PermanentError(f"Anthropic rejected the request ({exc.status_code})") from None
     except anthropic.APIStatusError as exc:
         raise RuntimeError(f"Anthropic API error ({exc.status_code})") from None
     except anthropic.APIConnectionError as exc:
         raise RuntimeError(f"Anthropic API unreachable ({type(exc).__name__})") from None
+    (ctx.media_dir / CREDIT_MARKER).unlink(missing_ok=True)
+    return message
 
 
 def _paid_call(
@@ -525,7 +546,7 @@ def _paid_call(
         cap_usd=cap,
         now=ctx.clock(),
     ) as charge:
-        message = _call(client, system, prompt, ctx.clock())
+        message = _call(client, system, prompt, ctx)
         usage = message.usage
         charge.usd = PRICING[MODEL].cost(usage)
         charge.input_tokens = _input_tokens(usage)
@@ -575,7 +596,14 @@ def _check_budget(ctx: StageContext, cap: float) -> None:
 def _window_cache(
     cache_dir: Path, index: int, system: list[dict[str, Any]], prompt: str, settings: Settings
 ) -> Path:
-    key = json.dumps([PROMPT_VERSION, MODEL, system, prompt, settings.model_dump()], sort_keys=True)
+    """Keyed by everything that shapes the request: prompt version, model, the exact system
+    blocks and user prompt, and the settings that reach the prompt (clip length range).
+    Unrelated settings (budgets, top-K) must not throw away paid windows."""
+    prompt_settings = {
+        "clip_min_seconds": settings.clip_min_seconds,
+        "clip_max_seconds": settings.clip_max_seconds,
+    }
+    key = json.dumps([PROMPT_VERSION, MODEL, system, prompt, prompt_settings], sort_keys=True)
     return cache_dir / f"{index:03d}-{hashlib.sha256(key.encode()).hexdigest()[:16]}.json"
 
 

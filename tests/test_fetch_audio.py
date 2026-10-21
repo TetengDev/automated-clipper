@@ -250,7 +250,7 @@ def test_live_or_upcoming_is_retried_later(
     with pytest.raises(SourceNotReady, match=live_status):
         run(make_job(), ctx, runner)
     assert runner.of("download") == []
-    assert leftovers(media_dir) == []
+    assert leftovers(media_dir) == [fa.NOT_READY_MARKER]
 
 
 def test_short_video_is_skipped_before_download(ctx: StageContext, media_dir: Path) -> None:
@@ -525,12 +525,33 @@ def test_not_ready_defers_thirty_minutes(media_dir: Path) -> None:
     assert exc.value.until == T0 + fa.NOT_READY_RETRY
 
 
-def test_not_ready_for_more_than_48h_is_permanent(media_dir: Path) -> None:
-    job = dataclasses.replace(make_job(), created_at=T0 - timedelta(hours=49))
+def _probe_at(media_dir: Path, when: datetime, job: Job, info: dict[str, Any]) -> None:
     with closing(sqlite3.connect(":memory:")) as conn:
-        ctx = StageContext(media_dir, conn, AppConfig(), clock=lambda: T0)
-        with pytest.raises(PermanentError, match="giving up"):
-            run(job, ctx, FakeRunner(base_info(live_status="is_live")))
+        run(job, StageContext(media_dir, conn, AppConfig(), clock=lambda: when), FakeRunner(info))
+
+
+def test_not_ready_for_more_than_48h_in_this_stage_is_permanent(media_dir: Path) -> None:
+    live = base_info(live_status="is_live")
+    with pytest.raises(SourceNotReady):
+        _probe_at(media_dir, T0, make_job(), live)
+    with pytest.raises(SourceNotReady):
+        _probe_at(media_dir, T0 + timedelta(hours=47), make_job(), live)
+    with pytest.raises(PermanentError, match="giving up"):
+        _probe_at(media_dir, T0 + timedelta(hours=49), make_job(), live)
+
+
+def test_not_ready_age_ignores_time_spent_before_this_stage(media_dir: Path) -> None:
+    # A stream that sat in waiting_vod for days is deferred, not failed, on its first probe.
+    old_job = dataclasses.replace(make_job(), created_at=T0 - timedelta(days=5))
+    with pytest.raises(SourceNotReady):
+        _probe_at(media_dir, T0, old_job, base_info(live_status="post_live"))
+
+
+def test_not_ready_marker_cleared_once_the_source_is_ready(media_dir: Path) -> None:
+    with pytest.raises(SourceNotReady):
+        _probe_at(media_dir, T0, make_job(), base_info(live_status="is_live"))
+    _probe_at(media_dir, T0 + timedelta(hours=1), make_job(), base_info())
+    assert not (media_dir / fa.NOT_READY_MARKER).exists()
 
 
 def test_too_long_video_is_skipped_before_download(ctx: StageContext, media_dir: Path) -> None:

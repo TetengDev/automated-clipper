@@ -37,13 +37,13 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     c.close()
 
 
-def _reserve(conn: sqlite3.Connection, estimate: float, cap: float = 1.0):
+def _reserve(conn: sqlite3.Connection, estimate: float, cap: float = 1.0, job_id: int = 1):
     return reserve_spend(
         conn,
         kind="llm",
         label="LLM",
         provider="anthropic",
-        job_id=1,
+        job_id=job_id,
         estimate_usd=estimate,
         cap_usd=cap,
         now=T0,
@@ -64,9 +64,17 @@ def test_reservation_is_visible_while_in_flight_then_settled(conn: sqlite3.Conne
 def test_second_reservation_over_cap_is_deferred_to_utc_midnight(
     conn: sqlite3.Connection,
 ) -> None:
-    held = _reserve(conn, 0.6)
+    conn.execute(
+        "INSERT INTO jobs (platform, item_id, creator, source_url, created_at, updated_at)"
+        " SELECT platform, 'other00000a', creator, source_url, created_at, updated_at"
+        " FROM jobs WHERE id = 1"
+    )
+    held = _reserve(conn, 0.6)  # job 1, in flight
     held.__enter__()
-    with pytest.raises(Deferred, match="daily LLM budget reached") as exc, _reserve(conn, 0.6):
+    with (
+        pytest.raises(Deferred, match="daily LLM budget reached") as exc,
+        _reserve(conn, 0.6, job_id=2),
+    ):
         pass
     held.__exit__(None, None, None)
     assert exc.value.until == datetime(2026, 10, 22, tzinfo=UTC)
@@ -119,3 +127,19 @@ def test_deadline_shrinks_and_then_expires() -> None:
 def test_next_utc_midnight_and_strip_control() -> None:
     assert next_utc_midnight(T0) == datetime(2026, 10, 22, tzinfo=UTC)
     assert strip_control("a\nb\x00\tc\x7f  d") == "a b c d"
+
+
+def test_leaked_reservation_of_this_job_is_dropped(conn: sqlite3.Connection) -> None:
+    leaked = _reserve(conn, 0.7)
+    leaked.__enter__()  # worker killed: never settled
+    conn.execute(
+        "INSERT INTO spend (job_id, provider, kind, usd, input_tokens, created_at)"
+        " VALUES (1, 'anthropic', 'llm', 0.2, 50, '2026-10-21T23:00:00Z')"
+    )  # a settled row stays
+    conn.execute(
+        "INSERT INTO spend (job_id, provider, kind, usd, created_at)"
+        " VALUES (NULL, 'groq', 'llm', 0.05, '2026-10-21T23:00:00Z')"
+    )  # another job's row stays
+    with _reserve(conn, 0.7) as charge:  # would not fit next to the leaked 0.7
+        charge.usd, charge.input_tokens = 0.1, 10
+    assert sorted(_rows(conn)) == [(0.05, None), (0.1, 10), (0.2, 50)]

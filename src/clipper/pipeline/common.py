@@ -33,7 +33,7 @@ from clipper.db import transaction
 from clipper.jobs.models import Job, to_iso
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob
 from clipper.pipeline import ytdlp
-from clipper.pipeline.ytdlp import CommandTimeout, Runner, RunResult
+from clipper.pipeline.ytdlp import REDACT_WINDOW_CHARS, CommandTimeout, Runner, RunResult
 from clipper.redact import redact
 
 logger = logging.getLogger(__name__)
@@ -119,8 +119,8 @@ def read_json(path: Path, *, required: bool = True) -> Any:
 
 
 def stderr_tail(stderr: str) -> str:
-    tail = " | ".join(stderr.strip().splitlines()[-3:])
-    return redact(tail)[-STDERR_TAIL_CHARS:]
+    tail = " | ".join(stderr[-REDACT_WINDOW_CHARS:].strip().splitlines()[-3:])
+    return redact(tail[-REDACT_WINDOW_CHARS:])[-STDERR_TAIL_CHARS:]
 
 
 def run_media(
@@ -178,6 +178,22 @@ def settings_for(job: Job, config: AppConfig) -> Settings:
     return config.effective_settings(creator.name) if creator else config.settings
 
 
+def first_seen(marker: Path, now: datetime) -> datetime:
+    """When a condition (source not ready, no API credit) was first hit for this job: read
+    from `marker`, or recorded as `now`. Remove the marker once the condition clears."""
+    try:
+        seen = datetime.fromisoformat(marker.read_text(encoding="utf-8").strip())
+        if seen.tzinfo is not None:
+            return seen
+    except (OSError, ValueError):
+        pass
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_name(f"{marker.name}.tmp")
+    tmp.write_text(now.astimezone(UTC).isoformat(), encoding="utf-8")
+    os.replace(tmp, marker)
+    return now
+
+
 def next_utc_midnight(now: datetime) -> datetime:
     return datetime.combine(now.astimezone(UTC).date() + timedelta(days=1), time(0), tzinfo=UTC)
 
@@ -223,6 +239,7 @@ def reserve_spend(
     """Check the daily cap and reserve `estimate_usd` atomically, then settle the row to
     the `SpendCharge` the caller fills in (deleted if nothing was charged).
 
+    Unsettled rows this job left behind (worker killed mid-call) are dropped first.
     Over the cap -> `Deferred` to the next UTC midnight. An estimate larger than the whole
     cap can never fit -> `SkipJob`. A DB error while settling after a failure is logged,
     never raised over the original exception.
@@ -231,6 +248,13 @@ def reserve_spend(
         raise SkipJob(f"{label} cost ${estimate_usd:.2f} exceeds the daily cap ${cap_usd:.2f}")
     start, end = _utc_day(now)
     with transaction(conn):
+        # A reservation this job leaked when its worker was killed (never settled: settled
+        # rows always carry tokens or audio seconds). Only one worker holds the job.
+        conn.execute(
+            "DELETE FROM spend WHERE job_id = ? AND kind = ?"
+            " AND input_tokens IS NULL AND audio_seconds IS NULL",
+            (job_id, kind),
+        )
         spent = float(
             conn.execute(
                 "SELECT COALESCE(SUM(usd), 0) FROM spend"

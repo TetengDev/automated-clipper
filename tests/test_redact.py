@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from clipper.redact import redact
@@ -59,3 +61,14 @@ def test_redacts_url_userinfo(text: str, expected: str) -> None:
 def test_keeps_url_without_password() -> None:
     text = "ssh://git@github.com/x and mailto:a@b.test"
     assert redact(text) == text
+
+
+@pytest.mark.parametrize("text", ["a-" * 32768, "a." * 32768, "a+" * 30000, "a" * 65536 + "://"])
+def test_url_userinfo_pattern_is_linear(text: str) -> None:
+    start = time.perf_counter()
+    redact(text)
+    assert time.perf_counter() - start < 0.1
+
+
+def test_url_userinfo_with_percent_encoded_password() -> None:
+    assert redact("via http://u:p%40ss@h:3128/ ok") == "via http://***@h:3128/ ok"

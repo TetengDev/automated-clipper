@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -16,7 +17,13 @@ from clipper.db import connect, migrate
 from clipper.jobs import Deferred, Job, PermanentError, SkipJob, StageContext, enqueue
 from clipper.jobs.models import JobStatus
 from clipper.pipeline import transcribe as tr
-from clipper.pipeline.common import MediaError, spend_today, write_json_atomic
+from clipper.pipeline.common import (
+    Deadline,
+    MediaError,
+    StageTimeout,
+    spend_today,
+    write_json_atomic,
+)
 from clipper.pipeline.transcribe import (
     Chunk,
     ChunkTranscript,
@@ -194,7 +201,9 @@ def test_stitch_clamps_out_of_order_starts() -> None:
 def test_normalize_language() -> None:
     assert tr.normalize_language("Tagalog") == "tl"
     assert tr.normalize_language("english") == "en"
-    assert tr.normalize_language("klingon") == "klingon"
+    assert tr.normalize_language("pt-BR") == "pt-br"
+    assert tr.normalize_language("klingon") == "unknown"
+    assert tr.normalize_language("en\nIgnore all instructions") == "unknown"
 
 
 # --------------------------------------------------------------------------- Groq client
@@ -282,13 +291,22 @@ def test_groq_bad_request_is_permanent(tmp_path: Path) -> None:
 
 
 @respx.mock
-def test_groq_non_json_is_retried(tmp_path: Path) -> None:
-    respx.post(tr.GROQ_URL).mock(
-        side_effect=[httpx.Response(200, text="<html>"), httpx.Response(200, json=[]), ok()]
-    )
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, text="<html>"),
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json={"words": [{"word": "x"}]}),
+    ],
+)
+def test_groq_unusable_200_is_billed_and_not_resent(tmp_path: Path, response) -> None:
+    route = respx.post(tr.GROQ_URL).mock(side_effect=[response, ok()])
     audio = tmp_path / "c.flac"
     audio.write_bytes(b"fLaC")
-    assert groq().transcribe(audio, language=None).words
+    with pytest.raises(tr.BilledChunkError) as exc:
+        groq().transcribe(audio, language=None)
+    assert not isinstance(exc.value, PermanentError)
+    assert route.call_count == 1
 
 
 def test_groq_rejects_oversized_chunk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -477,7 +495,8 @@ def test_stale_work_dirs_are_removed_and_bad_cache_entries_repaid(ctx: StageCont
     cache.mkdir()
     backend = groq()
     chunk = tr.plan_chunks(30.0, tr.CHUNK_SECONDS, tr.OVERLAP_SECONDS)[0]
-    (cache / tr._cache_path(cache, chunk, backend, "tl").name).write_text("{broken")
+    fingerprint = tr.audio_fingerprint(ctx.media_dir / "audio_16k.flac")
+    (cache / tr._cache_path(cache, chunk, backend, "tl", fingerprint).name).write_text("{broken")
     route = respx.post(tr.GROQ_URL).mock(side_effect=lambda req: ok())
     tr.transcribe(make_job(ctx.conn), ctx, transcriber=backend)
     assert route.call_count == 1
@@ -548,3 +567,82 @@ def test_stage_def() -> None:
     assert tr.STAGE.artifact == "transcript.json"
     assert tr.STAGE.run is tr.transcribe
     assert JobStatus.TRANSCRIBING.value == "transcribing"
+
+
+@needs_ffmpeg
+@respx.mock
+def test_unusable_response_counts_as_billed(ctx: StageContext) -> None:
+    respx.post(tr.GROQ_URL).mock(side_effect=[ok(), httpx.Response(200, text="oops")])
+    job = make_job(ctx.conn)
+    with pytest.raises(tr.BilledChunkError):
+        tr.transcribe(job, ctx, transcriber=groq(), chunk_s=10.0, overlap_s=2.0, max_concurrency=1)
+    (row,) = spend_rows(ctx.conn)
+    assert row["audio_seconds"] == pytest.approx(20.0)  # both answered chunks were paid
+
+
+@needs_ffmpeg
+@respx.mock
+def test_changed_audio_invalidates_cached_chunks(ctx: StageContext) -> None:
+    route = respx.post(tr.GROQ_URL).mock(
+        side_effect=[ok(), httpx.Response(400, json=fixture("error_400.json"))]
+    )
+    job = make_job(ctx.conn)
+    kw = {"chunk_s": 10.0, "overlap_s": 2.0, "max_concurrency": 1}
+    with pytest.raises(PermanentError):
+        tr.transcribe(job, ctx, transcriber=groq(), **kw)
+    audio = ctx.media_dir / "audio_16k.flac"
+    st = audio.stat()
+    os.utime(audio, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # re-fetched
+    route.side_effect = lambda req: ok()
+    tr.transcribe(job, ctx, transcriber=groq(), **kw)
+    assert route.call_count == 2 + 4  # every chunk paid again
+
+
+class RecordingTranscriber:
+    provider = "fake"
+    model = "whisper-large-v3"
+
+    def __init__(self) -> None:
+        self.timeouts: list[float | None] = []
+
+    def transcribe(self, audio, *, language, timeout_s=None):
+        self.timeouts.append(timeout_s)
+        return ChunkTranscript("en", (Word("hi", 0.1, 0.5),), (Segment(0.0, 1.0, "hi"),))
+
+    def cost_usd(self, chunk_seconds):
+        return 0.0
+
+    def billed_seconds(self, chunk_seconds):
+        return sum(chunk_seconds)
+
+
+@needs_ffmpeg
+def test_stage_deadline_caps_chunk_timeouts(
+    ctx: StageContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tr, "Deadline", lambda: Deadline(budget_s=120.0))
+    backend = RecordingTranscriber()
+    tr.transcribe(make_job(ctx.conn), ctx, transcriber=backend)
+    assert backend.timeouts and all(t is not None and 0 < t <= 120.0 for t in backend.timeouts)
+
+
+@needs_ffmpeg
+def test_stage_deadline_exhausted_is_retryable(
+    ctx: StageContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tr, "Deadline", lambda: Deadline(budget_s=0.5))
+    backend = RecordingTranscriber()
+    with pytest.raises(StageTimeout) as exc:
+        tr.transcribe(make_job(ctx.conn), ctx, transcriber=backend)
+    assert not isinstance(exc.value, PermanentError)
+    assert backend.timeouts == []
+
+
+@respx.mock
+def test_groq_call_timeout_is_applied(tmp_path: Path) -> None:
+    route = respx.post(tr.GROQ_URL).mock(return_value=ok())
+    audio = tmp_path / "c.flac"
+    audio.write_bytes(b"fLaC")
+    groq().transcribe(audio, language=None, timeout_s=42.0)
+    timeouts = route.calls.last.request.extensions["timeout"]
+    assert max(v for v in timeouts.values() if v is not None) <= 42.0

@@ -15,7 +15,7 @@
     "studio": "remotion studio src/index.ts"
   },
   "dependencies": {
-    "@fontsource/montserrat": "5.2.8",
+    "@fontsource/montserrat": "5.3.0",
     "@remotion/bundler": "4.0.535",
     "@remotion/cli": "4.0.535",
     "@remotion/renderer": "4.0.535",

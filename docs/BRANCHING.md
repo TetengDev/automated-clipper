@@ -19,7 +19,7 @@ hotfix/vX.Y.Z  (cut from main)  --merge PR-->  main  ==> tag + sync to dev
 | `main` | Production history. Only releases and hotfixes. | PR required; `test`, `node`, `docker`, `audit`, `branch-policy`; no force push; no deletion | merge commit |
 | `v*` tags | Release tags | no update, no deletion | n/a |
 
-`branch-policy` runs from the base branch's copy of the workflow (`pull_request_target`), so a PR cannot change the rule it is judged by. It also re-runs when a PR's base is changed. It only lets `release/vX.Y.Z` or `hotfix/vX.Y.Z` into `main`, and only `pre-release/vX.Y.Z` (same version) or `hotfix/vX.Y.Z` into `release/vX.Y.Z`. Fork branches are rejected.
+`branch-policy` runs from the default branch's (`dev`) copy of the workflow (`pull_request_target`), so a PR cannot change the rule it is judged by. It is a guardrail for the promotion path, not a security boundary. It also re-runs when a PR's base is changed. It only lets `release/vX.Y.Z` or `hotfix/vX.Y.Z` into `main`, and only `pre-release/vX.Y.Z` (same version) or `hotfix/vX.Y.Z` into `release/vX.Y.Z`. Fork branches are rejected.
 
 No approvals are required, because a solo maintainer cannot approve their own PR. The gate is the PR, its checks, the review record, and a human pressing merge.
 
@@ -73,5 +73,5 @@ scripts/sync-branch.sh
 - The base comes from the open PR. Failing that, it uses `git config branch.<name>.base`, and failing that, `dev`.
 - Set the base for a branch with no PR: `git config branch.my-fix.base pre-release/v0.1.0`.
 - The script refuses to run on `dev`, `main`, `pre-release/*` and `release/*`.
-- It pushes with `--force-with-lease`, so it never overwrites someone else's push.
+- It stops if the remote branch has commits you don't have locally, and pushes with an explicit `--force-with-lease`, so it never drops someone else's push.
 - GitHub's **Update branch** button also works (choose *rebase*).

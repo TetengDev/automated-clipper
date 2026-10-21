@@ -2,8 +2,9 @@ name: Branch policy
 
 # Required check on main and release/** (rulesets). Enforces the promotion path
 # dev -> pre-release/vX.Y.Z -> release/vX.Y.Z -> main; see docs/BRANCHING.md.
-# pull_request_target: the policy comes from the base branch, so a PR cannot edit
-# the check that judges it. Safe here: no checkout, no token, env-only inputs.
+# pull_request_target: the policy file comes from the default branch (dev), not the
+# PR, so a PR cannot edit the check that judges it. Safe: no checkout, no token,
+# env-only inputs. A guardrail for the promotion path, not a security boundary.
 # `edited` re-runs it when a PR's base is changed (retargeting to main).
 on:
   pull_request_target:

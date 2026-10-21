@@ -8,6 +8,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: post-release
+  cancel-in-progress: false
+
 jobs:
   post-release:
     if: github.event.pull_request.merged
@@ -25,6 +29,10 @@ jobs:
         run: |
           if [[ "$HEAD" =~ ^(release|hotfix)/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             tag="${BASH_REMATCH[2]}"
+            existing=$(gh api "repos/$GH_REPO/git/ref/tags/$tag" -q .object.sha 2>/dev/null || true)
+            if [ -n "$existing" ] && [ "$existing" != "$SHA" ]; then
+              echo "::error::tag $tag already points at $existing, not $SHA"; exit 1
+            fi
             gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --target "$SHA" --generate-notes
           fi
 

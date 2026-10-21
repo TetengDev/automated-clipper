@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import os
 import re
 import signal
 import sqlite3
@@ -24,12 +26,7 @@ from clipper.config import (
     load_config,
 )
 from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version, migrate
-from clipper.jobs.worker import (
-    DEFAULT_MEDIA_ROOT,
-    DEFAULT_POLL_SECONDS,
-    Worker,
-    default_worker_id,
-)
+from clipper.pipeline import build_stages
 from clipper.urls import InvalidSourceURL, parse_source_url
 
 EXIT_NOT_IMPLEMENTED = 70  # EX_SOFTWARE; distinct from Click's usage-error code 2
@@ -73,6 +70,10 @@ def main(
 
 def _not_implemented(issue: str) -> NoReturn:
     _fail(f"not implemented yet ({issue})", code=EXIT_NOT_IMPLEMENTED)
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
 @app.command("check-config")
@@ -131,7 +132,7 @@ def run_worker(
     ctx: typer.Context,
     media_dir: Annotated[
         Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Per-job stage artifacts.")
-    ] = DEFAULT_MEDIA_ROOT,
+    ] = jobs.DEFAULT_MEDIA_ROOT,
     worker_id: Annotated[
         str | None,
         typer.Option(envvar="CLIPPER_WORKER_ID", help="Claim id (default: unique per process)."),
@@ -141,7 +142,7 @@ def run_worker(
         typer.Option(help="Release jobs claimed by this dead worker id before starting."),
     ] = None,
     poll_seconds: Annotated[float, typer.Option(min=0.1, help="Idle sleep.")] = (
-        DEFAULT_POLL_SECONDS
+        jobs.DEFAULT_POLL_SECONDS
     ),
     once: Annotated[bool, typer.Option(help="Run one stage of one job, then exit.")] = False,
 ) -> None:
@@ -151,10 +152,14 @@ def run_worker(
         cfg = load_config(app_ctx.config_path)
     except ConfigError as exc:
         _fail(str(exc))
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    _setup_logging()
     conn = _open_db(app_ctx.db_path)
-    worker = Worker(
-        conn=conn, config=cfg, worker_id=worker_id or default_worker_id(), media_root=media_dir
+    worker = jobs.Worker(
+        conn=conn,
+        config=cfg,
+        worker_id=worker_id or jobs.default_worker_id(),
+        stages=build_stages(),
+        media_root=media_dir,
     )
     try:
         if recover_id:
@@ -172,6 +177,29 @@ def run_worker(
         conn.close()
 
 
+def _trusts_every_client(forwarded_allow_ips: str) -> bool:
+    """'*' or any prefix-length-0 network (0.0.0.0/0, ::/0, ...) trusts X-Forwarded-For from
+    anyone, letting clients spoof their IP and dodge the per-IP login throttle."""
+    for part in (p.strip() for p in forwarded_allow_ips.split(",")):
+        if part == "*":
+            return True
+        try:
+            if ipaddress.ip_network(part, strict=False).prefixlen == 0:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
 @app.command("run-review")
 def run_review(
     ctx: typer.Context,
@@ -181,14 +209,20 @@ def run_review(
         bool,
         typer.Option(
             "--insecure-cookies",
-            help="Drop the Secure cookie flag (plain-HTTP local development only).",
+            help=(
+                "Drop the Secure cookie flag (plain-HTTP local development only; needs a"
+                " loopback --host or CLIPPER_DEV=1)."
+            ),
         ),
     ] = False,
     forwarded_allow_ips: Annotated[
         str,
         typer.Option(
             envvar="CLIPPER_FORWARDED_ALLOW_IPS",
-            help="Comma-separated proxy IPs whose X-Forwarded-For is trusted ('*' refused).",
+            help=(
+                "Comma-separated proxy IPs whose X-Forwarded-For is trusted"
+                " ('*' and /0 networks refused)."
+            ),
         ),
     ] = "127.0.0.1",
 ) -> None:
@@ -197,8 +231,16 @@ def run_review(
 
     from clipper.review.app import create_app
 
-    if any(part.strip() == "*" for part in forwarded_allow_ips.split(",")):
-        _fail("run-review: --forwarded-allow-ips must list proxy IPs explicitly, not '*'")
+    if _trusts_every_client(forwarded_allow_ips):
+        _fail(
+            "run-review: --forwarded-allow-ips must list proxy IPs explicitly,"
+            " not '*' or a /0 network"
+        )
+    if insecure_cookies and not _is_loopback(host) and os.environ.get("CLIPPER_DEV") != "1":
+        _fail(
+            f"run-review: --insecure-cookies is only allowed on a loopback --host"
+            f" (got {host!r}) or with CLIPPER_DEV=1"
+        )
     try:
         secrets = Secrets()
         application = create_app(
@@ -209,6 +251,7 @@ def run_review(
         )
     except (MissingSecretError, ValidationError, ValueError) as exc:
         _fail(f"run-review: {exc}")
+    _setup_logging()
     uvicorn.run(
         application,
         host=host,
@@ -295,6 +338,20 @@ def status() -> None:
 
 
 @app.command("retry")
-def retry(job_id: Annotated[int, typer.Argument(help="Job ID to retry.")]) -> None:
-    """Re-queue a failed job."""
-    _not_implemented("CLP-34")
+def retry(
+    ctx: typer.Context, job_id: Annotated[int, typer.Argument(help="Job ID to retry.")]
+) -> None:
+    """Re-queue a failed or skipped job."""
+    conn = _open_db(_app(ctx).db_path)
+    try:
+        job = jobs.get_job(conn, job_id)
+        if job is None:
+            _fail(f"job {job_id} not found")
+        if job.status not in jobs.RETRYABLE:
+            _fail(f"job {job_id} is {job.status}; only failed/skipped jobs can be retried")
+        job = jobs.requeue(conn, job_id, jobs.utcnow())
+    except (sqlite3.Error, jobs.JobConflict) as exc:
+        _fail(f"retry failed: {exc}")
+    finally:
+        conn.close()
+    typer.echo(f"requeued job {job.id} ({job.status})")

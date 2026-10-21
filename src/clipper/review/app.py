@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import re
 import secrets
+import sqlite3
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -39,6 +41,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from clipper.config import MIN_SESSION_SECRET_LENGTH
+from clipper.db import connect
 
 PACKAGE_DIR = Path(__file__).parent
 TEMPLATES_DIR = PACKAGE_DIR / "templates"
@@ -70,6 +73,9 @@ SECURITY_HEADERS = {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
 }
 HSTS_VALUE = "max-age=31536000"
+
+logger = logging.getLogger(__name__)
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 
 class LoginRequired(Exception):
@@ -342,6 +348,39 @@ async def csrf_protect(request: Request) -> None:
         )
 
 
+def get_db(request: Request) -> Iterator[sqlite3.Connection]:
+    """FastAPI dependency: a connection to the app's DB, closed after the request.
+
+    Never migrates (run `clipper migrate` first). Usage in later routes (CLP-19..21)::
+
+        def clips(conn: Annotated[sqlite3.Connection, Depends(get_db)], ...): ...
+    """
+    conn = connect(request.app.state.db_path, check_same_thread=False)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def render(
+    request: Request,
+    name: str,
+    context: Mapping[str, Any] | None = None,
+    *,
+    status_code: int = 200,
+    headers: Mapping[str, str] | None = None,
+) -> HTMLResponse:
+    """Render a template with `csrf_token()`, `user` and `get_flashed_messages()` available."""
+    policy: SessionPolicy = request.app.state.session_policy
+    ctx = {
+        "csrf_token": lambda: get_csrf_token(request),
+        "user": REVIEWER if policy.is_valid(request.session) else None,
+        "get_flashed_messages": lambda: _pop_flashes(request),
+        **(context or {}),
+    }
+    return templates.TemplateResponse(request, name, ctx, status_code=status_code, headers=headers)
+
+
 def flash(request: Request, message: str) -> None:
     """Queue a one-time message; the next full-page render (base.html) shows and clears it.
     Partials don't call `get_flashed_messages()`, so HTMX swaps never swallow flashes."""
@@ -373,10 +412,9 @@ def create_app(
 ) -> FastAPI:
     """Build the review app. All config is passed in so tests need no environment.
 
-    `db_path` is stored on `app.state.db_path` for later routes; nothing connects yet.
+    `db_path` is stored on `app.state.db_path`; routes get a connection via `get_db`.
     `clock` (monotonic seconds) drives the login throttle; `wall_clock` (epoch seconds)
-    stamps and ages sessions. `app.state.render(request, template, context)` renders a
-    template with `csrf_token()`, `user` and `get_flashed_messages()` available.
+    stamps and ages sessions. Routes render templates with the module-level `render`.
     """
     if not _BCRYPT_HASH.match(password_hash):
         raise ValueError("REVIEW_PASSWORD_HASH must be a bcrypt hash ($2b$...)")
@@ -396,30 +434,9 @@ def create_app(
         dependencies=[Depends(csrf_protect)],
     )
     app.hsts = secure_cookies
-    templates = Jinja2Templates(directory=TEMPLATES_DIR)
-
-    def render(
-        request: Request,
-        name: str,
-        context: dict[str, Any] | None = None,
-        status_code: int = 200,
-        headers: dict[str, str] | None = None,
-    ) -> HTMLResponse:
-        ctx = {
-            "csrf_token": lambda: get_csrf_token(request),
-            "user": REVIEWER if policy.is_valid(request.session) else None,
-            "get_flashed_messages": lambda: _pop_flashes(request),
-            **(context or {}),
-        }
-        return templates.TemplateResponse(
-            request, name, ctx, status_code=status_code, headers=headers
-        )
-
     app.state.db_path = db_path
     app.state.login_throttle = throttle
     app.state.session_policy = policy
-    app.state.templates = templates
-    app.state.render = render
 
     # Middleware: last added is outermost -> [security headers](session(gate(app))).
     app.add_middleware(_AuthGate, policy=policy)
@@ -458,6 +475,7 @@ def create_app(
         client_ip = request.client.host if request.client else "unknown"
         retry_after = throttle.acquire(client_ip)
         if retry_after is not None:
+            logger.warning("login throttled for %s (retry after %ss)", client_ip, retry_after)
             return render(
                 request,
                 "login.html",
@@ -466,6 +484,7 @@ def create_app(
                 headers={"Retry-After": str(retry_after)},
             )
         if not _password_ok(password, hash_bytes):
+            logger.warning("login failed from %s", client_ip)
             return render(
                 request,
                 "login.html",

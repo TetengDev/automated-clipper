@@ -1,38 +1,19 @@
-"""Job queue and pipeline worker."""
+"""Job queue and pipeline worker.
 
-from clipper.jobs.models import PIPELINE, TERMINAL, Clock, Job, JobStatus, to_iso, utcnow
-from clipper.jobs.queue import (
-    MAX_ATTEMPTS,
-    RETRYABLE,
-    JobConflict,
-    advance,
-    claim_next,
-    enqueue,
-    get_job,
-    mark_terminal,
-    record_failure,
-    release_claim,
-    release_claims,
-    requeue,
-)
-from clipper.jobs.worker import (
-    DEFAULT_STAGES,
-    PermanentError,
-    SkipJob,
-    Stage,
-    StageContext,
-    StageDef,
-    Worker,
-    default_worker_id,
-)
+Re-exports what the CLI and stage authors need; queue internals live in
+`clipper.jobs.queue`, the stage contract in `clipper.jobs.stages`.
+"""
+
+from clipper.jobs.models import TERMINAL, Job, JobStatus, utcnow
+from clipper.jobs.queue import RETRYABLE, JobConflict, enqueue, get_job, requeue
+from clipper.jobs.stages import PermanentError, SkipJob, Stage, StageContext, StageDef
+from clipper.jobs.worker import DEFAULT_MEDIA_ROOT, DEFAULT_POLL_SECONDS, Worker, default_worker_id
 
 __all__ = [
-    "DEFAULT_STAGES",
-    "MAX_ATTEMPTS",
-    "PIPELINE",
+    "DEFAULT_MEDIA_ROOT",
+    "DEFAULT_POLL_SECONDS",
     "RETRYABLE",
     "TERMINAL",
-    "Clock",
     "Job",
     "JobConflict",
     "JobStatus",
@@ -42,16 +23,9 @@ __all__ = [
     "StageContext",
     "StageDef",
     "Worker",
-    "advance",
-    "claim_next",
+    "default_worker_id",
     "enqueue",
     "get_job",
-    "mark_terminal",
-    "default_worker_id",
-    "record_failure",
-    "release_claim",
-    "release_claims",
     "requeue",
-    "to_iso",
     "utcnow",
 ]

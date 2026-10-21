@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
+from typing import Annotated
 
 import bcrypt
 import pytest
@@ -20,6 +23,8 @@ from clipper.review.app import (
     SESSION_MAX_AGE,
     LoginThrottle,
     create_app,
+    get_db,
+    render,
     require_user,
     safe_next_path,
 )
@@ -348,6 +353,20 @@ def test_sixth_login_attempt_within_a_minute_is_throttled(
     assert client.get("/").status_code == 303
 
 
+def test_failed_and_throttled_logins_are_logged_without_password(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="clipper.review.app")
+    for _ in range(6):
+        login(client, password="hunter2-wrong")
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("login failed" in m for m in messages) == 5
+    assert sum("login throttled" in m for m in messages) == 1
+    assert all("testclient" in m for m in messages)  # TestClient's client host
+    assert "hunter2-wrong" not in caplog.text
+
+
 def test_throttle_window_slides(client: TestClient, clock: FakeClock) -> None:
     for _ in range(5):
         login(client, password="wrong")
@@ -503,7 +522,20 @@ def test_run_review_forwarded_allow_ips_option_and_env(
     assert review_env["forwarded_allow_ips"] == "10.0.0.2,10.0.0.3"
 
 
-@pytest.mark.parametrize("value", ["*", "127.0.0.1,*", " * "])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "*",
+        "127.0.0.1,*",
+        " * ",
+        "0.0.0.0/0",
+        "10.0.0.2, 0.0.0.0/0",
+        "::/0",
+        "1.2.3.4/0",
+        "0.0.0.0/0.0.0.0",
+        "::ffff:0:0/0",
+    ],
+)
 def test_run_review_refuses_wildcard_forwarded_ips(
     review_env: dict[str, object], value: str
 ) -> None:
@@ -512,6 +544,47 @@ def test_run_review_refuses_wildcard_forwarded_ips(
     assert result.exit_code == 1
     assert "forwarded-allow-ips" in result.stderr
     assert review_env == {}
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.5", "::", "example.com"])  # noqa: S104
+def test_run_review_refuses_insecure_cookies_on_non_loopback_host(
+    review_env: dict[str, object], host: str
+) -> None:
+    result = runner.invoke(cli_app, ["run-review", "--insecure-cookies", "--host", host])
+
+    assert result.exit_code == 1
+    assert "--insecure-cookies" in result.stderr
+    assert "loopback" in result.stderr
+    assert review_env == {}
+
+
+def test_run_review_refuses_insecure_cookies_on_default_host(
+    review_env: dict[str, object],
+) -> None:
+    result = runner.invoke(cli_app, ["run-review", "--insecure-cookies"])
+
+    assert result.exit_code == 1
+    assert review_env == {}
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.8.9.10", "::1", "[::1]", "localhost"])
+def test_run_review_allows_insecure_cookies_on_loopback(
+    review_env: dict[str, object], host: str
+) -> None:
+    result = runner.invoke(cli_app, ["run-review", "--insecure-cookies", "--host", host])
+
+    assert result.exit_code == 0, result.output
+    assert review_env["host"] == host
+
+
+def test_run_review_allows_insecure_cookies_in_dev_mode(
+    monkeypatch: pytest.MonkeyPatch, review_env: dict[str, object]
+) -> None:
+    monkeypatch.setenv("CLIPPER_DEV", "1")
+
+    result = runner.invoke(cli_app, ["run-review", "--insecure-cookies", "--host", "0.0.0.0"])  # noqa: S104
+
+    assert result.exit_code == 0, result.output
 
 
 # --- M1: session lifetime + password fingerprint ----------------------------------------
@@ -787,7 +860,7 @@ def test_partials_do_not_consume_flashes(make_app: Callable[..., FastAPI]) -> No
 
     @application.get("/partial", response_class=HTMLResponse)
     def partial(request: Request, _user: str = Depends(require_user)) -> HTMLResponse:
-        return application.state.render(request, "_queue_empty.html")
+        return render(request, "_queue_empty.html")
 
     client = TestClient(application, base_url=BASE_URL, follow_redirects=False)
     login(client)
@@ -817,3 +890,49 @@ def test_plain_csrf_failure_has_no_hx_refresh(client: TestClient) -> None:
 
     assert response.status_code == 403
     assert "HX-Refresh" not in response.headers
+
+
+# --- shared helpers for wave-2 routes -----------------------------------------------------
+
+
+def test_get_db_yields_connection_and_closes_it(
+    make_app: Callable[..., FastAPI], tmp_path: Path
+) -> None:
+    application = make_app()
+    seen: list[sqlite3.Connection] = []
+
+    @application.get("/dbcheck")
+    def dbcheck(
+        conn: Annotated[sqlite3.Connection, Depends(get_db)],
+        _user: Annotated[str, Depends(require_user)],
+    ) -> dict[str, object]:
+        seen.append(conn)
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        return {"tables": [t["name"] for t in tables]}
+
+    client = TestClient(application, base_url=BASE_URL, follow_redirects=False)
+    login(client)
+    response = client.get("/dbcheck")
+
+    assert response.status_code == 200
+    assert response.json() == {"tables": []}  # connects only; never migrates
+    assert (tmp_path / "state.db").exists()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        seen[0].execute("SELECT 1")
+
+
+def test_render_passes_status_and_headers(make_app: Callable[..., FastAPI]) -> None:
+    application = make_app()
+
+    @application.get("/teapot", response_class=HTMLResponse)
+    def teapot(request: Request, _user: Annotated[str, Depends(require_user)]) -> HTMLResponse:
+        return render(
+            request, "_queue_empty.html", {"x": 1}, status_code=418, headers={"X-Test": "1"}
+        )
+
+    client = TestClient(application, base_url=BASE_URL, follow_redirects=False)
+    login(client)
+    response = client.get("/teapot")
+
+    assert response.status_code == 418
+    assert response.headers["X-Test"] == "1"

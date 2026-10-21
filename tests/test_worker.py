@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 import threading
 from collections import Counter
@@ -11,7 +12,6 @@ import pytest
 from clipper.config import AppConfig
 from clipper.db import connect, migrate
 from clipper.jobs import (
-    DEFAULT_STAGES,
     Job,
     JobStatus,
     PermanentError,
@@ -25,6 +25,8 @@ from clipper.jobs import (
 )
 from clipper.jobs import worker as worker_mod
 from clipper.jobs.queue import DEFAULT_LEASE
+from clipper.jobs.stages import DEFAULT_STAGES
+from clipper.pipeline import build_stages
 from clipper.urls import SourceRef
 
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -414,3 +416,40 @@ def test_stage_def_rejects_escaping_artifact() -> None:
     for bad in ("/etc/passwd", "../x", "a/../../b", ""):
         with pytest.raises(ValueError, match="relative"):
             StageDef(lambda job, ctx: None, bad)
+
+
+def test_build_stages_registers_the_detected_pass_through() -> None:
+    stages = build_stages()
+
+    assert set(stages) == {JobStatus.DETECTED}
+    assert stages[JobStatus.DETECTED].artifact is None
+
+
+def test_stage_modules_do_not_depend_on_the_worker() -> None:
+    import clipper.jobs.stages as stages_mod
+
+    assert "clipper.jobs.worker" not in Path(stages_mod.__file__).read_text()
+
+
+@pytest.mark.parametrize(
+    ("exc", "column"),
+    [
+        (RuntimeError("GET https://api.example/v1?key=SECRET1 failed"), "last_error"),
+        (PermanentError("bad token in https://x.test/?token=SECRET1"), "last_error"),
+        (SkipJob("Authorization: Bearer SECRET1"), "skip_reason"),
+    ],
+)
+def test_stage_error_text_is_redacted_in_db_and_logs(
+    make_worker: MakeWorker, db: Path, caplog: pytest.LogCaptureFixture, exc: Exception, column: str
+) -> None:
+    caplog.set_level(logging.INFO)
+    pipeline = StubPipeline()
+    pipeline.fail_at[JobStatus.FETCHING_AUDIO] = exc
+    worker = make_worker(pipeline)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+
+    _drain(worker)
+
+    stored = _row(db, job.id)[column]
+    assert stored and "SECRET1" not in stored and "REDACTED" in stored
+    assert "SECRET1" not in caplog.text

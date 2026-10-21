@@ -197,3 +197,30 @@ def test_run_worker_recover_id(tmp_path: Path, config_file: Path) -> None:
     assert "no due jobs" in blocked.output
     assert recovered.exit_code == 0, recovered.output
     assert "no due jobs" not in recovered.output
+
+
+def test_retry_requeues_failed_or_skipped_job(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    db = ["--db", str(db_path)]
+    runner.invoke(app, [*db, "enqueue", "https://youtu.be/dQw4w9WgXcQ"])
+    with closing(connect(db_path)) as conn:
+        conn.execute("UPDATE jobs SET status = 'skipped', skip_reason = 'too short'")
+
+    result = runner.invoke(app, [*db, "retry", "1"])
+    again = runner.invoke(app, [*db, "retry", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert "requeued job 1 (detected)" in result.output
+    assert again.exit_code == 1
+    assert "job 1 is detected; only failed/skipped jobs can be retried" in again.stderr
+    with closing(connect(db_path)) as conn:
+        row = conn.execute("SELECT status, skip_reason FROM jobs").fetchone()
+    assert (row["status"], row["skip_reason"]) == ("detected", None)
+
+
+def test_retry_missing_job_fails_cleanly(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["--db", str(tmp_path / "state.db"), "retry", "42"])
+
+    assert result.exit_code == 1
+    assert "job 42 not found" in result.stderr
+    assert result.exception is None or isinstance(result.exception, SystemExit)

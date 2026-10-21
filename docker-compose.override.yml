@@ -9,6 +9,10 @@ services:
   review:
     restart: "no"
     # Plain HTTP on localhost: drop the Secure cookie flag (and HSTS) for local dev only.
+    # CLIPPER_DEV allows that although the app binds 0.0.0.0 inside the container; the
+    # port is still only published on the host's loopback.
     command: ["run-review", "--insecure-cookies"]
+    environment:
+      CLIPPER_DEV: "1"
     ports:
       - "127.0.0.1:8000:8000"

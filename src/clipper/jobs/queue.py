@@ -2,17 +2,21 @@
 
 A claim is recorded as (worker_id, lease_until), where worker_id is unique per process.
 Claimed jobs are invisible to other claimers until the holder finishes them or the lease
-expires. Lease renewal (heartbeats) and concurrency limits come later (E3-S1b).
+expires. Each claim counts as an attempt of the current stage, so a stage that keeps
+killing its worker (nothing ever recorded) still ends in `failed`. Lease renewal
+(heartbeats) and concurrency limits come later (E3-S1b).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 
 from clipper.db import transaction
 from clipper.jobs.models import TERMINAL, Job, JobStatus, to_iso
+from clipper.redact import redact
 from clipper.urls import SourceRef, canonical_url
 
 DEFAULT_LEASE = timedelta(hours=2)
@@ -75,8 +79,10 @@ def claim_next(
 ) -> Job | None:
     """Atomically claim the oldest due, unclaimed job whose status is in `statuses`.
 
-    Rows that cannot be decoded into a Job (corrupt platform/id) are marked failed and
-    passed over, so one bad row cannot wedge the queue.
+    The claim bumps `attempts`; the returned Job carries the bumped count. Rows that
+    already used up MAX_ATTEMPTS (earlier claimers died mid-stage) and rows that cannot be
+    decoded into a Job (corrupt platform/id) are marked failed and passed over, so one bad
+    row cannot wedge the queue.
     """
     wanted = [s.value for s in statuses if s not in TERMINAL]
     if not wanted:
@@ -94,20 +100,29 @@ def claim_next(
             ).fetchone()
             if row is None:
                 return None
+            if row["attempts"] >= MAX_ATTEMPTS:
+                reason = f"gave up after {row['attempts']} attempts (worker died mid-stage)"
+                _fail_row(conn, row["id"], reason, stamp)
+                continue
             try:
                 job = Job.from_row(row)
             except (ValueError, TypeError) as exc:
-                conn.execute(
-                    "UPDATE jobs SET status = ?, last_error = ?, worker_id = NULL,"
-                    " lease_until = NULL, updated_at = ? WHERE id = ?",
-                    (JobStatus.FAILED.value, f"undecodable job row: {exc}", stamp, row["id"]),
-                )
+                _fail_row(conn, row["id"], f"undecodable job row: {exc}", stamp)
                 continue
             conn.execute(
-                "UPDATE jobs SET worker_id = ?, lease_until = ?, updated_at = ? WHERE id = ?",
+                "UPDATE jobs SET worker_id = ?, lease_until = ?, attempts = attempts + 1,"
+                " updated_at = ? WHERE id = ?",
                 (worker_id, to_iso(now + lease), stamp, job.id),
             )
-            return job
+            return dataclasses.replace(job, attempts=job.attempts + 1)
+
+
+def _fail_row(conn: sqlite3.Connection, job_id: int, reason: str, stamp: str) -> None:
+    conn.execute(
+        "UPDATE jobs SET status = ?, last_error = ?, next_attempt_at = NULL, worker_id = NULL,"
+        " lease_until = NULL, updated_at = ? WHERE id = ?",
+        (JobStatus.FAILED.value, reason[:MAX_ERROR_CHARS], stamp, job_id),
+    )
 
 
 def release_claim(conn: sqlite3.Connection, job: Job, worker_id: str, now: datetime) -> bool:
@@ -166,20 +181,21 @@ def backoff(attempts: int) -> timedelta:
 def record_failure(
     conn: sqlite3.Connection, job: Job, error: str, now: datetime, *, worker_id: str
 ) -> datetime | None:
-    """Keep the status, bump attempts, schedule a retry with exponential backoff.
+    """Keep the status, schedule a retry with exponential backoff.
 
-    After MAX_ATTEMPTS failures of the same stage the job is marked failed; returns None.
+    `job.attempts` already counts this attempt (claim_next bumps it). Once it reaches
+    MAX_ATTEMPTS the job is marked failed; returns None.
     """
-    attempts = job.attempts + 1
+    attempts = job.attempts
+    error = redact(error)
     if attempts >= MAX_ATTEMPTS:
         _finish(
             conn,
             job,
             worker_id,
-            "status = ?, attempts = ?, last_error = ?, next_attempt_at = NULL, updated_at = ?",
+            "status = ?, last_error = ?, next_attempt_at = NULL, updated_at = ?",
             (
                 JobStatus.FAILED.value,
-                attempts,
                 f"gave up after {attempts} attempts: {error}"[:MAX_ERROR_CHARS],
                 to_iso(now),
             ),
@@ -190,8 +206,8 @@ def record_failure(
         conn,
         job,
         worker_id,
-        "attempts = ?, last_error = ?, next_attempt_at = ?, updated_at = ?",
-        (attempts, error[:MAX_ERROR_CHARS], to_iso(retry_at), to_iso(now)),
+        "last_error = ?, next_attempt_at = ?, updated_at = ?",
+        (error[:MAX_ERROR_CHARS], to_iso(retry_at), to_iso(now)),
     )
     return retry_at
 
@@ -217,7 +233,7 @@ def mark_terminal(
         job,
         worker_id,
         f"status = ?, {column} = ?, next_attempt_at = NULL, updated_at = ?",
-        (status.value, reason[:MAX_ERROR_CHARS], to_iso(now)),
+        (status.value, redact(reason)[:MAX_ERROR_CHARS], to_iso(now)),
     )
 
 
@@ -227,11 +243,12 @@ def requeue(conn: sqlite3.Connection, job_id: int, now: datetime) -> Job:
     Existing stage artifacts are kept, so the rerun skips stages that already finished.
     """
     retryable = [s.value for s in RETRYABLE]
+    marks = ", ".join("?" * len(retryable))
     with transaction(conn):
         cur = conn.execute(
-            "UPDATE jobs SET status = ?, attempts = 0, last_error = NULL, skip_reason = NULL,"
-            " next_attempt_at = NULL, worker_id = NULL, lease_until = NULL, updated_at = ?"
-            " WHERE id = ? AND status IN (?, ?)",
+            "UPDATE jobs SET status = ?, attempts = 0, last_error = NULL,"  # noqa: S608 - placeholders
+            " skip_reason = NULL, next_attempt_at = NULL, worker_id = NULL, lease_until = NULL,"
+            f" updated_at = ? WHERE id = ? AND status IN ({marks})",
             (JobStatus.DETECTED.value, to_iso(now), job_id, *retryable),
         )
         if cur.rowcount != 1:

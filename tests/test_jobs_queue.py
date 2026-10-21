@@ -7,12 +7,14 @@ from pathlib import Path
 import pytest
 
 from clipper.db import connect, migrate
-from clipper.jobs import (
-    PIPELINE,
-    TERMINAL,
+from clipper.jobs.models import PIPELINE, TERMINAL, JobStatus
+from clipper.jobs.queue import (
+    BACKOFF_CAP,
+    DEFAULT_LEASE,
+    MAX_ATTEMPTS,
     JobConflict,
-    JobStatus,
     advance,
+    backoff,
     claim_next,
     enqueue,
     get_job,
@@ -22,7 +24,6 @@ from clipper.jobs import (
     release_claims,
     requeue,
 )
-from clipper.jobs.queue import BACKOFF_CAP, MAX_ATTEMPTS, backoff
 from clipper.urls import SourceRef
 
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -128,7 +129,7 @@ def test_record_failure_backs_off_and_keeps_status(conn: sqlite3.Connection) -> 
     assert retry_at == T0 + timedelta(minutes=1)
     assert claim_next(conn, T0 + timedelta(seconds=59), worker_id="w", statuses=ALL) is None
     again = claim_next(conn, retry_at, worker_id="w", statuses=ALL)
-    assert again is not None and again.attempts == 1
+    assert again is not None and again.attempts == 2  # counted at claim
 
     advance(conn, again, retry_at, worker_id="w")
     advanced = get_job(conn, job.id)
@@ -211,7 +212,7 @@ def test_record_failure_gives_up_after_max_attempts(conn: sqlite3.Connection) ->
     now = T0
     for attempt in range(1, MAX_ATTEMPTS + 1):
         job = claim_next(conn, now, worker_id="w", statuses=ALL)
-        assert job is not None and job.attempts == attempt - 1
+        assert job is not None and job.attempts == attempt
         retry_at = record_failure(conn, job, "boom", now, worker_id="w")
         now += timedelta(hours=1)
 
@@ -219,6 +220,21 @@ def test_record_failure_gives_up_after_max_attempts(conn: sqlite3.Connection) ->
     final = get_job(conn, 1)
     assert final is not None and final.status is JobStatus.FAILED
     assert final.last_error == f"gave up after {MAX_ATTEMPTS} attempts: boom"
+
+
+def test_claim_counts_attempts_so_crash_loops_end_in_failed(conn: sqlite3.Connection) -> None:
+    enqueue(conn, YT, T0, creator="manual")
+    now = T0
+    seen = []
+    while (job := claim_next(conn, now, worker_id="w", statuses=ALL)) is not None:
+        seen.append(job.attempts)  # the worker dies mid-stage: nothing is recorded
+        now += DEFAULT_LEASE
+
+    assert seen == list(range(1, MAX_ATTEMPTS + 1))
+    row = conn.execute("SELECT * FROM jobs WHERE id = 1").fetchone()
+    assert row["status"] == JobStatus.FAILED.value
+    assert row["worker_id"] is None
+    assert row["last_error"] == (f"gave up after {MAX_ATTEMPTS} attempts (worker died mid-stage)")
 
 
 def test_claim_fails_undecodable_rows_and_moves_on(conn: sqlite3.Connection) -> None:

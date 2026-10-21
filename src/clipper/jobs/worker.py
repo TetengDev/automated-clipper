@@ -1,19 +1,6 @@
 """Single-worker loop: claim a due job, run the stage for its status, persist the outcome.
 
-Stage contract (what CLP-13..16 plug into):
-- A stage is registered as `StageDef(run, artifact)` keyed by the status it processes.
-  `run(job, ctx)` does the work for that status; returning normally advances the job.
-- `artifact` (relative to the job's media dir) marks the stage as done: if it already
-  exists the stage is not run again, and `run` must create it, atomically (write a temp
-  file, then rename), or the attempt counts as failed. This is what makes a killed worker
-  resume without redoing earlier stages.
-- Raise `SkipJob` to end the job as `skipped`, `PermanentError` to end it as `failed`;
-  any other exception is retried later with backoff (status unchanged).
-- Statuses with no registered stage are never claimed: such jobs stay put until a worker
-  that handles them runs (e.g. `waiting_vod` until the VOD poller exists).
-- A stage must finish within the claim lease (DEFAULT_LEASE). There is no heartbeat yet
-  (E3-S1b): past the lease another worker may take the job over, and the late result of
-  the original worker is dropped.
+The stage contract (what CLP-13..16 plug into) is documented in `clipper.jobs.stages`.
 
 Each worker process claims under a unique id, so a crashed worker's job becomes available
 again when its lease expires (or immediately via `run-worker --recover-id <dead id>`).
@@ -28,10 +15,10 @@ import socket
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from clipper.config import AppConfig
 from clipper.jobs.models import TERMINAL, Clock, Job, JobStatus, utcnow
@@ -45,49 +32,13 @@ from clipper.jobs.queue import (
     release_claim,
     release_claims,
 )
+from clipper.jobs.stages import DEFAULT_STAGES, PermanentError, SkipJob, StageContext, StageDef
+from clipper.redact import redact
 
 DEFAULT_MEDIA_ROOT = Path("data/media")
 DEFAULT_POLL_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
-
-
-class SkipJob(Exception):
-    """Stage decided the job should not be clipped (message becomes skip_reason)."""
-
-
-class PermanentError(Exception):
-    """Stage failed in a way retrying cannot fix (message becomes last_error)."""
-
-
-@dataclass(frozen=True)
-class StageContext:
-    media_dir: Path
-    conn: sqlite3.Connection
-    config: AppConfig
-    clock: Clock = utcnow
-
-
-Stage = Callable[[Job, StageContext], None]
-
-
-@dataclass(frozen=True)
-class StageDef:
-    run: Stage
-    artifact: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.artifact is not None:
-            path = PurePosixPath(self.artifact)
-            if path.is_absolute() or ".." in path.parts or not path.parts:
-                raise ValueError(f"artifact must be a relative path: {self.artifact!r}")
-
-
-def _pass_through(job: Job, ctx: StageContext) -> None:
-    """`detected` has no work of its own; the job just enters the pipeline."""
-
-
-DEFAULT_STAGES: Mapping[JobStatus, StageDef] = {JobStatus.DETECTED: StageDef(_pass_through)}
 
 
 def default_worker_id() -> str:
@@ -155,20 +106,18 @@ class Worker:
                 if artifact is not None and not artifact.is_file():
                     raise RuntimeError(f"stage finished without producing {stage.artifact}")
         except SkipJob as exc:
-            logger.info("%s: skipped: %s", log, exc)
-            self._terminal(job, JobStatus.SKIPPED, str(exc) or "skipped")
+            reason = redact(str(exc)) or "skipped"
+            logger.info("%s: skipped: %s", log, reason)
+            self._terminal(job, JobStatus.SKIPPED, reason)
         except PermanentError as exc:
-            logger.error("%s: failed permanently: %s", log, exc)
-            self._terminal(job, JobStatus.FAILED, f"{type(exc).__name__}: {exc}")
+            error = redact(f"{type(exc).__name__}: {exc}")
+            logger.error("%s: failed permanently: %s", log, error)
+            self._terminal(job, JobStatus.FAILED, error)
         except Exception as exc:
-            logger.exception("%s: stage error", log)
-            retry_at = record_failure(
-                self.conn,
-                job,
-                f"{type(exc).__name__}: {exc}",
-                self.clock(),
-                worker_id=self.worker_id,
-            )
+            error = redact(f"{type(exc).__name__}: {exc}")
+            logger.error("%s: stage error: %s", log, error)
+            logger.debug("%s: stage error traceback", log, exc_info=True)  # unredacted
+            retry_at = record_failure(self.conn, job, error, self.clock(), worker_id=self.worker_id)
             if retry_at is None:
                 logger.error("%s: out of attempts, marked failed", log)
             else:

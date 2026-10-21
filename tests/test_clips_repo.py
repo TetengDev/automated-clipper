@@ -50,6 +50,17 @@ def test_insert_pending_clip(conn: sqlite3.Connection, tmp_path: Path) -> None:
     assert (ver["title"], ver["score"], ver["created_at"]) == ("T", 0.9, "2026-10-21")
 
 
+def test_insert_pending_clip_with_explicit_source_range(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), start_s=125.5, end_s=155.5
+    )
+    ver = conn.execute("SELECT * FROM clip_versions WHERE clip_id = ?", (ref.clip_id,)).fetchone()
+    assert (ver["start_s"], ver["end_s"]) == (125.5, 155.5)
+
+
 def test_duplicate_rank_rolls_back(conn: sqlite3.Connection, tmp_path: Path) -> None:
     edl = parse_edl(EDL_DATA)
     insert_pending_clip(conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path))

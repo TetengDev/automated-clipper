@@ -1,10 +1,13 @@
 """End-to-end: a job walks detected -> fetching_audio -> transcribing -> selecting ->
-fetching_clips -> rendering through a real `Worker` with `build_stages()`.
+fetching_clips -> rendering -> clips_ready through a real `Worker` with `build_stages()`.
 
 Only the outside world is faked, at its boundary:
 - yt-dlp: `clipper.pipeline.ytdlp.run_command` is replaced by a runner that answers yt-dlp
   calls by rendering real small media with ffmpeg (lavfi); ffmpeg/ffprobe calls run for real.
 - Groq: HTTP mocked with respx. Anthropic: HTTP mocked with an httpx2 MockTransport.
+- Remotion: `render_clip` is faked in most tests; `test_real_render_reaches_review_and_export`
+  renders for real (skips without node or render/node_modules) and then approves and exports
+  the clip through the review app.
 """
 
 from __future__ import annotations
@@ -23,14 +26,18 @@ import httpx
 import httpx2
 import pytest
 import respx
+from fastapi.testclient import TestClient
 
 from clipper.config import AppConfig, Settings
 from clipper.db import connect, migrate
 from clipper.jobs import Job, JobStatus, Worker, enqueue, get_job
 from clipper.jobs import worker as worker_mod
-from clipper.pipeline import build_stages, select, ytdlp
+from clipper.pipeline import build_stages, render_clips, select, ytdlp
 from clipper.pipeline import transcribe as tr
+from clipper.render import REMOTION_CLI, RenderResult, default_render_dir
+from clipper.review.app import create_app
 from clipper.urls import SourceRef, canonical_url
+from review_support import BASE_URL, PASSWORD_HASH, SECRET, RecordingRunner, login
 
 pytestmark = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
@@ -190,6 +197,34 @@ def world(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[FakeYtdlpWorld, Fak
         yield yt, claude, groq
 
 
+class FakeRender:
+    """Stands in for Remotion: writes the files `render_clip` would and returns its result."""
+
+    def __init__(self) -> None:
+        self.ranks: list[int] = []
+        self.crash_on: int | None = None
+
+    def __call__(
+        self, edl: Any, media_root: Path, out_dir: Path, *, basename: str, **kw: Any
+    ) -> RenderResult:
+        self.ranks.append(int(out_dir.name))
+        if self.crash_on == len(self.ranks):
+            self.crash_on = None
+            raise Crash
+        assert (media_root / edl.source.path).is_file()
+        paths = [out_dir / f"{basename}.{ext}" for ext in ("mp4", "jpg", "json")]
+        for path in paths:
+            path.write_bytes(b"x")
+        return RenderResult(*paths, duration_s=edl.duration_s, render_seconds=0.0)
+
+
+@pytest.fixture
+def fake_render(monkeypatch: pytest.MonkeyPatch) -> FakeRender:
+    render = FakeRender()
+    monkeypatch.setattr(render_clips, "render_clip", render)
+    return render
+
+
 @pytest.fixture
 def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     c = connect(tmp_path / "state.db")
@@ -290,14 +325,41 @@ def _assert_artifacts(media: Path) -> None:
     assert not [p for p in media.rglob("*") if ".tmp" in p.name or p.name.startswith(".src")]
 
 
+def _assert_clips(conn: sqlite3.Connection, media: Path) -> list[sqlite3.Row]:
+    """One pending_review clip per highlight, carrying its copy and source-video range."""
+    highlights = json.loads((media / "highlights.json").read_text())["clips"]
+    rows = conn.execute(
+        "SELECT c.id, c.job_id, c.rank, c.status, v.* FROM clips c"
+        " JOIN clip_versions v ON v.clip_id = c.id ORDER BY c.rank"
+    ).fetchall()
+    assert [(r["job_id"], r["rank"], r["status"], r["version"]) for r in rows] == [
+        (1, h["rank"], "pending_review", 1) for h in highlights
+    ]
+    for row, h in zip(rows, highlights, strict=True):
+        assert (row["title"], row["caption"], row["score"], row["reason"]) == (
+            h["title"],
+            h["caption"],
+            h["score"],
+            h["reason"],
+        )
+        assert json.loads(row["hashtags"]) == h["hashtags"]
+        assert (row["start_s"], row["end_s"]) == (h["start_s"], h["end_s"])
+        assert row["video_path"] == str((media / f"clips/{h['rank']}/v1.mp4").resolve())
+        assert Path(row["video_path"]).is_file() and Path(row["thumb_path"]).is_file()
+    return rows
+
+
 def _spend(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
     rows = conn.execute("SELECT kind, provider, job_id, usd FROM spend ORDER BY id").fetchall()
     assert all(row["usd"] > 0 for row in rows)
     return [(row["kind"], row["provider"], row["job_id"]) for row in rows]
 
 
-def test_job_walks_the_pipeline_to_rendering(
-    conn: sqlite3.Connection, tmp_path: Path, world: tuple[FakeYtdlpWorld, FakeAnthropic, Any]
+def test_job_walks_the_pipeline_to_clips_ready(
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    world: tuple[FakeYtdlpWorld, FakeAnthropic, Any],
+    fake_render: FakeRender,
 ) -> None:
     yt, claude, groq = world
     enqueue(conn, YT, T0, creator="manual")
@@ -311,10 +373,13 @@ def test_job_walks_the_pipeline_to_rendering(
         JobStatus.SELECTING,
         JobStatus.FETCHING_CLIPS,
         JobStatus.RENDERING,
+        JobStatus.CLIPS_READY,
     ]
     job = _job(conn)
-    assert job.status is JobStatus.RENDERING and job.last_error is None
+    assert job.status is JobStatus.CLIPS_READY and job.last_error is None
     _assert_artifacts(tmp_path / "media" / YT.key)
+    _assert_clips(conn, tmp_path / "media" / YT.key)
+    assert fake_render.ranks == [1, 2]
     assert _spend(conn) == [("transcribe", "groq", 1), ("llm", "anthropic", 1)]
     assert (len(yt.of("probe")), len(yt.of("audio")), len(yt.of("section"))) == (1, 1, 2)
     assert (groq.call_count, claude.requests) == (1, 1)
@@ -324,6 +389,7 @@ def test_crashes_resume_without_redoing_completed_work(
     conn: sqlite3.Connection,
     tmp_path: Path,
     world: tuple[FakeYtdlpWorld, FakeAnthropic, Any],
+    fake_render: FakeRender,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     yt, claude, groq = world
@@ -354,10 +420,19 @@ def test_crashes_resume_without_redoing_completed_work(
     assert (media / "clips/1/source.mp4").is_file()
     assert not (media / "sections.json").exists()
 
+    # 3) Killed while rendering the second clip: the first one is already in the DB.
+    fake_render.crash_on = 2
+    with pytest.raises(Crash):
+        _drain(worker)
+    assert _job(conn).status is JobStatus.RENDERING
+    assert [r[0] for r in conn.execute("SELECT rank FROM clips")] == [1]
+
     _drain(worker)
 
-    assert _job(conn).status is JobStatus.RENDERING
+    assert _job(conn).status is JobStatus.CLIPS_READY
     _assert_artifacts(media)
+    _assert_clips(conn, media)
+    assert fake_render.ranks == [1, 2, 2]  # clip 1 was not rendered again
     # Transcription ran once although its stage was re-entered: the artifact was reused.
     assert groq.call_count == 1
     assert claude.requests == 1
@@ -366,3 +441,67 @@ def test_crashes_resume_without_redoing_completed_work(
     targets = [c[c.index("-o") + 1] for c in yt.of("section")]
     assert ["/clips/1/" in t for t in targets] == [True, False, False]
     assert _spend(conn) == [("transcribe", "groq", 1), ("llm", "anthropic", 1)]
+
+
+@pytest.mark.render
+@pytest.mark.skipif(
+    shutil.which("node") is None or not (default_render_dir() / REMOTION_CLI).is_file(),
+    reason="needs node and render/node_modules (run `npm ci` in render/)",
+)
+def test_real_render_reaches_review_and_export(
+    conn: sqlite3.Connection, tmp_path: Path, world: tuple[FakeYtdlpWorld, FakeAnthropic, Any]
+) -> None:
+    enqueue(conn, YT, T0, creator="manual")
+    media_root = tmp_path / "media"
+
+    statuses = _drain(_worker(conn, media_root))
+
+    assert statuses[-2:] == [JobStatus.RENDERING, JobStatus.CLIPS_READY]
+    assert _job(conn).last_error is None
+    rows = _assert_clips(conn, media_root / YT.key)
+    probe = subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,width,height:format=duration",
+            "-of",
+            "json",
+            rows[0]["video_path"],
+        ],  # fmt: skip
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    info = json.loads(probe.stdout)
+    streams = info["streams"]
+    assert {"codec_type": "video", "width": 1080, "height": 1920} in streams
+    # Within ~1 frame of the selected range.
+    length = rows[0]["end_s"] - rows[0]["start_s"]
+    assert float(info["format"]["duration"]) == pytest.approx(length, abs=0.04)
+    assert any(s["codec_type"] == "audio" for s in streams)
+
+    # The clip shows up in the review queue, plays, and can be approved and exported.
+    app = create_app(
+        password_hash=PASSWORD_HASH,
+        session_secret=SECRET,
+        db_path=tmp_path / "state.db",
+        media_root=media_root,
+        output_dir=tmp_path / "output",
+        export_runner=RecordingRunner(),
+    )
+    client = TestClient(app, base_url=BASE_URL, follow_redirects=False)
+    csrf = login(client)
+    clip_id = rows[0]["id"]
+    assert rows[0]["title"] in client.get("/queue").text
+    assert client.get(f"/media/clip/{clip_id}/1/video").status_code == 200
+    response = client.post(
+        f"/clip/{clip_id}/approve",
+        data={"version": 1},
+        headers={"X-CSRF-Token": csrf, "HX-Request": "true"},
+    )
+    assert response.status_code == 200
+    status = conn.execute("SELECT status FROM clips WHERE id = ?", (clip_id,)).fetchone()[0]
+    assert status == "exported"
+    assert any(p.suffix == ".mp4" for p in (tmp_path / "output").rglob("*"))

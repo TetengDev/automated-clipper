@@ -10,7 +10,7 @@ import pytest
 
 from clipper import render
 from clipper.edl import parse_edl
-from clipper.render import RenderError, render_clip
+from clipper.render import InvalidClipError, RenderError, render_clip
 
 LOUDNORM_STDERR = """\
 [Parsed_loudnorm_0 @ 0x1] 
@@ -44,12 +44,14 @@ class FakeRunner:
         fail_step: str | None = None,
         loudnorm_stderr: str = LOUDNORM_STDERR,
         raise_exc: BaseException | None = None,
+        fail_stderr: str = "boom: something broke\nlast line",
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.props: dict[str, Any] | None = None
         self.fail_step = fail_step
         self.loudnorm_stderr = loudnorm_stderr
         self.raise_exc = raise_exc
+        self.fail_stderr = fail_stderr
         self.public_listing: list[str] = []
 
     @staticmethod
@@ -72,7 +74,7 @@ class FakeRunner:
         if self.raise_exc is not None and step == self.fail_step:
             raise self.raise_exc
         if step == self.fail_step:
-            return subprocess.CompletedProcess(argv, 1, "", "boom: something broke\nlast line")
+            return subprocess.CompletedProcess(argv, 1, "", self.fail_stderr)
         stderr = ""
         if step == "remotion":
             props_arg = next(a for a in argv if a.startswith("--props="))
@@ -234,6 +236,33 @@ def test_remotion_failure_raises_with_stderr_tail(
     assert not (tmp_path / "out" / ".clip.work").exists()
     assert not (tmp_path / "out" / "clip.mp4").exists()
     assert not (tmp_path / "out" / "clip.json").exists()
+    assert not isinstance(excinfo.value, InvalidClipError)  # may be transient: retry
+
+
+def test_remotion_rejecting_props_is_invalid_clip(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    stderr = (
+        "Error rendering composition\n"
+        "EdlValidationError  EdlValidationError: invalid clip props: /hook/text: must match"
+        " pattern; /words: bad\n"
+        "    at parseEdl (validate.ts:64)"
+    )
+    runner = FakeRunner(fail_step="remotion", fail_stderr=stderr)
+    with pytest.raises(InvalidClipError) as excinfo:
+        _render(media_root, render_dir, tmp_path, runner)
+    assert str(excinfo.value).splitlines()[0] == (
+        "Remotion rejected the clip props: /hook/text: must match pattern; /words: bad"
+    )
+
+
+def test_props_text_without_the_error_class_is_not_a_rejection(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    runner = FakeRunner(fail_step="remotion", fail_stderr="echo: invalid clip props: x")
+    with pytest.raises(RenderError) as excinfo:
+        _render(media_root, render_dir, tmp_path, runner)
+    assert not isinstance(excinfo.value, InvalidClipError)
 
 
 def test_timeout(media_root: Path, render_dir: Path, tmp_path: Path) -> None:
@@ -283,7 +312,7 @@ def test_invalid_edl_rejected_before_any_subprocess(
 ) -> None:
     runner = FakeRunner()
     bad = {**EDL_DATA, "layout": "split_screen"}
-    with pytest.raises(RenderError, match="invalid EDL"):
+    with pytest.raises(InvalidClipError, match="invalid EDL"):
         render_clip(bad, media_root, tmp_path / "out", runner=runner, render_dir=render_dir)
     assert runner.calls == []
 
@@ -291,9 +320,10 @@ def test_invalid_edl_rejected_before_any_subprocess(
 def test_missing_source(media_root: Path, render_dir: Path, tmp_path: Path) -> None:
     (media_root / "media" / "source.mp4").unlink()
     runner = FakeRunner()
-    with pytest.raises(RenderError, match="source media not found"):
+    with pytest.raises(RenderError, match="source media not found") as excinfo:
         _render(media_root, render_dir, tmp_path, runner)
     assert runner.calls == []
+    assert not isinstance(excinfo.value, InvalidClipError)  # volume may be back on retry
 
 
 def test_symlink_escape_rejected(media_root: Path, render_dir: Path, tmp_path: Path) -> None:
@@ -302,7 +332,7 @@ def test_symlink_escape_rejected(media_root: Path, render_dir: Path, tmp_path: P
     (media_root / "media" / "source.mp4").unlink()
     (media_root / "media" / "source.mp4").symlink_to(outside)
     runner = FakeRunner()
-    with pytest.raises(RenderError, match="escapes media root"):
+    with pytest.raises(InvalidClipError, match="escapes media root"):
         _render(media_root, render_dir, tmp_path, runner)
 
 

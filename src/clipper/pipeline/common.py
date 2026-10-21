@@ -21,6 +21,7 @@ import re
 import sqlite3
 import tempfile
 import time as _time
+import unicodedata
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -48,6 +49,11 @@ STAGE_BUDGET_S = 100 * 60.0
 PROTOCOL_WHITELIST = ["-protocol_whitelist", "file,pipe"]
 """ffmpeg/ffprobe input option: local files only, never network or nested protocols."""
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Format (Cf) characters can spoof text (bidi overrides, zero-width, BOM, tags) and are
+# dropped, except ZWNJ (Persian/Indic spelling) and ZWJ (compound emoji).
+_KEEP_FORMAT = frozenset("\u200c\u200d")
+# Invisible fillers that are not Cf but render blank; plus the whole tag block.
+_FILLERS = re.compile("[\u034f\u115f\u1160\u3164\uffa0\U000e0000-\U000e007f]")
 
 
 class MediaError(RuntimeError):
@@ -84,7 +90,11 @@ class Deadline:
 
 
 def strip_control(text: str) -> str:
-    """Drop control characters (incl. newlines) and collapse whitespace."""
+    """Drop control and invisible spoofing characters (incl. newlines, bidi overrides) and
+    collapse whitespace."""
+    text = "".join(
+        c for c in _FILLERS.sub("", text) if c in _KEEP_FORMAT or unicodedata.category(c) != "Cf"
+    )
     return " ".join(_CONTROL.sub(" ", text).split())
 
 

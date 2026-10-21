@@ -12,7 +12,9 @@ export class EdlValidationError extends Error {
   readonly errors: string[];
 
   constructor(errors: string[]) {
-    super(`invalid clip props:\n  ${errors.join("\n  ")}`);
+    // One line, paths and rule messages only (never values): the Python side reads it
+    // from stderr as the reason a clip was left out.
+    super(`invalid clip props: ${errors.join("; ")}`);
     this.name = "EdlValidationError";
     this.errors = errors;
   }

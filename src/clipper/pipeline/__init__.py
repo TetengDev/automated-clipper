@@ -3,10 +3,8 @@ added to `build_stages()`; the contract is in `clipper.jobs.stages`.
 
 Artifacts, in order (each stage reads the ones before it from the job's media dir):
 fetching_audio -> audio_16k.flac (+ meta.json, signals.json), transcribing ->
-transcript.json, selecting -> highlights.json, fetching_clips -> sections.json.
-
-`rendering` (CLP-17) is not registered yet, so jobs stop at `rendering` until it is
-(statuses without a stage are never claimed).
+transcript.json, selecting -> highlights.json, fetching_clips -> sections.json,
+rendering -> `clips` rows in `pending_review` (CLP-63), after which the job is `clips_ready`.
 
 Stage modules are imported inside `build_stages()` so importing this package stays cheap
 and cannot form an import cycle with `clipper.jobs`.
@@ -21,7 +19,7 @@ from clipper.jobs.stages import DEFAULT_STAGES, StageDef
 
 
 def build_stages() -> Mapping[JobStatus, StageDef]:
-    from clipper.pipeline import fetch_audio, fetch_clips, select, transcribe
+    from clipper.pipeline import fetch_audio, fetch_clips, render_clips, select, transcribe
 
     return {
         **DEFAULT_STAGES,
@@ -29,4 +27,5 @@ def build_stages() -> Mapping[JobStatus, StageDef]:
         JobStatus.TRANSCRIBING: transcribe.STAGE,
         JobStatus.SELECTING: select.STAGE,
         JobStatus.FETCHING_CLIPS: fetch_clips.STAGE,
+        JobStatus.RENDERING: render_clips.STAGE,
     }

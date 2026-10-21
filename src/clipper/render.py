@@ -42,6 +42,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from clipper.edl import EDL, FPS, HEIGHT, WIDTH, parse_edl
+from clipper.redact import redact
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +83,12 @@ class RenderError(Exception):
         self.stderr_tail = stderr_tail
         detail = f"\n--- stderr (tail) ---\n{stderr_tail}" if stderr_tail else ""
         super().__init__(f"{message}{detail}")
+
+
+class InvalidClipError(RenderError):
+    """The clip's own input is bad (EDL, source path escaping the media root, props Remotion
+    rejects): rendering it again unchanged fails the same way. Other RenderErrors may be
+    transient."""
 
 
 @dataclass(frozen=True)
@@ -209,16 +216,16 @@ def _run(
         proc = runner(list(argv), cwd=cwd, env=dict(env), timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
         tail = _tail(exc.stderr)
-        log.error("render step %s timed out after %ss\n%s", step, timeout_s, tail)
+        log.error("render step %s timed out after %ss\n%s", step, timeout_s, redact(tail))
         raise RenderError(f"{step} timed out after {timeout_s:g}s", tail) from exc
     except OSError as exc:
         raise RenderError(f"{step} could not start: {exc}") from exc
     tail = _tail(proc.stderr)
     if proc.returncode != 0:
-        log.error("render step %s failed (exit %s)\n%s", step, proc.returncode, tail)
+        log.error("render step %s failed (exit %s)\n%s", step, proc.returncode, redact(tail))
         raise RenderError(f"{step} failed with exit code {proc.returncode}", tail)
     if tail:
-        log.debug("render step %s stderr:\n%s", step, tail)
+        log.debug("render step %s stderr:\n%s", step, redact(tail))
     return proc
 
 
@@ -288,8 +295,8 @@ def _resolve_source(edl: EDL, media_root: Path) -> Path:
     root = media_root.resolve()
     source = (root / edl.source.path).resolve()
     if not source.is_relative_to(root):
-        raise RenderError(f"source path escapes media root: {edl.source.path}")
-    if not source.is_file():
+        raise InvalidClipError(f"source path escapes media root: {edl.source.path}")
+    if not source.is_file():  # retryable: the volume may be briefly unavailable
         raise RenderError(f"source media not found: {source}")
     return source
 
@@ -486,7 +493,7 @@ def render_clip(
         try:
             edl = parse_edl(edl)
         except ValidationError as exc:
-            raise RenderError(f"invalid EDL: {exc}") from exc
+            raise InvalidClipError(f"invalid EDL: {exc}") from exc
     source = _resolve_source(edl, media_root)
     render_dir = (render_dir or default_render_dir()).resolve()
     entry = "src/index.ts"
@@ -525,23 +532,34 @@ def render_clip(
                 env=env,
             )
             _write_json(props_file, segment_props(edl))
-            _run(
-                runner,
-                remotion_argv(
-                    node=node,
-                    cli=cli,
-                    entry=entry,
-                    output=raw_video,
-                    props_file=props_file,
-                    public_dir=work_dir / "public",
-                    concurrency=concurrency,
+            try:
+                _run(
+                    runner,
+                    remotion_argv(
+                        node=node,
+                        cli=cli,
+                        entry=entry,
+                        output=raw_video,
+                        props_file=props_file,
+                        public_dir=work_dir / "public",
+                        concurrency=concurrency,
+                        timeout_s=timeout_s,
+                    ),
+                    step="remotion render",
                     timeout_s=timeout_s,
-                ),
-                step="remotion render",
-                timeout_s=timeout_s,
-                env=env,
-                cwd=render_dir,
-            )
+                    env=env,
+                    cwd=render_dir,
+                )
+            except RenderError as exc:
+                # validate.ts throws EdlValidationError("invalid clip props: <errors>"), one line.
+                marker = "EdlValidationError: invalid clip props:"
+                line = next((ln for ln in exc.stderr_tail.splitlines() if marker in ln), None)
+                if line is None:
+                    raise
+                detail = line.split(marker, 1)[1].strip()[:500]
+                raise InvalidClipError(
+                    f"Remotion rejected the clip props: {detail}", exc.stderr_tail
+                ) from exc
             remotion_seconds = time.monotonic() - started  # includes the pre-cut
 
             measure = _run(

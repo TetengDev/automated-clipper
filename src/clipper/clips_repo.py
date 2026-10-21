@@ -58,6 +58,8 @@ def _insert_version(
     result: RenderResult,
     meta: ClipMeta,
     now: str,
+    start_s: float | None = None,
+    end_s: float | None = None,
 ) -> None:
     conn.execute(
         "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption, hashtags,"
@@ -66,8 +68,8 @@ def _insert_version(
         (
             clip_id,
             version,
-            edl.source.in_s,
-            edl.source.out_s,
+            edl.source.in_s if start_s is None else start_s,
+            edl.source.out_s if end_s is None else end_s,
             meta.title,
             meta.caption,
             json.dumps(list(meta.hashtags)),
@@ -92,9 +94,14 @@ def insert_pending_clip(
     result: RenderResult,
     meta: ClipMeta | None = None,
     now: str | None = None,
+    start_s: float | None = None,
+    end_s: float | None = None,
 ) -> ClipVersionRef:
     """Insert a new clip (version 1, `pending_review`). Raises sqlite3.IntegrityError if
-    (job_id, rank) already exists or job_id is unknown."""
+    (job_id, rank) already exists or job_id is unknown.
+
+    `start_s`/`end_s` (default: the EDL's source range) are stored as the clip's position
+    in the original video, for when the EDL cuts a pre-fetched section of it."""
     stamp = now or _now()
     with transaction(conn):
         cursor = conn.execute(
@@ -112,6 +119,8 @@ def insert_pending_clip(
             result=result,
             meta=meta or ClipMeta(),
             now=stamp,
+            start_s=start_s,
+            end_s=end_s,
         )
     return ClipVersionRef(clip_id=clip_id, version=1)
 

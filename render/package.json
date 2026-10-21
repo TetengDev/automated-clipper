@@ -21,7 +21,7 @@
     "@remotion/renderer": "4.0.535",
     "ajv": "8.20.0",
     "react": "19.2.8",
-    "react-dom": "19.2.8",
+    "react-dom": "19.3.1",
     "remotion": "4.0.535"
   },
   "devDependencies": {

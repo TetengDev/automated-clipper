@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 jobs:
   test:
@@ -24,7 +24,7 @@ jobs:
         with:
           version: "0.11.31"
           enable-cache: true
-          save-cache: ${{ github.ref == 'refs/heads/main' }}
+          save-cache: ${{ github.ref == 'refs/heads/dev' }}
 
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
@@ -102,7 +102,7 @@ jobs:
           load: true
           tags: clipper:ci
           cache-from: type=gha
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max' || '' }}
+          cache-to: ${{ github.ref == 'refs/heads/dev' && 'type=gha,mode=max' || '' }}
 
       - name: Smoke test image
         run: |

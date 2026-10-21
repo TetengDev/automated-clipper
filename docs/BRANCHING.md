@@ -19,7 +19,7 @@ hotfix/vX.Y.Z  (cut from main)  --merge PR-->  main  ==> tag + sync to dev
 | `main` | Production history. Only releases and hotfixes. | PR required; `test`, `node`, `docker`, `audit`, `branch-policy`; no force push; no deletion | merge commit |
 | `v*` tags | Release tags | no update, no deletion | n/a |
 
-`branch-policy` only lets `release/vX.Y.Z` or `hotfix/vX.Y.Z` into `main`, and only `pre-release/vX.Y.Z` (same version) or `hotfix/vX.Y.Z` into `release/vX.Y.Z`. Fork branches are rejected.
+`branch-policy` runs from the base branch's copy of the workflow (`pull_request_target`), so a PR cannot change the rule it is judged by. It also re-runs when a PR's base is changed. It only lets `release/vX.Y.Z` or `hotfix/vX.Y.Z` into `main`, and only `pre-release/vX.Y.Z` (same version) or `hotfix/vX.Y.Z` into `release/vX.Y.Z`. Fork branches are rejected.
 
 No approvals are required, because a solo maintainer cannot approve their own PR. The gate is the PR, its checks, the review record, and a human pressing merge.
 
@@ -34,6 +34,8 @@ No approvals are required, because a solo maintainer cannot approve their own PR
 
 ## Cutting a release
 
+First merge any open "chore: sync main into dev" PR, so the new candidate starts from the last release.
+
 ```bash
 git fetch origin
 git push origin origin/dev:refs/heads/pre-release/v0.1.0   # freeze the candidate
@@ -47,8 +49,12 @@ gh pr create --base main --head release/v0.1.0 --title "release: v0.1.0"
 When the PR into `main` merges, the `Post-release` workflow:
 1. Tags `v0.1.0` and creates the GitHub release with generated notes.
 2. Opens a **"chore: sync main into dev"** PR. Merge it with a **merge commit**. That brings the release's dependency fixes back into dev without rewriting dev.
+   - The PR's checks are the ones from the push to main, which ran on the same commit. If they don't show, close and reopen the PR to run CI.
+   - If it was squash-merged by mistake, dev never gets main's commits and every later sync PR repeats old releases. To recover, merge `origin/main` into a branch cut from dev and open a PR with a merge commit.
+   - Opening this PR needs **Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"**, both at the TetengDev org level and in the repo. Without it the step fails red; open the PR by hand with `gh pr create --base dev --head main`.
+   - The workflow is safe to re-run: it skips a tag that already exists.
 
-Hotfix: cut `hotfix/v0.1.1` from `main`, then open a PR into `main`. It is tagged and synced in the same way.
+Hotfix: cut `hotfix/v0.1.1` from `main`, then open a PR into `main`. It is tagged and synced in the same way. If a `release/*` branch is in flight, also open a PR from the hotfix into it; `branch-policy` allows that. Otherwise that release ships without the fix.
 
 ## Why dev is merged into, never rebased
 

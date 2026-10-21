@@ -24,10 +24,12 @@ jobs:
       - name: Tag release
         run: |
           if [[ "$HEAD" =~ ^(release|hotfix)/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            gh release create "${BASH_REMATCH[2]}" --target "$SHA" --generate-notes
+            tag="${BASH_REMATCH[2]}"
+            gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --target "$SHA" --generate-notes
           fi
 
       - name: Open main -> dev sync PR
+        if: ${{ !cancelled() }}
         run: |
           ahead=$(gh api "repos/$GH_REPO/compare/dev...main" -q .ahead_by)
           open=$(gh pr list --base dev --head main --state open --json number -q length)

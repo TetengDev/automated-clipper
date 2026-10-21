@@ -38,6 +38,11 @@ jobs:
 
       - name: Open main -> dev sync PR
         if: ${{ !cancelled() }}
+        env:
+          # A PR opened with GITHUB_TOKEN runs no CI and needs Actions allowed to
+          # open PRs; SYNC_PR_TOKEN (fine-grained PAT: this repo, contents read +
+          # pull requests write) avoids both.
+          GH_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
         run: |
           ahead=$(gh api "repos/$GH_REPO/compare/dev...main" -q .ahead_by)
           open=$(gh pr list --base dev --head main --state open --json number -q length)

@@ -21,7 +21,7 @@ hotfix/vX.Y.Z  (cut from main)  --merge PR-->  main  ==> tag + sync to dev
 
 `branch-policy` runs from the default branch's (`dev`) copy of the workflow (`pull_request_target`), so a PR cannot change the rule it is judged by. It is a guardrail for the promotion path, not a security boundary. It also re-runs when a PR's base is changed. It only lets `release/vX.Y.Z` or `hotfix/vX.Y.Z` into `main`, and only `pre-release/vX.Y.Z` (same version) or `hotfix/vX.Y.Z` into `release/vX.Y.Z`. Fork branches are rejected.
 
-No approvals are required, because a solo maintainer cannot approve their own PR. The gate is the PR, its checks, the review record, and a human pressing merge.
+Every PR needs **1 approval**, and a new push dismisses earlier approvals. PRs are authored by the maintainer's account, and GitHub does not let an author approve their own PR. So the maintainer merges through the ruleset's **repo-admin bypass**, which works only on PRs, never on direct pushes; that merge is the human approval. Only bypass once the required checks are green and the review record is posted. Agents never merge.
 
 ## Vulnerabilities do not block dev
 
@@ -49,9 +49,9 @@ gh pr create --base main --head release/v0.1.0 --title "release: v0.1.0"
 When the PR into `main` merges, the `Post-release` workflow:
 1. Tags `v0.1.0` and creates the GitHub release with generated notes.
 2. Opens a **"chore: sync main into dev"** PR. Merge it with a **merge commit**. That brings the release's dependency fixes back into dev without rewriting dev.
-   - The PR's checks are the ones from the push to main, which ran on the same commit. If they don't show, close and reopen the PR to run CI.
+   - If its checks don't show up, close and reopen the PR to run CI.
    - If it was squash-merged by mistake, dev never gets main's commits and every later sync PR repeats old releases. To recover, merge `origin/main` into a branch cut from dev and open a PR with a merge commit.
-   - Opening this PR needs **Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"**, both at the TetengDev org level and in the repo. Without it the step fails red; open the PR by hand with `gh pr create --base dev --head main`.
+   - The workflow opens it with the `SYNC_PR_TOKEN` repo secret: a fine-grained PAT for this repo with *Contents: read* and *Pull requests: write*. That way CI runs on the PR. Without the secret it falls back to `GITHUB_TOKEN`, which fails unless Actions may create PRs. If so, open it by hand with `gh pr create --base dev --head main`. Keep "Allow GitHub Actions to create and approve pull requests" **off**, so no workflow can approve a PR.
    - The workflow is safe to re-run: it skips a tag that already exists.
 
 Hotfix: cut `hotfix/v0.1.1` from `main`, then open a PR into `main`. It is tagged and synced in the same way. If a `release/*` branch is in flight, also open a PR from the hotfix into it; `branch-policy` allows that. Otherwise that release ships without the fix.

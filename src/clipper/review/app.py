@@ -42,6 +42,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from clipper.config import MIN_SESSION_SECRET_LENGTH
 from clipper.db import connect
+from clipper.export import DEFAULT_OUTPUT_DIR, ExportLocks, Runner, run_subprocess
+from clipper.jobs.worker import DEFAULT_MEDIA_ROOT
 
 PACKAGE_DIR = Path(__file__).parent
 TEMPLATES_DIR = PACKAGE_DIR / "templates"
@@ -384,7 +386,8 @@ def render(
 def flash(request: Request, message: str) -> None:
     """Queue a one-time message; the next full-page render (base.html) shows and clears it.
     Partials don't call `get_flashed_messages()`, so HTMX swaps never swallow flashes."""
-    request.session.setdefault("flash", []).append(message)
+    # Reassign (not .append): the session only re-saves on top-level writes.
+    request.session["flash"] = [*request.session.get("flash", []), message]
 
 
 def _pop_flashes(request: Request) -> list[str]:
@@ -409,10 +412,16 @@ def create_app(
     secure_cookies: bool = True,
     clock: Callable[[], float] = time.monotonic,
     wall_clock: Callable[[], float] = time.time,
+    media_root: Path = DEFAULT_MEDIA_ROOT,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    rclone_remote: str | None = None,
+    export_runner: Runner = run_subprocess,
 ) -> FastAPI:
     """Build the review app. All config is passed in so tests need no environment.
 
     `db_path` is stored on `app.state.db_path`; routes get a connection via `get_db`.
+    `media_root` confines which rendered files /media may serve; approved clips are
+    exported under `output_dir`/ready (and copied to `rclone_remote` via `export_runner`).
     `clock` (monotonic seconds) drives the login throttle; `wall_clock` (epoch seconds)
     stamps and ages sessions. Routes render templates with the module-level `render`.
     """
@@ -435,6 +444,12 @@ def create_app(
     )
     app.hsts = secure_cookies
     app.state.db_path = db_path
+    app.state.media_root = media_root
+    app.state.output_dir = output_dir
+    app.state.rclone_remote = rclone_remote
+    app.state.export_runner = export_runner
+    app.state.export_locks = ExportLocks()
+    app.state.wall_clock = wall_clock
     app.state.login_throttle = throttle
     app.state.session_policy = policy
 
@@ -501,8 +516,7 @@ def create_app(
         flash(request, "Signed out.")
         return RedirectResponse("/login", status_code=303)
 
-    @app.get("/", response_class=HTMLResponse)
-    def queue(request: Request, _user: Annotated[str, Depends(require_user)]) -> Response:
-        return render(request, "queue.html")
+    from clipper.review.routes import router  # imports this module's helpers
 
+    app.include_router(router)
     return app

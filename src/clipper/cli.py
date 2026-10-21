@@ -26,6 +26,7 @@ from clipper.config import (
     load_config,
 )
 from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version, migrate
+from clipper.export import DEFAULT_OUTPUT_DIR
 from clipper.pipeline import build_stages
 from clipper.urls import InvalidSourceURL, parse_source_url
 
@@ -225,6 +226,12 @@ def run_review(
             ),
         ),
     ] = "127.0.0.1",
+    media_dir: Annotated[
+        Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Rendered clips (served/exported).")
+    ] = jobs.DEFAULT_MEDIA_ROOT,
+    output_dir: Annotated[
+        Path, typer.Option(envvar="CLIPPER_OUTPUT_DIR", help="Export root (ready/ lives here).")
+    ] = DEFAULT_OUTPUT_DIR,
 ) -> None:
     """Serve the clip review web app."""
     import uvicorn
@@ -248,6 +255,9 @@ def run_review(
             session_secret=secrets.require("SESSION_SECRET"),
             db_path=_app(ctx).db_path,
             secure_cookies=not insecure_cookies,
+            media_root=media_dir.resolve(),
+            output_dir=output_dir.resolve(),
+            rclone_remote=secrets.rclone_remote,
         )
     except (MissingSecretError, ValidationError, ValueError) as exc:
         _fail(f"run-review: {exc}")
@@ -259,6 +269,45 @@ def run_review(
         proxy_headers=True,
         forwarded_allow_ips=forwarded_allow_ips,
     )
+
+
+@app.command("export-pending")
+def export_pending_cmd(
+    ctx: typer.Context,
+    media_dir: Annotated[
+        Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Rendered clips.")
+    ] = jobs.DEFAULT_MEDIA_ROOT,
+    output_dir: Annotated[
+        Path, typer.Option(envvar="CLIPPER_OUTPUT_DIR", help="Export root (ready/ lives here).")
+    ] = DEFAULT_OUTPUT_DIR,
+) -> None:
+    """Export (or retry) every approved clip that has not been exported yet."""
+    from clipper.export import export_pending
+    from clipper.jobs.models import utcnow
+
+    try:
+        remote = Secrets().rclone_remote
+    except ValidationError as exc:
+        _fail(f"export-pending: {exc}")
+    _setup_logging()
+    conn = _open_db(_app(ctx).db_path)
+    try:
+        results = export_pending(
+            conn,
+            output_dir=output_dir.resolve(),
+            media_root=media_dir.resolve(),
+            now=utcnow(),
+            rclone_remote=remote,
+        )
+    finally:
+        conn.close()
+    failed = [r for r in results if r.status == "failed"]
+    for result in results:
+        detail = f": {result.error}" if result.error else ""
+        typer.echo(f"clip {result.clip_id} v{result.version}: {result.status}{detail}")
+    typer.echo(f"{len(results) - len(failed)} exported, {len(failed)} failed")
+    if failed:
+        raise typer.Exit(code=1)
 
 
 @app.command("hash-password")

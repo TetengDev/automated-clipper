@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% set v = clip.current %}
+{% block title %}{{ v.title or "Clip" }} · Clipper review{% endblock %}
+{% block content %}
+<nav class="clip-nav">
+  <a href="/queue">&larr; Queue</a>
+  <span>
+    {% if prev_id %}<a id="prev-clip" href="/clip/{{ prev_id }}" rel="prev">Previous (k)</a>{% endif %}
+    {% if next_id %}<a id="next-clip" href="/clip/{{ next_id }}" rel="next">Next (j)</a>{% endif %}
+  </span>
+</nav>
+<article class="clip" data-clip-id="{{ clip.id }}">
+  <video class="player" controls playsinline preload="metadata"
+         src="/media/clip/{{ clip.id }}/{{ v.version }}/video"
+         {% if v.thumb_path %}poster="/media/clip/{{ clip.id }}/{{ v.version }}/thumb"{% endif %}></video>
+  <div class="details">
+    <h1>{{ v.title or "Untitled clip" }}</h1>
+    <p><span class="badge status-{{ clip.status }}" id="clip-status">{{ clip.status | replace("_", " ") }}</span>
+      v{{ v.version }} · {{ clip.creator }} · {{ "%d" % v.duration_s }}s ·
+      score {{ "%.1f" % v.score if v.score is not none else "–" }}</p>
+    {% if v.caption %}<p class="caption">{{ v.caption }}</p>{% endif %}
+    {% if v.hashtags %}<p class="muted">{{ v.hashtags | join(" ") }}</p>{% endif %}
+    {% if v.reason %}<h2>Why Claude picked it</h2><p>{{ v.reason }}</p>{% endif %}
+    {% set at = "%d:%02d" % ((v.start_s // 60) | int, (v.start_s % 60) | int) %}
+    {% if clip.source_url %}
+    <p><a href="{{ clip.source_url }}" target="_blank" rel="noopener noreferrer" id="source-link">
+      {{ clip.source_title or "Source" }} @ {{ at }}</a></p>
+    {% else %}
+    <p class="muted">{{ clip.source_title or "Source" }} @ {{ at }} (no valid source link)</p>
+    {% endif %}
+
+    <div id="action-error" aria-live="polite"></div>
+    {% if can_review %}
+    <div class="actions">
+      <form method="post" action="/clip/{{ clip.id }}/approve" hx-post="/clip/{{ clip.id }}/approve"
+            hx-target="#action-error" hx-disabled-elt="find button">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="version" value="{{ v.version }}">
+        <button type="submit" id="approve-btn">Approve (a)</button>
+      </form>
+      <form method="post" action="/clip/{{ clip.id }}/reject" hx-post="/clip/{{ clip.id }}/reject"
+            hx-target="#action-error" hx-disabled-elt="find button" class="reject">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="version" value="{{ v.version }}">
+        <label for="reason-tag">Reject reason</label>
+        <select id="reason-tag" name="reason_tag" required>
+          <option value="">Choose…</option>
+          {% for reason in reasons %}<option value="{{ reason }}">{{ reason | replace("_", " ") }}</option>{% endfor %}
+        </select>
+        <button type="submit" id="reject-btn" class="danger">Reject (r)</button>
+      </form>
+    </div>
+    {% elif can_retry_export %}
+    {% if last_export_error %}<p class="error" id="export-error">Last export failed ({{ last_export_error }}). Details are in the server log.</p>{% endif %}
+    <form method="post" action="/clip/{{ clip.id }}/approve" hx-post="/clip/{{ clip.id }}/approve"
+          hx-target="#action-error" hx-disabled-elt="find button">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="version" value="{{ v.version }}">
+      <button type="submit" id="approve-btn">Retry export</button>
+    </form>
+    {% endif %}
+
+    <h2>Versions</h2>
+    <ul class="versions">
+      {% for ver in clip.versions %}
+      <li>v{{ ver.version }} · {{ "%.1f" % ver.start_s }}–{{ "%.1f" % ver.end_s }}s · {{ ver.created_at }}
+        {% if ver.note %}· {{ ver.note }}{% endif %}{% if ver.version == clip.current_version %} <strong>(current)</strong>{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% if reviews %}
+    <h2>History</h2>
+    <ul class="history">
+      {% for r in reviews %}
+      <li>{{ r["created_at"] }} · v{{ r["version"] }} · {{ r["action"] }}{% if r["reason_tag"] %} ({{ r["reason_tag"] }}){% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+</article>
+{% endblock %}

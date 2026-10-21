@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from clipper.cli import app as cli_app
+from clipper.db import connect, migrate
 from clipper.review.app import (
     LOGIN_GLOBAL_MAX_ATTEMPTS,
     LOGIN_MAX_ATTEMPTS,
@@ -61,11 +62,16 @@ def wall() -> FakeClock:
 def make_app(
     password_hash: str, tmp_path: Path, clock: FakeClock, wall: FakeClock
 ) -> Callable[..., FastAPI]:
+    db_path = tmp_path / "state.db"
+    conn = connect(db_path)
+    migrate(conn)
+    conn.close()
+
     def _make(**kwargs: object) -> FastAPI:
         params: dict[str, object] = {
             "password_hash": password_hash,
             "session_secret": SECRET,
-            "db_path": tmp_path / "state.db",
+            "db_path": db_path,
             "clock": clock,
             "wall_clock": wall,
         }
@@ -900,7 +906,7 @@ def test_plain_csrf_failure_has_no_hx_refresh(client: TestClient) -> None:
 def test_get_db_yields_connection_and_closes_it(
     make_app: Callable[..., FastAPI], tmp_path: Path
 ) -> None:
-    application = make_app()
+    application = make_app(db_path=tmp_path / "fresh.db")
     seen: list[sqlite3.Connection] = []
 
     @application.get("/dbcheck")
@@ -918,7 +924,7 @@ def test_get_db_yields_connection_and_closes_it(
 
     assert response.status_code == 200
     assert response.json() == {"tables": []}  # connects only; never migrates
-    assert (tmp_path / "state.db").exists()
+    assert (tmp_path / "fresh.db").exists()
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         seen[0].execute("SELECT 1")
 

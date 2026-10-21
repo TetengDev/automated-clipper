@@ -1,6 +1,47 @@
 {% extends "base.html" %}
 {% block title %}Queue · Clipper review{% endblock %}
 {% block content %}
-<h1>Review queue</h1>
+<h1>Review queue <span class="muted count" id="queue-total">{{ total }}</span></h1>
+<nav class="tabs" aria-label="Status">
+  <a href="{{ all_url }}" {% if status_value == "all" %}aria-current="page"{% endif %}>all <span class="count">{{ all_count }}</span></a>
+  {% for value, n, url in status_tabs %}
+  <a href="{{ url }}" data-status="{{ value }}" {% if status_value == value %}aria-current="page"{% endif %}>{{ value | replace("_", " ") }} <span class="count">{{ n }}</span></a>
+  {% endfor %}
+</nav>
+<form method="get" action="/queue" class="filters">
+  <label>Creator
+    <select name="creator">
+      <option value="">All creators</option>
+      {% for name in creators %}
+      <option value="{{ name }}" {% if flt.creator == name %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Status
+    <select name="status">
+      <option value="all" {% if status_value == "all" %}selected{% endif %}>All</option>
+      {% for value in statuses %}
+      <option value="{{ value }}" {% if status_value == value %}selected{% endif %}>{{ value | replace("_", " ") }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Min score
+    <input type="number" name="min_score" step="0.1" min="0" inputmode="decimal"
+           value="{{ '%g' % flt.min_score if flt.min_score is not none else '' }}">
+  </label>
+  <label>Sort
+    <select name="sort">
+      <option value="newest" {% if flt.sort == "newest" %}selected{% endif %}>Newest</option>
+      <option value="score" {% if flt.sort == "score" %}selected{% endif %}>Score</option>
+    </select>
+  </label>
+  <button type="submit">Apply</button>
+</form>
+{% if cards %}
+<section class="cards" id="queue">
+  {% include "_queue_cards.html" %}
+</section>
+{% else %}
 {% include "_queue_empty.html" %}
+{% endif %}
 {% endblock %}

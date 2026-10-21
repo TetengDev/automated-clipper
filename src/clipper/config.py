@@ -49,6 +49,7 @@ class Settings(_Strict):
     first_run_mode: Literal["baseline", "emit"] = "baseline"
     lookback_days: int = Field(7, ge=0)
     min_duration_seconds: int = Field(300, ge=0)
+    max_duration_seconds: int = Field(57_600, ge=60)
     clip_min_seconds: int = Field(20, ge=5)
     clip_max_seconds: int = Field(60, ge=5)
     max_clips_per_source: int = Field(3, ge=1)
@@ -71,6 +72,7 @@ class CreatorOverrides(_Strict):
     """Per-creator overrides; any field left unset falls back to global settings."""
 
     min_duration_seconds: int | None = Field(None, ge=0)
+    max_duration_seconds: int | None = Field(None, ge=60)
     clip_min_seconds: int | None = Field(None, ge=5)
     clip_max_seconds: int | None = Field(None, ge=5)
     max_clips_per_source: int | None = Field(None, ge=1)

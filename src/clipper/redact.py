@@ -22,6 +22,12 @@ _PATTERNS: tuple[tuple[re.Pattern[str], _Replacement], ...] = (
     (re.compile(r"(authorization['\"]?\s*[:=]\s*['\"]?)[^'\"\r\n]+", re.IGNORECASE), rf"\1{MASK}"),
     (re.compile(r"(\bbearer\s+)[\w.~+/=-]+", re.IGNORECASE), rf"\1{MASK}"),
     (re.compile(r"(?<![A-Za-z0-9])(?:sk-|gsk_)[\w-]{8,}"), MASK),
+    # user:password@ in any URL (proxies, remotes); keeps the scheme and host.
+    # Scheme length is bounded and anchored by a lookbehind so the scan stays linear.
+    (
+        re.compile(r"(?i)((?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}://)[^/\s:@]+:[^/\s@]+@"),
+        r"\1***@",
+    ),
     # key=value / key: value credentials in tool output (rclone, S3 errors, JSON configs).
     # The key prefix is bounded ({0,40}) so matching stays linear on long runs of [\w-].
     # Quoted values are masked up to the closing quote (values may contain spaces).

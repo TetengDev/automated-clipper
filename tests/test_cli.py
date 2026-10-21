@@ -1,6 +1,8 @@
+from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from clipper.cli import app
@@ -118,16 +120,30 @@ def test_enqueue_rejects_bad_creator(tmp_path: Path) -> None:
     assert "invalid creator" in result.stderr
 
 
-def test_run_worker_once(tmp_path: Path, config_file: Path) -> None:
+def test_run_worker_once(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clipper.pipeline import ytdlp
+
+    calls: list[list[str]] = []
+
+    def no_network(args: Sequence[str], timeout_s: float) -> ytdlp.RunResult:
+        calls.append(list(args))
+        return ytdlp.RunResult(1, "", "ERROR: [twitch:vod] 123: Video 123 does not exist")
+
+    monkeypatch.setattr(ytdlp, "run_command", no_network)
     opts = ["--db", str(tmp_path / "state.db"), "--config", str(config_file)]
     runner.invoke(app, [*opts, "enqueue", "https://www.twitch.tv/videos/123"])
 
-    worked = runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
-    idle = runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+    runs = [
+        runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+        for _ in range(3)
+    ]
 
-    assert worked.exit_code == 0, worked.output
-    assert idle.exit_code == 0
-    assert "no due jobs" in idle.output  # fetching_audio has no stage yet (CLP-13)
+    assert all(r.exit_code == 0 for r in runs), [r.output for r in runs]
+    # detected -> fetching_audio (build_stages' real stage) -> failed; then nothing is due.
+    assert len(calls) == 1 and "yt_dlp" in calls[0]
+    assert "no due jobs" in runs[2].output
 
 
 def test_run_worker_requires_valid_config(tmp_path: Path) -> None:

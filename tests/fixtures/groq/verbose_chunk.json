@@ -1,0 +1,20 @@
+{
+  "task": "transcribe",
+  "language": "Tagalog",
+  "duration": 10.0,
+  "text": "Grabe talaga, sobrang laki ng prize money.",
+  "segments": [
+    {"id": 0, "seek": 0, "start": 0.0, "end": 4.0, "text": " Grabe talaga,", "tokens": [1, 2], "temperature": 0.0, "avg_logprob": -0.2, "compression_ratio": 1.1, "no_speech_prob": 0.01},
+    {"id": 1, "seek": 0, "start": 4.5, "end": 9.5, "text": " sobrang laki ng prize money.", "tokens": [3, 4], "temperature": 0.0, "avg_logprob": -0.2, "compression_ratio": 1.1, "no_speech_prob": 0.01}
+  ],
+  "words": [
+    {"word": " Grabe", "start": 0.2, "end": 0.8},
+    {"word": " talaga,", "start": 0.9, "end": 1.6},
+    {"word": " sobrang", "start": 4.6, "end": 5.2},
+    {"word": " laki", "start": 5.3, "end": 5.8},
+    {"word": " ng", "start": 5.9, "end": 6.0},
+    {"word": " prize", "start": 6.1, "end": 6.6},
+    {"word": " money.", "start": 9.0, "end": 9.6}
+  ],
+  "x_groq": {"id": "req_fixture"}
+}

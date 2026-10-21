@@ -1,0 +1,26 @@
+{
+  "id": "msg_01Fixture0012",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-5-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "sig"
+    },
+    {
+      "type": "text",
+      "text": "{\"clips\": [{\"start_s\": 100.1, \"end_s\": 140.6, \"hook\": \"Hook 1\", \"title\": \"Title 1\", \"caption\": \"Caption 1\", \"hashtags\": [\"#clip\", \"#n1\"], \"score\": 90, \"reason\": \"Reason 1\"}, {\"start_s\": 110.1, \"end_s\": 150.6, \"hook\": \"Hook 2\", \"title\": \"Title 2\", \"caption\": \"Caption 2\", \"hashtags\": [\"#clip\", \"#n2\"], \"score\": 70, \"reason\": \"Reason 2\"}, {\"start_s\": 300.1, \"end_s\": 330.6, \"hook\": \"Hook 3\", \"title\": \"Title 3\", \"caption\": \"Caption 3\", \"hashtags\": [\"#clip\", \"#n3\"], \"score\": 60, \"reason\": \"Reason 3\"}]}"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 800,
+    "cache_creation_input_tokens": 1500,
+    "cache_read_input_tokens": 0
+  }
+}

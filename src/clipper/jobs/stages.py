@@ -7,8 +7,10 @@
   exists the stage is not run again, and `run` must create it, atomically (write a temp
   file, then rename), or the attempt counts as failed. This is what makes a killed worker
   resume without redoing earlier stages.
-- Raise `SkipJob` to end the job as `skipped`, `PermanentError` to end it as `failed`;
-  any other exception is retried later with backoff (status unchanged).
+- Raise `SkipJob` to end the job as `skipped`, `PermanentError` to end it as `failed`,
+  `Deferred(until, reason)` to try again at `until` without using up an attempt (budget
+  caps, a source that is not ready yet); any other exception is retried later with
+  backoff (status unchanged) and counts as an attempt.
 - Exception messages are stored in the DB and logged, so they must never contain secrets
   (API keys, tokens, signed URLs); `clipper.redact` scrubs known shapes only as a backstop.
 - Statuses with no registered stage are never claimed: such jobs stay put until a worker
@@ -24,6 +26,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 from clipper.config import AppConfig
@@ -36,6 +39,17 @@ class SkipJob(Exception):
 
 class PermanentError(Exception):
     """Stage failed in a way retrying cannot fix (message becomes last_error)."""
+
+
+class Deferred(Exception):
+    """Not now: run this stage again at `until` (UTC). Does not consume an attempt."""
+
+    def __init__(self, until: datetime, reason: str) -> None:
+        if until.tzinfo is None:
+            raise ValueError("Deferred.until must be timezone-aware")
+        super().__init__(reason)
+        self.until = until
+        self.reason = reason
 
 
 @dataclass(frozen=True)

@@ -5,6 +5,7 @@ description = "24/7 auto-clipper: detect new creator videos, pick highlights wit
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "anthropic>=1.17.0",
     "bcrypt>=5.0.0",
     "fastapi>=0.156.4",
     "httpx>=0.27",

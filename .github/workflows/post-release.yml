@@ -1,0 +1,37 @@
+name: Post-release
+
+# After a release/hotfix PR merges into main: tag it and open the main -> dev sync PR.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  post-release:
+    if: github.event.pull_request.merged
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HEAD: ${{ github.head_ref }}
+      SHA: ${{ github.event.pull_request.merge_commit_sha }}
+    steps:
+      - name: Tag release
+        run: |
+          if [[ "$HEAD" =~ ^(release|hotfix)/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            gh release create "${BASH_REMATCH[2]}" --target "$SHA" --generate-notes
+          fi
+
+      - name: Open main -> dev sync PR
+        run: |
+          ahead=$(gh api "repos/$GH_REPO/compare/dev...main" -q .ahead_by)
+          open=$(gh pr list --base dev --head main --state open --json number -q length)
+          if [ "$ahead" -gt 0 ] && [ "$open" -eq 0 ]; then
+            gh pr create --base dev --head main --title "chore: sync main into dev" \
+              --body "Post-release sync of main (${SHA}) into dev. Merge with a **merge commit** (not squash or rebase) so dev keeps main's history."
+          fi

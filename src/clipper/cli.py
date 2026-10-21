@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
+import logging
+import re
+import signal
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
 
-from clipper.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
+from clipper import jobs
+from clipper.config import CREATOR_NAME_PATTERN, DEFAULT_CONFIG_PATH, ConfigError, load_config
 from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version, migrate
+from clipper.jobs.worker import (
+    DEFAULT_MEDIA_ROOT,
+    DEFAULT_POLL_SECONDS,
+    Worker,
+    default_worker_id,
+)
+from clipper.urls import InvalidSourceURL, parse_source_url
 
 EXIT_NOT_IMPLEMENTED = 70  # EX_SOFTWARE; distinct from Click's usage-error code 2
+MANUAL_CREATOR = "manual"
 
 app = typer.Typer(
     help="24/7 auto-clipper: detect, transcribe, select highlights, render, review.",
@@ -92,10 +105,63 @@ def run_monitor() -> None:
     _not_implemented("CLP-24")
 
 
+def _open_db(db_path: Path) -> sqlite3.Connection:
+    try:
+        conn = connect(db_path)
+        try:
+            migrate(conn)
+        except BaseException:
+            conn.close()
+            raise
+    except (sqlite3.Error, OSError, MigrationError) as exc:
+        _fail(f"cannot open database {db_path}: {exc}")
+    return conn
+
+
 @app.command("run-worker")
-def run_worker() -> None:
+def run_worker(
+    ctx: typer.Context,
+    media_dir: Annotated[
+        Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Per-job stage artifacts.")
+    ] = DEFAULT_MEDIA_ROOT,
+    worker_id: Annotated[
+        str | None,
+        typer.Option(envvar="CLIPPER_WORKER_ID", help="Claim id (default: unique per process)."),
+    ] = None,
+    recover_id: Annotated[
+        str | None,
+        typer.Option(help="Release jobs claimed by this dead worker id before starting."),
+    ] = None,
+    poll_seconds: Annotated[float, typer.Option(min=0.1, help="Idle sleep.")] = (
+        DEFAULT_POLL_SECONDS
+    ),
+    once: Annotated[bool, typer.Option(help="Run one stage of one job, then exit.")] = False,
+) -> None:
     """Process queued jobs through the clip pipeline."""
-    _not_implemented("CLP-12")
+    app_ctx = _app(ctx)
+    try:
+        cfg = load_config(app_ctx.config_path)
+    except ConfigError as exc:
+        _fail(str(exc))
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    conn = _open_db(app_ctx.db_path)
+    worker = Worker(
+        conn=conn, config=cfg, worker_id=worker_id or default_worker_id(), media_root=media_dir
+    )
+    try:
+        if recover_id:
+            worker.recover(recover_id)
+        if once:
+            if not worker.run_once():
+                typer.echo("no due jobs")
+            return
+        stop = threading.Event()
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        worker.run_forever(stop, poll_seconds=poll_seconds)
+    except KeyboardInterrupt:
+        raise typer.Exit(code=130) from None
+    finally:
+        conn.close()
 
 
 @app.command("run-review")
@@ -105,9 +171,39 @@ def run_review() -> None:
 
 
 @app.command("enqueue")
-def enqueue(url: Annotated[str, typer.Argument(help="YouTube or Twitch video URL.")]) -> None:
+def enqueue(
+    ctx: typer.Context,
+    url: Annotated[str, typer.Argument(help="YouTube or Twitch video URL.")],
+    creator: Annotated[str, typer.Option(help="Creator name to record.")] = MANUAL_CREATOR,
+    retry: Annotated[bool, typer.Option(help="Requeue the job if it failed/was skipped.")] = False,
+) -> None:
     """Queue a single video for clipping."""
-    _not_implemented("CLP-12")
+    try:
+        ref = parse_source_url(url)
+    except InvalidSourceURL as exc:
+        _fail(f"invalid URL: {exc}")
+    if not re.fullmatch(CREATOR_NAME_PATTERN, creator):
+        _fail(f"invalid creator name: {creator!r}")
+    conn = _open_db(_app(ctx).db_path)
+    requeued = False
+    try:
+        job, created = jobs.enqueue(conn, ref, jobs.utcnow(), creator=creator)
+        if retry and job.status in jobs.RETRYABLE:
+            job, requeued = jobs.requeue(conn, job.id, jobs.utcnow()), True
+    except (sqlite3.Error, jobs.JobConflict) as exc:
+        _fail(f"enqueue failed: {exc}")
+    finally:
+        conn.close()
+    if created:
+        typer.echo(f"queued job {job.id}: {ref.platform} {ref.item_id}")
+    elif requeued:
+        typer.echo(f"requeued job {job.id} ({job.status})")
+    elif job.status in jobs.RETRYABLE:
+        typer.echo(f"job {job.id} is {job.status} (terminal); use --retry to requeue it")
+    elif job.status in jobs.TERMINAL:
+        typer.echo(f"job {job.id} is {job.status} (terminal); nothing to do")
+    else:
+        typer.echo(f"already queued: job {job.id} ({job.status})")
 
 
 @app.command("resolve")

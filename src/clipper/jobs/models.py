@@ -51,6 +51,14 @@ def to_iso(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime(_ISO)
 
 
+def from_iso(text: str | None) -> datetime | None:
+    """Parse `to_iso` output (or any ISO-8601 UTC stamp); None stays None."""
+    if not text:
+        return None
+    moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
 @dataclass(frozen=True)
 class Job:
     id: int
@@ -63,6 +71,7 @@ class Job:
     title: str | None = None
     duration_seconds: int | None = None
     last_error: str | None = None
+    created_at: datetime | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Job:
@@ -77,6 +86,7 @@ class Job:
             title=row["title"],
             duration_seconds=row["duration_seconds"],
             last_error=row["last_error"],
+            created_at=from_iso(row["created_at"]),
         )
 
     @property

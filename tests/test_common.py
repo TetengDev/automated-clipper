@@ -1,0 +1,121 @@
+"""Shared pipeline helpers: spend reservation, stage deadline, small utilities."""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from clipper.db import connect, migrate
+from clipper.jobs import Deferred, SkipJob
+from clipper.pipeline import common
+from clipper.pipeline.common import (
+    Deadline,
+    StageTimeout,
+    next_utc_midnight,
+    reserve_spend,
+    spend_today,
+    strip_control,
+)
+
+T0 = datetime(2026, 10, 21, 23, 30, tzinfo=UTC)
+
+
+@pytest.fixture
+def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+    c = connect(tmp_path / "state.db")
+    migrate(c)
+    c.execute(
+        "INSERT INTO jobs (platform, item_id, creator, source_url, created_at, updated_at)"
+        " VALUES ('youtube', 'dQw4w9WgXcQ', 'x', 'u', ?, ?)",
+        ("2026-10-21T00:00:00Z", "2026-10-21T00:00:00Z"),
+    )
+    yield c
+    c.close()
+
+
+def _reserve(conn: sqlite3.Connection, estimate: float, cap: float = 1.0):
+    return reserve_spend(
+        conn,
+        kind="llm",
+        label="LLM",
+        provider="anthropic",
+        job_id=1,
+        estimate_usd=estimate,
+        cap_usd=cap,
+        now=T0,
+    )
+
+
+def _rows(conn: sqlite3.Connection) -> list[tuple[float, int | None]]:
+    return [tuple(r) for r in conn.execute("SELECT usd, input_tokens FROM spend ORDER BY id")]
+
+
+def test_reservation_is_visible_while_in_flight_then_settled(conn: sqlite3.Connection) -> None:
+    with _reserve(conn, 0.4) as charge:
+        assert spend_today(conn, "llm", T0) == pytest.approx(0.4)
+        charge.usd, charge.input_tokens, charge.output_tokens = 0.05, 100, 10
+    assert _rows(conn) == [(0.05, 100)]
+
+
+def test_second_reservation_over_cap_is_deferred_to_utc_midnight(
+    conn: sqlite3.Connection,
+) -> None:
+    held = _reserve(conn, 0.6)
+    held.__enter__()
+    with pytest.raises(Deferred, match="daily LLM budget reached") as exc, _reserve(conn, 0.6):
+        pass
+    held.__exit__(None, None, None)
+    assert exc.value.until == datetime(2026, 10, 22, tzinfo=UTC)
+
+
+def test_estimate_above_cap_is_skipped(conn: sqlite3.Connection) -> None:
+    with pytest.raises(SkipJob, match="exceeds the daily cap"), _reserve(conn, 2.0):
+        pass
+    assert _rows(conn) == []
+
+
+def test_nothing_charged_deletes_the_reservation(conn: sqlite3.Connection) -> None:
+    with pytest.raises(RuntimeError, match="network"), _reserve(conn, 0.4):
+        raise RuntimeError("network down")
+    assert _rows(conn) == []
+
+
+def test_partial_charge_is_kept_when_the_call_fails(conn: sqlite3.Connection) -> None:
+    with pytest.raises(RuntimeError), _reserve(conn, 0.4) as charge:
+        charge.usd, charge.audio_seconds = 0.1, 600.0
+        raise RuntimeError("later chunk failed")
+    (row,) = conn.execute("SELECT usd, audio_seconds FROM spend").fetchall()
+    assert tuple(row) == (0.1, 600.0)
+
+
+def test_settle_db_error_does_not_mask_the_original_error(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken(*args: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(common, "_settle", broken)
+    with pytest.raises(ValueError, match="the real problem"), _reserve(conn, 0.4):
+        raise ValueError("the real problem")
+    assert "could not settle spend row" in caplog.text
+
+
+def test_deadline_shrinks_and_then_expires() -> None:
+    now = [100.0]
+    deadline = Deadline(budget_s=60.0, clock=lambda: now[0])
+    assert deadline.timeout(600.0) == 60.0
+    assert deadline.timeout(10.0) == 10.0
+    now[0] = 150.0
+    assert deadline.timeout(600.0) == pytest.approx(10.0)
+    now[0] = 159.5
+    with pytest.raises(StageTimeout, match="1 min budget"):
+        deadline.timeout(5.0)
+
+
+def test_next_utc_midnight_and_strip_control() -> None:
+    assert next_utc_midnight(T0) == datetime(2026, 10, 22, tzinfo=UTC)
+    assert strip_control("a\nb\x00\tc\x7f  d") == "a b c d"

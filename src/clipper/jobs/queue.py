@@ -174,6 +174,25 @@ def advance(conn: sqlite3.Connection, job: Job, now: datetime, *, worker_id: str
     return nxt
 
 
+def defer(
+    conn: sqlite3.Connection,
+    job: Job,
+    until: datetime,
+    reason: str,
+    now: datetime,
+    *,
+    worker_id: str,
+) -> None:
+    """Keep the status, run again at `until`, and give back the attempt the claim took."""
+    _finish(
+        conn,
+        job,
+        worker_id,
+        "attempts = MAX(attempts - 1, 0), last_error = ?, next_attempt_at = ?, updated_at = ?",
+        (redact(reason)[:MAX_ERROR_CHARS], to_iso(until), to_iso(now)),
+    )
+
+
 def backoff(attempts: int) -> timedelta:
     return min(BACKOFF_BASE * 2 ** min(max(attempts - 1, 0), 16), BACKOFF_CAP)
 

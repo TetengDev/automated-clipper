@@ -41,3 +41,21 @@ def test_keeps_url_shape_and_is_idempotent() -> None:
 
     assert once == "https://x.test/a?id=1&key=REDACTED&page=2"
     assert redact(once) == once
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("proxy http://bob:SECRET@10.0.0.1:8080 refused", "proxy http://***@10.0.0.1:8080 refused"),
+        ("socks5h://u:p%40SECRET@proxy.test", "socks5h://***@proxy.test"),
+        ("HTTPS://Me:SECRET@host/x", "HTTPS://***@host/x"),
+    ],
+)
+def test_redacts_url_userinfo(text: str, expected: str) -> None:
+    assert redact(text) == expected
+    assert redact(expected) == expected
+
+
+def test_keeps_url_without_password() -> None:
+    text = "ssh://git@github.com/x and mailto:a@b.test"
+    assert redact(text) == text

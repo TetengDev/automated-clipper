@@ -1,0 +1,1 @@
+{"error": {"message": "Rate limit reached for model `whisper-large-v3` on audio seconds per hour (ASPH). Please try again in 2s.", "type": "audio_seconds", "code": "rate_limit_exceeded"}}

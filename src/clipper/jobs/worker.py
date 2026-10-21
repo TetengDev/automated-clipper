@@ -27,12 +27,20 @@ from clipper.jobs.queue import (
     JobConflict,
     advance,
     claim_next,
+    defer,
     mark_terminal,
     record_failure,
     release_claim,
     release_claims,
 )
-from clipper.jobs.stages import DEFAULT_STAGES, PermanentError, SkipJob, StageContext, StageDef
+from clipper.jobs.stages import (
+    DEFAULT_STAGES,
+    Deferred,
+    PermanentError,
+    SkipJob,
+    StageContext,
+    StageDef,
+)
 from clipper.redact import redact
 
 DEFAULT_MEDIA_ROOT = Path("data/media")
@@ -105,6 +113,10 @@ class Worker:
                 stage.run(job, StageContext(media_dir, self.conn, self.config, self.clock))
                 if artifact is not None and not artifact.is_file():
                     raise RuntimeError(f"stage finished without producing {stage.artifact}")
+        except Deferred as exc:
+            reason = redact(f"deferred: {exc.reason}")
+            logger.info("%s: %s; next try at %s", log, reason, exc.until.isoformat())
+            defer(self.conn, job, exc.until, reason, self.clock(), worker_id=self.worker_id)
         except SkipJob as exc:
             reason = redact(str(exc)) or "skipped"
             logger.info("%s: skipped: %s", log, reason)

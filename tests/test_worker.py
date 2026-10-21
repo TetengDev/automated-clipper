@@ -12,6 +12,7 @@ import pytest
 from clipper.config import AppConfig
 from clipper.db import connect, migrate
 from clipper.jobs import (
+    Deferred,
     Job,
     JobStatus,
     PermanentError,
@@ -31,11 +32,12 @@ from clipper.urls import SourceRef
 
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 YT = SourceRef("youtube", "dQw4w9WgXcQ")
+# Real artifact names (clipper.pipeline.build_stages); rendering is CLP-17's, still a stub.
 ARTIFACTS = {
-    JobStatus.FETCHING_AUDIO: "audio.m4a",
+    JobStatus.FETCHING_AUDIO: "audio_16k.flac",
     JobStatus.TRANSCRIBING: "transcript.json",
-    JobStatus.SELECTING: "selection.json",
-    JobStatus.FETCHING_CLIPS: "clips/sources.done",
+    JobStatus.SELECTING: "highlights.json",
+    JobStatus.FETCHING_CLIPS: "sections.json",
     JobStatus.RENDERING: "render.done",
 }
 
@@ -276,14 +278,14 @@ def test_existing_artifact_skips_stage(make_worker: MakeWorker, db: Path, tmp_pa
     pipeline = StubPipeline()
     media = tmp_path / "media" / YT.key
     media.mkdir(parents=True)
-    (media / "audio.m4a").write_text("already here")
+    (media / "audio_16k.flac").write_text("already here")
     worker = make_worker(pipeline)
     job, _ = enqueue(worker.conn, YT, T0, creator="manual")
 
     _drain(worker)
 
     assert pipeline.calls[JobStatus.FETCHING_AUDIO] == 0
-    assert (media / "audio.m4a").read_text() == "already here"
+    assert (media / "audio_16k.flac").read_text() == "already here"
     assert _status(db, job.id) is JobStatus.CLIPS_READY
 
 
@@ -292,7 +294,7 @@ def test_directory_does_not_count_as_artifact(make_worker: MakeWorker, tmp_path:
     worker.stages = {
         **worker.stages,
         JobStatus.FETCHING_AUDIO: StageDef(
-            lambda job, ctx: (ctx.media_dir / "audio.m4a").mkdir(), "audio.m4a"
+            lambda job, ctx: (ctx.media_dir / "audio_16k.flac").mkdir(), "audio_16k.flac"
         ),
     }
     job, _ = enqueue(worker.conn, YT, T0, creator="manual")
@@ -301,7 +303,7 @@ def test_directory_does_not_count_as_artifact(make_worker: MakeWorker, tmp_path:
 
     stuck = get_job(worker.conn, job.id)
     assert stuck is not None and stuck.status is JobStatus.FETCHING_AUDIO
-    assert "without producing audio.m4a" in (stuck.last_error or "")
+    assert "without producing audio_16k.flac" in (stuck.last_error or "")
 
 
 def test_stage_error_is_recorded_and_retried_after_backoff(
@@ -418,11 +420,16 @@ def test_stage_def_rejects_escaping_artifact() -> None:
             StageDef(lambda job, ctx: None, bad)
 
 
-def test_build_stages_registers_the_detected_pass_through() -> None:
+def test_build_stages_registers_the_pipeline_up_to_rendering() -> None:
     stages = build_stages()
 
-    assert set(stages) == {JobStatus.DETECTED}
     assert stages[JobStatus.DETECTED].artifact is None
+    assert {status: stage.artifact for status, stage in stages.items() if stage.artifact} == {
+        status: name for status, name in ARTIFACTS.items() if status is not JobStatus.RENDERING
+    }
+    # CLP-17 not merged yet: jobs park at `rendering`.
+    assert JobStatus.RENDERING not in stages
+    assert JobStatus.WAITING_VOD not in stages
 
 
 def test_stage_modules_do_not_depend_on_the_worker() -> None:
@@ -453,3 +460,36 @@ def test_stage_error_text_is_redacted_in_db_and_logs(
     stored = _row(db, job.id)[column]
     assert stored and "SECRET1" not in stored and "REDACTED" in stored
     assert "SECRET1" not in caplog.text
+
+
+def test_deferred_keeps_status_reschedules_and_does_not_consume_attempts(
+    make_worker: MakeWorker, db: Path
+) -> None:
+    clock = FakeClock()
+    pipeline = StubPipeline()
+    worker = make_worker(pipeline, clock)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()  # detected -> fetching_audio
+
+    # Far more deferrals than MAX_ATTEMPTS: the job must never be failed by them.
+    for _ in range(8):
+        until = clock.now + timedelta(hours=3)
+        pipeline.fail_at[JobStatus.FETCHING_AUDIO] = Deferred(until, "daily budget reached")
+        assert worker.run_once()
+        row = _row(db, job.id)
+        assert row["status"] == JobStatus.FETCHING_AUDIO.value
+        assert row["attempts"] == 0
+        assert row["worker_id"] is None and row["lease_until"] is None
+        assert row["next_attempt_at"] == until.strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert "deferred: daily budget reached" in row["last_error"]
+        assert not worker.run_once()  # not due before `until`
+        clock.now = until
+
+    del pipeline.fail_at[JobStatus.FETCHING_AUDIO]
+    _drain(worker)
+    assert _status(db, job.id) is JobStatus.CLIPS_READY
+
+
+def test_deferred_requires_aware_datetime() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        Deferred(datetime(2026, 1, 1), "x")

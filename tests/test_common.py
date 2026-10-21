@@ -134,6 +134,11 @@ def test_deadline_shrinks_and_then_expires() -> None:
 def test_next_utc_midnight_and_strip_control() -> None:
     assert next_utc_midnight(T0) == datetime(2026, 10, 22, tzinfo=UTC)
     assert strip_control("a\nb\x00\tc\x7f  d") == "a b c d"
+    # Bidi/zero-width/tag characters go; ZWJ stays so compound emoji survive.
+    spoof = "\u202eab\u200b\u200c\u200e\u200f\u2060\u2066c\u2069\ufeff\U000e0041"
+    assert strip_control(spoof) == "abc"
+    family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+    assert strip_control(family) == family
 
 
 def test_leaked_reservation_of_this_job_is_dropped(conn: sqlite3.Connection) -> None:

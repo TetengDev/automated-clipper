@@ -85,8 +85,9 @@ class RenderError(Exception):
 
 
 class InvalidClipError(RenderError):
-    """The clip's own input is bad (EDL, source file, props Remotion rejects): rendering it
-    again unchanged fails the same way. Other RenderErrors may be transient."""
+    """The clip's own input is bad (EDL, source path escaping the media root, props Remotion
+    rejects): rendering it again unchanged fails the same way. Other RenderErrors may be
+    transient."""
 
 
 @dataclass(frozen=True)
@@ -294,8 +295,8 @@ def _resolve_source(edl: EDL, media_root: Path) -> Path:
     source = (root / edl.source.path).resolve()
     if not source.is_relative_to(root):
         raise InvalidClipError(f"source path escapes media root: {edl.source.path}")
-    if not source.is_file():
-        raise InvalidClipError(f"source media not found: {source}")
+    if not source.is_file():  # retryable: the volume may be briefly unavailable
+        raise RenderError(f"source media not found: {source}")
     return source
 
 
@@ -549,10 +550,16 @@ def render_clip(
                     cwd=render_dir,
                 )
             except RenderError as exc:
-                # validate.ts throws EdlValidationError("invalid clip props: ...").
-                if "invalid clip props" not in exc.stderr_tail:
+                # validate.ts throws EdlValidationError("invalid clip props: <errors>"), one line.
+                line = next(
+                    (ln for ln in exc.stderr_tail.splitlines() if "invalid clip props:" in ln), None
+                )
+                if line is None:
                     raise
-                raise InvalidClipError("Remotion rejected the clip props", exc.stderr_tail) from exc
+                detail = line.split("invalid clip props:", 1)[1].strip()[:500]
+                raise InvalidClipError(
+                    f"Remotion rejected the clip props: {detail}", exc.stderr_tail
+                ) from exc
             remotion_seconds = time.monotonic() - started  # includes the pre-cut
 
             measure = _run(

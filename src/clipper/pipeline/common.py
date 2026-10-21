@@ -48,6 +48,11 @@ STAGE_BUDGET_S = 100 * 60.0
 PROTOCOL_WHITELIST = ["-protocol_whitelist", "file,pipe"]
 """ffmpeg/ffprobe input option: local files only, never network or nested protocols."""
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Invisible characters that can spoof text: bidi controls, zero-width space/non-joiner,
+# LRM/RLM, word joiner, BOM, tag characters. ZWJ (U+200D) stays: compound emoji need it.
+_INVISIBLE = re.compile(
+    "[\u200b\u200c\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff\U000e0000-\U000e007f]"
+)
 
 
 class MediaError(RuntimeError):
@@ -84,8 +89,9 @@ class Deadline:
 
 
 def strip_control(text: str) -> str:
-    """Drop control characters (incl. newlines) and collapse whitespace."""
-    return " ".join(_CONTROL.sub(" ", text).split())
+    """Drop control and invisible spoofing characters (incl. newlines, bidi overrides) and
+    collapse whitespace."""
+    return " ".join(_CONTROL.sub(" ", _INVISIBLE.sub("", text)).split())
 
 
 def default_runner() -> Runner:

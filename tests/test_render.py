@@ -242,10 +242,17 @@ def test_remotion_failure_raises_with_stderr_tail(
 def test_remotion_rejecting_props_is_invalid_clip(
     media_root: Path, render_dir: Path, tmp_path: Path
 ) -> None:
-    stderr = "EdlValidationError: invalid clip props:\n  /hook/text: must match pattern"
+    stderr = (
+        "Error rendering composition\n"
+        "EdlValidationError: invalid clip props: /hook/text: must match pattern; /words: bad\n"
+        "    at parseEdl (validate.ts:64)"
+    )
     runner = FakeRunner(fail_step="remotion", fail_stderr=stderr)
-    with pytest.raises(InvalidClipError, match="Remotion rejected the clip props"):
+    with pytest.raises(InvalidClipError) as excinfo:
         _render(media_root, render_dir, tmp_path, runner)
+    assert str(excinfo.value).splitlines()[0] == (
+        "Remotion rejected the clip props: /hook/text: must match pattern; /words: bad"
+    )
 
 
 def test_timeout(media_root: Path, render_dir: Path, tmp_path: Path) -> None:
@@ -303,9 +310,10 @@ def test_invalid_edl_rejected_before_any_subprocess(
 def test_missing_source(media_root: Path, render_dir: Path, tmp_path: Path) -> None:
     (media_root / "media" / "source.mp4").unlink()
     runner = FakeRunner()
-    with pytest.raises(InvalidClipError, match="source media not found"):
+    with pytest.raises(RenderError, match="source media not found") as excinfo:
         _render(media_root, render_dir, tmp_path, runner)
     assert runner.calls == []
+    assert not isinstance(excinfo.value, InvalidClipError)  # volume may be back on retry
 
 
 def test_symlink_escape_rejected(media_root: Path, render_dir: Path, tmp_path: Path) -> None:

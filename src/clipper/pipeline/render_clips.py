@@ -14,7 +14,8 @@ clip's position in the source video (the review page links there), not in the se
 re-render from `clips/<rank>/source.mp4` must convert back by subtracting
 `requested_start_s - pad_start_s` (sections.json).
 
-A transient render failure or timeout (`RenderError`) is retried with the job. A clip with
+A transient render failure or timeout (`RenderError`) does not stop the other clips; the
+first one is re-raised at the end so the job retries just the failed ranks. A clip with
 bad input (invalid EDL or metadata, `InvalidClipError` from the renderer) is left out and
 the others still render; the skipped ranks are logged once. If no clip of the job ends up
 rendered, the job fails. A clip is only started if the stage budget still covers its worst
@@ -27,18 +28,25 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
-import unicodedata
 from typing import Any
 
 from clipper.clips_repo import ClipMeta, insert_pending_clip
 from clipper.edl import EDL, parse_edl
 from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
-from clipper.pipeline.common import Deadline, StageTimeout, read_json, strip_control
+from clipper.pipeline.common import (
+    STAGE_BUDGET_S,
+    Deadline,
+    StageTimeout,
+    read_json,
+    strip_control,
+)
+from clipper.redact import redact
 from clipper.render import (
     DEFAULT_FFMPEG_TIMEOUT_S,
     DEFAULT_RENDER_TIMEOUT_S,
     InvalidClipError,
+    RenderError,
     render_clip,
 )
 
@@ -48,15 +56,12 @@ MAX_WORD_CHARS = 64
 """EDL limit for one caption word."""
 CLIP_WORST_CASE_S = DEFAULT_RENDER_TIMEOUT_S + 4 * DEFAULT_FFMPEG_TIMEOUT_S
 """Remotion plus the four ffmpeg steps of `render_clip`, each at its timeout."""
+assert CLIP_WORST_CASE_S < STAGE_BUDGET_S / 2, "a stage run must fit at least two clips"
+MAX_REASON_CHARS = 300
 
 
 def _number(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def _clean(text: str) -> str:
-    """No control or format (bidi, zero-width) characters; whitespace collapsed."""
-    return strip_control("".join(c for c in text if unicodedata.category(c) != "Cf"))
 
 
 def _clips(data: Any, name: str) -> list[Any]:
@@ -72,7 +77,7 @@ def _words(transcript: Any, offset: float, start: float, end: float) -> list[dic
     for w in transcript.get("words") or ():
         if w["end"] <= start or w["start"] >= end:
             continue
-        text = _clean(str(w["word"]))[:MAX_WORD_CHARS]
+        text = strip_control(str(w["word"]))[:MAX_WORD_CHARS]
         if text:
             begin = round(max(w["start"] - offset, 0.0), 3)
             words.append(
@@ -91,7 +96,7 @@ def _plan(
     clip = highlights.get(rank)
     if not isinstance(clip, dict):
         raise PermanentError(f"clip {rank}: no highlight")
-    texts = [clip.get(k) for k in ("title", "caption", "reason")]
+    texts = [clip.get(k) for k in ("title", "caption", "reason", "hook")]
     score, hashtags = clip.get("score"), clip.get("hashtags", [])
     if (
         any(t is not None and not isinstance(t, str) for t in texts)
@@ -112,15 +117,22 @@ def _plan(
                     "in_s": pad,
                     "out_s": round(pad + end - start, 3),
                 },
-                "hook": {"text": clip["hook"]} if clip.get("hook") else None,
+                # An empty hook (also after cleaning) means no hook card.
+                "hook": {"text": hook} if (hook := strip_control(clip.get("hook") or "")) else None,
                 "words": _words(transcript, start - pad, start, end),
             }
         )
     # Malformed artifact entries, or an EDL pydantic rejects (ValidationError is a ValueError).
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise PermanentError(f"clip {rank}: invalid EDL: {exc}") from None
-    title, caption, reason = texts
-    meta = ClipMeta(title, caption, tuple(hashtags), score, reason, prompt_version)
+    meta = ClipMeta(
+        title=clip.get("title"),
+        caption=clip.get("caption"),
+        hashtags=tuple(hashtags),
+        score=score,
+        reason=clip.get("reason"),
+        prompt_version=prompt_version,
+    )
     return rank, edl, start, end, meta
 
 
@@ -138,6 +150,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
     transcript = read_json(ctx.media_dir / "transcript.json")
     done = _done(ctx.conn, job.id)
     invalid: list[str] = []
+    retry: RenderError | None = None
     for section in sections:
         try:
             rank, edl, start, end, meta = _plan(
@@ -156,10 +169,16 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 ffmpeg_timeout_s=deadline.timeout(DEFAULT_FFMPEG_TIMEOUT_S),
             )
         except PermanentError as exc:
-            invalid.append(str(exc))
+            invalid.append(strip_control(str(exc))[:MAX_REASON_CHARS])
             continue
         except InvalidClipError as exc:
-            invalid.append(f"clip {rank}: {exc}")
+            invalid.append(f"clip {rank}: {str(exc).splitlines()[0][:MAX_REASON_CHARS]}")
+            continue
+        except RenderError as exc:
+            # Possibly transient: render the remaining clips, then retry the job for this one.
+            reason = redact(str(exc).splitlines()[0])
+            logger.warning("job %s: clip %s failed, will retry: %s", job.id, rank, reason)
+            retry = retry or exc
             continue
         insert_pending_clip(
             ctx.conn,
@@ -172,10 +191,13 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             end_s=end,
         )
         done.add(rank)
+    if retry is not None:
+        raise retry
     if not done:
         raise PermanentError("no clip could be rendered: " + "; ".join(invalid))
     if invalid:
-        logger.warning("job %s: %d clip(s) left out: %s", job.id, len(invalid), "; ".join(invalid))
+        summary = redact("; ".join(invalid))
+        logger.warning("job %s: %d clip(s) left out: %s", job.id, len(invalid), summary)
 
 
 STAGE = StageDef(render_clips)

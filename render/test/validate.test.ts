@@ -56,6 +56,12 @@ describe("parseEdl", () => {
     } catch (err) {
       expect(err).toBeInstanceOf(EdlValidationError);
       expect((err as EdlValidationError).errors.length).toBeGreaterThanOrEqual(3);
+      // One line, error paths and messages only; never the offending values.
+      const { message } = err as Error;
+      expect(message).toMatch(/^invalid clip props: \/layout: .+; \/source\/in_s: must be >= 0; /);
+      expect(message).not.toContain("\n");
+      expect(message).not.toContain("abs.mp4");
+      expect(message).not.toContain("nope");
     }
   });
 

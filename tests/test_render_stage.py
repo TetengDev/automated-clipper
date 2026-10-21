@@ -163,6 +163,7 @@ def test_renders_each_section_into_a_pending_clip(
     assert words[-1] == ("w14", pytest.approx(6.1), pytest.approx(6.6))
     assert len(words) == 5
     assert 0 < first["timeout_s"] <= rc.DEFAULT_RENDER_TIMEOUT_S
+    assert 0 < first["ffmpeg_timeout_s"] <= rc.DEFAULT_FFMPEG_TIMEOUT_S
 
     rows = _rows(conn)
     assert [(r["job_id"], r["rank"], r["status"], r["version"]) for r in rows] == [
@@ -222,6 +223,37 @@ def test_crash_resumes_without_duplicates(
     assert len(fake.calls) == 4 and len(_rows(conn)) == 3
 
 
+def test_transient_failure_does_not_stop_later_clips(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2, 3)])
+    fake.fail_on[2] = RenderError("remotion render failed with exit code 1\nstderr...")
+
+    with pytest.raises(RenderError, match="exit code 1"):  # retryable: the job tries again
+        rc.render_clips(job, _ctx(media, conn))
+    assert [r["rank"] for r in _rows(conn)] == [1, 3]
+
+    rc.render_clips(job, _ctx(media, conn))  # the retry only redoes clip 2
+    assert [r["rank"] for r in _rows(conn)] == [1, 2, 3]
+    assert [c["out_dir"].name for c in fake.calls] == ["1", "2", "3", "2"]
+
+
+def test_hook_is_cleaned_and_empty_after_cleaning_means_none(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(
+        media,
+        [
+            _highlight(1, 10.0, 15.0, hook="\u202eWow\u200b it\nworked"),
+            _highlight(2, 20.0, 25.0, hook="\u200b\u2066 \u2069"),
+        ],
+    )
+    rc.render_clips(job, _ctx(media, conn))
+    hooks = [c["edl"].hook for c in fake.calls]
+    assert hooks[0] is not None and hooks[0].text == "Wow it worked"
+    assert hooks[1] is None
+
+
 def test_render_failure_is_retryable(
     conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
 ) -> None:
@@ -257,14 +289,23 @@ def test_invalid_clip_is_skipped_others_render(
 
 
 def test_renderer_rejecting_a_clip_skips_only_that_clip(
-    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     _setup(media, [_highlight(1, 10.0, 15.0), _highlight(2, 20.0, 25.0)])
-    fake.fail_on[1] = InvalidClipError("source media not found: x")
+    stderr = "many\nlines of\nstderr with token=sk-ant-api03-" + "x" * 40
+    fake.fail_on[1] = InvalidClipError("Remotion rejected the clip props: /hook/text: bad", stderr)
 
     rc.render_clips(job, _ctx(media, conn))
 
     assert [r["rank"] for r in _rows(conn)] == [2]
+    (summary,) = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert summary.endswith(
+        "1 clip(s) left out: clip 1: Remotion rejected the clip props: /hook/text: bad"
+    )
 
 
 @pytest.mark.parametrize(
@@ -278,6 +319,7 @@ def test_renderer_rejecting_a_clip_skips_only_that_clip(
         {"score": float("nan")},
         {"hashtags": "#clip"},
         {"hashtags": ["#ok", 3]},
+        {"hook": 7},
     ],
 )
 def test_bad_metadata_is_invalid(
@@ -308,7 +350,7 @@ def test_control_and_format_characters_stripped_from_words(
     words = [
         {"word": "a\u202eb\u200b", "start": 10.1, "end": 10.5},
         {"word": "c\x00\nd", "start": 11.1, "end": 11.5},
-        {"word": "\u200d", "start": 12.1, "end": 12.5},
+        {"word": "\u2060", "start": 12.1, "end": 12.5},
         {"word": "x" * 70, "start": 13.1, "end": 13.5},
     ]
     _setup(media, [_highlight(1, 10.0, 15.0)], words=words)

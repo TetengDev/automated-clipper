@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Node LTS for the Remotion renderer (render/). Only the node binary + bundled npm are
 # copied into the Python image below.
-FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS node
+FROM node:26.11.1-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS node
 
 FROM node AS render-deps
 WORKDIR /app/render

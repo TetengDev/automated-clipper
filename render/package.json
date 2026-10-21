@@ -16,13 +16,13 @@
   },
   "dependencies": {
     "@fontsource/montserrat": "5.2.8",
-    "@remotion/bundler": "4.0.533",
-    "@remotion/cli": "4.0.533",
-    "@remotion/renderer": "4.0.533",
+    "@remotion/bundler": "4.0.535",
+    "@remotion/cli": "4.0.535",
+    "@remotion/renderer": "4.0.535",
     "ajv": "8.20.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
-    "remotion": "4.0.533"
+    "remotion": "4.0.535"
   },
   "devDependencies": {
     "@types/node": "24.19.0",

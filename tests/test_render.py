@@ -244,7 +244,8 @@ def test_remotion_rejecting_props_is_invalid_clip(
 ) -> None:
     stderr = (
         "Error rendering composition\n"
-        "EdlValidationError: invalid clip props: /hook/text: must match pattern; /words: bad\n"
+        "EdlValidationError  EdlValidationError: invalid clip props: /hook/text: must match"
+        " pattern; /words: bad\n"
         "    at parseEdl (validate.ts:64)"
     )
     runner = FakeRunner(fail_step="remotion", fail_stderr=stderr)
@@ -253,6 +254,15 @@ def test_remotion_rejecting_props_is_invalid_clip(
     assert str(excinfo.value).splitlines()[0] == (
         "Remotion rejected the clip props: /hook/text: must match pattern; /words: bad"
     )
+
+
+def test_props_text_without_the_error_class_is_not_a_rejection(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    runner = FakeRunner(fail_step="remotion", fail_stderr="echo: invalid clip props: x")
+    with pytest.raises(RenderError) as excinfo:
+        _render(media_root, render_dir, tmp_path, runner)
+    assert not isinstance(excinfo.value, InvalidClipError)
 
 
 def test_timeout(media_root: Path, render_dir: Path, tmp_path: Path) -> None:

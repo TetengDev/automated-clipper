@@ -42,6 +42,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from clipper.edl import EDL, FPS, HEIGHT, WIDTH, parse_edl
+from clipper.redact import redact
 
 log = logging.getLogger(__name__)
 
@@ -215,16 +216,16 @@ def _run(
         proc = runner(list(argv), cwd=cwd, env=dict(env), timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
         tail = _tail(exc.stderr)
-        log.error("render step %s timed out after %ss\n%s", step, timeout_s, tail)
+        log.error("render step %s timed out after %ss\n%s", step, timeout_s, redact(tail))
         raise RenderError(f"{step} timed out after {timeout_s:g}s", tail) from exc
     except OSError as exc:
         raise RenderError(f"{step} could not start: {exc}") from exc
     tail = _tail(proc.stderr)
     if proc.returncode != 0:
-        log.error("render step %s failed (exit %s)\n%s", step, proc.returncode, tail)
+        log.error("render step %s failed (exit %s)\n%s", step, proc.returncode, redact(tail))
         raise RenderError(f"{step} failed with exit code {proc.returncode}", tail)
     if tail:
-        log.debug("render step %s stderr:\n%s", step, tail)
+        log.debug("render step %s stderr:\n%s", step, redact(tail))
     return proc
 
 
@@ -551,12 +552,11 @@ def render_clip(
                 )
             except RenderError as exc:
                 # validate.ts throws EdlValidationError("invalid clip props: <errors>"), one line.
-                line = next(
-                    (ln for ln in exc.stderr_tail.splitlines() if "invalid clip props:" in ln), None
-                )
+                marker = "EdlValidationError: invalid clip props:"
+                line = next((ln for ln in exc.stderr_tail.splitlines() if marker in ln), None)
                 if line is None:
                     raise
-                detail = line.split("invalid clip props:", 1)[1].strip()[:500]
+                detail = line.split(marker, 1)[1].strip()[:500]
                 raise InvalidClipError(
                     f"Remotion rejected the clip props: {detail}", exc.stderr_tail
                 ) from exc

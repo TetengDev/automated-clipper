@@ -254,6 +254,37 @@ def test_hook_is_cleaned_and_empty_after_cleaning_means_none(
     assert hooks[1] is None
 
 
+def test_transient_failure_with_all_others_invalid_stays_retryable(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0, title=5), _highlight(2, 20.0, 25.0)])
+    fake.fail_on[1] = RenderError("remotion render timed out after 900s")
+
+    with pytest.raises(RenderError) as excinfo:
+        rc.render_clips(job, _ctx(media, conn))
+    assert not isinstance(excinfo.value, PermanentError)
+    assert _rows(conn) == []
+
+
+def test_post_text_is_cleaned(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    clip = _highlight(
+        1,
+        10.0,
+        15.0,
+        title="\u202eTi\u200btle",
+        caption="Cap\ntion\u3164",
+        reason="Re\x00ason",
+        hashtags=["#a b", "\u200b", "#c\u2066"],
+    )
+    _setup(media, [clip])
+    rc.render_clips(job, _ctx(media, conn))
+    (row,) = _rows(conn)
+    assert (row["title"], row["caption"], row["reason"]) == ("Title", "Cap tion", "Re ason")
+    assert json.loads(row["hashtags"]) == ["#ab", "#c"]
+
+
 def test_render_failure_is_retryable(
     conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
 ) -> None:

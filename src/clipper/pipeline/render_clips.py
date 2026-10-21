@@ -125,12 +125,15 @@ def _plan(
     # Malformed artifact entries, or an EDL pydantic rejects (ValidationError is a ValueError).
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise PermanentError(f"clip {rank}: invalid EDL: {exc}") from None
+    # Cleaned again here: highlights.json may be stale or hand-edited.
+    title, caption, reason = (None if t is None else strip_control(t) for t in texts[:3])
+    tags = (strip_control(h).replace(" ", "") for h in hashtags)
     meta = ClipMeta(
-        title=clip.get("title"),
-        caption=clip.get("caption"),
-        hashtags=tuple(hashtags),
+        title=title,
+        caption=caption,
+        hashtags=tuple(t for t in tags if t),
         score=score,
-        reason=clip.get("reason"),
+        reason=reason,
         prompt_version=prompt_version,
     )
     return rank, edl, start, end, meta
@@ -169,10 +172,11 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 ffmpeg_timeout_s=deadline.timeout(DEFAULT_FFMPEG_TIMEOUT_S),
             )
         except PermanentError as exc:
-            invalid.append(strip_control(str(exc))[:MAX_REASON_CHARS])
+            invalid.append(redact(strip_control(str(exc)))[:MAX_REASON_CHARS])
             continue
         except InvalidClipError as exc:
-            invalid.append(f"clip {rank}: {str(exc).splitlines()[0][:MAX_REASON_CHARS]}")
+            reason = redact(strip_control(str(exc).splitlines()[0]))
+            invalid.append(f"clip {rank}: {reason}"[:MAX_REASON_CHARS])
             continue
         except RenderError as exc:
             # Possibly transient: render the remaining clips, then retry the job for this one.
@@ -196,7 +200,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
     if not done:
         raise PermanentError("no clip could be rendered: " + "; ".join(invalid))
     if invalid:
-        summary = redact("; ".join(invalid))
+        summary = "; ".join(invalid)  # each reason redacted before it was cut
         logger.warning("job %s: %d clip(s) left out: %s", job.id, len(invalid), summary)
 
 

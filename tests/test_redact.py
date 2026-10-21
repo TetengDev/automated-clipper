@@ -112,9 +112,11 @@ def test_keeps_url_without_password() -> None:
 
 @pytest.mark.parametrize("text", ["a-" * 32768, "a." * 32768, "a+" * 30000, "a" * 65536 + "://"])
 def test_url_userinfo_pattern_is_linear(text: str) -> None:
+    # 64 KB inputs run every pattern, ~35 ms locally; CI runners are ~3x slower.
+    # Backtracking blow-up would take seconds, so 0.5 s still catches it.
     start = time.perf_counter()
     redact(text)
-    assert time.perf_counter() - start < 0.1
+    assert time.perf_counter() - start < 0.5
 
 
 def test_url_userinfo_with_percent_encoded_password() -> None:

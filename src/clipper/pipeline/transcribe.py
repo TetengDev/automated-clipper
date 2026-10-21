@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -45,7 +46,7 @@ from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
 from clipper.pipeline.common import (
     PROTOCOL_WHITELIST,
-    REDACT_WINDOW_CHARS,
+    REDACT_LIMIT_CHARS,
     Deadline,
     MediaError,
     NoDuration,
@@ -69,6 +70,8 @@ WORK_PREFIX = ".transcribe-"
 CUT_TIMEOUT_S = 10 * 60.0
 CHUNK_CALL_TIMEOUT_S = 15 * 60.0
 """Upper bound for one chunk's Groq call incl. retries; shrunk to the stage's Deadline."""
+MAX_UNUSABLE_PER_CHUNK = 2
+"""A chunk whose paid response was unusable is re-requested once more, then the job fails."""
 _LANGUAGE_CODE = re.compile(r"^[a-z]{2,3}(-[a-z]{2,4})?$")
 
 CHUNK_SECONDS = 600.0
@@ -203,7 +206,7 @@ def _error_detail(response: httpx.Response) -> str:
         message = response.json()["error"]["message"]
     except (ValueError, KeyError, TypeError):
         message = response.text
-    return redact(str(message)[:REDACT_WINDOW_CHARS])[:200]
+    return redact(str(message)[-REDACT_LIMIT_CHARS:])[:200]
 
 
 @dataclass
@@ -331,8 +334,9 @@ def _parse_verbose_json(body: dict[str, Any]) -> ChunkTranscript:
         for s in body.get("segments") or ()
         if str(s.get("text", "")).strip()
     )
-    language = body.get("language")
-    return ChunkTranscript(normalize_language(language) if language else None, words, segments)
+    language = normalize_language(str(body["language"])) if body.get("language") else None
+    # "unknown" is the transcript's fallback, never a detected language: keep looking.
+    return ChunkTranscript(None if language == "unknown" else language, words, segments)
 
 
 def normalize_language(value: str) -> str:
@@ -416,6 +420,25 @@ def _cache_path(
     )
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
     return cache_dir / f"{chunk.index:04d}-{digest}.json"
+
+
+def _unusable_count(cache_file: Path) -> int:
+    """Paid-but-unusable responses so far for the chunk cached at `cache_file` (same key:
+    a re-fetched audio file or another model starts from zero)."""
+    try:
+        return int(cache_file.with_suffix(".unusable").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _note_unusable(cache_file: Path) -> int:
+    """Record one more paid-but-unusable response; returns the new count."""
+    count = _unusable_count(cache_file) + 1
+    note = cache_file.with_suffix(".unusable")
+    tmp = note.with_name(f".{note.name}.tmp")
+    tmp.write_text(str(count), encoding="utf-8")
+    os.replace(tmp, note)
+    return count
 
 
 def _save_chunk(path: Path, result: ChunkTranscript) -> None:
@@ -546,7 +569,16 @@ def transcribe(
     results: dict[int, ChunkTranscript] = {i: r for i, r in cached.items() if r is not None}
     if todo:
         _transcribe_chunks(
-            job, ctx, audio, todo, backend, language, cache_dir, max_concurrency, deadline
+            job,
+            ctx,
+            audio,
+            todo,
+            backend,
+            language,
+            cache_dir,
+            max_concurrency,
+            deadline,
+            fingerprint,
         )
         results.update(
             (c.index, r)
@@ -586,13 +618,24 @@ def _transcribe_chunks(
     cache_dir: Path,
     max_concurrency: int,
     deadline: Deadline,
+    fingerprint: tuple[int, int],
 ) -> None:
     """Transcribe `chunks`, caching each result as soon as it is paid for. The estimate is
     reserved against the daily cap first; the row is settled to what was billed, also
     when a later chunk fails. Every chunk's ffmpeg and API timeouts are shrunk to what is
     left of the stage `deadline`; running out raises `StageTimeout` (retryable, and the
-    retry resumes from the cached chunks)."""
-    fingerprint = audio_fingerprint(audio)
+    retry resumes from the cached chunks).
+
+    A paid but unusable response leaves a note next to the cache; a chunk with
+    MAX_UNUSABLE_PER_CHUNK notes fails the job instead of being paid for again. On the
+    first failing chunk, chunks not yet started are cancelled."""
+
+    def cache_file(chunk: Chunk) -> Path:
+        return _cache_path(cache_dir, chunk, backend, language, fingerprint)
+
+    for chunk in chunks:
+        if _unusable_count(cache_file(chunk)) >= MAX_UNUSABLE_PER_CHUNK:
+            raise PermanentError(f"chunk {chunk.index}: transcription unusable twice; giving up")
     done: list[Chunk] = []
     lock = threading.Lock()
     with reserve_spend(
@@ -613,18 +656,28 @@ def _transcribe_chunks(
                 result = backend.transcribe(
                     path, language=language, timeout_s=deadline.timeout(CHUNK_CALL_TIMEOUT_S)
                 )
-            except BilledChunkError:
+            except BilledChunkError as exc:
                 with lock:
                     done.append(chunk)
+                    count = _note_unusable(cache_file(chunk))
+                if count >= MAX_UNUSABLE_PER_CHUNK:
+                    raise PermanentError(
+                        f"chunk {chunk.index}: transcription unusable twice ({exc}); giving up"
+                    ) from None
                 raise
             with lock:
                 done.append(chunk)
-            _save_chunk(_cache_path(cache_dir, chunk, backend, language, fingerprint), result)
+            _save_chunk(cache_file(chunk), result)
             path.unlink(missing_ok=True)
 
+        pool = ThreadPoolExecutor(max_workers=max(1, max_concurrency))
         try:
-            with ThreadPoolExecutor(max_workers=max(1, max_concurrency)) as pool:
-                list(pool.map(run, chunks))
+            list(pool.map(run, chunks))
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)  # stop paying for queued chunks
+            raise
+        else:
+            pool.shutdown(wait=True)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
             seconds = [c.duration for c in done]

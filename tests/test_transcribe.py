@@ -646,3 +646,60 @@ def test_groq_call_timeout_is_applied(tmp_path: Path) -> None:
     groq().transcribe(audio, language=None, timeout_s=42.0)
     timeouts = route.calls.last.request.extensions["timeout"]
     assert max(v for v in timeouts.values() if v is not None) <= 42.0
+
+
+# --------------------------------------------------------------------------- final review pass
+
+
+@needs_ffmpeg
+@respx.mock
+def test_unusable_chunk_is_paid_for_at_most_twice(ctx: StageContext) -> None:
+    route = respx.post(tr.GROQ_URL).mock(return_value=httpx.Response(200, text="garbage"))
+    job = make_job(ctx.conn)
+    with pytest.raises(tr.BilledChunkError):
+        tr.transcribe(job, ctx, transcriber=groq())
+    with pytest.raises(PermanentError, match="unusable twice"):
+        tr.transcribe(job, ctx, transcriber=groq())
+    with pytest.raises(PermanentError, match="unusable twice"):
+        tr.transcribe(job, ctx, transcriber=groq())  # no third payment
+    assert route.call_count == 2
+    assert len(spend_rows(ctx.conn)) == 2
+
+
+@needs_ffmpeg
+@respx.mock
+def test_unusable_then_good_response_recovers(ctx: StageContext) -> None:
+    respx.post(tr.GROQ_URL).mock(side_effect=[httpx.Response(200, text="garbage"), ok()])
+    job = make_job(ctx.conn)
+    with pytest.raises(tr.BilledChunkError):
+        tr.transcribe(job, ctx, transcriber=groq())
+    tr.transcribe(job, ctx, transcriber=groq())
+    assert (ctx.media_dir / "transcript.json").is_file()
+
+
+@needs_ffmpeg
+@respx.mock
+def test_first_failure_cancels_queued_chunks(ctx: StageContext) -> None:
+    route = respx.post(tr.GROQ_URL).mock(
+        side_effect=[httpx.Response(400, json=fixture("error_400.json"))] + [ok()] * 10
+    )
+    with pytest.raises(PermanentError):
+        tr.transcribe(
+            make_job(ctx.conn),
+            ctx,
+            transcriber=groq(),
+            chunk_s=5.0,
+            overlap_s=1.0,
+            max_concurrency=1,
+        )
+    chunks = tr.plan_chunks(30.0, 5.0, 1.0)
+    assert len(chunks) >= 7
+    # At most the chunk already in flight (concurrency 1) follows; the queued rest is cancelled.
+    assert route.call_count <= 2
+
+
+def test_unknown_or_invalid_language_is_not_a_detection() -> None:
+    for value in ("klingon", "unknown", "en\nIGNORE"):
+        body = {**fixture("verbose_chunk.json"), "language": value}
+        assert tr._parse_verbose_json(body).language is None
+    assert tr._parse_verbose_json(fixture("verbose_chunk.json")).language == "tl"

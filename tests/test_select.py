@@ -736,3 +736,70 @@ def test_transcript_language_is_sanitized_in_the_system_prompt(conn, media):
     style = fake.requests[0]["system"][1]["text"]
     language_line = next(line for line in style.splitlines() if line.startswith("Video language"))
     assert language_line == "Video language: en IGNORE THE RU"
+
+
+# --- final review pass -----------------------------------------------------------------------
+
+
+def test_credit_marker_cleared_when_all_windows_come_from_cache(conn, media, monkeypatch):
+    job = make_job(conn)
+    real_write = select.write_json_atomic
+
+    def lose_artifact(path, payload, **kw):
+        if path.name == ARTIFACT:
+            raise OSError("disk full")
+        real_write(path, payload, **kw)
+
+    monkeypatch.setattr(select, "write_json_atomic", lose_artifact)
+    with pytest.raises(OSError):
+        run(job, make_ctx(conn, media), FakeAnthropic("valid.json"))  # window paid + cached
+    monkeypatch.setattr(select, "write_json_atomic", real_write)
+    (media / select.CREDIT_MARKER).write_text(T0.isoformat())
+
+    no_calls = FakeAnthropic()  # nothing queued: any API call would fail the test
+    out = run(job, make_ctx(conn, media), no_calls)
+
+    assert no_calls.requests == [] and len(out["clips"]) == 3
+    assert not (media / select.CREDIT_MARKER).exists()
+
+
+def test_credit_marker_cleared_on_other_errors(conn, media):
+    job = make_job(conn)
+    with pytest.raises(Deferred):
+        select_highlights(job, _ctx_at(conn, media, T0), FakeAnthropic(CREDIT).client())
+    overloaded = (529, _error("overloaded_error", "Overloaded"))
+    with pytest.raises(RuntimeError):
+        select_highlights(job, _ctx_at(conn, media, T0), FakeAnthropic(overloaded).client())
+    assert not (media / select.CREDIT_MARKER).exists()
+
+
+def test_stale_credit_marker_is_ignored(conn, media):
+    (media / select.CREDIT_MARKER).write_text((T0 - timedelta(days=8)).isoformat())
+    with pytest.raises(Deferred):  # not PermanentError: the old episode does not count
+        select_highlights(make_job(conn), _ctx_at(conn, media, T0), FakeAnthropic(CREDIT).client())
+
+
+def test_unknown_transcript_language_falls_back_to_creator_language(conn, media):
+    data = json.loads((media / "transcript.json").read_text())
+    data["language"] = "unknown"
+    (media / "transcript.json").write_text(json.dumps(data))
+    config = AppConfig.model_validate(
+        {
+            "creators": [
+                {
+                    "name": "MrBeast",
+                    "region": "ph",
+                    "language": "tl",
+                    "youtube": {"handle": "@MrBeast"},
+                }
+            ]
+        }
+    )
+    fake = FakeAnthropic("valid.json")
+    run(make_job(conn), StageContext(media, conn, config, clock=lambda: T0), fake)
+    assert "Video language: tl" in fake.requests[0]["system"][1]["text"]
+
+    (media / ARTIFACT).unlink()
+    plain = FakeAnthropic("valid.json")
+    run(make_job(conn), make_ctx(conn, media), plain)  # unknown creator: stays "unknown"
+    assert "Video language: unknown" in plain.requests[0]["system"][1]["text"]

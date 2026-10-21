@@ -31,15 +31,18 @@ from typing import Any
 from clipper.config import AppConfig, Creator, Settings
 from clipper.db import transaction
 from clipper.jobs.models import Job, to_iso
+from clipper.jobs.queue import DEFAULT_LEASE
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob
 from clipper.pipeline import ytdlp
-from clipper.pipeline.ytdlp import REDACT_WINDOW_CHARS, CommandTimeout, Runner, RunResult
+from clipper.pipeline.ytdlp import CommandTimeout, Runner, RunResult
 from clipper.redact import redact
 
 logger = logging.getLogger(__name__)
 
 FFPROBE_TIMEOUT_S = 60.0
 STDERR_TAIL_CHARS = 300
+REDACT_LIMIT_CHARS = 64 * 1024
+"""Error text is redacted over at most its last 64 KB, then cut for storage."""
 STAGE_BUDGET_S = 100 * 60.0
 """Wall-clock budget of one stage run: well inside the 2 h claim lease."""
 PROTOCOL_WHITELIST = ["-protocol_whitelist", "file,pipe"]
@@ -119,8 +122,9 @@ def read_json(path: Path, *, required: bool = True) -> Any:
 
 
 def stderr_tail(stderr: str) -> str:
-    tail = " | ".join(stderr[-REDACT_WINDOW_CHARS:].strip().splitlines()[-3:])
-    return redact(tail[-REDACT_WINDOW_CHARS:])[-STDERR_TAIL_CHARS:]
+    """Last lines of `stderr`, redacted before cutting (a cut must not split a secret)."""
+    text = redact(stderr[-REDACT_LIMIT_CHARS:])
+    return " | ".join(text.strip().splitlines()[-3:])[-STDERR_TAIL_CHARS:]
 
 
 def run_media(
@@ -178,12 +182,16 @@ def settings_for(job: Job, config: AppConfig) -> Settings:
     return config.effective_settings(creator.name) if creator else config.settings
 
 
-def first_seen(marker: Path, now: datetime) -> datetime:
+def first_seen(marker: Path, now: datetime, *, max_age: timedelta | None = None) -> datetime:
     """When a condition (source not ready, no API credit) was first hit for this job: read
-    from `marker`, or recorded as `now`. Remove the marker once the condition clears."""
+    from `marker`, or recorded as `now`. Remove the marker once the condition clears.
+
+    A future-dated marker (clock skew) counts as `now`; one older than `max_age` is stale
+    (from an earlier, unrelated episode) and is restarted at `now`."""
     try:
         seen = datetime.fromisoformat(marker.read_text(encoding="utf-8").strip())
-        if seen.tzinfo is not None:
+        fresh = max_age is None or now - seen <= max_age
+        if seen.tzinfo is not None and seen <= now and fresh:
             return seen
     except (OSError, ValueError):
         pass
@@ -249,11 +257,13 @@ def reserve_spend(
     start, end = _utc_day(now)
     with transaction(conn):
         # A reservation this job leaked when its worker was killed (never settled: settled
-        # rows always carry tokens or audio seconds). Only one worker holds the job.
+        # rows always carry tokens or audio seconds). Assumes a single holder per job: the
+        # claim lease makes this worker the job's only runner, and a row older than the
+        # lease cannot belong to a call still in flight.
         conn.execute(
             "DELETE FROM spend WHERE job_id = ? AND kind = ?"
-            " AND input_tokens IS NULL AND audio_seconds IS NULL",
-            (job_id, kind),
+            " AND input_tokens IS NULL AND audio_seconds IS NULL AND created_at < ?",
+            (job_id, kind, to_iso(now - DEFAULT_LEASE)),
         )
         spent = float(
             conn.execute(

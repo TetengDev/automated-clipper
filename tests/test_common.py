@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -15,6 +15,7 @@ from clipper.pipeline import common
 from clipper.pipeline.common import (
     Deadline,
     StageTimeout,
+    first_seen,
     next_utc_midnight,
     reserve_spend,
     spend_today,
@@ -37,7 +38,13 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     c.close()
 
 
-def _reserve(conn: sqlite3.Connection, estimate: float, cap: float = 1.0, job_id: int = 1):
+def _reserve(
+    conn: sqlite3.Connection,
+    estimate: float,
+    cap: float = 1.0,
+    job_id: int = 1,
+    now: datetime = T0,
+):
     return reserve_spend(
         conn,
         kind="llm",
@@ -46,7 +53,7 @@ def _reserve(conn: sqlite3.Connection, estimate: float, cap: float = 1.0, job_id
         job_id=job_id,
         estimate_usd=estimate,
         cap_usd=cap,
-        now=T0,
+        now=now,
     )
 
 
@@ -130,8 +137,8 @@ def test_next_utc_midnight_and_strip_control() -> None:
 
 
 def test_leaked_reservation_of_this_job_is_dropped(conn: sqlite3.Connection) -> None:
-    leaked = _reserve(conn, 0.7)
-    leaked.__enter__()  # worker killed: never settled
+    leaked = _reserve(conn, 0.7, now=T0 - timedelta(hours=3))
+    leaked.__enter__()  # worker killed 3 h ago (past the 2 h lease): never settled
     conn.execute(
         "INSERT INTO spend (job_id, provider, kind, usd, input_tokens, created_at)"
         " VALUES (1, 'anthropic', 'llm', 0.2, 50, '2026-10-21T23:00:00Z')"
@@ -143,3 +150,37 @@ def test_leaked_reservation_of_this_job_is_dropped(conn: sqlite3.Connection) -> 
     with _reserve(conn, 0.7) as charge:  # would not fit next to the leaked 0.7
         charge.usd, charge.input_tokens = 0.1, 10
     assert sorted(_rows(conn)) == [(0.05, None), (0.1, 10), (0.2, 50)]
+
+
+def test_fresh_unsettled_row_is_kept(conn: sqlite3.Connection) -> None:
+    in_flight = _reserve(conn, 0.3, now=T0 - timedelta(minutes=30))
+    in_flight.__enter__()  # within the lease: may still be a live call, so it counts
+    with _reserve(conn, 0.3) as charge:
+        charge.usd, charge.input_tokens = 0.1, 10
+    assert sorted(_rows(conn)) == [(0.1, 10), (0.3, None)]
+    with pytest.raises(Deferred), _reserve(conn, 0.65):
+        pass
+
+
+def test_first_seen_records_reads_and_clamps(tmp_path: Path) -> None:
+    marker = tmp_path / "m"
+    assert first_seen(marker, T0) == T0
+    assert first_seen(marker, T0 + timedelta(hours=5)) == T0
+    marker.write_text((T0 + timedelta(days=1)).isoformat())  # future-dated (clock skew)
+    assert first_seen(marker, T0) == T0
+    assert first_seen(marker, T0 + timedelta(hours=1)) == T0
+
+
+def test_first_seen_restarts_a_stale_marker(tmp_path: Path) -> None:
+    marker = tmp_path / "m"
+    first_seen(marker, T0)
+    later = T0 + timedelta(days=8)
+    assert first_seen(marker, later, max_age=timedelta(days=7)) == later
+    assert first_seen(marker, later + timedelta(hours=1), max_age=timedelta(days=7)) == later
+
+
+def test_stderr_tail_redacts_before_cutting() -> None:
+    noise = "x" * 100_000 + "\n"
+    tail = common.stderr_tail(noise + "fetch https://h/?sig=SECRET1 failed\nmore\nERROR: end\n")
+    assert "SECRET1" not in tail and tail.endswith("ERROR: end")
+    assert len(tail) <= common.STDERR_TAIL_CHARS

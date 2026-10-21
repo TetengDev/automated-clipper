@@ -76,6 +76,8 @@ MAX_LANGUAGE_CHARS = 16
 CREDIT_RETRY = timedelta(hours=1)
 CREDIT_MAX_WAIT = timedelta(hours=48)
 CREDIT_MARKER = ".credit_deferred_since"
+CREDIT_MARKER_MAX_AGE = timedelta(days=7)
+"""An older marker is from an earlier, unrelated outage and restarts the clock."""
 CACHE_DIR = ".select"
 FIELD_LIMITS = {"hook": 120, "title": 100, "caption": 2200, "reason": 500}
 MAX_HASHTAGS = 10
@@ -487,10 +489,14 @@ def _parse_reply(message: Any) -> list[Candidate]:
     return _Reply.model_validate_json(text).clips
 
 
+class _CreditDeferred(Deferred):
+    """Deferred because the Anthropic account is out of credit (keeps the marker)."""
+
+
 def _no_credit(ctx: StageContext) -> Exception:
     """Deferred an hour at a time, for at most CREDIT_MAX_WAIT since the first deferral."""
     now = ctx.clock()
-    since = common.first_seen(ctx.media_dir / CREDIT_MARKER, now)
+    since = common.first_seen(ctx.media_dir / CREDIT_MARKER, now, max_age=CREDIT_MARKER_MAX_AGE)
     if now - since > CREDIT_MAX_WAIT:
         hours = CREDIT_MAX_WAIT.total_seconds() / 3600
         return PermanentError(f"Anthropic credit balance too low for {hours:.0f} h; giving up")
@@ -499,7 +505,7 @@ def _no_credit(ctx: StageContext) -> Exception:
         since.isoformat(),
         CREDIT_RETRY,
     )
-    return Deferred(now + CREDIT_RETRY, "Anthropic credit balance too low")
+    return _CreditDeferred(now + CREDIT_RETRY, "Anthropic credit balance too low")
 
 
 def _call(
@@ -623,6 +629,24 @@ def select_highlights(
     client: anthropic.Anthropic | None = None,
     feedback_examples: Sequence[Mapping[str, Any]] = (),
 ) -> None:
+    """The stage. Any outcome other than a credit deferral (success incl. all windows from
+    cache, any error, giving up) ends the credit episode and removes its marker."""
+    try:
+        _select(job, ctx, client, feedback_examples)
+    except _CreditDeferred:
+        raise
+    except BaseException:
+        (ctx.media_dir / CREDIT_MARKER).unlink(missing_ok=True)
+        raise
+    (ctx.media_dir / CREDIT_MARKER).unlink(missing_ok=True)
+
+
+def _select(
+    job: Job,
+    ctx: StageContext,
+    client: anthropic.Anthropic | None,
+    feedback_examples: Sequence[Mapping[str, Any]],
+) -> None:
     raw_transcript = read_json(ctx.media_dir / "transcript.json", required=True)
     try:
         transcript = _Transcript.model_validate(raw_transcript)
@@ -641,7 +665,8 @@ def select_highlights(
     settings, language, tags = _settings_for(job, ctx)
     top_k = settings.max_clips_per_stream if job.is_stream else settings.max_clips_per_source
     cap = settings.daily_llm_usd_cap
-    system = build_system(job.creator, transcript.language or language, tags)
+    detected = transcript.language if transcript.language != "unknown" else None
+    system = build_system(job.creator, detected or language, tags)
     duration = meta.get("duration_s") or transcript.duration_s
     windows = make_windows(transcript.segments, duration_s=float(duration) if duration else None)
     cache_dir = ctx.media_dir / CACHE_DIR

@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -108,32 +109,48 @@ def child_env() -> dict[str, str]:
 
 class _Tail:
     """Keeps (at least) the last `limit` bytes written to it, as a deque of chunks so a
-    large buffer is never shifted byte by byte."""
+    large buffer is never shifted byte by byte. Thread-safe; once `close()`d it ignores
+    further writes (an abandoned reader may still be running)."""
 
     def __init__(self, limit: int) -> None:
         self.limit = limit
         self.chunks: deque[bytes] = deque()
         self.size = 0
+        self.closed = False
+        self._lock = threading.Lock()
 
-    def add(self, data: bytes) -> None:
-        self.chunks.append(data)
-        self.size += len(data)
-        while self.chunks and self.size - len(self.chunks[0]) >= self.limit:
-            self.size -= len(self.chunks.popleft())
+    def add(self, data: bytes) -> bool:
+        """Append `data`; False once closed (the reader should stop)."""
+        with self._lock:
+            if self.closed:
+                return False
+            self.chunks.append(data)
+            self.size += len(data)
+            while self.chunks and self.size - len(self.chunks[0]) >= self.limit:
+                self.size -= len(self.chunks.popleft())
+            return True
+
+    def close(self) -> None:
+        with self._lock:
+            self.closed = True
 
     def text(self) -> str:
-        return b"".join(self.chunks)[-self.limit :].decode("utf-8", errors="replace")
+        with self._lock:
+            data = b"".join(self.chunks)
+        return data[-self.limit :].decode("utf-8", errors="replace")
 
 
 def _pump(stream: IO[bytes], tail: _Tail, on_line: Callable[[str], None] | None) -> None:
     with stream:
         if on_line is None:
             for chunk in iter(lambda: stream.read(65536), b""):
-                tail.add(chunk)
+                if not tail.add(chunk):
+                    return
             return
         broken = False
         while raw := stream.readline(LINE_LIMIT_BYTES):
-            tail.add(raw)
+            if not tail.add(raw):
+                return  # abandoned by run_command: no more callbacks
             if broken:
                 continue
             try:
@@ -152,20 +169,38 @@ def _kill_group(proc: subprocess.Popen[bytes]) -> None:
     proc.wait()
 
 
-def _finish_pumps(proc: subprocess.Popen[bytes], pumps: Sequence[threading.Thread]) -> None:
+def _group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _finish_pumps(
+    proc: subprocess.Popen[bytes], pumps: Sequence[threading.Thread], tails: Sequence[_Tail]
+) -> None:
     """Wait for the output readers; if something still holds the pipes after the child is
-    gone, kill the rest of its process group and give the readers a last chance. A reader
-    that is still blocked after that is a daemon thread and is abandoned (closing a pipe
-    under a blocked reader is not safe)."""
+    gone, kill the rest of its process group and give the readers a last chance, all
+    within one deadline. A reader still blocked after that is a daemon thread and is
+    abandoned (closing a pipe under a blocked reader is not safe); its tail is closed so it
+    can neither change the result nor call `on_stderr_line` again."""
+    deadline = time.monotonic() + 2 * PUMP_JOIN_TIMEOUT_S
     for pump in pumps:
-        pump.join(PUMP_JOIN_TIMEOUT_S)
-    if any(p.is_alive() for p in pumps):
+        pump.join(max(0.0, deadline - PUMP_JOIN_TIMEOUT_S - time.monotonic()))
+    # The leader is reaped by now, so its pid could in principle be reused. A pid is not
+    # handed out while a process group with that id exists, so probing first means we
+    # only signal when members of our group are still alive. Remaining risk: the group
+    # empties and the id is reused as a new group id between probe and kill (tiny window).
+    if any(p.is_alive() for p in pumps) and _group_exists(proc.pid):
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
-        for pump in pumps:
-            pump.join(PUMP_JOIN_TIMEOUT_S)
-        if any(p.is_alive() for p in pumps):
-            logger.warning("%s: output pipe still held open; not waiting", Path(proc.args[0]).name)
+    for pump in pumps:
+        pump.join(max(0.0, deadline - time.monotonic()))
+    for tail in tails:
+        tail.close()
+    if any(p.is_alive() for p in pumps):
+        logger.warning("%s: output pipe still held open; not waiting", Path(proc.args[0]).name)
 
 
 def run_command(
@@ -196,12 +231,12 @@ def run_command(
         proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         _kill_group(proc)
-        _finish_pumps(proc, pumps)
+        _finish_pumps(proc, pumps, (out, err))
         raise CommandTimeout(f"{Path(args[0]).name} timed out after {timeout_s:.0f}s") from None
     except BaseException:
         _kill_group(proc)
         raise
-    _finish_pumps(proc, pumps)
+    _finish_pumps(proc, pumps, (out, err))
     return RunResult(proc.returncode, out.text(), err.text())
 
 

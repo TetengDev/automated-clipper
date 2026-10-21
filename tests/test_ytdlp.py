@@ -291,3 +291,61 @@ def test_tail_keeps_the_last_bytes_without_shifting() -> None:
         tail.add(chunk)
     assert tail.text() == "ghijklmnop"
     assert len(tail.chunks) == 2
+
+
+# --- final review pass -----------------------------------------------------------------------
+
+
+def test_tail_is_safe_while_a_pump_is_still_adding() -> None:
+    import threading
+
+    tail = ytdlp._Tail(1024)
+    stop = threading.Event()
+
+    def writer() -> None:
+        while not stop.is_set():
+            tail.add(b"z" * 7)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        for _ in range(2000):
+            assert len(tail.text()) <= 1024
+    finally:
+        stop.set()
+        thread.join()
+    tail.close()
+    before = tail.text()
+    assert tail.add(b"late") is False
+    assert tail.text() == before
+
+
+def test_abandoned_pump_stops_appending_and_calling_back() -> None:
+    import os
+    import threading
+
+    read_fd, write_fd = os.pipe()
+    tail = ytdlp._Tail(1024)
+    calls: list[str] = []
+    with os.fdopen(read_fd, "rb") as stream:
+        pump = threading.Thread(target=ytdlp._pump, args=(stream, tail, calls.append))
+        pump.start()
+        os.write(write_fd, b"first\n")
+        deadline = time.monotonic() + 5
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        tail.close()  # what _finish_pumps does when it gives up on a reader
+        os.write(write_fd, b"second\nthird\n")
+        os.close(write_fd)
+        pump.join(5)
+    assert not pump.is_alive()
+    assert calls == ["first\n"]
+    assert tail.text() == "first\n"
+
+
+def test_group_probe_is_false_once_the_group_is_gone() -> None:
+    import subprocess
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)  # noqa: S603
+    proc.wait()
+    assert ytdlp._group_exists(proc.pid) is False

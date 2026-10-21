@@ -15,14 +15,16 @@ from typing import Any
 
 import pytest
 
+from clipper.config import AppConfig
 from clipper.db import connect, migrate
 from clipper.edl import EDL
-from clipper.jobs import enqueue
+from clipper.jobs import Worker, enqueue, get_job
 from clipper.jobs.models import Job, JobStatus
 from clipper.jobs.stages import PermanentError, StageContext
 from clipper.pipeline import build_stages
 from clipper.pipeline import render_clips as rc
-from clipper.render import RenderError, RenderResult
+from clipper.pipeline.common import Deadline, StageTimeout
+from clipper.render import InvalidClipError, RenderError, RenderResult
 from clipper.urls import SourceRef
 
 T0 = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
@@ -249,7 +251,113 @@ def test_invalid_clip_is_skipped_others_render(
 
     assert [r["rank"] for r in _rows(conn)] == [2]
     assert len(fake.calls) == 1
-    assert "clip 1: invalid EDL" in caplog.text and "clip 3: invalid EDL" in caplog.text
+    (summary,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert "2 clip(s) left out" in summary.message
+    assert "clip 1: invalid EDL" in summary.message and "clip 3: invalid EDL" in summary.message
+
+
+def test_renderer_rejecting_a_clip_skips_only_that_clip(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0), _highlight(2, 20.0, 25.0)])
+    fake.fail_on[1] = InvalidClipError("source media not found: x")
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    assert [r["rank"] for r in _rows(conn)] == [2]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"title": 5},
+        {"caption": ["x"]},
+        {"reason": {"a": 1}},
+        {"score": True},
+        {"score": "90"},
+        {"score": float("nan")},
+        {"hashtags": "#clip"},
+        {"hashtags": ["#ok", 3]},
+    ],
+)
+def test_bad_metadata_is_invalid(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, bad: dict[str, Any]
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0, **bad)])
+    with pytest.raises(PermanentError, match="clip 1: invalid metadata"):
+        rc.render_clips(job, _ctx(media, conn))
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(-1.0, 5.0), (5.0, 5.0), (6.0, 5.0), ("1", 5.0), (1.0, float("inf")), (True, 5.0)],
+)
+def test_bad_requested_range_is_invalid(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, start: Any, end: Any
+) -> None:
+    section = {**_section(1, 10.0, 15.0), "requested_start_s": start, "requested_end_s": end}
+    _setup(media, [_highlight(1, 10.0, 15.0)], sections=[section])
+    with pytest.raises(PermanentError, match="clip 1: invalid range"):
+        rc.render_clips(job, _ctx(media, conn))
+
+
+def test_control_and_format_characters_stripped_from_words(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    words = [
+        {"word": "a\u202eb\u200b", "start": 10.1, "end": 10.5},
+        {"word": "c\x00\nd", "start": 11.1, "end": 11.5},
+        {"word": "\u200d", "start": 12.1, "end": 12.5},
+        {"word": "x" * 70, "start": 13.1, "end": 13.5},
+    ]
+    _setup(media, [_highlight(1, 10.0, 15.0)], words=words)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    texts = [w.text for w in fake.calls[0]["edl"].words]
+    assert texts == ["ab", "c d", "x" * 64]
+
+
+def test_small_stage_budget_stops_before_a_clip(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    monkeypatch.setattr(rc, "Deadline", lambda: Deadline(budget_s=rc.CLIP_WORST_CASE_S - 1))
+    with pytest.raises(StageTimeout):
+        rc.render_clips(job, _ctx(media, conn))
+    assert fake.calls == [] and _rows(conn) == []
+
+
+def test_transient_render_error_is_retried_by_the_worker(
+    conn: sqlite3.Connection, job: Job, tmp_path: Path, fake: FakeRender
+) -> None:
+    conn.execute("UPDATE jobs SET status = 'rendering' WHERE id = ?", (job.id,))
+    media_root = tmp_path / "media"
+    media = media_root / job.ref.key
+    media.mkdir(parents=True)
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    fake.fail_on[1] = RenderError("remotion render failed with exit code 1")
+    worker = Worker(
+        conn=conn,
+        config=AppConfig(),
+        worker_id="w",
+        stages=build_stages(),
+        media_root=media_root,
+        clock=lambda: T0,
+    )
+
+    assert worker.run_once()
+
+    after = get_job(conn, job.id)
+    assert after is not None and after.status is JobStatus.RENDERING
+    assert after.attempts == 1
+    assert after.last_error is not None and "remotion render failed" in after.last_error
+    assert _rows(conn) == []
 
 
 def test_all_clips_invalid_fails_the_job(

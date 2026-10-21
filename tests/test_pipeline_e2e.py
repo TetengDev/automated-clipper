@@ -465,7 +465,7 @@ def test_real_render_reaches_review_and_export(
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,width,height",
+            "stream=codec_type,width,height:format=duration",
             "-of",
             "json",
             rows[0]["video_path"],
@@ -474,8 +474,12 @@ def test_real_render_reaches_review_and_export(
         capture_output=True,
         text=True,
     )
-    streams = json.loads(probe.stdout)["streams"]
+    info = json.loads(probe.stdout)
+    streams = info["streams"]
     assert {"codec_type": "video", "width": 1080, "height": 1920} in streams
+    # Within ~1 frame of the selected range.
+    length = rows[0]["end_s"] - rows[0]["start_s"]
+    assert float(info["format"]["duration"]) == pytest.approx(length, abs=0.04)
     assert any(s["codec_type"] == "audio" for s in streams)
 
     # The clip shows up in the review queue, plays, and can be approved and exported.

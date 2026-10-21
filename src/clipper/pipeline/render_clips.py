@@ -10,30 +10,53 @@ score and reason.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
 rerun after a crash renders only the clips without a row. The row's start_s/end_s are the
-clip's position in the source video (the review page links there), not in the section.
+clip's position in the source video (the review page links there), not in the section; a
+re-render from `clips/<rank>/source.mp4` must convert back by subtracting
+`requested_start_s - pad_start_s` (sections.json).
 
-A render failure or timeout (`RenderError`) is retried with the job. A clip whose EDL is
-invalid is logged and left out; the others still render. If no clip of the job ends up
-rendered, the job fails.
+A transient render failure or timeout (`RenderError`) is retried with the job. A clip with
+bad input (invalid EDL or metadata, `InvalidClipError` from the renderer) is left out and
+the others still render; the skipped ranks are logged once. If no clip of the job ends up
+rendered, the job fails. A clip is only started if the stage budget still covers its worst
+case (CLIP_WORST_CASE_S), so a run never outlives the claim lease; else `StageTimeout`
+(retryable) and the next claim resumes.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
+import unicodedata
 from typing import Any
 
 from clipper.clips_repo import ClipMeta, insert_pending_clip
 from clipper.edl import EDL, parse_edl
 from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
-from clipper.pipeline.common import Deadline, read_json
-from clipper.render import DEFAULT_RENDER_TIMEOUT_S, render_clip
+from clipper.pipeline.common import Deadline, StageTimeout, read_json, strip_control
+from clipper.render import (
+    DEFAULT_FFMPEG_TIMEOUT_S,
+    DEFAULT_RENDER_TIMEOUT_S,
+    InvalidClipError,
+    render_clip,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_WORD_CHARS = 64
 """EDL limit for one caption word."""
+CLIP_WORST_CASE_S = DEFAULT_RENDER_TIMEOUT_S + 4 * DEFAULT_FFMPEG_TIMEOUT_S
+"""Remotion plus the four ffmpeg steps of `render_clip`, each at its timeout."""
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _clean(text: str) -> str:
+    """No control or format (bidi, zero-width) characters; whitespace collapsed."""
+    return strip_control("".join(c for c in text if unicodedata.category(c) != "Cf"))
 
 
 def _clips(data: Any, name: str) -> list[Any]:
@@ -49,7 +72,7 @@ def _words(transcript: Any, offset: float, start: float, end: float) -> list[dic
     for w in transcript.get("words") or ():
         if w["end"] <= start or w["start"] >= end:
             continue
-        text = str(w["word"]).strip()[:MAX_WORD_CHARS]
+        text = _clean(str(w["word"]))[:MAX_WORD_CHARS]
         if text:
             begin = round(max(w["start"] - offset, 0.0), 3)
             words.append(
@@ -68,8 +91,19 @@ def _plan(
     clip = highlights.get(rank)
     if not isinstance(clip, dict):
         raise PermanentError(f"clip {rank}: no highlight")
+    texts = [clip.get(k) for k in ("title", "caption", "reason")]
+    score, hashtags = clip.get("score"), clip.get("hashtags", [])
+    if (
+        any(t is not None and not isinstance(t, str) for t in texts)
+        or not (score is None or _number(score))
+        or not isinstance(hashtags, list)
+        or not all(isinstance(t, str) for t in hashtags)
+    ):
+        raise PermanentError(f"clip {rank}: invalid metadata")
+    start, end = section.get("requested_start_s"), section.get("requested_end_s")
+    if not (_number(start) and _number(end) and 0 <= start < end):
+        raise PermanentError(f"clip {rank}: invalid range")
     try:
-        start, end = section["requested_start_s"], section["requested_end_s"]
         pad = section["pad_start_s"]
         edl = parse_edl(
             {
@@ -82,17 +116,11 @@ def _plan(
                 "words": _words(transcript, start - pad, start, end),
             }
         )
-        meta = ClipMeta(
-            title=clip.get("title"),
-            caption=clip.get("caption"),
-            hashtags=tuple(clip.get("hashtags") or ()),
-            score=clip.get("score"),
-            reason=clip.get("reason"),
-            prompt_version=prompt_version,
-        )
     # Malformed artifact entries, or an EDL pydantic rejects (ValidationError is a ValueError).
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise PermanentError(f"clip {rank}: invalid EDL: {exc}") from None
+    title, caption, reason = texts
+    meta = ClipMeta(title, caption, tuple(hashtags), score, reason, prompt_version)
     return rank, edl, start, end, meta
 
 
@@ -115,32 +143,39 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             rank, edl, start, end, meta = _plan(
                 section, highlights, transcript, selection.get("prompt_version")
             )
+            if rank in done:
+                continue
+            if deadline.remaining() < CLIP_WORST_CASE_S:
+                raise StageTimeout(f"stage budget left too small for clip {rank}; resuming later")
+            result = render_clip(
+                edl,
+                ctx.media_dir,
+                ctx.media_dir / "clips" / str(rank),
+                basename="v1",  # a new clip is version 1
+                timeout_s=deadline.timeout(DEFAULT_RENDER_TIMEOUT_S),
+                ffmpeg_timeout_s=deadline.timeout(DEFAULT_FFMPEG_TIMEOUT_S),
+            )
         except PermanentError as exc:
-            logger.warning("job %s: clip left out: %s", job.id, exc)
             invalid.append(str(exc))
             continue
-        if rank in done:
+        except InvalidClipError as exc:
+            invalid.append(f"clip {rank}: {exc}")
             continue
-        result = render_clip(
-            edl,
-            ctx.media_dir,
-            ctx.media_dir / "clips" / str(rank),
-            basename="v1",  # a new clip is version 1
-            timeout_s=deadline.timeout(DEFAULT_RENDER_TIMEOUT_S),
-        )
-        # Store the clip's position in the source video, not in the padded section file.
-        source = edl.source.model_copy(update={"in_s": start, "out_s": end})
         insert_pending_clip(
             ctx.conn,
             job_id=job.id,
             rank=rank,
-            edl=edl.model_copy(update={"source": source}),
+            edl=edl,
             result=result,
             meta=meta,
+            start_s=start,  # position in the source video, not in the padded section file
+            end_s=end,
         )
         done.add(rank)
     if not done:
         raise PermanentError("no clip could be rendered: " + "; ".join(invalid))
+    if invalid:
+        logger.warning("job %s: %d clip(s) left out: %s", job.id, len(invalid), "; ".join(invalid))
 
 
 STAGE = StageDef(render_clips)

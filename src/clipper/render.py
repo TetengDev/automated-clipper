@@ -84,6 +84,11 @@ class RenderError(Exception):
         super().__init__(f"{message}{detail}")
 
 
+class InvalidClipError(RenderError):
+    """The clip's own input is bad (EDL, source file, props Remotion rejects): rendering it
+    again unchanged fails the same way. Other RenderErrors may be transient."""
+
+
 @dataclass(frozen=True)
 class RenderResult:
     video_path: Path
@@ -288,9 +293,9 @@ def _resolve_source(edl: EDL, media_root: Path) -> Path:
     root = media_root.resolve()
     source = (root / edl.source.path).resolve()
     if not source.is_relative_to(root):
-        raise RenderError(f"source path escapes media root: {edl.source.path}")
+        raise InvalidClipError(f"source path escapes media root: {edl.source.path}")
     if not source.is_file():
-        raise RenderError(f"source media not found: {source}")
+        raise InvalidClipError(f"source media not found: {source}")
     return source
 
 
@@ -486,7 +491,7 @@ def render_clip(
         try:
             edl = parse_edl(edl)
         except ValidationError as exc:
-            raise RenderError(f"invalid EDL: {exc}") from exc
+            raise InvalidClipError(f"invalid EDL: {exc}") from exc
     source = _resolve_source(edl, media_root)
     render_dir = (render_dir or default_render_dir()).resolve()
     entry = "src/index.ts"
@@ -525,23 +530,29 @@ def render_clip(
                 env=env,
             )
             _write_json(props_file, segment_props(edl))
-            _run(
-                runner,
-                remotion_argv(
-                    node=node,
-                    cli=cli,
-                    entry=entry,
-                    output=raw_video,
-                    props_file=props_file,
-                    public_dir=work_dir / "public",
-                    concurrency=concurrency,
+            try:
+                _run(
+                    runner,
+                    remotion_argv(
+                        node=node,
+                        cli=cli,
+                        entry=entry,
+                        output=raw_video,
+                        props_file=props_file,
+                        public_dir=work_dir / "public",
+                        concurrency=concurrency,
+                        timeout_s=timeout_s,
+                    ),
+                    step="remotion render",
                     timeout_s=timeout_s,
-                ),
-                step="remotion render",
-                timeout_s=timeout_s,
-                env=env,
-                cwd=render_dir,
-            )
+                    env=env,
+                    cwd=render_dir,
+                )
+            except RenderError as exc:
+                # validate.ts throws EdlValidationError("invalid clip props: ...").
+                if "invalid clip props" not in exc.stderr_tail:
+                    raise
+                raise InvalidClipError("Remotion rejected the clip props", exc.stderr_tail) from exc
             remotion_seconds = time.monotonic() - started  # includes the pre-cut
 
             measure = _run(

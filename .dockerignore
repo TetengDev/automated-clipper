@@ -18,3 +18,8 @@ tests
 .pytest_cache
 .ruff_cache
 .coverage
+render/node_modules
+render/out
+render/build
+render/.cache
+render/test

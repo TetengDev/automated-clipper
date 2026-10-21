@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "source": {
+    "path": "media/source.mp4",
+    "in_s": 12.5,
+    "out_s": 42.5
+  },
+  "layout": "blurred_fill",
+  "hook": {
+    "text": "Would you take the deal",
+    "style": "question"
+  },
+  "words": [],
+  "captions_enabled": false,
+  "caption_style": "bold_pop",
+  "progress_bar": true
+}

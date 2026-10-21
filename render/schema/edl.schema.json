@@ -1,0 +1,176 @@
+{
+  "$defs": {
+    "CaptionStyle": {
+      "enum": [
+        "bold_pop"
+      ],
+      "title": "CaptionStyle",
+      "type": "string"
+    },
+    "Hook": {
+      "additionalProperties": false,
+      "properties": {
+        "duration_s": {
+          "default": 2.0,
+          "description": "Seconds from clip start.",
+          "maximum": 3.0,
+          "minimum": 1.0,
+          "title": "Duration S",
+          "type": "number"
+        },
+        "style": {
+          "$ref": "#/$defs/HookStyle",
+          "default": "stakes"
+        },
+        "text": {
+          "maxLength": 120,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "Hook",
+      "type": "object"
+    },
+    "HookStyle": {
+      "enum": [
+        "stakes",
+        "question",
+        "quote"
+      ],
+      "title": "HookStyle",
+      "type": "string"
+    },
+    "Layout": {
+      "description": "Frame layout. Only blurred_fill ships in S1; face_track/split_screen come in S4b.",
+      "enum": [
+        "blurred_fill"
+      ],
+      "title": "Layout",
+      "type": "string"
+    },
+    "SourceSegment": {
+      "additionalProperties": false,
+      "properties": {
+        "in_s": {
+          "description": "Cut start, seconds in the source.",
+          "minimum": 0,
+          "title": "In S",
+          "type": "number"
+        },
+        "out_s": {
+          "description": "Cut end, seconds in the source.",
+          "exclusiveMinimum": 0,
+          "title": "Out S",
+          "type": "number"
+        },
+        "path": {
+          "description": "Source media path relative to the media root (POSIX separators).",
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.\\-/ ]{0,511}$",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "in_s",
+        "out_s"
+      ],
+      "title": "SourceSegment",
+      "type": "object"
+    },
+    "Word": {
+      "additionalProperties": false,
+      "properties": {
+        "end_s": {
+          "description": "Seconds in the source timeline.",
+          "minimum": 0,
+          "title": "End S",
+          "type": "number"
+        },
+        "start_s": {
+          "description": "Seconds in the source timeline.",
+          "minimum": 0,
+          "title": "Start S",
+          "type": "number"
+        },
+        "text": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "start_s",
+        "end_s"
+      ],
+      "title": "Word",
+      "type": "object"
+    }
+  },
+  "$id": "https://clipper.local/schema/edl.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Composition props for the Remotion `Clip` composition (1080x1920 @ 30 fps).",
+  "properties": {
+    "caption_style": {
+      "$ref": "#/$defs/CaptionStyle",
+      "default": "bold_pop"
+    },
+    "captions_enabled": {
+      "default": true,
+      "title": "Captions Enabled",
+      "type": "boolean"
+    },
+    "hook": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Hook"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "layout": {
+      "$ref": "#/$defs/Layout",
+      "default": "blurred_fill"
+    },
+    "progress_bar": {
+      "default": true,
+      "title": "Progress Bar",
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceSegment"
+    },
+    "words": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Word"
+      },
+      "maxItems": 5000,
+      "title": "Words",
+      "type": "array"
+    }
+  },
+  "required": [
+    "source"
+  ],
+  "title": "ClipEDL",
+  "type": "object"
+}

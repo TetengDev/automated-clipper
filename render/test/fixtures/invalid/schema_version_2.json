@@ -1,0 +1,59 @@
+{
+  "schema_version": 2,
+  "source": {
+    "path": "media/source.mp4",
+    "in_s": 12.5,
+    "out_s": 42.5
+  },
+  "layout": "blurred_fill",
+  "hook": {
+    "text": "He bet everything on one hand",
+    "style": "stakes",
+    "duration_s": 2.5
+  },
+  "words": [
+    {
+      "text": "I",
+      "start_s": 12.6,
+      "end_s": 12.7
+    },
+    {
+      "text": "put",
+      "start_s": 12.7,
+      "end_s": 12.9
+    },
+    {
+      "text": "it",
+      "start_s": 12.9,
+      "end_s": 13.0
+    },
+    {
+      "text": "all",
+      "start_s": 13.0,
+      "end_s": 13.3
+    },
+    {
+      "text": "in.",
+      "start_s": 13.3,
+      "end_s": 13.7
+    },
+    {
+      "text": "Every",
+      "start_s": 14.5,
+      "end_s": 14.8
+    },
+    {
+      "text": "last",
+      "start_s": 14.8,
+      "end_s": 15.1
+    },
+    {
+      "text": "chip.",
+      "start_s": 15.1,
+      "end_s": 15.6
+    }
+  ],
+  "captions_enabled": true,
+  "caption_style": "bold_pop",
+  "progress_bar": true
+}

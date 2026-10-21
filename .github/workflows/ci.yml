@@ -42,6 +42,31 @@ jobs:
       - name: Audit dependencies
         run: uv export --locked --no-dev --no-emit-project --format requirements-txt > requirements.txt && uvx --python 3.12 pip-audit --strict --require-hashes --disable-pip -r requirements.txt
 
+  node:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: render
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: render/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npx vitest run
+
   docker:
     runs-on: ubuntu-24.04
     steps:
@@ -66,3 +91,12 @@ jobs:
           docker run --rm -v "$PWD/smoke:/app/data" clipper:ci --db /app/data/state.db migrate
           docker run --rm --entrypoint yt-dlp clipper:ci --version
           docker run --rm --entrypoint ffmpeg clipper:ci -version
+          docker run --rm --entrypoint node clipper:ci --version
+          docker run --rm --read-only --tmpfs /tmp -w /app/render --entrypoint node clipper:ci node_modules/@remotion/cli/remotion-cli.js versions
+
+      - name: Render smoke test (read-only, non-root)
+        timeout-minutes: 10
+        run: >-
+          docker run --rm --read-only --tmpfs /tmp --user 10001:10001
+          --cap-drop ALL --security-opt no-new-privileges:true
+          -v "$PWD/scripts:/smoke:ro" --entrypoint python clipper:ci /smoke/render_smoke.py

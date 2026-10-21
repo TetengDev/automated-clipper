@@ -223,3 +223,39 @@ def test_current_version_on_fresh_db_does_not_write(tmp_path: Path) -> None:
     conn = connect(tmp_path / "state.db")
     assert current_version(conn) == 0
     assert "schema_version" not in _tables(conn)
+
+
+def test_export_once_migration_dedupes_existing_rows(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "dup.db")
+    first, *_rest = bundled_migrations()
+    migrate(conn, [first])
+    conn.execute(
+        "INSERT INTO jobs (id, platform, item_id, creator, source_url, status, created_at,"
+        " updated_at) VALUES (1, 'youtube', 'dQw4w9WgXcQ', 'c', 'u', 'clips_ready', 't', 't')"
+    )
+    conn.execute(
+        "INSERT INTO clips (id, job_id, rank, created_at, updated_at) VALUES (1, 1, 1, 't', 't')"
+    )
+    rows = [("export", 1), ("export", 1), ("export_failed", 1), ("export_failed", 1),
+            ("export", 2), ("export", 2)]  # fmt: skip
+    for action, version in rows:
+        conn.execute(
+            "INSERT INTO clip_reviews (clip_id, version, action, created_at) VALUES (1, ?, ?, 't')",
+            (version, action),
+        )
+
+    migrate(conn)
+
+    kept = conn.execute("SELECT id, version, action FROM clip_reviews ORDER BY id").fetchall()
+    assert [(r["id"], r["version"], r["action"]) for r in kept] == [
+        (1, 1, "export"),
+        (3, 1, "export_failed"),
+        (4, 1, "export_failed"),
+        (5, 2, "export"),
+    ]
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO clip_reviews (clip_id, version, action, created_at)"
+            " VALUES (1, 1, 'export', 't')"
+        )
+    conn.close()

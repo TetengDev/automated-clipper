@@ -54,6 +54,9 @@ ignore = ["S101"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "render: real Remotion render; skips when node/npx or render/node_modules is missing",
+]
 
 [tool.coverage.run]
 source = ["clipper"]

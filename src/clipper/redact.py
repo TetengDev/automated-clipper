@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 MASK = "REDACTED"
 
-_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+_Replacement = str | Callable[[re.Match[str]], str]
+
+_PATTERNS: tuple[tuple[re.Pattern[str], _Replacement], ...] = (
     (
         re.compile(
             r"([?&](?:key|api_key|token|access_token|client_secret|sig|signature)=)[^&#\s'\"]+",
@@ -24,6 +27,20 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"(?i)((?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}://)[^/\s:@]+:[^/\s@]+@"),
         r"\1***@",
+    ),
+    # key=value / key: value credentials in tool output (rclone, S3 errors, JSON configs).
+    # The key prefix is bounded ({0,40}) so matching stays linear on long runs of [\w-].
+    # Quoted values are masked up to the closing quote (values may contain spaces).
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])("
+            r"[\w-]{0,40}(?:secret(?:[_-]access)?(?:[_-]key)?|token|password|passwd"
+            r"|passphrase|signature|api[_-]?key)"
+            r"|access[_-]key[_-]id|pass"
+            r")(['\"]?\s*[:=]\s*)(?:(['\"])[^'\"\n]*\3|[^\s'\"&,;]+)",
+            re.IGNORECASE,
+        ),
+        lambda m: f"{m[1]}{m[2]}{m[3] or ''}{MASK}{m[3] or ''}",
     ),
 )
 

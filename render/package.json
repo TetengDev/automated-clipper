@@ -1,0 +1,33 @@
+{
+  "name": "clipper-render",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remotion templates for clipper: 1080x1920 Clip composition (hook card, animated captions, progress bar).",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "stills": "node scripts/stills.mjs",
+    "studio": "remotion studio src/index.ts"
+  },
+  "dependencies": {
+    "@fontsource/montserrat": "5.2.8",
+    "@remotion/bundler": "4.0.533",
+    "@remotion/cli": "4.0.533",
+    "@remotion/renderer": "4.0.533",
+    "ajv": "8.20.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "remotion": "4.0.533"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.0",
+    "@types/react": "19.2.18",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}

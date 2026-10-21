@@ -1,0 +1,56 @@
+name: Post-release
+
+# After a release/hotfix PR merges into main: tag it and open the main -> dev sync PR.
+# Triggered by the push to main (not pull_request), so the workflow file and the
+# SYNC_PR_TOKEN environment secret are only ever used from main's reviewed code.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  post-release:
+    runs-on: ubuntu-24.04
+    # Environment secrets are limited to the main branch (deployment branch policy).
+    environment: release-sync
+    concurrency:
+      group: post-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Tag release
+        run: |
+          head=$(gh api "repos/$GH_REPO/commits/$SHA/pulls" -q '[.[] | select(.base.ref == "main")][0].head.ref // empty') || head=""
+          if [[ "$head" =~ ^(release|hotfix)/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            tag="${BASH_REMATCH[2]}"
+            # commits/<tag> peels annotated tags; a missing tag returns 404 -> empty.
+            existing=$(gh api "repos/$GH_REPO/commits/refs/tags/$tag" -q .sha 2>/dev/null) || existing=""
+            if [ -n "$existing" ] && [ "$existing" != "$SHA" ]; then
+              echo "::error::tag $tag already points at $existing, not $SHA"; exit 1
+            fi
+            gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --target "$SHA" --generate-notes
+          else
+            echo "push to main not from a release/hotfix PR ('$head'); no tag"
+          fi
+
+      - name: Open main -> dev sync PR
+        if: ${{ !cancelled() }}
+        env:
+          # A PR opened with GITHUB_TOKEN runs no CI and needs Actions allowed to
+          # open PRs; SYNC_PR_TOKEN (fine-grained PAT: this repo, contents read +
+          # pull requests write, with an expiry) avoids both.
+          GH_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
+        run: |
+          ahead=$(gh api "repos/$GH_REPO/compare/dev...main" -q .ahead_by)
+          open=$(gh pr list --base dev --head main --state open --json number -q length)
+          if [ "$ahead" -gt 0 ] && [ "$open" -eq 0 ]; then
+            gh pr create --base dev --head main --title "chore: sync main into dev" \
+              --body "Post-release sync of main (${SHA}) into dev. Merge with a **merge commit** (not squash or rebase) so dev keeps main's history."
+          fi

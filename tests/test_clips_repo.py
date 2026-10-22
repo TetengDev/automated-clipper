@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
@@ -108,3 +109,22 @@ def test_each_version_keeps_its_own_files(conn: sqlite3.Connection, tmp_path: Pa
         (1, "v1.mp4", "v1.jpg"),
         (2, "v2.mp4", "v2.jpg"),
     ]
+
+
+def test_rendered_duration_is_stored_apart_from_the_source_range(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """With jump cuts the video (38 s) is shorter than its source range (45 s)."""
+    from clipper import clips
+
+    result = dataclasses.replace(_result(tmp_path), duration_s=38.0)
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=parse_edl(EDL_DATA), result=result, start_s=100.0,
+        end_s=145.0,
+    )  # fmt: skip
+    detail = clips.get_clip(conn, ref.clip_id)
+    assert detail is not None
+    (version,) = detail.versions
+    assert (version.start_s, version.end_s, version.duration_s) == (100.0, 145.0, 38.0)
+    (card,) = clips.list_queue(conn, clips.QueueFilter())
+    assert card.duration_s == 38.0

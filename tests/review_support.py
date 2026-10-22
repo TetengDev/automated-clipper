@@ -146,6 +146,7 @@ class Env:
         caption: str | None = "Watch this",
         hashtags: list[str] | None = None,
         versions: int = 1,
+        duration_s: float | None = None,
     ) -> int:
         job = job_id if job_id is not None else self.job()
         rank = self.conn.execute(
@@ -177,6 +178,10 @@ class Env:
                     "select-v3",
                     created_at,
                 ),
+            )
+        if duration_s is not None:  # the rendered length (jump cuts make it < end - start)
+            self.conn.execute(
+                "UPDATE clip_versions SET duration_s = ? WHERE clip_id = ?", (duration_s, clip_id)
             )
         return clip_id
 

@@ -75,7 +75,8 @@ def test_breath_is_longer_after_a_sentence_and_a_long_pause(
 
 
 def test_stutter_cuts_the_first_occurrence() -> None:
-    words = [w("I", 0.0, 0.2), w("i,", 0.4, 0.6), w("think", 0.6, 1.0)]
+    """ "I- I think": the first "I" is cut short, the mark of a stutter."""
+    words = [w("I-", 0.0, 0.1), w("i,", 0.4, 0.6), w("think", 0.6, 1.0)]
     (c,) = jc.stutter_cuts(words)
     assert (c.in_s, c.out_s, c.kind, c.applied) == (0.0, 0.4, "stutter", True)
     assert 0 < c.confidence <= 1
@@ -157,7 +158,7 @@ def test_tagalog_stop_words_do_not_make_a_retake() -> None:
 
 
 def _mixed() -> list[Word]:
-    words = [w("I", 0.0, 0.2), w("I", 0.35, 0.5), w("know", 0.5, 0.8)]
+    words = [w("I-", 0.0, 0.08), w("I", 0.35, 0.5), w("know", 0.5, 0.8)]
     words += [w("um", 1.6, 1.8), w("right", 2.6, 3.0)]  # filler between two long gaps
     return words
 
@@ -381,3 +382,104 @@ def test_retakes_are_only_looked_for_nearby() -> None:
     first = _phrase("the boss fight in this game was honestly brutal", 0.0)
     second = _phrase("the boss fight in this game was honestly insane", 100.0)
     assert jc.retake_candidates(first + second) == []
+
+
+# --- review pass 1 ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pair",
+    ["araw araw", "isa isa", "dahan dahan", "gabi gabi", "no no", "very very", "bye bye"],
+)
+def test_intended_repetition_is_not_a_stutter(pair: str) -> None:
+    a, b = pair.split()
+    # Even when the first is said a little shorter, these words are never stutters.
+    assert jc.stutter_cuts([w(a, 0.0, 0.2), w(b, 0.3, 0.6)]) == []
+
+
+def test_repeat_said_at_full_length_is_not_a_stutter() -> None:
+    """Emphasis ("go go") has both words at full length; a stutter cuts the first short."""
+    assert jc.stutter_cuts([w("go", 0.0, 0.25), w("go", 0.35, 0.6)]) == []
+
+
+def test_phrases_with_one_start_time_never_make_an_empty_cut() -> None:
+    """A Whisper glitch: two words with one start time used to give a retake of zero
+    length, which the Cut model rejects (and that failed the whole stage)."""
+    words = [w("kamote", 5.0, 5.2), w("kamote", 5.0, 30.0)]
+    for mode in ("silences", "full"):
+        planned = jc.plan_cuts(words, EVERYWHERE, mode)  # type: ignore[arg-type]
+        assert all(c.out_s > c.in_s for c in planned)
+
+
+def test_crop_join_keys_sit_exactly_on_the_join_frame() -> None:
+    """Join keys at exactly from/FPS, the time FaceTrack looks up for a segment's first
+    frame; summed float differences drifted past it."""
+    import random
+
+    rng = random.Random(73)  # noqa: S311 - test data, seeded
+    keys = [(0.0, 0.2), (200.0, 0.8)]
+    for _ in range(500):
+        f, spans = rng.randint(0, 90), []
+        for _ in range(rng.randint(2, 12)):
+            start = f + rng.randint(0, 40)
+            f = start + rng.randint(9, 120)
+            spans.append((start / FPS, f / FPS))
+        out = jc.crop_on_output(keys, spans, origin=spans[0][0])
+        times = [t for t, _ in out]
+        joins = [sum(round((b - a) * FPS) for a, b in spans[: i + 1]) for i in range(len(spans))]
+        for frame in joins[:-1]:
+            assert times.count(frame / FPS) == 2, (spans, frame)
+        assert times[-1] == joins[-1] / FPS
+        assert times == sorted(times)
+
+
+def test_merged_back_cuts_are_not_applied() -> None:
+    """A cut merged back (its sliver segment under 0.3 s) is recorded as not applied."""
+    silence = cut(2.0, 5.0)
+    stutter = Cut(in_s=5.2, out_s=5.6, kind="stutter", confidence=0.9, reason="r", applied=True)
+    proposal = cut(6.0, 7.0, applied=False, kind="retake")
+    settled, segments = jc.cut_clip((0.0, 10.0), [silence, stutter, proposal])
+    assert segments == [(0.0, 2.0), (5.0, 10.0)]
+    assert [(c.kind, c.applied) for c in settled] == [
+        ("silence", True),
+        ("stutter", False),
+        ("retake", False),
+    ]
+
+
+def test_all_merged_back_means_nothing_applied() -> None:
+    settled, segments = jc.cut_clip((0.0, 10.0), [cut(0.1, 3.0)])
+    assert segments == [(0.0, 10.0)]
+    assert [c.applied for c in settled] == [False]
+
+
+def test_cuts_never_take_a_clip_below_the_minimum() -> None:
+    """Least confident cuts go first (then the shortest) until the clip is long enough."""
+    cuts = [
+        Cut(in_s=2.0, out_s=3.0, kind="silence", confidence=1.0, reason="r", applied=True),
+        Cut(in_s=5.0, out_s=6.0, kind="filler", confidence=0.8, reason="r", applied=True),
+        Cut(in_s=8.0, out_s=8.5, kind="silence", confidence=1.0, reason="r", applied=True),
+        Cut(in_s=11.0, out_s=13.0, kind="silence", confidence=1.0, reason="r", applied=True),
+    ]
+    settled, segments = jc.cut_clip((0.0, 20.0), cuts, min_s=17.5)
+    # 4.5 s of cuts leave 15.5 s. Back go the filler (lowest confidence), then the
+    # silences shortest first (0.5 s, 1 s): 18 s, and the 2 s silence stays cut.
+    assert [c.applied for c in settled] == [False, False, False, True]
+    assert sum(b - a for a, b in segments) == pytest.approx(18.0)
+
+
+def test_min_that_no_cut_can_meet_keeps_the_clip_whole() -> None:
+    settled, segments = jc.cut_clip((0.0, 10.0), [cut(2.0, 3.0)], min_s=12.0)
+    assert segments == [(0.0, 10.0)] and not settled[0].applied
+
+
+def test_silencedetect_lines_must_be_whole_metadata_lines() -> None:
+    noisy = (
+        "frame:1 pts:0 pts_time:0\n"
+        "lavfi.silence_start=1.0\n"
+        "comment=lavfi.silence_end=1.2\n"  # injected inside another value
+        "lavfi.silence_end=1.5 lavfi.silence_start=9\n"  # not a whole line
+        "xlavfi.silence_start=2\n"
+        "lavfi.silence_end=3.0\n"
+    )
+    assert jc.parse_silencedetect(noisy) == [[1.0, 3.0]]

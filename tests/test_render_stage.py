@@ -879,8 +879,8 @@ def _gap_words() -> list[dict[str, Any]]:
     ]
 
 
-def _mode(mode: str) -> AppConfig:
-    return AppConfig(settings=Settings(jump_cuts=mode))  # type: ignore[arg-type]
+def _mode(mode: str, **settings: Any) -> AppConfig:
+    return AppConfig(settings=Settings(jump_cuts=mode, **settings))  # type: ignore[arg-type]
 
 
 def _render_mode(
@@ -890,12 +890,15 @@ def _render_mode(
     mode: str,
     video: str,
     words: list[dict[str, Any]],
+    end: float = 40.0,
+    **settings: Any,
 ) -> EDL:
     media = root / video
     media.mkdir(parents=True)
     job, _ = enqueue(conn, SourceRef("youtube", video), T0, creator="manual")
-    _setup(media, [_highlight(1, 10.0, 40.0)], words=words)
-    rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=_mode(mode)))
+    _setup(media, [_highlight(1, 10.0, end)], words=words)
+    config = _mode(mode, **settings)
+    rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
     return fake.calls[-1]["edl"]
 
 
@@ -989,7 +992,7 @@ def test_full_mode_cuts_stutters_even_when_silencedetect_fails(
 ) -> None:
     silences.append(None)  # detection failed: no silence cuts (fail open)
     words = _gap_words()
-    words[29] = {"word": " again", "start": 29.8, "end": 30.1}  # "again again": a stutter
+    words[29] = {"word": " again", "start": 29.8, "end": 29.95}  # "again- again": a stutter
     words[30] = {"word": " again", "start": 30.2, "end": 30.5}
     edl = _render_mode(conn, tmp_path, fake, "full", "aaaaaaaaaaa", words)
     assert {c.kind for c in edl.cuts if c.applied} == {"stutter"}
@@ -1041,3 +1044,57 @@ def test_face_track_keys_follow_the_output_timeline(
     assert edl.crop[-1].t_s <= edl.duration_s + 1e-6
     times = [k.t_s for k in edl.crop]
     assert times == sorted(times)
+
+
+# --- review pass 1 -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["silences", "full"])
+def test_words_with_one_start_time_still_render(
+    conn: sqlite3.Connection, tmp_path: Path, fake: FakeRender, mode: str
+) -> None:
+    """A Whisper glitch (two phrases starting together) once failed the whole stage."""
+    words = [
+        {"word": " kamote", "start": 13.0, "end": 13.2},
+        {"word": " kamote", "start": 13.0, "end": 38.0},
+    ]
+    edl = _render_mode(conn, tmp_path, fake, mode, "aaaaaaaaaaa", words)
+    assert all(c.out_s > c.in_s for c in edl.cuts)
+    assert len(_rows(conn)) == 1
+
+
+def test_any_jump_cut_error_keeps_the_clip_whole(
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def boom(*a: Any, **kw: Any) -> Any:
+        raise ValueError("bad cut")
+
+    monkeypatch.setattr(rc, "plan_cuts", boom)
+    edl = _render_mode(conn, tmp_path, fake, "silences", "aaaaaaaaaaa", _gap_words())
+    assert (edl.segments, edl.cuts) == (None, ())
+    assert "jump cuts rejected" in caplog.text
+    assert len(_rows(conn)) == 1
+
+
+def test_jump_cuts_keep_the_creator_minimum(
+    conn: sqlite3.Connection, tmp_path: Path, fake: FakeRender, silences: FakeSilences
+) -> None:
+    """A clip near clip_min_seconds keeps enough of its pauses to stay at or above it."""
+    silences.append((0.0, 1000.0))
+    words = [
+        {"word": f" w{k}", "start": 10.0 + 1.5 * k, "end": 10.4 + 1.5 * k} for k in range(14)
+    ]  # 1.1 s pauses: about 12.5 s of cuts in a 20 s clip
+    edl = _render_mode(
+        conn, tmp_path, fake, "silences", "aaaaaaaaaaa", words, end=31.0,
+        clip_min_seconds=15, clip_max_seconds=60,
+    )  # fmt: skip
+    span = edl.source.out_s - edl.source.in_s
+    assert edl.segments is not None
+    assert 15.0 <= edl.duration_s < span
+    applied = [c for c in edl.cuts if c.applied]
+    assert 0 < len(applied) < 13
+    assert len(edl.segments) == len(applied) + 1

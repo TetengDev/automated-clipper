@@ -198,3 +198,10 @@ def test_empty_state_reflects_filters(
 
     assert text in html
     assert card_ids(html) == []
+
+
+def test_card_shows_the_rendered_duration(client: TestClient, env: Env) -> None:
+    """Jump cuts: a 45 s source range rendered to 38 s shows 38 s."""
+    env.clip(start_s=125.0, end_s=170.0, duration_s=38.0)
+    html = client.get("/queue").text
+    assert "· 38s ·" in html and "45s" not in html

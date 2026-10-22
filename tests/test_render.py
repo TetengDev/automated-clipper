@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -460,6 +461,65 @@ def test_precut_covers_the_whole_span_of_segments(
     sidecar = json.loads(result.sidecar_path.read_text())
     assert sidecar["duration_in_frames"] == 120
     assert sidecar["edl"]["segments"] == data["segments"]
+
+
+def test_finalize_fades_the_audio_at_each_join() -> None:
+    argv = render.finalize_argv("ffmpeg", Path("in.mp4"), Path("out.mp4"), None, joins=(2.0, 4.5))
+    chain = argv[argv.index("-af") + 1]
+    assert chain.startswith("asetnsamples=n=48:p=0,volume=")
+    assert "eval=frame" in chain
+    assert "2.000000" in chain and "4.500000" in chain
+    # No joins, no fade: the v1 command is unchanged.
+    assert "-af" not in render.finalize_argv("ffmpeg", Path("i"), Path("o"), None)
+
+
+def test_render_passes_the_output_join_times_to_finalize(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    data = {
+        **EDL_DATA,
+        "source": {"path": "media/source.mp4", "in_s": 1.0, "out_s": 6.0},
+        "segments": [{"in_s": 1.0, "out_s": 3.0}, {"in_s": 4.0, "out_s": 6.0}],
+        "hook": None,
+    }
+    runner = FakeRunner()
+    render_clip(data, media_root, tmp_path / "out", runner=runner, render_dir=render_dir)
+    finalize = next(c["argv"] for c in runner.calls if FakeRunner.step(c["argv"]) == "finalize")
+    chain = finalize[finalize.index("-af") + 1]
+    assert "2.000000" in chain and "loudnorm=" in chain
+    assert chain.index("volume=") < chain.index("loudnorm=")
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_join_fade_dips_the_audio_to_silence(tmp_path: Path) -> None:
+    """A real sample-level fade: near-silent at the join, untouched 50 ms away."""
+    src, dst = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+            "-c:v", "libx264", "-c:a", "pcm_s16le", "-f", "mov", str(src),
+        ],
+        check=True, capture_output=True, timeout=60,
+    )  # fmt: skip
+    argv = render.finalize_argv("ffmpeg", src, dst, None, joins=(0.5,))
+    argv[argv.index("-c:a") + 1 : argv.index("-c:a") + 3] = ["pcm_s16le", "-ar"]
+    argv = [a for a in argv if a not in ("-b:a", render.AUDIO_BITRATE)]
+    argv[argv.index("-f") + 1] = "mov"
+    subprocess.run(argv, check=True, capture_output=True, timeout=60)  # noqa: S603
+    pcm = subprocess.run(  # noqa: S603
+        ["ffmpeg", "-v", "error", "-i", str(dst), "-f", "s16le", "-ac", "1", "-"],  # noqa: S607
+        check=True, capture_output=True, timeout=60,
+    ).stdout  # fmt: skip
+    samples = memoryview(pcm).cast("h")
+
+    def peak(t: float) -> int:
+        i = int(t * 48000)
+        return max(abs(x) for x in samples[i - 24 : i + 24])
+
+    assert peak(0.5) < 0.1 * peak(0.3)
+    assert peak(0.56) > 0.9 * peak(0.3)
 
 
 def test_thumbnail_failure_publishes_nothing(

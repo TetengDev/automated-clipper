@@ -19,6 +19,7 @@ x-clipper: &clipper
     CLIPPER_DB: /app/data/state.db
   volumes:
     - ./config:/app/config:ro
+    # data/models holds the faster-whisper model cache (downloaded once, kept across restarts).
     - ./data:/app/data
     - ./output:/app/output
   user: "10001:10001"

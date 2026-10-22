@@ -1,7 +1,8 @@
 """TRANSCRIBING stage (CLP-14): audio_16k.flac -> transcript.json with word timestamps.
 
 The audio is cut into overlapping chunks (each well under Groq's 25 MB upload limit),
-transcribed concurrently through a `Transcriber`, then stitched back into one timeline:
+transcribed concurrently through a `Transcriber` (local faster-whisper by default, CLP-35;
+Groq when `transcriber: groq`), then stitched back into one timeline:
 timestamps are offset by the chunk start, the overlap is split at its midpoint so each
 word is kept from exactly one chunk, and word starts are forced to be non-decreasing.
 
@@ -25,9 +26,11 @@ import shutil
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -41,7 +44,7 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from clipper.config import MissingSecretError, Secrets
+from clipper.config import MissingSecretError, Secrets, Settings
 from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
 from clipper.pipeline.common import (
@@ -50,11 +53,13 @@ from clipper.pipeline.common import (
     Deadline,
     MediaError,
     NoDuration,
+    StageTimeout,
     creator_for,
     ffprobe_duration,
     read_json,
     reserve_spend,
     run_media,
+    settings_for,
     write_json_atomic,
 )
 from clipper.redact import redact
@@ -88,6 +93,16 @@ GROQ_USD_PER_HOUR = {"whisper-large-v3": 0.111, "whisper-large-v3-turbo": 0.04}
 GROQ_MIN_BILLED_SECONDS = 10.0
 GROQ_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_RETRY_AFTER_SECONDS = 60.0
+
+MODELS_DIR = Path("data/models")
+"""faster-whisper model cache (relative to the working dir: /app/data/models, the data
+volume, in compose), so models are downloaded once and survive container restarts."""
+# Hallucination guards (Whisper's own thresholds): silence the model talked over, and
+# repetition loops. Words outside the Latin script are dropped for these languages.
+NO_SPEECH_PROB = 0.6
+LOW_AVG_LOGPROB = -1.0
+MAX_COMPRESSION_RATIO = 2.4
+LATIN_LANGUAGES = frozenset({"en", "tl"})
 
 # verbose_json reports the language by name; transcript.json uses ISO-639-1 codes.
 _LANGUAGE_CODES = {
@@ -161,7 +176,7 @@ class Transcript:
 
 
 class Transcriber(Protocol):
-    """Speech-to-text backend. A local faster-whisper fallback (CLP-35) implements this too."""
+    """Speech-to-text backend: `GroqTranscriber` or `FasterWhisperTranscriber` (CLP-35)."""
 
     provider: str
     model: str
@@ -346,6 +361,97 @@ def normalize_language(value: str) -> str:
     return code if _LANGUAGE_CODE.fullmatch(code) else "unknown"
 
 
+# --------------------------------------------------------------------------- local whisper
+
+
+def keep_segment(no_speech_prob: float, avg_logprob: float, compression_ratio: float) -> bool:
+    """False for a likely hallucination: speech "heard" in silence, or a repetition loop."""
+    if no_speech_prob > NO_SPEECH_PROB and avg_logprob < LOW_AVG_LOGPROB:
+        return False
+    return compression_ratio <= MAX_COMPRESSION_RATIO
+
+
+def latin_word(word: str) -> bool:
+    """Every letter is Latin script (diacritics like ñ/é included); digits and punctuation
+    pass. Whisper sometimes "translates" Taglish into CJK/Cyrillic fragments."""
+    return all(not ch.isalpha() or unicodedata.name(ch, "").startswith("LATIN") for ch in word)
+
+
+def _whisper_model_class() -> Any:
+    """Imported lazily: the module (and the Groq path) work without faster-whisper."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        raise PermanentError("faster-whisper is not installed; set transcriber: groq") from None
+    return WhisperModel
+
+
+@dataclass
+class FasterWhisperTranscriber:
+    """Local faster-whisper (CTranslate2) on CPU. The model is loaded on the first chunk and
+    reused by every later one; `default_transcriber` reuses the instance per process."""
+
+    model: str = "large-v3-turbo"
+    compute_type: str = "int8"
+    download_root: Path = MODELS_DIR
+    cpu_threads: int = field(default_factory=lambda: os.cpu_count() or 0)
+    provider: str = "local"
+    _model: Any = field(default=None, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def billed_seconds(self, chunk_seconds: Sequence[float]) -> float:
+        return float(sum(chunk_seconds))
+
+    def cost_usd(self, chunk_seconds: Sequence[float]) -> float:
+        return 0.0
+
+    def load(self) -> Any:
+        """The WhisperModel, created (and downloaded if needed) on first use."""
+        with self._lock:
+            if self._model is None:
+                self._model = _whisper_model_class()(
+                    self.model,
+                    device="cpu",
+                    compute_type=self.compute_type,
+                    download_root=str(self.download_root),
+                    cpu_threads=self.cpu_threads,
+                )
+            return self._model
+
+    def transcribe(
+        self, audio: Path, *, language: str | None, timeout_s: float | None = None
+    ) -> ChunkTranscript:
+        started = time.monotonic()
+        segments, info = self.load().transcribe(
+            str(audio),
+            language=language,
+            word_timestamps=True,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+        latin_only = language in LATIN_LANGUAGES
+        words: list[Word] = []
+        kept: list[Segment] = []
+        for s in segments:  # lazy: decoding happens while iterating
+            if timeout_s is not None and time.monotonic() - started > timeout_s:
+                raise StageTimeout(f"local transcription exceeded {timeout_s:.0f} s")
+            if not keep_segment(s.no_speech_prob, s.avg_logprob, s.compression_ratio):
+                continue
+            raw = [
+                w
+                for w in s.words or ()
+                if w.word.strip() and (not latin_only or latin_word(w.word))
+            ]
+            text = "".join(w.word for w in raw).strip()  # Whisper's own spacing
+            if text:
+                words.extend(Word(w.word.strip(), float(w.start), float(w.end)) for w in raw)
+                kept.append(Segment(float(s.start), float(s.end), text))
+        detected = normalize_language(info.language) if info.language else "unknown"
+        return ChunkTranscript(
+            None if detected == "unknown" else detected, tuple(words), tuple(kept)
+        )
+
+
 # --------------------------------------------------------------------------- chunking
 
 
@@ -528,7 +634,15 @@ def creator_language(job: Job, ctx: StageContext) -> str | None:
     return creator.language if creator else None
 
 
-def default_transcriber() -> Transcriber:
+@cache
+def _local_transcriber(model: str, compute_type: str) -> FasterWhisperTranscriber:
+    return FasterWhisperTranscriber(model=model, compute_type=compute_type)
+
+
+def default_transcriber(settings: Settings) -> Transcriber:
+    """The configured backend; GROQ_API_KEY is needed only for `transcriber: groq`."""
+    if settings.transcriber == "local":
+        return _local_transcriber(settings.whisper_model, settings.whisper_compute_type)
     try:
         key = Secrets().require("GROQ_API_KEY")
     except MissingSecretError as exc:
@@ -553,7 +667,9 @@ def transcribe(
     if not chunks:
         raise PermanentError(f"{AUDIO_FILE} has no audio")
 
-    backend = transcriber if transcriber is not None else default_transcriber()
+    if transcriber is None:
+        transcriber = default_transcriber(settings_for(job, ctx.config))
+    backend = transcriber
     language = creator_language(job, ctx)
     fingerprint = audio_fingerprint(audio)
     deadline = Deadline()

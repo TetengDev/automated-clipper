@@ -28,7 +28,8 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 `/srv/clipper/.env` exists only on the server and is never committed. It holds:
 
 - `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`
-- `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `PEXELS_API_KEY`, `PIXABAY_API_KEY`
+- `ANTHROPIC_API_KEY`, `PEXELS_API_KEY`, `PIXABAY_API_KEY`
+- `GROQ_API_KEY`, only with `transcriber: groq` (transcription runs locally with faster-whisper by default; models are cached in `data/models/`)
 - `DISCORD_WEBHOOK_URL`, `DISCORD_ALERTS_WEBHOOK_URL`, `HEALTHCHECK_URL_*`
 - `REVIEW_PASSWORD_HASH`, `SESSION_SECRET`, `RCLONE_REMOTE`
 - the restic credentials

@@ -28,6 +28,9 @@ MIN_SESSION_SECRET_LENGTH = 32
 # Letters/digits first; then letters, digits, space and a few punctuation marks. No path
 # separators, no leading dot/dash, no control characters.
 CREATOR_NAME_PATTERN = r"^\w[\w .'&()-]{0,99}$"
+# A faster-whisper model *name* (tiny, base.en, large-v3-turbo, distil-large-v3): no '/',
+# ':' or leading dot, so it can never be a local path or a URL / Hub repo id.
+WHISPER_MODEL_PATTERN = r"^[a-z0-9][a-z0-9.-]{0,39}$"
 _RCLONE_REMOTE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*:\S*$")
 
 
@@ -60,6 +63,9 @@ class Settings(_Strict):
     disk_budget_gb: int = Field(150, ge=1)
     media_retention_hours: int = Field(48, ge=1)
     review_expiry_days: int = Field(7, ge=1)
+    transcriber: Literal["local", "groq"] = "local"
+    whisper_model: str = Field("large-v3-turbo", pattern=WHISPER_MODEL_PATTERN)
+    whisper_compute_type: Literal["int8", "int8_float16", "float16", "float32"] = "int8"
 
     @model_validator(mode="after")
     def _clip_range(self) -> Settings:
@@ -78,6 +84,8 @@ class CreatorOverrides(_Strict):
     max_clips_per_source: int | None = Field(None, ge=1)
     max_clips_per_stream: int | None = Field(None, ge=1)
     max_source_hours_per_day: float | None = Field(None, gt=0)
+    transcriber: Literal["local", "groq"] | None = None
+    whisper_model: str | None = Field(None, pattern=WHISPER_MODEL_PATTERN)
 
 
 class YouTubeChannel(_Strict):

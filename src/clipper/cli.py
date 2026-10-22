@@ -374,6 +374,55 @@ def enqueue(
         typer.echo(f"already queued: job {job.id} ({job.status})")
 
 
+@app.command("bench-transcribe")
+def bench_transcribe(
+    audio: Annotated[
+        Path, typer.Argument(exists=True, dir_okay=False, readable=True, help="Audio file.")
+    ],
+    models: Annotated[
+        str, typer.Option(help="Comma-separated faster-whisper model names.")
+    ] = "large-v3-turbo,large-v3",
+    compute_type: Annotated[str, typer.Option(help="int8, int8_float16, float16, float32.")] = (
+        "int8"
+    ),
+    language: Annotated[
+        str | None, typer.Option(help="Language code (e.g. tl); default: auto-detect.")
+    ] = None,
+) -> None:
+    """Compare local Whisper models: real-time factor and a transcript preview each."""
+    import time
+
+    from clipper.config import Settings
+    from clipper.jobs import PermanentError
+    from clipper.pipeline import transcribe as tr
+    from clipper.pipeline.common import MediaError
+
+    try:
+        settings = [
+            Settings(whisper_model=m.strip(), whisper_compute_type=compute_type)
+            for m in models.split(",")
+        ]
+    except ValidationError:
+        _fail(f"invalid model or compute type: {models!r} / {compute_type!r}")
+    if language is not None and not re.fullmatch(r"[a-z]{2,3}", language):
+        _fail(f"invalid language code: {language!r}")
+    try:
+        duration = tr.probe_duration(audio)
+        for s in settings:
+            backend = tr.FasterWhisperTranscriber(
+                model=s.whisper_model, compute_type=s.whisper_compute_type
+            )
+            backend.load()  # download/load outside the timed run
+            started = time.monotonic()
+            result = backend.transcribe(audio, language=language)
+            rtf = (time.monotonic() - started) / duration
+            text = " ".join(seg.text for seg in result.segments)
+            typer.echo(f"{s.whisper_model}  rtf={rtf:.3f}  words={len(result.words)}")
+            typer.echo(f"  {text[:300]}")
+    except (PermanentError, MediaError) as exc:
+        _fail(f"bench-transcribe: {exc}")
+
+
 @app.command("resolve")
 def resolve() -> None:
     """Resolve creator handles to stable channel / user IDs."""

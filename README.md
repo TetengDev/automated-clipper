@@ -18,6 +18,12 @@ uv run pytest                     # tests
 docker compose build              # image with ffmpeg + yt-dlp
 ```
 
+Transcription runs locally with faster-whisper by default (`transcriber: local`,
+`whisper_model: large-v3-turbo` in `config/creators.yaml`, also per creator). The model is
+downloaded once into `data/models/`. `GROQ_API_KEY` is needed only with `transcriber: groq`.
+Compare models on a sample with `uv run clipper bench-transcribe audio.flac --models
+large-v3-turbo,large-v3`.
+
 ## Adding a creator
 
 1. Add an entry to `config/creators.yaml`.

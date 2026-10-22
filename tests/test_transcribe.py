@@ -926,7 +926,8 @@ def test_stage_uses_creator_transcriber_override(
     groq_ctx = StageContext(ctx.media_dir, ctx.conn, config, clock=ctx.clock)
     with pytest.raises(PermanentError, match="GROQ_API_KEY is not set"):
         tr.transcribe(make_job(ctx.conn), groq_ctx)
-    tr.transcribe(make_job(ctx.conn, creator="MrBeast"), groq_ctx)  # still local
+    other, _ = enqueue(ctx.conn, SourceRef("youtube", "aaaaaaaaaaa"), T0, creator="MrBeast")
+    tr.transcribe(other, groq_ctx)  # no override: still local
     assert fake_whisper.instances
 
 

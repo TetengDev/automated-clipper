@@ -298,3 +298,12 @@ def test_bench_transcribe_rejects_unsafe_model_names(tmp_path: Path, models: str
 def test_bench_transcribe_needs_existing_audio(tmp_path: Path) -> None:
     result = runner.invoke(app, ["bench-transcribe", str(tmp_path / "missing.flac")])
     assert result.exit_code != 0
+
+
+def test_bench_transcribe_rejects_bad_language_and_unreadable_audio(tmp_path: Path) -> None:
+    audio = tmp_path / "a.flac"
+    audio.write_bytes(b"not audio")
+    bad_lang = runner.invoke(app, ["bench-transcribe", str(audio), "--language", "../x"])
+    assert bad_lang.exit_code != 0 and "invalid language" in bad_lang.output
+    unreadable = runner.invoke(app, ["bench-transcribe", str(audio), "--models", "tiny"])
+    assert unreadable.exit_code == 1 and "bench-transcribe:" in unreadable.output

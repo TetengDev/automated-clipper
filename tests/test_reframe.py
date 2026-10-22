@@ -153,6 +153,25 @@ def test_noisy_two_shot_with_dropouts_barely_crosses() -> None:
     assert sum(a != b for a, b in zip(sides, sides[1:], strict=False)) <= 1
 
 
+def test_missed_speaker_is_not_replaced_by_a_small_face_in_the_gate() -> None:
+    # Speakers at 0.3 (locked) and 0.8, a small background face at 0.42 inside the gate;
+    # the 0.3 speaker is missed once. The lock must not detour to 0.42 and then switch
+    # to 0.8 for good.
+    bg = (0.42, 0.004)
+    samples = [
+        (i / 5, [f for f in [(0.3, 0.0105), (0.8, 0.01), bg] if i != 40 or f[0] != 0.3])
+        for i in range(150)
+    ]
+    assert {x for _, x in rf.face_targets(samples, [], HALF)} == {0.3}
+
+
+def test_single_miss_with_only_a_small_face_nearby_holds() -> None:
+    samples = [
+        (i / 5, [(0.3, 0.01), (0.42, 0.004)] if i != 40 else [(0.42, 0.004)]) for i in range(100)
+    ]
+    assert [x for _, x in rf.face_targets(samples, [], HALF)] == [0.3] * 100
+
+
 def test_lock_moves_when_the_face_really_leaves() -> None:
     samples = [(i / 5, TWO) for i in range(10)]
     samples += [(2.0 + i / 5, [(0.7, 0.009)]) for i in range(10)]

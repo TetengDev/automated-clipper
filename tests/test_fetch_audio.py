@@ -389,6 +389,18 @@ def test_parse_ebur128_and_peaks() -> None:
     assert loudness_peaks([]) == []
 
 
+def test_heatmap_is_clamped_to_what_select_accepts() -> None:
+    raw = [
+        {"start_time": -2, "end_time": 5, "value": 1.3},
+        {"start_time": 5, "end_time": 10, "value": -0.1},
+        {"start_time": 10, "end_time": 15, "value": float("nan")},
+    ]
+    assert fa._heatmap(raw) == [
+        {"start_s": 0.0, "end_s": 5.0, "value": 1.0},
+        {"start_s": 5.0, "end_s": 10.0, "value": 0.0},
+    ]
+
+
 # --- worker integration: outcome recorded on the job -------------------------------------
 
 

@@ -7,8 +7,10 @@ from pydantic import ValidationError
 
 from clipper.config import (
     ConfigError,
+    CreatorOverrides,
     MissingSecretError,
     Secrets,
+    Settings,
     load_config,
 )
 
@@ -187,3 +189,11 @@ def test_rclone_remote_validated(monkeypatch: pytest.MonkeyPatch, remote: str) -
 def test_rclone_remote_valid(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RCLONE_REMOTE", "gdrive:clips/ready")
     assert Secrets().rclone_remote == "gdrive:clips/ready"
+
+
+def test_max_llm_windows_must_be_positive() -> None:
+    assert Settings().max_llm_windows == 8
+    with pytest.raises(ValidationError):
+        Settings(max_llm_windows=0)
+    with pytest.raises(ValidationError):
+        CreatorOverrides(max_llm_windows=0)

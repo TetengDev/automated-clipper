@@ -13,6 +13,7 @@ settings:
   max_clips_per_stream: 10
   max_source_hours_per_day: 24
   daily_llm_usd_cap: 10.0
+  max_llm_windows: 8             # long sources: only the most engaging windows go to Claude
   daily_transcribe_usd_cap: 5.0
   disk_budget_gb: 150
   media_retention_hours: 48

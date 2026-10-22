@@ -4,6 +4,7 @@ replays recorded-style responses from tests/fixtures/anthropic/."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -1121,7 +1122,7 @@ def test_output_schema_has_payoff_open_question_and_sensitive():
 
 
 @pytest.mark.parametrize("payoff", [9.9, 30.1, -1.0])
-def test_candidate_rejects_payoff_outside_the_clip(payoff):
+def test_candidate_model_rejects_payoff_outside_the_clip(payoff):
     base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
     with pytest.raises(ValueError):
         Candidate(start_s=10, end_s=30, payoff_s=payoff, **base)
@@ -1136,18 +1137,72 @@ def test_open_question_is_limited_and_sanitized():
     assert "\x00" not in c.open_question
 
 
-def test_payoff_outside_clip_goes_through_the_retry_path(conn, media):
-    bad = (200, _message([_cand(30.1, 60.6, payoff_s=90.0, open_question="", sensitive=False)]))
-    fake = FakeAnthropic(bad, "valid.json")
+@pytest.mark.parametrize("payoff", [0.0, 70.0])
+def test_payoff_outside_its_clip_drops_only_that_candidate(conn, media, caplog, payoff):
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    reply = _message(
+        [
+            _cand(30.1, 60.6, hook="bad", payoff_s=payoff, open_question="", sensitive=False),
+            _cand(200.1, 235.6, hook="good", payoff_s=210.0, open_question="", sensitive=False),
+        ]
+    )
+    fake = FakeAnthropic((200, reply))  # a retry call would fail: nothing else is queued
     out = run(make_job(conn), make_ctx(conn, media), fake)
-    assert len(fake.requests) == 2
-    assert len(out["clips"]) == 3
+    assert len(fake.requests) == 1
+    assert [c["hook"] for c in out["clips"]] == ["good"]
+    assert "payoff_s" in caplog.text and "30.1" in caplog.text
 
 
-def test_payoff_outside_clip_twice_is_invalid_output(conn, media):
-    bad = (200, _message([_cand(30.1, 60.6, payoff_s=10.0, open_question="", sensitive=False)]))
-    with pytest.raises(InvalidModelOutput):
-        run(make_job(conn), make_ctx(conn, media), FakeAnthropic(bad, bad))
+def test_malformed_reply_still_goes_through_the_retry_path(conn, media):
+    fake = FakeAnthropic("invalid.json", "valid.json")
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 2 and len(out["clips"]) == 3
+
+
+def test_payoff_cut_off_by_the_length_clamp_drops_the_candidate(caplog):
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(300)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    cut_off = Candidate(start_s=100.0, end_s=200.0, payoff_s=190.0, **base)
+    assert select.finalize([cut_off], words, Settings(), 3) == []
+    assert "payoff" in caplog.text
+
+
+def test_payoff_nudged_by_snapping_is_clamped_not_dropped():
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(300)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    edge = Candidate(start_s=100.0, end_s=130.0, payoff_s=100.0, **base)
+    (clip,) = select.finalize([edge], words, Settings(), 3)
+    assert clip["start_s"] == 100.1 and clip["payoff_s"] == 100.1
+
+
+@pytest.mark.parametrize("bad", ["../select_v1", "playbook/universal", "Comedy", ""])
+def test_load_playbook_rejects_unknown_sections(bad):
+    with pytest.raises(ValueError):
+        select.load_playbook(bad)
+
+
+PLAYBOOK_HASHES = {
+    "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
+}
+
+
+def test_playbook_version_is_bumped_when_the_prompt_or_playbook_changes():
+    """If this fails after editing the playbook or select_v2.md, bump PLAYBOOK_VERSION and
+    add its new hash here (cached windows are keyed by the version, not the text)."""
+    root = Path(select.__file__).parent / "prompts"
+    digest = hashlib.sha256()
+    for path in sorted([*root.glob("playbook/*.md"), root / "select_v2.md"]):
+        rel = path.relative_to(root).as_posix().encode()
+        digest.update(rel + b"\0" + path.read_bytes() + b"\0")
+    assert PLAYBOOK_HASHES.get(select.PLAYBOOK_VERSION) == digest.hexdigest()
+
+
+def test_playbook_wording_review_fixes():
+    assert "or mark them" not in select.load_playbook("comedy")
+    public = select.load_playbook("public_service")
+    assert "Leave out moments that identify a minor or a victim" in public
+    assert "address or phone" in select.load_playbook("universal")
 
 
 def test_v1_recorded_reply_still_parses(conn, media):
@@ -1165,7 +1220,7 @@ def test_payoff_stays_inside_the_snapped_clip(conn, media):
         assert clip["start_s"] <= clip["payoff_s"] <= clip["end_s"]
 
 
-def test_sensitive_flag_is_passed_through(conn, media):
+def test_sensitive_flag_is_passed_through_to_highlights(conn, media):
     reply = (200, _message([_cand(30.1, 60.6, payoff_s=40.0, open_question="", sensitive=True)]))
     out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic(reply))
     assert out["clips"][0]["sensitive"] is True

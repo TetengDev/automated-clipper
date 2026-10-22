@@ -132,3 +132,24 @@ def test_playbook_version_defaults_to_null(conn: sqlite3.Connection, tmp_path: P
         "SELECT playbook_version FROM clip_versions WHERE clip_id = ?", (ref.clip_id,)
     ).fetchone()
     assert row[0] is None
+
+
+def test_sensitive_flag_round_trips(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    edl = parse_edl(EDL_DATA)
+    flagged = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), meta=ClipMeta(sensitive=True)
+    )
+    plain = insert_pending_clip(conn, job_id=1, rank=2, edl=edl, result=_result(tmp_path))
+    again = add_clip_version(
+        conn,
+        clip_id=flagged.clip_id,
+        edl=edl,
+        result=_result(tmp_path, "v2"),
+        meta=ClipMeta(sensitive=True),
+    )
+    rows = conn.execute("SELECT clip_id, version, sensitive FROM clip_versions ORDER BY id")
+    assert [tuple(r) for r in rows] == [
+        (flagged.clip_id, 1, 1),
+        (plain.clip_id, 1, 0),
+        (flagged.clip_id, again.version, 1),
+    ]

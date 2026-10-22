@@ -198,3 +198,16 @@ def test_empty_state_reflects_filters(
 
     assert text in html
     assert card_ids(html) == []
+
+
+def test_sensitive_badge_only_on_sensitive_cards(client: TestClient, env: Env) -> None:
+    job = env.job("Raffy Tulfo in Action", title="Case")
+    flagged = env.clip(job, title="Flagged one", sensitive=True, created_at="2027-01-02T00:00:00Z")
+    env.clip(job, title="Plain one", created_at="2027-01-01T00:00:00Z")
+
+    html = client.get("/queue").text
+
+    cards = html.split('class="clip-card"')[1:]
+    assert len(cards) == 2
+    assert f'data-clip-id="{flagged}"' in cards[0] and 'class="badge sensitive"' in cards[0]
+    assert 'class="badge sensitive"' not in cards[1]

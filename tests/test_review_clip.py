@@ -79,6 +79,16 @@ def test_detail_shows_metadata_reason_source_and_versions(client: TestClient, en
     assert '<script src="/static/review.js" defer></script>' in html
 
 
+def test_sensitive_badge_on_detail_page_only_for_sensitive_clips(
+    client: TestClient, env: Env
+) -> None:
+    flagged = env.clip(sensitive=True)
+    plain = env.clip()
+
+    assert 'class="badge sensitive"' in client.get(f"/clip/{flagged}").text
+    assert 'class="badge sensitive"' not in client.get(f"/clip/{plain}").text
+
+
 def test_youtube_source_link_has_timestamp(client: TestClient, env: Env) -> None:
     clip_id = env.clip(env.job(item_id="dQw4w9WgXcQ"), start_s=125.9)
 

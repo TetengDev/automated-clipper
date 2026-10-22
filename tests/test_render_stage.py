@@ -518,3 +518,20 @@ def test_malformed_versions_are_not_stored(
     rc.render_clips(job, _ctx(media, conn))
     row = _rows(conn)[0]
     assert row["prompt_version"] is None and row["playbook_version"] is None
+
+
+def test_sensitive_flag_is_passed_through(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0, sensitive=True), _highlight(2, 30.5, 40.5)])
+    rc.render_clips(job, _ctx(media, conn))
+    assert [r["sensitive"] for r in _rows(conn)] == [1, 0]
+
+
+@pytest.mark.parametrize("bad", ["yes", 1, None, ["x"]])
+def test_non_boolean_sensitive_is_invalid_metadata(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, bad: Any
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0, sensitive=bad), _highlight(2, 30.5, 40.5)])
+    rc.render_clips(job, _ctx(media, conn))
+    assert [r["rank"] for r in _rows(conn)] == [2]  # the bad clip is skipped, not stored

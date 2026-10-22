@@ -217,10 +217,14 @@ def _polish(
     return round(a, 3), math.floor(round(b * 1000, 6)) / 1000
 
 
-def _rejected(edl: EDL, what: str, fallback: str, exc: ValueError) -> EDL:
-    """`edl` unchanged, with a warning that the EDL with `what` was invalid."""
+def _rejected(edl: EDL, what: str, fallback: str, exc: ValueError, *, trace: bool = False) -> EDL:
+    """`edl` unchanged, with a warning that the EDL with `what` was invalid (with the
+    traceback if `trace`, so a logic bug cannot hide behind the fallback)."""
     reason = redact(strip_control(str(exc).splitlines()[0]))[:MAX_REASON_CHARS]
-    logger.warning("clip source %s: %s rejected, %s: %s", edl.source.path, what, fallback, reason)
+    logger.warning(
+        "clip source %s: %s rejected, %s: %s", edl.source.path, what, fallback, reason,
+        exc_info=trace,
+    )  # fmt: skip
     return edl
 
 
@@ -240,7 +244,7 @@ def _jump_cut(edl: EDL, mode: JumpCuts, min_s: float, media_dir: Path, deadline:
             props["segments"] = [{"in_s": a, "out_s": b} for a, b in segments]
         return parse_edl(props)
     except ValueError as exc:  # pydantic's ValidationError too
-        return _rejected(edl, "jump cuts", "no cuts", exc)
+        return _rejected(edl, "jump cuts", "no cuts", exc, trace=True)
 
 
 def _reframe(edl: EDL, cuts: list[float], media_dir: Path, deadline: Deadline) -> EDL:

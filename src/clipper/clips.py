@@ -109,10 +109,12 @@ class ClipVersion:
     prompt_version: str | None
     note: str | None
     created_at: str
+    rendered_s: float | None = None
+    """The video's length; with jump cuts shorter than end_s - start_s (the source range)."""
 
     @property
     def duration_s(self) -> float:
-        return self.end_s - self.start_s
+        return self.end_s - self.start_s if self.rendered_s is None else self.rendered_s
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ClipVersion:
@@ -130,6 +132,7 @@ class ClipVersion:
             prompt_version=row["prompt_version"],
             note=row["note"],
             created_at=row["created_at"],
+            rendered_s=row["duration_s"],
         )
 
 
@@ -201,7 +204,7 @@ def source_url_at(platform: str, item_id: str, start_s: float) -> str:
 
 _CARD_SELECT = """
 SELECT c.id, c.status, c.current_version, c.created_at, j.creator, j.title AS source_title,
-       v.title, v.score, v.start_s, v.end_s, v.thumb_path
+       v.title, v.score, v.start_s, v.end_s, v.duration_s, v.thumb_path
 FROM clips c
 JOIN jobs j ON j.id = c.job_id
 JOIN clip_versions v ON v.clip_id = c.id AND v.version = c.current_version
@@ -242,7 +245,7 @@ def list_queue(
             title=r["title"],
             creator=r["creator"],
             score=r["score"],
-            duration_s=r["end_s"] - r["start_s"],
+            duration_s=r["end_s"] - r["start_s"] if r["duration_s"] is None else r["duration_s"],
             source_title=r["source_title"],
             has_thumb=bool(r["thumb_path"]),
             created_at=r["created_at"],

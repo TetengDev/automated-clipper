@@ -64,7 +64,7 @@ def _insert_version(
     conn.execute(
         "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption, hashtags,"
         " score, reason, captions_enabled, note, video_path, thumb_path, prompt_version,"
-        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " created_at, duration_s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             clip_id,
             version,
@@ -81,6 +81,7 @@ def _insert_version(
             str(result.thumbnail_path),
             meta.prompt_version,
             now,
+            result.duration_s,
         ),
     )
 

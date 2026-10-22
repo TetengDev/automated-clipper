@@ -203,3 +203,36 @@ def test_reframe_setting_defaults_to_auto_with_creator_opt_out() -> None:
     assert cfg.effective_settings("Static").reframe == "blurred_fill"
     with pytest.raises(ValidationError):
         Settings(reframe="split_screen")  # type: ignore[arg-type]
+
+
+def test_jump_cuts_defaults_to_silences_with_creator_override() -> None:
+    from clipper.config import AppConfig, Creator, CreatorOverrides, Settings, YouTubeChannel
+
+    creator = Creator(
+        name="Raw",
+        region="ph",
+        youtube=YouTubeChannel(handle="@raw"),
+        overrides=CreatorOverrides(jump_cuts="full"),
+    )
+    cfg = AppConfig(creators=(creator,))
+    assert cfg.settings.jump_cuts == "silences"
+    assert cfg.effective_settings("Raw").jump_cuts == "full"
+    with pytest.raises(ValidationError):
+        Settings(jump_cuts="everything")  # type: ignore[arg-type]
+
+
+def test_jump_cuts_off_survives_yaml(tmp_path: Path) -> None:
+    """YAML 1.1 reads a bare `off` as false; it still means "off"."""
+    from clipper.config import Settings
+
+    path = tmp_path / "creators.yaml"
+    path.write_text(
+        "settings:\n  jump_cuts: off\ncreators:\n"
+        "  - name: Raw\n    region: ph\n    youtube: {handle: '@raw'}\n"
+        "    overrides: {jump_cuts: off}\n"
+    )
+    cfg = load_config(path)
+    assert cfg.settings.jump_cuts == "off"
+    assert cfg.effective_settings("Raw").jump_cuts == "off"
+    with pytest.raises(ValidationError):
+        Settings(jump_cuts=True)  # type: ignore[arg-type]

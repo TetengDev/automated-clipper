@@ -17,7 +17,7 @@ import pytest
 
 from clipper.config import AppConfig, Creator, CreatorOverrides, Settings, YouTubeChannel
 from clipper.db import connect, migrate
-from clipper.edl import EDL
+from clipper.edl import EDL, parse_edl
 from clipper.jobs import Worker, enqueue, get_job
 from clipper.jobs.models import Job, JobStatus
 from clipper.jobs.stages import PermanentError, StageContext
@@ -26,7 +26,7 @@ from clipper.pipeline import build_stages
 from clipper.pipeline import reframe as rf
 from clipper.pipeline import render_clips as rc
 from clipper.pipeline.common import Deadline, StageTimeout
-from clipper.render import InvalidClipError, RenderError, RenderResult
+from clipper.render import InvalidClipError, RenderError, RenderResult, segment_props
 from clipper.urls import SourceRef
 
 T0 = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
@@ -130,6 +130,26 @@ def cuts(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     found: list[float] = []
     monkeypatch.setattr(rc, "detect_cuts", lambda path, deadline: found)
     return found
+
+
+class FakeSilences(list[Any]):
+    """What the fake silencedetect reports, in section time (none by default); a None
+    entry makes it fail. `calls` holds the paths it ran on."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[Path] = []
+
+    def detect(self, path: Path, deadline: Deadline) -> list[tuple[float, float]] | None:
+        self.calls.append(path)
+        return None if None in self else list(self)
+
+
+@pytest.fixture(autouse=True)
+def silences(monkeypatch: pytest.MonkeyPatch) -> FakeSilences:
+    fake = FakeSilences()
+    monkeypatch.setattr(rc, "detect_silences", fake.detect)
+    return fake
 
 
 class FakeFaces:
@@ -839,3 +859,185 @@ def test_worst_case_covers_face_tracking() -> None:
         + 4 * rc.DEFAULT_FFMPEG_TIMEOUT_S
     )
     assert rc.CLIP_WORST_CASE_S < rc.STAGE_BUDGET_S / 2
+
+
+# --- jump cuts (CLP-73) -----------------------------------------------------------------
+
+F = 1 / 30
+GAP_AT = 21
+"""Word 21 starts 0.7 s late: a 1.2 s gap after word 20 (source 20.6 -> 21.8)."""
+
+
+def _gap_words() -> list[dict[str, Any]]:
+    return [
+        {
+            "word": f" w{i}",
+            "start": i + 0.1 + 0.7 * (i >= GAP_AT),
+            "end": i + 0.6 + 0.7 * (i >= GAP_AT),
+        }
+        for i in range(60)
+    ]
+
+
+def _mode(mode: str) -> AppConfig:
+    return AppConfig(settings=Settings(jump_cuts=mode))  # type: ignore[arg-type]
+
+
+def _render_mode(
+    conn: sqlite3.Connection,
+    root: Path,
+    fake: FakeRender,
+    mode: str,
+    video: str,
+    words: list[dict[str, Any]],
+) -> EDL:
+    media = root / video
+    media.mkdir(parents=True)
+    job, _ = enqueue(conn, SourceRef("youtube", video), T0, creator="manual")
+    _setup(media, [_highlight(1, 10.0, 40.0)], words=words)
+    rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=_mode(mode)))
+    return fake.calls[-1]["edl"]
+
+
+def test_silence_inside_the_clip_is_cut_down_to_a_breath(
+    conn: sqlite3.Connection, tmp_path: Path, fake: FakeRender, silences: FakeSilences
+) -> None:
+    """AC: 1.2 s of silence renders shorter by the gap minus the kept breath."""
+    silences.append((12.6, 13.8))  # the gap in section time (section starts at 8.0)
+    off = _render_mode(conn, tmp_path, fake, "off", "aaaaaaaaaaa", _gap_words())
+    cut = _render_mode(conn, tmp_path, fake, "silences", "bbbbbbbbbbb", _gap_words())
+
+    assert off.segments is None and cut.segments is not None and len(cut.segments) == 2
+    (applied,) = [c for c in cut.cuts if c.applied]
+    assert applied.kind == "silence"
+    assert off.duration_s - cut.duration_s == pytest.approx(1.2 - 0.14, abs=F)
+    # Whole frames, and the span is the polished range on the frame grid.
+    assert cut.source.in_s == pytest.approx(off.source.in_s, abs=F / 2)
+    assert cut.source.out_s == pytest.approx(off.source.out_s, abs=F / 2)
+    for seg in cut.segments:
+        for x in (seg.in_s, seg.out_s):
+            assert abs(x * 30 - round(x * 30)) < 1e-6
+    # Words stay in section time: the renderer maps them onto the output timeline.
+    assert cut.words == off.words
+    row = conn.execute("SELECT start_s, end_s FROM clips ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["start_s"] == pytest.approx(cut.source.in_s + 8.0)
+    assert row["end_s"] == pytest.approx(cut.source.out_s + 8.0)
+
+
+def test_gap_with_game_audio_is_not_cut(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, silences: FakeSilences
+) -> None:
+    """AC: silencedetect hears sound in the gap (game audio, laughter): no cut."""
+    silences.append((30.0, 31.0))  # silence elsewhere only
+    _setup(media, [_highlight(1, 10.0, 40.0)], words=_gap_words())
+    rc.render_clips(job, _ctx(media, conn))  # default: silences
+    edl = fake.calls[0]["edl"]
+    assert edl.segments is None
+    assert not [c for c in edl.cuts if c.applied]
+
+
+def test_jump_cuts_off_is_the_v1_render(
+    conn: sqlite3.Connection, tmp_path: Path, fake: FakeRender, silences: FakeSilences
+) -> None:
+    """AC: `off` gives the v1 output: no silencedetect, no segments, no cuts, and the
+    composition props are those of the same clip as a v1 EDL."""
+    silences.append((0.0, 1000.0))
+    edl = _render_mode(conn, tmp_path, fake, "off", "aaaaaaaaaaa", _gap_words())
+    assert (edl.segments, edl.cuts) == (None, ())
+    assert silences.calls == []
+    v1 = {**edl.to_props(), "schema_version": 1}
+    del v1["segments"], v1["cuts"]
+    as_v1 = parse_edl(v1)
+    props, v1_props = segment_props(edl), segment_props(as_v1)
+    assert {**props, "schema_version": 1} == v1_props
+    assert edl.duration_in_frames == as_v1.duration_in_frames
+
+
+def test_taglish_words_are_all_kept(
+    conn: sqlite3.Connection, tmp_path: Path, fake: FakeRender, silences: FakeSilences
+) -> None:
+    """AC: "ano", "yung", "parang" are real words, never cut (even in `full`)."""
+    silences.append((0.0, 1000.0))
+    text = "ano yung ano ano parang game kasi parang ang hirap nung boss eh grabe " * 4
+    words = [
+        {"word": f" {t}", "start": 10.0 + i * 0.4, "end": 10.3 + i * 0.4}
+        for i, t in enumerate(text.split())
+    ]
+    edl = _render_mode(conn, tmp_path, fake, "full", "aaaaaaaaaaa", words)
+    assert edl.segments is None and not [c for c in edl.cuts if c.applied]
+    assert [w.text for w in edl.words] == text.split()
+
+
+def test_retakes_are_proposed_only(
+    conn: sqlite3.Connection, tmp_path: Path, fake: FakeRender
+) -> None:
+    """AC: a retake is recorded with applied=false and nothing is cut for it."""
+    take = ["the", "boss", "fight", "in", "this", "game", "was", "honestly", "brutal"]
+    words = [
+        {"word": f" {t}", "start": 10.0 + k * 4 + i * 0.3, "end": 10.25 + k * 4 + i * 0.3}
+        for k in range(2)
+        for i, t in enumerate(take)
+    ]
+    edl = _render_mode(conn, tmp_path, fake, "full", "aaaaaaaaaaa", words)
+    retakes = [c for c in edl.cuts if c.kind in {"retake", "false_start"}]
+    assert retakes and all(c.applied is False for c in retakes)
+    assert edl.segments is None
+
+
+def test_full_mode_cuts_stutters_even_when_silencedetect_fails(
+    conn: sqlite3.Connection, tmp_path: Path, fake: FakeRender, silences: FakeSilences
+) -> None:
+    silences.append(None)  # detection failed: no silence cuts (fail open)
+    words = _gap_words()
+    words[29] = {"word": " again", "start": 29.8, "end": 30.1}  # "again again": a stutter
+    words[30] = {"word": " again", "start": 30.2, "end": 30.5}
+    edl = _render_mode(conn, tmp_path, fake, "full", "aaaaaaaaaaa", words)
+    assert {c.kind for c in edl.cuts if c.applied} == {"stutter"}
+    assert edl.segments is not None and len(edl.segments) == 2
+
+
+def test_silencedetect_failure_keeps_the_clip_whole(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, silences: FakeSilences
+) -> None:
+    silences.append(None)
+    _setup(media, [_highlight(1, 10.0, 40.0)], words=_gap_words())
+    rc.render_clips(job, _ctx(media, conn))
+    assert fake.calls[0]["edl"].segments is None
+    assert len(_rows(conn)) == 1
+
+
+def test_jump_cut_edl_the_validator_rejects_keeps_the_clip_whole(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    silences: FakeSilences,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    silences.append((0.0, 1000.0))
+    monkeypatch.setattr(rc, "apply_cuts", lambda span, cuts: [(2.0, 2.4), (3.0, 3.4)])
+    _setup(media, [_highlight(1, 10.0, 40.0)], words=_gap_words())
+    rc.render_clips(job, _ctx(media, conn))
+    assert fake.calls[0]["edl"].segments is None
+    assert "jump cuts rejected" in caplog.text
+
+
+def test_face_track_keys_follow_the_output_timeline(
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    fake: FakeRender,
+    faces: FakeFaces,
+    silences: FakeSilences,
+) -> None:
+    """CLP-58 crop keys are on the output timeline, with a jump key at the join."""
+    silences.append((12.6, 13.8))
+    faces.result = _faces(1.0)
+    edl = _render_mode(conn, tmp_path, fake, "silences", "aaaaaaaaaaa", _gap_words())
+    assert edl.layout == "face_track" and edl.segments is not None and edl.crop is not None
+    first = edl.segments[0]
+    join = first.out_s - first.in_s
+    assert [k.t_s for k in edl.crop].count(pytest.approx(join)) >= 2
+    assert edl.crop[-1].t_s <= edl.duration_s + 1e-6
+    times = [k.t_s for k in edl.crop]
+    assert times == sorted(times)

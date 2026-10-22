@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "source": {
+    "path": "a.mp4",
+    "in_s": 0.25,
+    "out_s": 5.0
+  },
+  "layout": "blurred_fill",
+  "hook": null,
+  "words": [],
+  "captions_enabled": true,
+  "caption_style": "bold_pop",
+  "progress_bar": true,
+  "crop": null
+}

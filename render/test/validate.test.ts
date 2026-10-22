@@ -29,7 +29,7 @@ describe("parseEdl", () => {
     const raw = { source: { path: "source.mp4", in_s: 0, out_s: 5 } };
     const edl = parseEdl(raw);
     expect(edl).toEqual({
-      schema_version: 1,
+      schema_version: 2,
       source: { path: "source.mp4", in_s: 0, out_s: 5 },
       layout: "blurred_fill",
       hook: null,
@@ -38,6 +38,8 @@ describe("parseEdl", () => {
       caption_style: "bold_pop",
       progress_bar: true,
       crop: null,
+      segments: null,
+      cuts: [],
     });
     expect(raw).toEqual({ source: { path: "source.mp4", in_s: 0, out_s: 5 } });
   });
@@ -108,5 +110,41 @@ describe("parseEdl", () => {
     expect(durationInFrames(edl, 30)).toBe(900);
     const odd = parseEdl({ source: { path: "a.mp4", in_s: 0, out_s: 1.05 } });
     expect(durationInFrames(odd, 30)).toBe(32);
+  });
+
+  it("sums whole-frame segments for an EDL v2", () => {
+    const edl = parseEdl({
+      source: { path: "a.mp4", in_s: 1, out_s: 6 },
+      segments: [
+        { in_s: 1, out_s: 3 },
+        { in_s: 126 / 30, out_s: 6 },
+      ],
+    });
+    expect(durationInFrames(edl, 30)).toBe(60 + 54);
+  });
+
+  it("keeps v1 EDLs (one range) valid", () => {
+    const edl = parseEdl({ schema_version: 1, source: { path: "a.mp4", in_s: 0.25, out_s: 5 } });
+    expect(edl.schema_version).toBe(1);
+    expect(durationInFrames(edl, 30)).toBe(143);
+  });
+
+  it.each([
+    [[{ in_s: 0, out_s: 2 }, { in_s: 1.5, out_s: 5 }], /sorted and must not overlap/],
+    [[{ in_s: 0, out_s: 2 }, { in_s: 3, out_s: 3.2 }], /at least 0.3/],
+    [[{ in_s: 0, out_s: 2 }, { in_s: 3.01, out_s: 5 }], /frame grid/],
+    [[{ in_s: 0, out_s: 0.4 }, { in_s: 1, out_s: 1.4 }], /between 1 and 180/],
+  ])("names the segment rule that failed (%#)", (segments, message) => {
+    const source = { path: "a.mp4", in_s: segments[0]!.in_s, out_s: segments.at(-1)!.out_s };
+    expect(() => parseEdl({ source, segments })).toThrow(message);
+  });
+
+  it("rejects segments that do not span the source", () => {
+    expect(() =>
+      parseEdl({
+        source: { path: "a.mp4", in_s: 0, out_s: 6 },
+        segments: [{ in_s: 0, out_s: 2 }, { in_s: 3, out_s: 5 }],
+      }),
+    ).toThrow(/span source/);
   });
 });

@@ -417,6 +417,51 @@ def test_segment_props_shift_and_clip_words() -> None:
     assert props["progress_bar"] is False
 
 
+def test_segment_props_shift_segments_and_drop_cut_records() -> None:
+    """EDL v2: one pre-cut of the whole span (no pre-cut per segment: lip-sync drift),
+    segments shifted with it; the cut records stay in the sidecar, not in the props."""
+    edl = parse_edl(
+        {
+            "source": {"path": "a.mp4", "in_s": 10.0, "out_s": 16.0},
+            "segments": [{"in_s": 10.0, "out_s": 12.0}, {"in_s": 13.2, "out_s": 16.0}],
+            "cuts": [
+                {"in_s": 12.0, "out_s": 13.2, "kind": "silence", "confidence": 1.0,
+                 "reason": "pause", "applied": True},
+                {"in_s": 9.0, "out_s": 11.0, "kind": "retake", "confidence": 0.4,
+                 "reason": "phrase", "applied": False},
+            ],
+            "words": [{"text": "in", "start_s": 13.5, "end_s": 13.9}],
+        }
+    )  # fmt: skip
+    props = render.segment_props(edl)
+    assert props["source"] == {"path": "segment.mp4", "in_s": 0.0, "out_s": 6.0}
+    assert props["segments"] == [
+        {"in_s": 0.0, "out_s": pytest.approx(2.0)},
+        {"in_s": pytest.approx(3.2), "out_s": pytest.approx(6.0)},
+    ]
+    assert props["cuts"] == []
+    assert [(w["text"], round(w["start_s"], 3)) for w in props["words"]] == [("in", 3.5)]
+
+
+def test_precut_covers_the_whole_span_of_segments(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    data = {
+        **EDL_DATA,
+        "source": {"path": "media/source.mp4", "in_s": 1.0, "out_s": 6.0},
+        "segments": [{"in_s": 1.0, "out_s": 3.0}, {"in_s": 4.0, "out_s": 6.0}],
+        "hook": None,
+    }
+    runner = FakeRunner()
+    result = render_clip(data, media_root, tmp_path / "out", runner=runner, render_dir=render_dir)
+    precut = runner.calls[0]["argv"]
+    assert precut[precut.index("-t") + 1] == "5.000"  # the span, not the 4 s output
+    assert result.duration_s == pytest.approx(4.0)
+    sidecar = json.loads(result.sidecar_path.read_text())
+    assert sidecar["duration_in_frames"] == 120
+    assert sidecar["edl"]["segments"] == data["segments"]
+
+
 def test_thumbnail_failure_publishes_nothing(
     media_root: Path, render_dir: Path, tmp_path: Path
 ) -> None:

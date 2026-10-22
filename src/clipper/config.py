@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NamedTuple
 
 import yaml
 from pydantic import (
@@ -29,19 +29,52 @@ MIN_SESSION_SECRET_LENGTH = 32
 # Letters/digits first; then letters, digits, space and a few punctuation marks. No path
 # separators, no leading dot/dash, no control characters.
 CREATOR_NAME_PATTERN = r"^\w[\w .'&()-]{0,99}$"
-# Local Whisper models: name -> (Hugging Face repo, pinned commit). Repos are the ones
-# faster-whisper 1.2.1 maps these names to (large-v3-turbo's moved from mobiuslabsgmbh to
-# dropbox-dash). Commits checked on the Hub API 2026-10-22. Only these names are accepted,
-# so a setting can never point at a local path, a URL or an unpinned repo.
-WHISPER_MODELS: dict[str, tuple[str, str]] = {
-    "tiny": ("Systran/faster-whisper-tiny", "d90ca5fe260221311c53c58e660288d3deb8d356"),
-    "base": ("Systran/faster-whisper-base", "ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66"),
-    "small": ("Systran/faster-whisper-small", "536b0662742c02347bc0e980a01041f333bce120"),
-    "medium": ("Systran/faster-whisper-medium", "08e178d48790749d25932bbc082711ddcfdfbc4f"),
-    "large-v3": ("Systran/faster-whisper-large-v3", "edaa852ec7e145841d8ffdb056a99866b5f0a478"),
-    "large-v3-turbo": (
+
+
+class PinnedModel(NamedTuple):
+    repo: str
+    revision: str
+    """Hugging Face commit the snapshot is fetched at."""
+    sha256: str
+    """SHA-256 of model.bin (its Git LFS oid at that commit)."""
+
+
+# Local Whisper models, checked on the Hub API 2026-10-22. The repos are the ones
+# faster-whisper 1.2.1 maps these names to, except large-v3-turbo: faster-whisper maps it
+# to mobiuslabsgmbh/faster-whisper-large-v3-turbo, which the Hub now redirects to
+# dropbox-dash/faster-whisper-large-v3-turbo, so the pin names dropbox-dash directly.
+# Only these names are accepted, so a setting can never point at a local path, a URL or
+# an unpinned repo.
+WHISPER_MODELS: dict[str, PinnedModel] = {
+    "tiny": PinnedModel(
+        "Systran/faster-whisper-tiny",
+        "d90ca5fe260221311c53c58e660288d3deb8d356",
+        "dcb76c6586fc06cbdac6dd21f14cfd129cc4cdd9dce19bf4ffa62e59cbe6e6d1",
+    ),
+    "base": PinnedModel(
+        "Systran/faster-whisper-base",
+        "ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66",
+        "d01c3014881c9c6f3133c182f3d2887eb6ca1c789a7538c5c007196857a0a6a9",
+    ),
+    "small": PinnedModel(
+        "Systran/faster-whisper-small",
+        "536b0662742c02347bc0e980a01041f333bce120",
+        "3e305921506d8872816023e4c273e75d2419fb89b24da97b4fe7bce14170d671",
+    ),
+    "medium": PinnedModel(
+        "Systran/faster-whisper-medium",
+        "08e178d48790749d25932bbc082711ddcfdfbc4f",
+        "9b45e1009dcc4ab601eff815b61d80e60ce3fd8c74c1a14f4a282258286b51ae",
+    ),
+    "large-v3": PinnedModel(
+        "Systran/faster-whisper-large-v3",
+        "edaa852ec7e145841d8ffdb056a99866b5f0a478",
+        "69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1",
+    ),
+    "large-v3-turbo": PinnedModel(
         "dropbox-dash/faster-whisper-large-v3-turbo",
         "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+        "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
     ),
 }
 _RCLONE_REMOTE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*:\S*$")

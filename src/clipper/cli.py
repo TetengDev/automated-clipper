@@ -419,14 +419,17 @@ def bench_transcribe(
         if duration <= 0:
             _fail(f"bench-transcribe: {audio.name} has no audio")
         for s in settings:
-            backend = tr.default_transcriber(s)
-            assert isinstance(backend, tr.FasterWhisperTranscriber)
+            backend = tr.FasterWhisperTranscriber(
+                model=s.whisper_model,
+                compute_type=s.whisper_compute_type,
+                cpu_threads=s.whisper_cpu_threads,
+            )
             backend.ensure_model()  # a first-run download is not timed
             started = time.monotonic()
             result = backend.transcribe(
                 audio.resolve(),
                 language=language,
-                timeout_s=max(tr.CHUNK_CALL_TIMEOUT_S, duration * 4),
+                timeout_s=tr.call_timeout(backend, duration),
             )
             rtf = (time.monotonic() - started) / duration
             text = strip_control(" ".join(seg.text for seg in result.segments))

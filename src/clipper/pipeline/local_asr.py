@@ -21,7 +21,7 @@ import os
 import re
 import sys
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import IO, Any
 
 GUARD_VERSION = 1
@@ -53,10 +53,16 @@ large-v3-turbo 6 GiB, large-v3 8 GiB (peak RSS 0.3 / 2.9 / 2.6 / 5.1 GB). 12 GiB
 room for more threads; it stops a runaway child where no cgroup limit does (compose
 already caps the worker at 8g). Too tight a limit fails the model load."""
 
+REQUIRED_FILES = ("config.json", "model.bin", "tokenizer.json")
+"""Plus one `vocabulary.*` (txt or json); preprocessor_config.json only some models have."""
+
+EXIT_RETRY = 1
+"""Out of memory, a CTranslate2 runtime error, I/O trouble, a crash: retryable."""
 EXIT_USAGE = 2
+"""Bad arguments: a bug in the parent, so the parent fails the job (permanent)."""
 EXIT_MODEL = 3
-"""The model could not be loaded (missing/corrupt files, faster-whisper not installed):
-the parent treats this as permanent. Any other failure is retryable."""
+"""The model can never load as configured: faster-whisper not installed, model files
+missing, or a ValueError (e.g. a compute type the CPU cannot run). Permanent."""
 
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 _REPO = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
@@ -142,6 +148,15 @@ def _fetch(repo_id: str, revision: str, models_dir: str, out: IO[str]) -> int:
     return 0
 
 
+def missing_model_files(model_dir: str) -> list[str]:
+    missing = [f for f in REQUIRED_FILES if not os.path.isfile(os.path.join(model_dir, f))]
+    has_vocabulary = os.path.isdir(model_dir) and any(
+        f.startswith("vocabulary.") and os.path.isfile(os.path.join(model_dir, f))
+        for f in os.listdir(model_dir)
+    )
+    return missing if has_vocabulary else [*missing, "vocabulary.*"]
+
+
 def _usage(message: str) -> int:
     print(f"local_asr: {message}", file=sys.stderr)
     return EXIT_USAGE
@@ -161,16 +176,40 @@ def main(argv: Sequence[str], out: IO[str] = sys.stdout, model_class: Any = None
         return _usage(f"bad cpu thread count {threads!r}")
     if language != "-" and not _LANGUAGE.match(language):
         return _usage(f"bad language {language!r}")
+    if missing := missing_model_files(model_dir):
+        print(f"model files missing: {', '.join(missing)}", file=sys.stderr)
+        return EXIT_MODEL
     try:
         if model_class is None:
             from faster_whisper import WhisperModel as model_class
         model = model_class(model_dir, **model_kwargs(compute_type, int(threads)))
-    except Exception as exc:
+    except (ImportError, ValueError) as exc:
         print(f"cannot load model: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_MODEL
+    except Exception as exc:  # MemoryError, CTranslate2 RuntimeError, OSError: transient
+        print(f"model load failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_RETRY
     result = transcribe_chunk(model, audio, None if language == "-" else language)
     json.dump(result, out, ensure_ascii=False)
     return 0
+
+
+def run_with_json_stdout(run: Callable[[IO[str]], int]) -> int:
+    """Call `run(out)` with fd 1 and `sys.stdout` pointed at stderr, so library prints
+    (Python or native) cannot corrupt the JSON; `out` is the real stdout."""
+    sys.stdout.flush()
+    saved = os.dup(1)
+    real_stdout = sys.stdout
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    try:
+        with os.fdopen(os.dup(saved), "w", encoding="utf-8") as out:
+            return run(out)
+    finally:
+        sys.stdout.flush()
+        sys.stdout = real_stdout
+        os.dup2(saved, 1)
+        os.close(saved)
 
 
 def _limit_address_space() -> None:
@@ -189,4 +228,4 @@ if __name__ == "__main__":  # pragma: no cover - exercised as a real child proce
     else:
         os.environ["HF_HUB_OFFLINE"] = "1"  # transcription never touches the network
         _limit_address_space()
-    sys.exit(main(args))
+    sys.exit(run_with_json_stdout(lambda out: main(args, out)))

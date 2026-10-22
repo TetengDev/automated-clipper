@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -103,6 +104,12 @@ DEFAULT_MODELS_DIR = Path("data/models")
 ASR_COMMAND = (sys.executable, "-I", "-m", "clipper.pipeline.local_asr")
 """The local ASR child: isolated Python (no PYTHON* env, no cwd on sys.path)."""
 MODEL_FETCH_TIMEOUT_S = 30 * 60.0
+"""Budget for fetching one model, including the one retry after a failed verification."""
+COMPLETE_MARKER = ".clipper-complete"
+"""Written into a snapshot once its files and model.bin's sha256 were verified."""
+LOCAL_RTF_BUDGET = 3
+"""A local chunk may take up to 3x its length (large-v3 on a slow VPS CPU), never less
+than CHUNK_CALL_TIMEOUT_S; the stage deadline still caps it."""
 
 # verbose_json reports the language by name; transcript.json uses ISO-639-1 codes.
 _LANGUAGE_CODES = {
@@ -349,6 +356,8 @@ def _parse_verbose_json(body: dict[str, Any]) -> ChunkTranscript:
         for s in body.get("segments") or ()
         if str(s.get("text", "")).strip()
     )
+    if not all(math.isfinite(t) for x in (*words, *segments) for t in (x.start, x.end)):
+        raise ValueError("non-finite timestamp")
     language = normalize_language(str(body["language"])) if body.get("language") else None
     # "unknown" is the transcript's fallback, never a detected language: keep looking.
     return ChunkTranscript(None if language == "unknown" else language, words, segments)
@@ -378,6 +387,8 @@ def _run_asr(args: Sequence[str], timeout_s: float, what: str) -> RunResult:
         raise MediaError(f"{what}: {exc}") from None
     if result.returncode == local_asr.EXIT_MODEL:
         raise PermanentError(f"{what}: cannot load the model: {stderr_tail(result.stderr)}")
+    if result.returncode == local_asr.EXIT_USAGE:
+        raise PermanentError(f"{what}: bad arguments: {stderr_tail(result.stderr)}")
     if result.returncode != 0:
         raise MediaError(f"{what} failed (exit {result.returncode}): {stderr_tail(result.stderr)}")
     return result
@@ -407,20 +418,55 @@ class FasterWhisperTranscriber:
 
     @property
     def snapshot_dir(self) -> Path:
-        repo, sha = WHISPER_MODELS[self.model]
-        return self.models_dir / f"models--{repo.replace('/', '--')}" / "snapshots" / sha
+        pin = WHISPER_MODELS[self.model]
+        return (
+            self.models_dir / f"models--{pin.repo.replace('/', '--')}" / "snapshots" / pin.revision
+        )
 
     def ensure_model(self, timeout_s: float = MODEL_FETCH_TIMEOUT_S) -> Path:
-        """Download the pinned snapshot once (in a child, bounded by `timeout_s`)."""
+        """The verified snapshot dir. A snapshot counts only with its completion marker and
+        a model.bin that links to the pinned blob (cheap; the full hash runs at fetch).
+        Otherwise it is fetched (in a child, all within `timeout_s`), verified and marked;
+        a snapshot that fails verification is discarded and fetched once more, then this
+        raises a retryable `MediaError`."""
+        pin = WHISPER_MODELS[self.model]
         snapshot = self.snapshot_dir
-        if not (snapshot / "model.bin").is_file():
-            repo, sha = WHISPER_MODELS[self.model]
-            self.models_dir.mkdir(parents=True, exist_ok=True)
-            args = [*ASR_COMMAND, "fetch", repo, sha, str(self.models_dir)]
-            _run_asr(args, timeout_s, f"downloading whisper model {self.model}")
-            if not (snapshot / "model.bin").is_file():
-                raise MediaError(f"whisper model {self.model}: download left no model.bin")
-        return snapshot
+        marker = snapshot / COMPLETE_MARKER
+        if marker.is_file():
+            if _blob_name(snapshot / "model.bin") == pin.sha256:
+                return snapshot
+            self._discard(snapshot, bad_blob=False)  # marked, but model.bin was swapped
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        args = [*ASR_COMMAND, "fetch", pin.repo, pin.revision, str(self.models_dir)]
+        what = f"downloading whisper model {self.model}"
+        started = time.monotonic()
+        problem = ""
+        for _ in range(2):
+            left = timeout_s - (time.monotonic() - started)
+            if left <= 1.0:
+                break
+            _run_asr(args, left, what)
+            problem = _snapshot_problem(snapshot, pin.sha256)
+            if not problem:
+                tmp = marker.with_name(f"{marker.name}.tmp")
+                tmp.write_text(pin.sha256, encoding="utf-8")
+                os.replace(tmp, marker)
+                return snapshot
+            logger.warning("whisper model %s: snapshot rejected (%s)", self.model, problem)
+            self._discard(snapshot, bad_blob="sha256" in problem)
+        raise MediaError(f"{what}: {problem or 'out of time'}")
+
+    def _discard(self, snapshot: Path, *, bad_blob: bool) -> None:
+        """Drop the snapshot links; when model.bin's content is wrong also its repo blob
+        and the stored file behind it, or the Hub client would link the same bytes again."""
+        link = snapshot / "model.bin"
+        if bad_blob and link.is_symlink():
+            repo_blob = (link.parent / os.readlink(link)).parent.resolve() / link.readlink().name
+            root = self.models_dir.resolve()
+            for path in (link.resolve(), repo_blob):  # content first, then the link to it
+                if path.is_relative_to(root):
+                    path.unlink(missing_ok=True)
+        shutil.rmtree(snapshot, ignore_errors=True)
 
     def transcribe(
         self, audio: Path, *, language: str | None, timeout_s: float | None = None
@@ -444,6 +490,33 @@ class FasterWhisperTranscriber:
             raise BilledChunkError("local transcription output unusable") from None
         logger.info("%s: guards dropped %d segment(s), %d word(s)", audio.name, segments, words)
         return chunk
+
+
+def _blob_name(link: Path) -> str | None:
+    """Name of the repo blob a snapshot file links to: its sha256 (LFS etag) in the Hub
+    cache layout. Only the first hop: in huggingface_hub 2.x that blob links on into a
+    shared store under another name. None when it is not a link (e.g. a copied file)."""
+    try:
+        return Path(os.readlink(link)).name
+    except OSError:
+        return None
+
+
+def _snapshot_problem(snapshot: Path, sha256: str) -> str:
+    """Why `snapshot` is unusable, or "" when every required file is there and model.bin
+    has the pinned SHA-256."""
+    if missing := local_asr.missing_model_files(str(snapshot)):
+        return f"missing {', '.join(missing)}"
+    with (snapshot / "model.bin").open("rb") as fh:
+        actual = hashlib.file_digest(fh, "sha256").hexdigest()
+    return "" if actual == sha256 else "model.bin sha256 mismatch"
+
+
+def call_timeout(backend: Transcriber, chunk_seconds: float) -> float:
+    """Per-chunk call timeout before the stage deadline caps it."""
+    if isinstance(backend, FasterWhisperTranscriber):
+        return max(CHUNK_CALL_TIMEOUT_S, chunk_seconds * LOCAL_RTF_BUDGET)
+    return CHUNK_CALL_TIMEOUT_S
 
 
 # --------------------------------------------------------------------------- chunking
@@ -517,7 +590,11 @@ def _cache_path(
         *fingerprint,
     ]
     if isinstance(backend, FasterWhisperTranscriber):  # Groq keys stay as they were
-        parts += [backend.compute_type, local_asr.GUARD_VERSION]
+        parts += [
+            backend.compute_type,
+            WHISPER_MODELS[backend.model].revision,
+            local_asr.GUARD_VERSION,
+        ]
     key = json.dumps(parts)
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
     return cache_dir / f"{chunk.index:04d}-{digest}.json"
@@ -769,7 +846,9 @@ def _transcribe_chunks(
             path = cut_chunk(audio, chunk, work_dir, timeout_s=deadline.timeout(CUT_TIMEOUT_S))
             try:
                 result = backend.transcribe(
-                    path, language=language, timeout_s=deadline.timeout(CHUNK_CALL_TIMEOUT_S)
+                    path,
+                    language=language,
+                    timeout_s=deadline.timeout(call_timeout(backend, chunk.duration)),
                 )
             except BilledChunkError as exc:
                 with lock:

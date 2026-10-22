@@ -927,9 +927,8 @@ def test_invalid_signals_are_ignored_not_fatal(conn, media, raw, caplog):
     # signals are optional hints: a bad point must not fail the job, only drop the hints
     caplog.set_level(logging.WARNING, logger="clipper.pipeline.select")
     (media / "signals.json").write_text(json.dumps(raw))
-    fake = FakeAnthropic()
-    run(make_job(conn), make_ctx(conn, media), fake)
-    assert fake.requests
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic("overlap.json"))
+    assert out["clips"]
     assert "signals.json is invalid" in caplog.text
 
 

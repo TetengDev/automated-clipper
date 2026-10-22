@@ -316,11 +316,13 @@ def rank_windows(windows: Sequence[Window], signals: _Signals) -> list[float]:
 
 def choose_windows(windows: Sequence[Window], signals: _Signals, limit: int) -> list[int]:
     """Indexes of the windows to send to Claude, in time order: all of them when they fit
-    in `limit` or there are no signals; else the first (intros hold hooks) plus the
+    in `limit` or the signals are empty or all zero; else the first (intros hold hooks) plus the
     best-scoring others, ties broken by index."""
     if len(windows) <= limit or not (signals.heatmap or signals.loudness_peaks):
         return list(range(len(windows)))
     scores = rank_windows(windows, signals)
+    if not any(scores):  # signals carry no information: keep every window
+        return list(range(len(windows)))
     best = sorted(range(1, len(windows)), key=lambda i: (-scores[i], i))[: limit - 1]
     return [0, *sorted(best)]
 
@@ -695,11 +697,18 @@ def _select(
     raw_transcript = read_json(ctx.media_dir / "transcript.json", required=True)
     try:
         transcript = _Transcript.model_validate(raw_transcript)
+    except ValidationError as exc:
+        raise PermanentError(f"invalid input artifact ({exc.error_count()} errors)") from None
+    try:
         signals = _Signals.model_validate(
             read_json(ctx.media_dir / "signals.json", required=False) or {}
         )
     except ValidationError as exc:
-        raise PermanentError(f"invalid input artifact ({exc.error_count()} errors)") from None
+        # Signals are optional hints: drop them rather than fail the job.
+        logger.warning(
+            "job %s: signals.json is invalid (%d errors); ignoring it", job.id, exc.error_count()
+        )
+        signals = _Signals()
     meta = read_json(ctx.media_dir / "meta.json", required=False) or {}
     if not isinstance(meta, dict):
         meta = {}

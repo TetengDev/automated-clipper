@@ -8,7 +8,9 @@ the job's media dir and writes `highlights.json`:
                 "hashtags", "score", "reason"}]}
 
 The transcript is split into ~30 min windows with a small overlap; each window is one
-Messages API call with a cached system prompt and a JSON-schema structured output. The
+Messages API call with a cached system prompt and a JSON-schema structured output. When a
+source has more than `max_llm_windows` windows and engagement signals, only the first window
+and the best-scoring others are sent (CLP-36); windows already cached are still used. The
 candidates are then validated, snapped to word boundaries within [clip_min, clip_max],
 deduped (>30% overlap keeps the higher score) and cut to the top K.
 
@@ -278,6 +280,37 @@ def make_windows(
             break
         start += step
     return windows
+
+
+def _normalised(values: list[float]) -> list[float]:
+    top = max(values, default=0.0)
+    return [v / top if top > 0 else 0.0 for v in values]
+
+
+def rank_windows(windows: Sequence[Window], signals: _Signals) -> list[float]:
+    """Engagement score per window: the mean of its top-3 heatmap values plus its
+    loudness peaks per minute, each normalised 0-1 (divided by the source's maximum)."""
+    heat, loud = [], []
+    for w in windows:
+        values = sorted(
+            (h.value for h in signals.heatmap if h.end_s > w.start_s and h.start_s < w.end_s),
+            reverse=True,
+        )[:3]
+        heat.append(sum(values) / len(values) if values else 0.0)
+        peaks = sum(1 for p in signals.loudness_peaks if w.start_s <= p.t_s < w.end_s)
+        loud.append(peaks * 60 / (w.end_s - w.start_s) if w.end_s > w.start_s else 0.0)
+    return [h + lo for h, lo in zip(_normalised(heat), _normalised(loud), strict=True)]
+
+
+def choose_windows(windows: Sequence[Window], signals: _Signals, limit: int) -> list[int]:
+    """Indexes of the windows to send to Claude, in time order: all of them when they fit
+    in `limit` or there are no signals; else the first (intros hold hooks) plus the
+    best-scoring others, ties broken by index."""
+    if len(windows) <= limit or not (signals.heatmap or signals.loudness_peaks):
+        return list(range(len(windows)))
+    scores = rank_windows(windows, signals)
+    best = sorted(range(1, len(windows)), key=lambda i: (-scores[i], i))[: limit - 1]
+    return [0, *sorted(best)]
 
 
 def _hints(window: Window, signals: _Signals) -> str:
@@ -669,6 +702,20 @@ def _select(
     system = build_system(job.creator, detected or language, tags)
     duration = meta.get("duration_s") or transcript.duration_s
     windows = make_windows(transcript.segments, duration_s=float(duration) if duration else None)
+    chosen = set(choose_windows(windows, signals, settings.max_llm_windows))
+    if len(chosen) < len(windows):
+        logger.info(
+            "job %s: %d windows exceed max_llm_windows=%d; low-engagement windows skipped "
+            "unless already cached: %s",
+            job.id,
+            len(windows),
+            settings.max_llm_windows,
+            ", ".join(
+                f"#{i} {fmt_ts(w.start_s)}-{fmt_ts(w.end_s)}"
+                for i, w in enumerate(windows)
+                if i not in chosen
+            ),
+        )
     cache_dir = ctx.media_dir / CACHE_DIR
     cache_dir.mkdir(exist_ok=True)
     candidates: list[Candidate] = []
@@ -676,6 +723,8 @@ def _select(
         prompt = build_user_prompt(window, signals, meta, settings, feedback_examples)
         cache = _window_cache(cache_dir, index, system, prompt, settings)
         found = _load_window(cache)
+        if found is None and index not in chosen:
+            continue  # not worth a call; a window paid for earlier is still used, for free
         if found is None:
             _check_budget(ctx, cap)
             if client is None:

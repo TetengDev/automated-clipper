@@ -6,7 +6,7 @@ in the job's media dir. For each section the EDL cuts the requested range out of
 and the transcript words that overlap the clip, shifted into the section's timeline.
 `clipper.render.render_clip` writes `clips/<rank>/v1.{mp4,jpg,json}` and
 `clips_repo.insert_pending_clip` records it with the highlight's title, caption, hashtags,
-score and reason.
+score, reason, and the prompt and playbook versions it was selected with.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
 rerun after a crash renders only the clips without a row. The row's start_s/end_s are the
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import sqlite3
 from typing import Any
 
@@ -58,6 +59,12 @@ CLIP_WORST_CASE_S = DEFAULT_RENDER_TIMEOUT_S + 4 * DEFAULT_FFMPEG_TIMEOUT_S
 """Remotion plus the four ffmpeg steps of `render_clip`, each at its timeout."""
 assert CLIP_WORST_CASE_S < STAGE_BUDGET_S / 2, "a stage run must fit at least two clips"
 MAX_REASON_CHARS = 300
+_VERSION = re.compile(r"^[\w.-]{1,64}$")
+
+
+def _version(value: Any) -> str | None:
+    """A version label from highlights.json; anything else (stale or hand-edited) is dropped."""
+    return value if isinstance(value, str) and _VERSION.fullmatch(value) else None
 
 
 def _number(value: Any) -> bool:
@@ -87,7 +94,7 @@ def _words(transcript: Any, offset: float, start: float, end: float) -> list[dic
 
 
 def _plan(
-    section: Any, highlights: dict[Any, Any], transcript: Any, prompt_version: str | None
+    section: Any, highlights: dict[Any, Any], transcript: Any, selection: dict[str, Any]
 ) -> tuple[int, EDL, float, float, ClipMeta]:
     """(rank, EDL, source start, source end, meta) for one section; PermanentError if invalid."""
     rank = section.get("rank") if isinstance(section, dict) else None
@@ -134,7 +141,8 @@ def _plan(
         hashtags=tuple(t for t in tags if t),
         score=score,
         reason=reason,
-        prompt_version=prompt_version,
+        prompt_version=_version(selection.get("prompt_version")),
+        playbook_version=_version(selection.get("playbook_version")),
     )
     return rank, edl, start, end, meta
 
@@ -156,9 +164,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
     retry: RenderError | None = None
     for section in sections:
         try:
-            rank, edl, start, end, meta = _plan(
-                section, highlights, transcript, selection.get("prompt_version")
-            )
+            rank, edl, start, end, meta = _plan(section, highlights, transcript, selection)
             if rank in done:
                 continue
             if deadline.remaining() < CLIP_WORST_CASE_S:

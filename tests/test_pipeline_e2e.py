@@ -48,7 +48,10 @@ T0 = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
 YT = SourceRef("youtube", "dQw4w9WgXcQ")
 VIDEO_S = 60
 REAL_RUN = ytdlp.run_command
-CLIP_KEYS = {"rank", "start_s", "end_s", "hook", "title", "caption", "hashtags", "score", "reason"}
+CLIP_KEYS = {
+    *("rank", "start_s", "end_s", "hook", "title", "caption", "hashtags", "score", "reason"),
+    *("payoff_s", "open_question", "sensitive"),
+}
 SECTION_KEYS = {
     "rank",
     "path",
@@ -150,6 +153,9 @@ def _clip(start: float, end: float, score: int) -> dict[str, Any]:
         "hashtags": ["#clip"],
         "score": score,
         "reason": "Reason",
+        "payoff_s": start + 5,
+        "open_question": "What happens next?",
+        "sensitive": False,
     }
 
 
@@ -306,6 +312,7 @@ def _assert_artifacts(media: Path) -> None:
         select.MODEL,
         select.PROMPT_VERSION,
     )
+    assert highlights["playbook_version"] == select.PLAYBOOK_VERSION
     clips = highlights["clips"]
     assert [c["rank"] for c in clips] == [1, 2]
     assert all(set(c) == CLIP_KEYS for c in clips)
@@ -344,6 +351,10 @@ def _assert_clips(conn: sqlite3.Connection, media: Path) -> list[sqlite3.Row]:
         )
         assert json.loads(row["hashtags"]) == h["hashtags"]
         assert (row["start_s"], row["end_s"]) == (h["start_s"], h["end_s"])
+        assert (row["prompt_version"], row["playbook_version"]) == (
+            select.PROMPT_VERSION,
+            select.PLAYBOOK_VERSION,
+        )
         assert row["video_path"] == str((media / f"clips/{h['rank']}/v1.mp4").resolve())
         assert Path(row["video_path"]).is_file() and Path(row["thumb_path"]).is_file()
     return rows

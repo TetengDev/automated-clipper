@@ -206,7 +206,7 @@ def test_request_uses_cached_system_prompt_and_json_schema(conn, media):
     assert body["model"] == "claude-sonnet-5-5"
     system = body["system"]
     assert system[0]["cache_control"] == {"type": "ephemeral"}
-    assert system[0]["text"] == select.load_system_prompt()
+    assert system[0]["text"].startswith(select.load_system_prompt())  # + universal playbook
     assert "MrBeast" in system[1]["text"]
     fmt = body["output_config"]["format"]
     assert fmt["type"] == "json_schema"

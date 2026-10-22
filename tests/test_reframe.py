@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,21 @@ def test_face_target() -> None:
     assert rf.face_target([(0.2, 0.010), (0.6, 0.0059)]) == 0.2
     # More than two: the two largest.
     assert rf.face_target([(0.9, 0.001), (0.2, 0.010), (0.6, 0.008)]) == pytest.approx(0.4)
+
+
+def test_pair_too_far_apart_for_the_window_frames_the_largest() -> None:
+    # Two similar faces at 0.25 and 0.75 cannot both fit a 9:16 window of a 16:9 frame:
+    # centring on the empty gap between them would frame neither.
+    assert rf.face_target([(0.25, 0.010), (0.75, 0.009)], HALF) == 0.25
+    assert rf.face_target([(0.75, 0.009), (0.25, 0.010)], HALF) == 0.25
+    # Close enough to share the window: their centroid.
+    assert rf.face_target([(0.45, 0.010), (0.55, 0.009)], HALF) == pytest.approx(0.5)
+
+
+def test_plan_reframe_frames_the_largest_of_a_distant_pair() -> None:
+    samples = [(i / 5, [(0.25, 0.010), (0.75, 0.009)]) for i in range(50)]
+    _, keys = rf.plan_reframe(rf.Faces(1280, 720, samples), [], 0.0, 10.0)
+    assert keys is not None and {x for _, x in keys} == {0.25}
 
 
 def test_choose_layout() -> None:
@@ -141,6 +157,23 @@ def test_plan_reframe_uses_clip_time() -> None:
     assert keys[-1][0] == pytest.approx(10.0 - 1 / FPS)
 
 
+def test_clip_origin_rounds_half_up_like_remotion() -> None:
+    # in_s = 0.15 s is frame 4.5: Remotion's Math.round trims 5 frames (Python's round would
+    # say 4), so a cut at 0.15 s is on clip frame 0 and the crop starts in the new shot.
+    samples = [(i / 5, [(0.3 if i / 5 < 0.15 else 0.7, 0.02)]) for i in range(30)]
+    _, keys = rf.plan_reframe(rf.Faces(1280, 720, samples), [0.15], 0.15, 5.15)
+    assert keys is not None
+    assert keys[0] == (0.0, 0.7)
+    assert 0.3 not in {x for _, x in keys}
+
+
+def test_many_cuts_stay_cheap_and_correct() -> None:
+    cuts = [i / 30 + 0.001 for i in range(1, 5000)]
+    samples = [(i / 5, 0.5) for i in range(3000)]
+    keys = rf.crop_path(samples, cuts, 180.0, HALF)
+    assert {x for _, x in keys} == {0.5}
+
+
 def test_plan_reframe_falls_back_to_blurred_fill() -> None:
     few = [(i / 5, [(0.5, 0.02)] if i % 2 else []) for i in range(50)]  # faces in 50%
     assert rf.plan_reframe(rf.Faces(1280, 720, few), [], 0.0, 10.0) == (Layout.BLURRED_FILL, None)
@@ -161,6 +194,11 @@ def test_plan_reframe_too_many_keys_falls_back(monkeypatch: pytest.MonkeyPatch) 
 
 
 GOOD = b"model bytes"
+
+
+@pytest.fixture(autouse=True)
+def _no_failure_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rf, "_fetch_failed_at", None, raising=False)
 
 
 @pytest.fixture
@@ -219,6 +257,70 @@ def test_download_failure_disables_face_tracking(
 
     assert rf.ensure_model(tmp_path, fetch=fail) is None
     assert "face model" in caplog.text
+
+
+def test_failed_fetch_is_not_retried_for_a_while(
+    tmp_path: Path, pinned: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    now = [1000.0]
+    monkeypatch.setattr(rf.time, "monotonic", lambda: now[0])
+
+    def tampered(url: str, timeout_s: float) -> bytes:
+        calls.append(url)
+        return b"tampered"
+
+    assert rf.ensure_model(tmp_path, fetch=tampered) is None
+    now[0] += rf.MODEL_RETRY_S - 1
+    assert rf.ensure_model(tmp_path, fetch=tampered) is None
+    assert len(calls) == 1  # each later clip falls back at once, without a 30 s fetch
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+    now[0] += 2
+    assert rf.ensure_model(tmp_path, fetch=lambda url, timeout_s: GOOD) is not None
+    assert rf._fetch_failed_at is None
+
+
+def test_model_read_refuses_symlinks_and_fifos(tmp_path: Path, pinned: str) -> None:
+    real = tmp_path / "elsewhere.tflite"
+    real.write_bytes(GOOD)
+    link = tmp_path / "models" / rf.MODEL_NAME
+    link.parent.mkdir()
+    link.symlink_to(real)
+    assert rf.read_model(link) is None
+    fifo = tmp_path / "fifo.tflite"
+    os.mkfifo(fifo)
+    assert rf.read_model(fifo) is None  # returns at once: never waits for a writer
+    assert rf.read_model(real) == GOOD
+    real.write_bytes(b"tampered")
+    assert rf.read_model(real) is None
+    # A symlinked model is replaced by a verified regular file.
+    assert rf.ensure_model(link.parent, fetch=lambda url, timeout_s: GOOD) == link
+    assert not link.is_symlink() and link.read_bytes() == GOOD
+
+
+def test_child_verifies_the_model_itself(tmp_path: Path, section: Path) -> None:
+    bad = tmp_path / rf.MODEL_NAME
+    bad.write_bytes(b"swapped after the parent's check")
+    with pytest.raises(ValueError, match="checksum"):
+        rf.scan(bad, section)
+
+
+def test_download_timeout_covers_every_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+    real = rf.httpx.stream
+
+    def spy(*args: Any, **kw: Any) -> Any:
+        seen.append(kw["timeout"])
+        return real(*args, **kw)
+
+    monkeypatch.setattr(rf.httpx, "stream", spy)
+    with respx.mock:
+        respx.get(rf.MODEL_URL).mock(return_value=httpx.Response(200, content=GOOD))
+        rf.download(rf.MODEL_URL, 30.0)
+    (timeout,) = seen
+    # Connect, headers and the body each get a third: never more than 30 s in all.
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.connect == timeout.read == timeout.write == timeout.pool == 10.0
 
 
 @respx.mock

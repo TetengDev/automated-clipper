@@ -15,12 +15,13 @@ from typing import Any
 
 import pytest
 
-from clipper.config import AppConfig
+from clipper.config import AppConfig, Creator, CreatorOverrides, Settings, YouTubeChannel
 from clipper.db import connect, migrate
 from clipper.edl import EDL
 from clipper.jobs import Worker, enqueue, get_job
 from clipper.jobs.models import Job, JobStatus
 from clipper.jobs.stages import PermanentError, StageContext
+from clipper.pipeline import boundaries as bd
 from clipper.pipeline import build_stages
 from clipper.pipeline import render_clips as rc
 from clipper.pipeline.common import Deadline, StageTimeout
@@ -193,7 +194,7 @@ def test_renders_each_section_into_a_pending_clip(
     assert one["thumb_path"] == str(media / "clips/1/v1.jpg")
 
 
-def test_boundaries_are_snapped_then_trimmed(
+def test_boundaries_are_trimmed_then_snapped(
     conn: sqlite3.Connection,
     job: Job,
     media: Path,
@@ -224,8 +225,8 @@ def test_boundaries_are_snapped_then_trimmed(
 
     assert seen == [(media / "clips/1/source.mp4").resolve()]
     edl = fake.calls[0]["edl"]
-    # Start snaps 2.0 -> 1.5 (a cut in a word gap, kept by the trim: "early" starts at 1.6);
-    # end snaps 32.0 -> 31.2, then the trim pulls it to 0.4 s after "last" (29.5).
+    # Start: "early" straddles 2.0, so no trim; the cut at 1.5 completes the word.
+    # End: trimmed to 0.4 s after "last" (29.5); the cut at 31.2 is beyond the tolerance.
     assert (edl.source.in_s, edl.source.out_s) == (1.5, pytest.approx(29.9))
     assert [(w.text, w.start_s, w.end_s) for w in edl.words] == [
         ("early", pytest.approx(1.6), pytest.approx(2.4)),
@@ -237,6 +238,116 @@ def test_boundaries_are_snapped_then_trimmed(
 
     rc.render_clips(job, _ctx(media, conn))  # done: no second detection
     assert len(seen) == 1
+
+
+def test_creator_clip_limits_reach_the_polish(
+    conn: sqlite3.Connection, media: Path, fake: FakeRender, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = AppConfig(
+        settings=Settings(clip_min_seconds=20, clip_max_seconds=60),
+        creators=(
+            Creator(
+                name="Long",
+                region="global",
+                youtube=YouTubeChannel(handle="@LongForm"),
+                overrides=CreatorOverrides(clip_min_seconds=25, clip_max_seconds=300),
+            ),
+        ),
+    )
+    job, _ = enqueue(conn, SourceRef("youtube", "dQw4w9WgXcQ"), T0, creator="Long")
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    limits: list[tuple[float, float]] = []
+    real = rc.polish
+
+    def spy(*args: Any, **kw: Any) -> tuple[float, float]:
+        limits.append(args[4:6])
+        return real(*args, **kw)
+
+    monkeypatch.setattr(rc, "polish", spy)
+    rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
+    # The creator's minimum; the maximum is capped at what an EDL allows.
+    assert limits == [(25, rc.MAX_CLIP_SECONDS)]
+
+
+@pytest.mark.parametrize(("known", "out_s"), [(True, 32.5 - bd.FRAME_GUARD_S), (False, 32.0)])
+def test_unknown_section_length_never_extends_the_end(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    cuts: list[float],
+    known: bool,
+    out_s: float,
+) -> None:
+    # Without duration_s the file is only known to cover the requested range, so the end
+    # may not snap past it; the start can still move (the section starts at 0).
+    section = _section(1, 10.0, 40.0)
+    if not known:
+        del section["duration_s"]
+    words = [{"word": "a", "start": 10.5, "end": 11.0}, {"word": "b", "start": 39.0, "end": 39.9}]
+    _setup(media, [_highlight(1, 10.0, 40.0)], sections=[section], words=words)
+    cuts.extend([1.6, 32.5])  # section time
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    source = fake.calls[0]["edl"].source
+    assert (source.in_s, source.out_s) == pytest.approx((1.6, out_s), abs=1e-3)
+
+
+@pytest.mark.parametrize("detector", ["none found", "real, failing"])
+def test_words_still_trim_without_cuts(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    detector: str,
+) -> None:
+    if detector == "real, failing":  # the fake source bytes are no video: the child fails
+        monkeypatch.setattr(rc, "detect_cuts", bd.detect_cuts)
+    words = [{"word": "a", "start": 12.0, "end": 13.0}, {"word": "b", "start": 30.0, "end": 35.0}]
+    _setup(media, [_highlight(1, 10.0, 40.0)], words=words)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    source = fake.calls[0]["edl"].source
+    assert (source.in_s, source.out_s) == pytest.approx((3.75, 27.4))
+    (row,) = _rows(conn)
+    assert (row["start_s"], row["end_s"]) == pytest.approx((11.75, 35.4))
+    failed = any("scene detection failed" in r.getMessage() for r in caplog.records)
+    assert failed is (detector == "real, failing")
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "detected"),
+    [
+        (4096, 2160, True),
+        (2160, 3840, True),
+        (7680, 4320, False),
+        (4097, 2160, False),
+        ("x", 1, False),
+    ],
+)
+def test_oversized_section_skips_detection(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    width: Any,
+    height: Any,
+    detected: bool,
+) -> None:
+    section = {**_section(1, 10.0, 40.0), "width": width, "height": height}
+    _setup(media, [_highlight(1, 10.0, 40.0)], sections=[section])
+    seen: list[Path] = []
+    monkeypatch.setattr(rc, "detect_cuts", lambda path, deadline: seen.append(path) or [])
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    assert bool(seen) is detected
+    assert len(_rows(conn)) == 1  # the clip renders either way
 
 
 def test_word_at_clamped_section_start_and_no_hook(

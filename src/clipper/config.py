@@ -71,7 +71,9 @@ class Settings(_Strict):
     reframe: Literal["auto", "blurred_fill"] = "auto"
     """auto: a face-tracked 9:16 crop when faces are found, else blurred fill (CLP-58)."""
     jump_cuts: JumpCuts = "silences"
-    """Cuts inside a clip (CLP-73): silences only, also stutters and fillers (full), or off."""
+    """Cuts inside a clip (CLP-73): silences only, also stutters and fillers (full), or off.
+    A stutter is cut only when its first word is clearly cut short, so with Whisper's
+    timestamps such cuts are rare: missing a stutter beats cutting deliberate repetition."""
 
     _jump_cuts_off = field_validator("jump_cuts", mode="before")(_yaml_off)
 

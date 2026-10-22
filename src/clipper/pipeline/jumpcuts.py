@@ -6,7 +6,9 @@ Times are seconds in the section file, like the EDL words. The rules are pure:
   after a sentence end or a long pause), SPLIT of it kept after the word and the rest
   before the next one, but only where silencedetect heard silence over the whole cut. On
   streams a gap in the transcript is often game audio or laughter.
-- `stutter_cuts`: the same word twice within STUTTER_GAP_S; the first one goes.
+- `stutter_cuts`: the same word twice within STUTTER_GAP_S, the first clearly cut short
+  (STUTTER_SHORT); the first one goes. With Whisper's timestamps this is rare by design:
+  missing a stutter beats cutting deliberate repetition.
 - `filler_cuts`: um/uh/eh/ah alone between two pauses that silencedetect calls silent.
 - `retake_candidates`: a phrase much like a later one (Jaccard of the content words). These
   are only proposed (applied=False), because picking the better take is a human call.

@@ -347,7 +347,7 @@ def test_model_pin_is_exact() -> None:
 
 def test_models_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("CLIPPER_MODELS_DIR", raising=False)
-    assert rf.models_dir() == Path("data/models")
+    assert rf.models_dir() == Path("data/models").resolve()
     monkeypatch.setenv("CLIPPER_MODELS_DIR", str(tmp_path))
     assert rf.models_dir() == tmp_path
 

@@ -8,7 +8,9 @@ the job's media dir and writes `highlights.json`:
                 "hashtags", "score", "reason"}]}
 
 The transcript is split into ~30 min windows with a small overlap; each window is one
-Messages API call with a cached system prompt and a JSON-schema structured output. The
+Messages API call with a cached system prompt and a JSON-schema structured output. When a
+source has more than `max_llm_windows` windows and engagement signals, only the first window
+and the best-scoring others are sent (CLP-36); windows already cached are still used. The
 candidates are then validated, snapped to word boundaries within [clip_min, clip_max],
 deduped (>30% overlap keeps the higher score) and cut to the top K.
 
@@ -140,20 +142,28 @@ class _Transcript(BaseModel):
     words: list[_Word] = []
 
 
+MAX_SIGNAL_POINTS = 10_000
+
+
 class _HeatPoint(BaseModel):
-    start_s: float
-    end_s: float
-    value: float
+    start_s: float = Field(ge=0, allow_inf_nan=False)
+    end_s: float = Field(ge=0, allow_inf_nan=False)
+    value: float = Field(allow_inf_nan=False)
+
+    @field_validator("value", mode="after")
+    @classmethod
+    def _clamp(cls, value: float) -> float:
+        return min(max(value, 0.0), 1.0)
 
 
 class _LoudPeak(BaseModel):
-    t_s: float
-    lufs: float
+    t_s: float = Field(ge=0, allow_inf_nan=False)
+    lufs: float = Field(allow_inf_nan=False)
 
 
 class _Signals(BaseModel):
-    heatmap: list[_HeatPoint] = []
-    loudness_peaks: list[_LoudPeak] = []
+    heatmap: list[_HeatPoint] = Field([], max_length=MAX_SIGNAL_POINTS)
+    loudness_peaks: list[_LoudPeak] = Field([], max_length=MAX_SIGNAL_POINTS)
 
 
 # --- model output ------------------------------------------------------------------------
@@ -278,6 +288,43 @@ def make_windows(
             break
         start += step
     return windows
+
+
+def _normalised(values: list[float]) -> list[float]:
+    top = max(values, default=0.0)
+    return [v / top if top > 0 else 0.0 for v in values]
+
+
+def rank_windows(windows: Sequence[Window], signals: _Signals) -> list[float]:
+    """Engagement score per window, 0-2: the mean of its top-3 heatmap values divided by
+    the source's highest heatmap value, plus its loudness-peak density divided by the
+    source's highest density. Density is per full window length, so a short tail window
+    (mostly overlap) is not inflated."""
+    top_heat = max((h.value for h in signals.heatmap), default=0.0)
+    heat: list[float] = []
+    loud: list[float] = []
+    for w in windows:
+        values = sorted(
+            (h.value for h in signals.heatmap if h.end_s > w.start_s and h.start_s < w.end_s),
+            reverse=True,
+        )[:3]
+        heat.append(sum(values) / len(values) / top_heat if values and top_heat > 0 else 0.0)
+        peaks = sum(1 for p in signals.loudness_peaks if w.start_s <= p.t_s < w.end_s)
+        loud.append(peaks / max(w.end_s - w.start_s, WINDOW_S))
+    return [h + lo for h, lo in zip(heat, _normalised(loud), strict=True)]
+
+
+def choose_windows(windows: Sequence[Window], signals: _Signals, limit: int) -> list[int]:
+    """Indexes of the windows to send to Claude, in time order: all of them when they fit
+    in `limit` or the signals are empty or all zero; else the first (intros hold hooks) plus the
+    best-scoring others, ties broken by index."""
+    if len(windows) <= limit or not (signals.heatmap or signals.loudness_peaks):
+        return list(range(len(windows)))
+    scores = rank_windows(windows, signals)
+    if not any(scores):  # signals carry no information: keep every window
+        return list(range(len(windows)))
+    best = sorted(range(1, len(windows)), key=lambda i: (-scores[i], i))[: limit - 1]
+    return [0, *sorted(best)]
 
 
 def _hints(window: Window, signals: _Signals) -> str:
@@ -650,11 +697,18 @@ def _select(
     raw_transcript = read_json(ctx.media_dir / "transcript.json", required=True)
     try:
         transcript = _Transcript.model_validate(raw_transcript)
+    except ValidationError as exc:
+        raise PermanentError(f"invalid input artifact ({exc.error_count()} errors)") from None
+    try:
         signals = _Signals.model_validate(
             read_json(ctx.media_dir / "signals.json", required=False) or {}
         )
     except ValidationError as exc:
-        raise PermanentError(f"invalid input artifact ({exc.error_count()} errors)") from None
+        # Signals are optional hints: drop them rather than fail the job.
+        logger.warning(
+            "job %s: signals.json is invalid (%d errors); ignoring it", job.id, exc.error_count()
+        )
+        signals = _Signals()
     meta = read_json(ctx.media_dir / "meta.json", required=False) or {}
     if not isinstance(meta, dict):
         meta = {}
@@ -669,6 +723,8 @@ def _select(
     system = build_system(job.creator, detected or language, tags)
     duration = meta.get("duration_s") or transcript.duration_s
     windows = make_windows(transcript.segments, duration_s=float(duration) if duration else None)
+    chosen = set(choose_windows(windows, signals, settings.max_llm_windows))
+    skipped: list[str] = []
     cache_dir = ctx.media_dir / CACHE_DIR
     cache_dir.mkdir(exist_ok=True)
     candidates: list[Candidate] = []
@@ -676,13 +732,24 @@ def _select(
         prompt = build_user_prompt(window, signals, meta, settings, feedback_examples)
         cache = _window_cache(cache_dir, index, system, prompt, settings)
         found = _load_window(cache)
-        if found is None:
+        if found is None:  # a window paid for earlier is used even if not chosen: it is free
+            if index not in chosen:
+                skipped.append(f"#{index} {fmt_ts(window.start_s)}-{fmt_ts(window.end_s)}")
+                continue
             _check_budget(ctx, cap)
             if client is None:
                 client = _make_client()
             found = _select_window(client, system, prompt, job, ctx, cap)
             write_json_atomic(cache, {"clips": [c.model_dump() for c in found]})
         candidates += found
+    if skipped:
+        logger.info(
+            "job %s: %d windows exceed max_llm_windows=%d; skipped low-engagement windows %s",
+            job.id,
+            len(windows),
+            settings.max_llm_windows,
+            ", ".join(skipped),
+        )
 
     words = sorted(transcript.words, key=lambda w: w.start)
     clips = finalize(candidates, words, settings, top_k)

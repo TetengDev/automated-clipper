@@ -187,3 +187,19 @@ def test_rclone_remote_validated(monkeypatch: pytest.MonkeyPatch, remote: str) -
 def test_rclone_remote_valid(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RCLONE_REMOTE", "gdrive:clips/ready")
     assert Secrets().rclone_remote == "gdrive:clips/ready"
+
+
+def test_reframe_setting_defaults_to_auto_with_creator_opt_out() -> None:
+    from clipper.config import AppConfig, Creator, CreatorOverrides, Settings, YouTubeChannel
+
+    creator = Creator(
+        name="Static",
+        region="global",
+        youtube=YouTubeChannel(handle="@static"),
+        overrides=CreatorOverrides(reframe="blurred_fill"),
+    )
+    cfg = AppConfig(creators=(creator,))
+    assert cfg.settings.reframe == "auto"
+    assert cfg.effective_settings("Static").reframe == "blurred_fill"
+    with pytest.raises(ValidationError):
+        Settings(reframe="split_screen")  # type: ignore[arg-type]

@@ -37,8 +37,26 @@ describe("parseEdl", () => {
       captions_enabled: true,
       caption_style: "bold_pop",
       progress_bar: true,
+      crop: null,
     });
     expect(raw).toEqual({ source: { path: "source.mp4", in_s: 0, out_s: 5 } });
+  });
+
+  it("caps crop keys at 2000", () => {
+    const keys = (n: number) => Array.from({ length: n }, (_, i) => ({ t_s: i / 100, x_center: 0.5 }));
+    const props = (n: number) => ({
+      source: { path: "a.mp4", in_s: 0, out_s: 30 },
+      layout: "face_track",
+      crop: keys(n),
+    });
+    expect(parseEdl(props(2000)).crop).toHaveLength(2000);
+    expect(() => parseEdl(props(2001))).toThrow(EdlValidationError);
+  });
+
+  it("names the crop rule that failed", () => {
+    expect(() =>
+      parseEdl({ source: { path: "a.mp4", in_s: 0, out_s: 5 }, layout: "face_track" }),
+    ).toThrow(/crop is required when layout is face_track/);
   });
 
   it("applies hook defaults", () => {

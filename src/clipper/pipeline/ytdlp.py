@@ -84,6 +84,7 @@ class Runner(Protocol):
         timeout_s: float,
         *,
         on_stderr_line: Callable[[str], None] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult: ...
 
 
@@ -101,6 +102,10 @@ class DownloadBlocked(YtDlpError):
 
 class Unavailable(PermanentError):
     """The video cannot be fetched by anyone without special access; do not retry."""
+
+
+_UNSAFE_ENV_PREFIXES = ("LD_", "DYLD_", "PYTHON")
+"""Extra child env may only add keys: never loader or interpreter hooks."""
 
 
 def child_env() -> dict[str, str]:
@@ -208,15 +213,20 @@ def run_command(
     timeout_s: float,
     *,
     on_stderr_line: Callable[[str], None] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> RunResult:
-    """Default `Runner`: argument list (no shell), no stdin, allowlisted env, own process
-    group (killed as a whole on timeout), bounded stdout/stderr."""
+    """Default `Runner`: argument list (no shell), no stdin, allowlisted env (plus `env`),
+    own process group (killed as a whole on timeout), bounded stdout/stderr."""
+    extra = dict(env or {})
+    unsafe = [k for k in extra if k in CHILD_ENV_ALLOWLIST or k.startswith(_UNSAFE_ENV_PREFIXES)]
+    if unsafe:
+        raise ValueError(f"extra env may not set {sorted(unsafe)}")
     proc = subprocess.Popen(  # noqa: S603 - argument list, never a shell
         list(args),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=child_env(),
+        env={**child_env(), **extra},
         start_new_session=True,
     )
     out, err = _Tail(STDOUT_LIMIT_BYTES), _Tail(STDERR_LIMIT_BYTES)

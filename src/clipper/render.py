@@ -291,7 +291,7 @@ def segment_props(edl: EDL) -> dict[str, Any]:
     return parse_edl(props).to_props()
 
 
-def _resolve_source(edl: EDL, media_root: Path) -> Path:
+def resolve_source(edl: EDL, media_root: Path) -> Path:
     root = media_root.resolve()
     source = (root / edl.source.path).resolve()
     if not source.is_relative_to(root):
@@ -494,7 +494,7 @@ def render_clip(
             edl = parse_edl(edl)
         except ValidationError as exc:
             raise InvalidClipError(f"invalid EDL: {exc}") from exc
-    source = _resolve_source(edl, media_root)
+    source = resolve_source(edl, media_root)
     render_dir = (render_dir or default_render_dir()).resolve()
     entry = "src/index.ts"
     if not (render_dir / entry).is_file():

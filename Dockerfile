@@ -53,7 +53,8 @@ COPY render/schema ./render/schema
 COPY render/src ./render/src
 
 COPY src ./src
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --no-dev \
+    && python -I -c "import cv2, scenedetect"
 
 RUN useradd --create-home --uid 10001 clipper \
     && mkdir -p /app/data /app/output /app/config \

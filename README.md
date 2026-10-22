@@ -18,6 +18,9 @@ uv run pytest                     # tests
 docker compose build              # image with ffmpeg + yt-dlp
 ```
 
+Install with uv only: `pyproject.toml` overrides scenedetect's GUI `opencv-python` dependency
+so that only `opencv-python-headless` is installed, and pip does not honour that override.
+
 ## Adding a creator
 
 1. Add an entry to `config/creators.yaml`.

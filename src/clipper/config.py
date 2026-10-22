@@ -56,6 +56,7 @@ class Settings(_Strict):
     max_clips_per_stream: int = Field(10, ge=1)
     max_source_hours_per_day: float = Field(24, gt=0)
     daily_llm_usd_cap: float = Field(10.0, ge=0)
+    max_llm_windows: int = Field(8, ge=1)
     daily_transcribe_usd_cap: float = Field(5.0, ge=0)
     disk_budget_gb: int = Field(150, ge=1)
     media_retention_hours: int = Field(48, ge=1)
@@ -78,6 +79,7 @@ class CreatorOverrides(_Strict):
     max_clips_per_source: int | None = Field(None, ge=1)
     max_clips_per_stream: int | None = Field(None, ge=1)
     max_source_hours_per_day: float | None = Field(None, gt=0)
+    max_llm_windows: int | None = Field(None, ge=1)
 
 
 class YouTubeChannel(_Strict):

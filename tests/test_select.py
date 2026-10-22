@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -803,3 +804,217 @@ def test_unknown_transcript_language_falls_back_to_creator_language(conn, media)
     plain = FakeAnthropic("valid.json")
     run(make_job(conn), make_ctx(conn, media), plain)  # unknown creator: stays "unknown"
     assert "Video language: unknown" in plain.requests[0]["system"][1]["text"]
+
+
+# --- CLP-36: rank windows by engagement signals ------------------------------------------------
+
+LONG_S = 41_000  # 24 windows of 30 min, 29 min apart
+HOT = [3, 5, 7, 9, 11, 13, 15]  # windows with heatmap peaks at their centre
+_WINDOW_START = re.compile(r"\(seconds (\d+)-")
+
+
+def _window(start: float, end: float) -> select.Window:
+    return select.Window(start, end, ())
+
+
+def _signals(**raw: Any) -> select._Signals:
+    return select._Signals.model_validate(raw)
+
+
+def _hot_signals() -> dict[str, Any]:
+    step = select.WINDOW_S - select.OVERLAP_S
+    return {
+        "heatmap": [
+            {"start_s": k * step + 900, "end_s": k * step + 910, "value": 0.9} for k in HOT
+        ],
+        "loudness_peaks": [],
+    }
+
+
+@pytest.fixture
+def long_media(media: Path) -> Path:
+    write_transcript(media, seconds=LONG_S)
+    _set_meta_duration(media, LONG_S)
+    (media / "signals.json").write_text(json.dumps(_hot_signals()))
+    return media
+
+
+def _sent_windows(fake: FakeAnthropic) -> list[int]:
+    step = select.WINDOW_S - select.OVERLAP_S
+    starts = [int(_WINDOW_START.search(r["messages"][0]["content"])[1]) for r in fake.requests]
+    return [round(s / step) for s in starts]
+
+
+def _empty(n: int) -> FakeAnthropic:
+    return FakeAnthropic(*[(200, _message([]))] * n)
+
+
+def test_rank_windows_mixes_top3_heatmap_and_loudness_density():
+    windows = [_window(0, 100), _window(100, 200), _window(200, 300)]
+    signals = _signals(
+        heatmap=[
+            {"start_s": 10, "end_s": 20, "value": 0.2},
+            *(
+                {"start_s": 110 + i, "end_s": 111 + i, "value": v}
+                for i, v in enumerate([1, 0.8, 0.6, 0.1])
+            ),
+        ],
+        loudness_peaks=[{"t_s": 50, "lufs": -9}, *({"t_s": 210 + i, "lufs": -9} for i in range(4))],
+    )
+    # heat: mean of top-3 values / source max value (1.0) -> 0.2 / 0.8 / 0
+    # loudness: peaks per full window, normalised by the max -> 1/4 / 0 / 4/4
+    assert select.rank_windows(windows, signals) == pytest.approx([0.45, 0.8, 1.0])
+    assert select.rank_windows(windows, _signals()) == [0.0, 0.0, 0.0]
+
+
+def test_rank_windows_normalises_heat_by_the_source_max_value():
+    windows = [_window(0, 100), _window(100, 200)]
+    heat = [
+        {"start_s": 10 + i, "end_s": 11 + i, "value": v} for i, v in enumerate([0.8, 0.0, 0.0])
+    ] + [{"start_s": 110, "end_s": 120, "value": 0.4}]
+    # top-3 / 0.8 -> mean(1, 0, 0) = 1/3 and 0.5 (not re-scaled so the best window is 1)
+    assert select.rank_windows(windows, _signals(heatmap=heat)) == pytest.approx([1 / 3, 0.5])
+
+
+def _peaks(*times: float) -> list[dict[str, float]]:
+    return [{"t_s": t, "lufs": -9} for t in times]
+
+
+_SIX = [_window(i * 100, i * 100 + 100) for i in range(6)]
+_FULL = select.WINDOW_S
+
+
+@pytest.mark.parametrize(
+    ("windows", "peaks", "limit", "expected"),
+    [
+        (_SIX, _peaks(450, 451, 250), 3, [0, 2, 4]),  # first kept, then the best
+        (_SIX, [p * 100 + 50 for p in range(6)], 3, [0, 1, 2]),  # ties broken by index
+        (_SIX, _peaks(450), 6, list(range(6))),  # all fit
+        (_SIX, [], 2, list(range(6))),  # no signals: every window
+        (_SIX, _peaks(450), 1, [0]),
+        (_SIX, _peaks(50, 51, 52, 350), 3, [0, 1, 3]),  # window 0 is the top scorer
+        ([], _peaks(10), 2, []),
+        # a ~61 s tail window with 1 peak must not beat a full window with 10 peaks
+        (
+            [
+                _window(0, _FULL),
+                _window(_FULL - 60, 2 * _FULL - 60),
+                _window(2 * _FULL - 120, 2 * _FULL - 59),
+            ],
+            _peaks(*(_FULL + i for i in range(10)), 2 * _FULL - 60),
+            2,
+            [0, 1],
+        ),
+    ],
+)
+def test_choose_windows(windows, peaks, limit, expected):
+    if peaks and not isinstance(peaks[0], dict):
+        peaks = _peaks(*peaks)
+    assert select.choose_windows(windows, _signals(loudness_peaks=peaks), limit) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"heatmap": [{"start_s": 0, "end_s": 1, "value": float("nan")}]},
+        {"heatmap": [{"start_s": -1, "end_s": 1, "value": 0.5}]},
+        {"loudness_peaks": [{"t_s": float("inf"), "lufs": -9}]},
+        {"loudness_peaks": [{"t_s": 1, "lufs": float("nan")}]},
+        {"loudness_peaks": _peaks(*range(10_001))},
+    ],
+)
+def test_invalid_signals_are_ignored_not_fatal(conn, media, raw, caplog):
+    # signals are optional hints: a bad point must not fail the job, only drop the hints
+    caplog.set_level(logging.WARNING, logger="clipper.pipeline.select")
+    (media / "signals.json").write_text(json.dumps(raw))
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic("overlap.json"))
+    assert out["clips"]
+    assert "signals.json is invalid" in caplog.text
+
+
+def test_all_zero_signals_send_every_window():
+    # signals present but carrying no information must not silently drop the tail
+    zero = [{"start_s": w.start_s, "end_s": w.end_s, "value": 0.0} for w in _SIX]
+    assert select.choose_windows(_SIX, _signals(heatmap=zero), 2) == list(range(6))
+
+
+def test_heat_values_are_clamped_to_0_1():
+    heat = [{"start_s": 0, "end_s": 1, "value": v} for v in (1.7, -0.2)]
+    assert [h.value for h in _signals(heatmap=heat).heatmap] == [1.0, 0.0]
+
+
+def test_long_source_with_signals_sends_only_the_best_windows(
+    conn, long_media, caplog, monkeypatch
+):
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    estimated: list[str] = []
+    real = select.estimate_call_usd
+
+    def spy(system: Any, prompt: str) -> float:
+        estimated.append(prompt)
+        return real(system, prompt)
+
+    monkeypatch.setattr(select, "estimate_call_usd", spy)
+    fake = _empty(8)
+    run(make_job(conn, is_stream=True), make_ctx(conn, long_media), fake)
+    assert len(fake.requests) == 8
+    assert _sent_windows(fake) == [0, *HOT]  # first window kept, sent in time order
+    assert estimated == [r["messages"][0]["content"] for r in fake.requests]  # budget: chosen only
+    assert conn.execute("SELECT COUNT(*) FROM spend").fetchone()[0] == 8
+    assert "#1 [29:00]-[59:00]" in caplog.text  # skipped windows logged with their range
+    assert "#3 " not in caplog.text
+
+
+@pytest.mark.parametrize("signals", [None, {"heatmap": [], "loudness_peaks": []}])
+def test_long_source_without_signals_sends_every_window(conn, long_media, signals):
+    path = long_media / "signals.json"
+    path.unlink()
+    if signals is not None:
+        path.write_text(json.dumps(signals))
+    fake = _empty(24)
+    run(make_job(conn, is_stream=True), make_ctx(conn, long_media), fake)
+    assert _sent_windows(fake) == list(range(24))
+
+
+def test_cached_unchosen_window_is_used_and_not_rebilled(conn, long_media, caplog):
+    (long_media / "signals.json").unlink()
+    job = make_job(conn, is_stream=True)
+    paid = (200, _message([_cand(2000.1, 2030.6, hook="from-cache", score=99)]))
+    overloaded = (529, _error("overloaded_error", "Overloaded"))
+    with pytest.raises(RuntimeError):
+        run(job, make_ctx(conn, long_media), FakeAnthropic((200, _message([])), paid, overloaded))
+    assert conn.execute("SELECT COUNT(*) FROM spend").fetchone()[0] == 2
+
+    (long_media / "signals.json").write_text(json.dumps(_hot_signals()))
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    fake = _empty(7)
+    out = run(job, make_ctx(conn, long_media), fake)
+
+    assert _sent_windows(fake) == HOT  # windows 0 and 1 came from the cache
+    assert conn.execute("SELECT COUNT(*) FROM spend").fetchone()[0] == 2 + 7
+    assert [c["hook"] for c in out["clips"]] == ["from-cache"]
+    assert "#2 [58:00]" in caplog.text
+    assert "#1 " not in caplog.text  # cached, so not skipped
+
+
+def test_max_llm_windows_creator_override(conn, long_media):
+    config = AppConfig.model_validate(
+        {
+            "settings": {"max_llm_windows": 8},
+            "creators": [
+                {
+                    "name": "MrBeast",
+                    "region": "global",
+                    "youtube": {"handle": "@MrBeast"},
+                    "overrides": {"max_llm_windows": 3},
+                }
+            ],
+        }
+    )
+    fake = _empty(3)
+    run(
+        make_job(conn, is_stream=True),
+        StageContext(long_media, conn, config, clock=lambda: T0),
+        fake,
+    )
+    assert _sent_windows(fake) == [0, 3, 5]

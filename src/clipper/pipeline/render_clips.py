@@ -6,7 +6,9 @@ in the job's media dir. For each section the EDL cuts the requested range out of
 and the transcript words that overlap the clip, shifted into the section's timeline.
 `clipper.render.render_clip` writes `clips/<rank>/v1.{mp4,jpg,json}` and
 `clips_repo.insert_pending_clip` records it with the highlight's title, caption, hashtags,
-score and reason.
+score and reason. Before the EDL is final, the clip edges are snapped to scene cuts and
+dead air is trimmed (CLP-68, `clipper.pipeline.boundaries`); a failed scene detection
+keeps the requested range.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
 rerun after a crash renders only the clips without a row. The row's start_s/end_s are the
@@ -28,17 +30,25 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 from clipper.clips_repo import ClipMeta, insert_pending_clip
-from clipper.edl import EDL, parse_edl
+from clipper.edl import EDL, MAX_CLIP_SECONDS, parse_edl
 from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
+from clipper.pipeline.boundaries import (
+    DETECT_TIMEOUT_S,
+    detect_cuts,
+    snap_to_cuts,
+    trim_dead_air,
+)
 from clipper.pipeline.common import (
     STAGE_BUDGET_S,
     Deadline,
     StageTimeout,
     read_json,
+    settings_for,
     strip_control,
 )
 from clipper.redact import redact
@@ -47,6 +57,7 @@ from clipper.render import (
     DEFAULT_RENDER_TIMEOUT_S,
     InvalidClipError,
     RenderError,
+    _resolve_source,
     render_clip,
 )
 
@@ -54,8 +65,8 @@ logger = logging.getLogger(__name__)
 
 MAX_WORD_CHARS = 64
 """EDL limit for one caption word."""
-CLIP_WORST_CASE_S = DEFAULT_RENDER_TIMEOUT_S + 4 * DEFAULT_FFMPEG_TIMEOUT_S
-"""Remotion plus the four ffmpeg steps of `render_clip`, each at its timeout."""
+CLIP_WORST_CASE_S = DETECT_TIMEOUT_S + DEFAULT_RENDER_TIMEOUT_S + 4 * DEFAULT_FFMPEG_TIMEOUT_S
+"""Scene detection, Remotion and the four ffmpeg steps of `render_clip`, each at its timeout."""
 assert CLIP_WORST_CASE_S < STAGE_BUDGET_S / 2, "a stage run must fit at least two clips"
 MAX_REASON_CHARS = 300
 
@@ -87,9 +98,14 @@ def _words(transcript: Any, offset: float, start: float, end: float) -> list[dic
 
 
 def _plan(
-    section: Any, highlights: dict[Any, Any], transcript: Any, prompt_version: str | None
+    section: Any,
+    highlights: dict[Any, Any],
+    transcript: Any,
+    prompt_version: str | None,
+    bounds: tuple[float, float] | None = None,
 ) -> tuple[int, EDL, float, float, ClipMeta]:
-    """(rank, EDL, source start, source end, meta) for one section; PermanentError if invalid."""
+    """(rank, EDL, source start, source end, meta) for one section; PermanentError if invalid.
+    `bounds` overrides the cut inside the section file (seconds, from `_polish`)."""
     rank = section.get("rank") if isinstance(section, dict) else None
     if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
         raise PermanentError(f"invalid clip rank: {rank!r}")
@@ -110,16 +126,16 @@ def _plan(
         raise PermanentError(f"clip {rank}: invalid range")
     try:
         pad = section["pad_start_s"]
+        offset = start - pad  # source time = section time + offset
+        in_s, out_s = bounds or (pad, round(pad + end - start, 3))
+        if bounds:
+            start, end = round(in_s + offset, 3), round(out_s + offset, 3)
         edl = parse_edl(
             {
-                "source": {
-                    "path": section["path"],
-                    "in_s": pad,
-                    "out_s": round(pad + end - start, 3),
-                },
+                "source": {"path": section["path"], "in_s": in_s, "out_s": out_s},
                 # An empty hook (also after cleaning) means no hook card.
                 "hook": {"text": hook} if (hook := strip_control(clip.get("hook") or "")) else None,
-                "words": _words(transcript, start - pad, start, end),
+                "words": _words(transcript, offset, start, end),
             }
         )
     # Malformed artifact entries, or an EDL pydantic rejects (ValidationError is a ValueError).
@@ -139,6 +155,29 @@ def _plan(
     return rank, edl, start, end, meta
 
 
+def _polish(
+    edl: EDL,
+    start: float,
+    section: dict[str, Any],
+    transcript: Any,
+    limits: tuple[float, float],
+    media_dir: Path,
+    deadline: Deadline,
+) -> tuple[float, float]:
+    """Clip edges in the section file after the scene-cut snap and the dead-air trim."""
+    src = edl.source
+    offset = start - src.in_s
+    size = section.get("duration_s")
+    span = (0.0, size if _number(size) and size >= src.out_s else src.out_s)
+    words = [
+        (w["start_s"], w["end_s"]) for w in _words(transcript, offset, offset, offset + span[1])
+    ]
+    cuts = detect_cuts(_resolve_source(edl, media_dir), deadline)
+    a, b = snap_to_cuts(src.in_s, src.out_s, cuts, words, *limits, section=span)
+    a, b = trim_dead_air(a, b, words, min_s=limits[0])
+    return round(a, 3), round(b, 3)
+
+
 def _done(conn: sqlite3.Connection, job_id: int) -> set[int]:
     return {row[0] for row in conn.execute("SELECT rank FROM clips WHERE job_id = ?", (job_id,))}
 
@@ -152,6 +191,8 @@ def render_clips(job: Job, ctx: StageContext) -> None:
     }
     transcript = read_json(ctx.media_dir / "transcript.json")
     done = _done(ctx.conn, job.id)
+    settings = settings_for(job, ctx.config)
+    limits = (settings.clip_min_seconds, min(settings.clip_max_seconds, MAX_CLIP_SECONDS))
     invalid: list[str] = []
     retry: RenderError | None = None
     for section in sections:
@@ -163,6 +204,10 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 continue
             if deadline.remaining() < CLIP_WORST_CASE_S:
                 raise StageTimeout(f"stage budget left too small for clip {rank}; resuming later")
+            bounds = _polish(edl, start, section, transcript, limits, ctx.media_dir, deadline)
+            rank, edl, start, end, meta = _plan(
+                section, highlights, transcript, selection.get("prompt_version"), bounds
+            )
             result = render_clip(
                 edl,
                 ctx.media_dir,

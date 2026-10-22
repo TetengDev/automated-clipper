@@ -11,14 +11,14 @@ succeeded:
     clip.json        sidecar: EDL, file names, loudness measurements, timings
 
 `edl.source.path` is resolved under `media_root` (and must stay inside it). The segment
-[in_s, out_s] is first cut out with ffmpeg into a private work dir (frame-accurate, CFR
-30 fps, at most 1080 px wide) written straight into `work/public/`, Remotion's public dir;
-props, raw render and temp files live outside it. (A symlink would be nicer, but Remotion's
-static server refuses symlinks with a 404.) Remotion copies served media into its temp dir
-before decoding, so it must never see a multi-GB VOD, and decoding a small 1080-wide
-segment keeps a 30 s clip well inside the render budget. Children get
-TMPDIR=`work/tmp`, so the final rmtree of the work dir removes Remotion's bundle and frame
-caches too.
+[in_s, out_s] (with jump cuts, the span of all kept segments) is first cut out with ffmpeg
+into a private work dir (frame-accurate, CFR 30 fps, at most 1080 px wide) written straight
+into `work/public/`, Remotion's public dir; props, raw render and temp files live outside
+it. (A symlink would be nicer, but Remotion's static server refuses symlinks with a 404.)
+Remotion copies served media into its temp dir before decoding, so it must never see a
+multi-GB VOD, and decoding a small 1080-wide segment keeps a 30 s clip well inside the
+render budget. Children get TMPDIR=`work/tmp`, so the final rmtree of the work dir removes
+Remotion's bundle and frame caches too.
 """
 
 from __future__ import annotations
@@ -272,12 +272,14 @@ def precut_argv(ffmpeg: str, src: Path, dst: Path, in_s: float, duration_s: floa
 
 
 def segment_props(edl: EDL) -> dict[str, Any]:
-    """Composition props for the pre-cut segment: source starts at 0, words shifted to match.
+    """Composition props for the pre-cut segment: source starts at 0, words (and jump-cut
+    segments) shifted to match. The span is pre-cut once, never per segment (lip-sync
+    drift); Remotion plays the segments from it. The cut records stay in the sidecar.
 
     Words that end before the cut or start after it are dropped; boundary words are clamped.
     The result is re-validated, so Remotion never receives props pydantic would reject.
     """
-    in_s, duration = edl.source.in_s, edl.duration_s
+    in_s, duration = edl.source.in_s, edl.source.duration_s
     words = []
     for word in edl.words:
         start, end = word.start_s - in_s, word.end_s - in_s
@@ -288,6 +290,11 @@ def segment_props(edl: EDL) -> dict[str, Any]:
     props = edl.to_props()
     props["source"] = {"path": SEGMENT_NAME, "in_s": 0.0, "out_s": duration}
     props["words"] = words
+    props["cuts"] = []
+    if edl.segments is not None:
+        props["segments"] = [
+            {"in_s": max(0.0, a - in_s), "out_s": min(duration, b - in_s)} for a, b in edl.spans
+        ]
     return parse_edl(props).to_props()
 
 
@@ -526,7 +533,7 @@ def render_clip(
         try:
             _run(
                 runner,
-                precut_argv(ffmpeg, source, segment, edl.source.in_s, edl.duration_s),
+                precut_argv(ffmpeg, source, segment, edl.source.in_s, edl.source.duration_s),
                 step="pre-cut",
                 timeout_s=ffmpeg_timeout_s,
                 env=env,

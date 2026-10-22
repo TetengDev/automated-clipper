@@ -919,7 +919,7 @@ def test_silence_inside_the_clip_is_cut_down_to_a_breath(
             assert abs(x * 30 - round(x * 30)) < 1e-6
     # Words stay in section time: the renderer maps them onto the output timeline.
     assert cut.words == off.words
-    row = conn.execute("SELECT start_s, end_s FROM clips ORDER BY id DESC LIMIT 1").fetchone()
+    row = max(_rows(conn), key=lambda r: r["job_id"])  # the silences run
     assert row["start_s"] == pytest.approx(cut.source.in_s + 8.0)
     assert row["end_s"] == pytest.approx(cut.source.out_s + 8.0)
 

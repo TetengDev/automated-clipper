@@ -3,6 +3,7 @@ remap and the silencedetect child."""
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import subprocess
@@ -81,7 +82,7 @@ def test_stutter_cuts_the_first_occurrence() -> None:
 
 
 def test_repeat_further_apart_is_not_a_stutter() -> None:
-    assert jc.stutter_cuts([w("go", 0.0, 0.2), w("go", 0.7, 0.9)]) == []
+    assert jc.stutter_cuts([w("go", 0.0, 0.2), w("go", 0.8, 1.0)]) == []
 
 
 def test_tagalog_reduplication_is_not_a_stutter() -> None:
@@ -269,29 +270,34 @@ def test_crop_end_key_takes_the_value_before_a_jump_at_the_join() -> None:
 
 # --- silencedetect ---------------------------------------------------------------------
 
-STDERR = """\
-[silencedetect @ 0x1] silence_start: 0.5
-[silencedetect @ 0x1] silence_end: 1.7 | silence_duration: 1.2
-[silencedetect @ 0x1] silence_start: -0.01
-[silencedetect @ 0x1] silence_end: 3.25 | silence_duration: 0.3
-[silencedetect @ 0x1] silence_start: 9.5
+OUTPUT = """\
+frame:23   pts:24000   pts_time:0.5
+lavfi.silence_start=0.5
+frame:81   pts:81600   pts_time:1.7
+lavfi.silence_end=1.7
+lavfi.silence_duration=1.2
+frame:90   pts:0   pts_time:0
+lavfi.silence_start=-1e-05
+lavfi.silence_end=3.25
+lavfi.silence_start=9.5
 """
+"""silencedetect's frame metadata as `ametadata=mode=print:file=-` writes it to stdout."""
 
 
 def test_parse_silencedetect() -> None:
     # A start without an end runs to the end of the file.
-    assert jc.parse_silencedetect(STDERR) == [[0.5, 1.7], [0.0, 3.25], [9.5, jc.FILE_END_S]]
+    assert jc.parse_silencedetect(OUTPUT) == [[0.5, 1.7], [0.0, 3.25], [9.5, jc.FILE_END_S]]
 
 
 class FakeRunner:
-    def __init__(self, stderr: str = STDERR, code: int = 0) -> None:
-        self.stderr, self.code = stderr, code
+    def __init__(self, stdout: str = OUTPUT, code: int = 0) -> None:
+        self.stdout, self.code = stdout, code
         self.calls: list[list[str]] = []
 
     def __call__(self, args: list[str], timeout_s: float, **kw: Any) -> Any:
         self.calls.append(list(args))
         assert 0 < timeout_s <= jc.SILENCE_TIMEOUT_S
-        return subprocess.CompletedProcess(args, self.code, "", self.stderr)
+        return subprocess.CompletedProcess(args, self.code, self.stdout, "")
 
 
 def test_detect_silences_runs_a_guarded_ffmpeg_and_caches(tmp_path: Path) -> None:
@@ -306,7 +312,7 @@ def test_detect_silences_runs_a_guarded_ffmpeg_and_caches(tmp_path: Path) -> Non
     assert argv[i - 4 : i] == ["-protocol_whitelist", "file", "-format_whitelist", argv[i - 1]]
     assert argv[i + 1] == str(section)
     assert "-vn" in argv
-    assert "silencedetect=noise=-40dB:d=0.2" in argv
+    assert argv[argv.index("-af") + 1].startswith("silencedetect=noise=-40dB:d=0.2,")
     # Cached by size and mtime: no second run.
     assert jc.detect_silences(section, Deadline(), runner=runner) == got
     assert len(runner.calls) == 1
@@ -340,3 +346,38 @@ def test_detect_silences_with_real_ffmpeg(tmp_path: Path) -> None:
     got = jc.detect_silences(section, Deadline())
     assert got is not None
     assert any(s <= 1.1 and e >= 2.1 for s, e in got)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["nope", [[1.0]], [[2.0, 1.0]], [[-1.0, 1.0]], [[True, 1.0]], [["0", "1"]], [[0, 1]] * 20_001],
+)
+def test_tampered_silence_cache_is_ignored(tmp_path: Path, bad: Any) -> None:
+    section = tmp_path / "source.mp4"
+    section.write_bytes(b"mp4")
+    stat = section.stat()
+    cache = {"v": 1, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "silences": bad}
+    (tmp_path / "source.mp4.silences.json").write_text(json.dumps(cache))
+    runner = FakeRunner()
+    assert jc.detect_silences(section, Deadline(), runner=runner) == [
+        (0.5, 1.7),
+        (0.0, 3.25),
+        (9.5, jc.FILE_END_S),
+    ]
+    assert len(runner.calls) == 1
+
+
+def test_silence_end_without_a_start_is_ignored() -> None:
+    assert jc.parse_silencedetect("lavfi.silence_end=1.0\nlavfi.silence_start=2e0\n") == [
+        [2.0, jc.FILE_END_S]
+    ]
+
+
+def test_cut_outside_the_range_is_ignored() -> None:
+    assert jc.apply_cuts((2.0, 8.0), [cut(0.0, 1.0), cut(9.0, 9.5)]) == [(2.0, 8.0)]
+
+
+def test_retakes_are_only_looked_for_nearby() -> None:
+    first = _phrase("the boss fight in this game was honestly brutal", 0.0)
+    second = _phrase("the boss fight in this game was honestly insane", 100.0)
+    assert jc.retake_candidates(first + second) == []

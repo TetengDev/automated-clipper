@@ -2,23 +2,33 @@
 // centre (a share of the source width, from the EDL's crop keys) sits mid-frame. The
 // keys are clamped in Python so the 9:16 window never leaves the source.
 import type React from "react";
-import { AbsoluteFill, OffthreadVideo, useCurrentFrame, useVideoConfig } from "remotion";
+import {
+  AbsoluteFill,
+  OffthreadVideo,
+  useCurrentFrame,
+  useVideoConfig,
+  type VolumeProp,
+} from "remotion";
 import { cropXAt } from "./crop";
 import type { CropKey } from "./types";
 
-export const FaceTrack: React.FC<{ src: string; trimBefore: number; crop: CropKey[] }> = ({
-  src,
-  trimBefore,
-  crop,
-}) => {
+export const FaceTrack: React.FC<{
+  src: string;
+  trimBefore: number;
+  crop: CropKey[];
+  /** Output frame this segment starts at: the crop keys are on the output timeline. */
+  from?: number;
+  volume?: VolumeProp;
+}> = ({ src, trimBefore, crop, from = 0, volume }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
-  const x = cropXAt(crop, frame / fps);
+  const x = cropXAt(crop, (frame + from) / fps);
   return (
     <AbsoluteFill style={{ backgroundColor: "#000", overflow: "hidden" }}>
       <OffthreadVideo
         src={src}
         trimBefore={trimBefore}
+        volume={volume}
         style={{
           position: "absolute",
           top: 0,

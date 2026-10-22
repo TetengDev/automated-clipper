@@ -43,6 +43,14 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+JumpCuts = Literal["off", "silences", "full"]
+
+
+def _yaml_off(value: Any) -> Any:
+    """YAML 1.1 reads a bare `off` as false."""
+    return "off" if value is False else value
+
+
 class Settings(_Strict):
     poll_interval_youtube_minutes: int = Field(10, ge=1)
     poll_interval_twitch_minutes: int = Field(5, ge=1)
@@ -62,6 +70,10 @@ class Settings(_Strict):
     review_expiry_days: int = Field(7, ge=1)
     reframe: Literal["auto", "blurred_fill"] = "auto"
     """auto: a face-tracked 9:16 crop when faces are found, else blurred fill (CLP-58)."""
+    jump_cuts: JumpCuts = "silences"
+    """Cuts inside a clip (CLP-73): silences only, also stutters and fillers (full), or off."""
+
+    _jump_cuts_off = field_validator("jump_cuts", mode="before")(_yaml_off)
 
     @model_validator(mode="after")
     def _clip_range(self) -> Settings:
@@ -81,6 +93,9 @@ class CreatorOverrides(_Strict):
     max_clips_per_stream: int | None = Field(None, ge=1)
     max_source_hours_per_day: float | None = Field(None, gt=0)
     reframe: Literal["auto", "blurred_fill"] | None = None
+    jump_cuts: JumpCuts | None = None
+
+    _jump_cuts_off = field_validator("jump_cuts", mode="before")(_yaml_off)
 
 
 class YouTubeChannel(_Strict):

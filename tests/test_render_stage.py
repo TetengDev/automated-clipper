@@ -350,6 +350,27 @@ def test_oversized_section_skips_detection(
     assert len(_rows(conn)) == 1  # the clip renders either way
 
 
+def test_polished_edges_the_edl_rejects_fall_back_to_the_request(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    monkeypatch.setattr(rc, "_polish", lambda *a, **kw: (2.0, 2.5))  # 0.5 s: under the EDL min
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    source = fake.calls[0]["edl"].source
+    assert (source.in_s, source.out_s) == (2.0, 7.0)
+    (row,) = _rows(conn)
+    assert (row["start_s"], row["end_s"]) == (10.0, 15.0)
+    (warning,) = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert "clip 1" in warning and "requested range" in warning
+
+
 def test_word_at_clamped_section_start_and_no_hook(
     conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
 ) -> None:

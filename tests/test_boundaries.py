@@ -112,6 +112,37 @@ def test_trim_never_goes_below_min() -> None:
     assert bd.trim_dead_air(10.0, 40.0, [(12.0, 35.0)], min_s=20) == (11.75, 35.4)
 
 
+def test_trim_under_min_tries_one_edge_at_a_time() -> None:
+    words = [(12.0, 13.0), (28.0, 29.0)]  # a full trim (11.75, 29.4) is 17.65 s
+    assert bd.trim_dead_air(10.0, 40.0, words, min_s=20) == (11.75, 40.0)
+    # Cut-driven moves are kept first; the dead-air trim then goes on one edge only.
+    assert bd.trim_dead_air(10.0, 40.0, words, [39.0], min_s=20) == pytest.approx((11.75, 39.0 - G))
+    assert bd.trim_dead_air(10.0, 31.0, words, [10.5], min_s=20) == (10.5, 31.0)
+
+
+@pytest.mark.parametrize(
+    ("cuts", "expected"),
+    [
+        ([20.5], (10.05, 20.5 - G)),  # cut exactly on the last word's end
+        ([20.45], (10.05, 20.45 - G)),  # cut just inside the last word
+        ([10.4], (10.4, 20.9)),  # cut inside the first word (10.3-10.6)
+        ([10.3 + 0.2], (10.05, 20.9)),  # deeper than EPS: the word is kept whole
+    ],
+)
+def test_trim_takes_a_cut_just_inside_the_first_or_last_word(
+    cuts: list[float], expected: tuple[float, float]
+) -> None:
+    words = [(10.3, 10.6), (15.0, 16.0), (19.8, 20.5)]
+    assert bd.trim_dead_air(10.0, 30.0, words, cuts) == pytest.approx(expected)
+
+
+def test_edge_on_a_cut_is_not_snapped_away() -> None:
+    # The trim put the start on the cut at 10.4 (inside the first word); a valid cut at 9.6
+    # within the tolerance must not pull the start back over the 0.8 s of the other shot.
+    words = [(10.3, 10.6), (35.0, 36.0)]
+    assert bd.polish(10.0, 40.0, [9.6, 10.4], words, MIN, MAX) == pytest.approx((10.4, 36.4))
+
+
 @pytest.mark.parametrize(
     ("cuts", "words", "expected"),
     [
@@ -137,9 +168,11 @@ class FakeRunner:
     def __init__(self, result: RunResult | BaseException) -> None:
         self.result = result
         self.calls: list[tuple[list[str], float]] = []
+        self.kw: list[dict[str, Any]] = []
 
     def __call__(self, args: list[str], timeout_s: float, **kw: Any) -> RunResult:
         self.calls.append((list(args), timeout_s))
+        self.kw.append(kw)
         if isinstance(self.result, BaseException):
             raise self.result
         return self.result
@@ -160,6 +193,7 @@ def test_detect_cuts_runs_bounded_subprocess_and_caches(section: Path) -> None:
 
     ((args, timeout_s),) = runner.calls
     assert args == [sys.executable, "-I", "-m", "clipper.pipeline.boundaries", str(section)]
+    assert runner.kw == [{"env": {"MALLOC_ARENA_MAX": "2"}}]  # glibc reads it at startup
     assert 0 < timeout_s <= bd.DETECT_TIMEOUT_S
     cache = section.with_name("source.mp4.cuts.json")
     stat = section.stat()
@@ -210,7 +244,7 @@ def test_bad_cache_is_ignored(section: Path, change: dict[str, Any]) -> None:
     assert len(runner.calls) == 1
 
 
-@pytest.mark.parametrize("cached", ["[2.0]", "not json", "{}"])
+@pytest.mark.parametrize("cached", ["[2.0]", "not json", "{}", "[" * 100_000 + "]" * 100_000])
 def test_unreadable_or_old_cache_is_ignored(section: Path, cached: str) -> None:
     section.with_name("source.mp4.cuts.json").write_text(cached)
     runner = FakeRunner(RunResult(0, "[3.0]", ""))
@@ -237,6 +271,23 @@ def test_detection_failure_returns_no_cuts_and_warns(
     assert not section.with_name("source.mp4.cuts.json").exists()  # a failure is not cached
 
 
+def test_oversized_cache_is_ignored(section: Path) -> None:
+    padded = _cache(section) + " " * bd.MAX_CACHE_BYTES  # valid JSON, too big to read
+    section.with_name("source.mp4.cuts.json").write_text(padded)
+    runner = FakeRunner(RunResult(0, "[3.0]", ""))
+    assert bd.detect_cuts(section, Deadline(), runner=runner) == [3.0]
+
+
+def test_section_changed_during_detection_is_not_cached(section: Path) -> None:
+    class Replacing(FakeRunner):
+        def __call__(self, args: list[str], timeout_s: float, **kw: Any) -> RunResult:
+            section.write_bytes(b"replaced while detecting")
+            return super().__call__(args, timeout_s, **kw)
+
+    assert bd.detect_cuts(section, Deadline(), runner=Replacing(RunResult(0, "[2.0]", ""))) == [2.0]
+    assert not section.with_name("source.mp4.cuts.json").exists()
+
+
 def test_failure_details_go_to_debug(section: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level("DEBUG", logger=bd.__name__)
     bd.detect_cuts(section, Deadline(), runner=FakeRunner(OSError("boom")))
@@ -255,7 +306,8 @@ def test_child_hardening(monkeypatch: pytest.MonkeyPatch) -> None:
     bd.harden()
 
     assert limits == [(resource.RLIMIT_AS, (bd.DECODER_MEMORY_BYTES, bd.DECODER_MEMORY_BYTES))]
-    assert bd.os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] == "protocol_whitelist;file"
+    # OpenCV parses these as `key;value|key;value` (av_dict_parse_string with ";" and "|").
+    assert bd.os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] == "protocol_whitelist;file|threads;2"
     assert bd.os.environ["OPENBLAS_NUM_THREADS"] == "1"
 
 
@@ -269,7 +321,7 @@ def test_child_hardening_tolerates_no_rlimit(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", "x")
     monkeypatch.setenv("OPENBLAS_NUM_THREADS", "8")
     bd.harden()  # does not raise
-    assert bd.os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] == "protocol_whitelist;file"
+    assert bd.os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] == "protocol_whitelist;file|threads;2"
 
 
 def test_exhausted_deadline_returns_no_cuts(

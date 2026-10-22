@@ -6,9 +6,9 @@ in the job's media dir. For each section the EDL cuts the requested range out of
 and the transcript words that overlap the clip, shifted into the section's timeline.
 `clipper.render.render_clip` writes `clips/<rank>/v1.{mp4,jpg,json}` and
 `clips_repo.insert_pending_clip` records it with the highlight's title, caption, hashtags,
-score and reason. Before the EDL is final, the clip edges are snapped to scene cuts and
-dead air is trimmed (CLP-68, `clipper.pipeline.boundaries`); a failed scene detection
-keeps the requested range.
+score and reason. Before the EDL is final, dead air is trimmed and the clip edges are
+snapped to scene cuts (CLP-68, `clipper.pipeline.boundaries`); a failed or skipped scene
+detection (sections over MAX_DETECT_PIXELS) leaves only the trim.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
 rerun after a crash renders only the clips without a row. The row's start_s/end_s are the
@@ -37,12 +37,7 @@ from clipper.clips_repo import ClipMeta, insert_pending_clip
 from clipper.edl import EDL, MAX_CLIP_SECONDS, parse_edl
 from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
-from clipper.pipeline.boundaries import (
-    DETECT_TIMEOUT_S,
-    detect_cuts,
-    snap_to_cuts,
-    trim_dead_air,
-)
+from clipper.pipeline.boundaries import DETECT_TIMEOUT_S, detect_cuts, polish
 from clipper.pipeline.common import (
     STAGE_BUDGET_S,
     Deadline,
@@ -57,8 +52,8 @@ from clipper.render import (
     DEFAULT_RENDER_TIMEOUT_S,
     InvalidClipError,
     RenderError,
-    _resolve_source,
     render_clip,
+    resolve_source,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +64,8 @@ CLIP_WORST_CASE_S = DETECT_TIMEOUT_S + DEFAULT_RENDER_TIMEOUT_S + 4 * DEFAULT_FF
 """Scene detection, Remotion and the four ffmpeg steps of `render_clip`, each at its timeout."""
 assert CLIP_WORST_CASE_S < STAGE_BUDGET_S / 2, "a stage run must fit at least two clips"
 MAX_REASON_CHARS = 300
+MAX_DETECT_PIXELS = 4096 * 2160
+"""Larger sections are not scene-detected (decoder cost and attack surface)."""
 
 
 def _number(value: Any) -> bool:
@@ -164,18 +161,24 @@ def _polish(
     media_dir: Path,
     deadline: Deadline,
 ) -> tuple[float, float]:
-    """Clip edges in the section file after the scene-cut snap and the dead-air trim."""
+    """Clip edges in the section file after the dead-air trim and the scene-cut snap."""
     src = edl.source
     offset = start - src.in_s
+    # Without a valid duration_s the file is only known to cover the requested range.
     size = section.get("duration_s")
     span = (0.0, size if _number(size) and size >= src.out_s else src.out_s)
     words = [
         (w["start_s"], w["end_s"]) for w in _words(transcript, offset, offset, offset + span[1])
     ]
-    cuts = detect_cuts(_resolve_source(edl, media_dir), deadline)
-    a, b = snap_to_cuts(src.in_s, src.out_s, cuts, words, *limits, section=span)
-    a, b = trim_dead_air(a, b, words, min_s=limits[0])
-    return round(a, 3), round(b, 3)
+    width, height = section.get("width"), section.get("height")
+    if _number(width) and _number(height) and 0 < width * height <= MAX_DETECT_PIXELS:
+        cuts = detect_cuts(resolve_source(edl, media_dir), deadline)
+    else:
+        logger.info("clip source %s: %sx%s, scene detection skipped", src.path, width, height)
+        cuts = []
+    a, b = polish(src.in_s, src.out_s, cuts, words, *limits, section=span)
+    # Floor, so an end just before a cut never rounds up onto the next shot's first frame.
+    return round(a, 3), math.floor(round(b * 1000, 6)) / 1000
 
 
 def _done(conn: sqlite3.Connection, job_id: int) -> set[int]:

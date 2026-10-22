@@ -191,6 +191,75 @@ def test_rclone_remote_valid(monkeypatch: pytest.MonkeyPatch) -> None:
     assert Secrets().rclone_remote == "gdrive:clips/ready"
 
 
+# --------------------------------------------------------------------------- transcriber (CLP-35)
+
+
+def test_transcriber_defaults_to_local_whisper() -> None:
+    from clipper.config import Settings
+
+    s = Settings()
+    assert (s.transcriber, s.whisper_model, s.whisper_compute_type) == (
+        "local",
+        "large-v3-turbo",
+        "int8",
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "../models/x",
+        "/etc/passwd",
+        "Systran/faster-whisper-tiny",
+        "https://evil.example/m",
+        "a b",
+        ".",
+        "",
+        "small.en",  # a real faster-whisper name, but not pinned
+        "large",  # alias: only pinned names
+    ],
+)
+def test_whisper_model_must_be_a_pinned_name(model: str) -> None:
+    from clipper.config import CreatorOverrides, Settings
+
+    with pytest.raises(ValidationError, match="whisper_model must be one of"):
+        Settings(whisper_model=model)
+    with pytest.raises(ValidationError, match="whisper_model must be one of"):
+        CreatorOverrides(whisper_model=model)
+
+
+@pytest.mark.parametrize("threads", [0, 65, -1])
+def test_whisper_cpu_threads_bounded(threads: int) -> None:
+    from clipper.config import Settings
+
+    assert Settings().whisper_cpu_threads == 4
+    with pytest.raises(ValidationError):
+        Settings(whisper_cpu_threads=threads)
+
+
+@pytest.mark.parametrize("field", ["transcriber", "whisper_compute_type"])
+def test_transcriber_choices_are_closed(field: str) -> None:
+    from clipper.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(**{field: "bogus"})
+
+
+def test_transcriber_per_creator_override(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "settings: {whisper_model: large-v3}\n"
+        "creators:\n"
+        "  - {name: A, region: global, youtube: {handle: '@aaa'},"
+        " overrides: {transcriber: groq, whisper_model: tiny, whisper_compute_type: float32}}\n"
+        "  - {name: B, region: global, youtube: {handle: '@bbb'}}\n"
+    )
+    cfg = load_config(path)
+    a, b = cfg.effective_settings("A"), cfg.effective_settings("B")
+    assert (a.transcriber, a.whisper_model, a.whisper_compute_type) == ("groq", "tiny", "float32")
+    assert (b.transcriber, b.whisper_model, b.whisper_compute_type) == ("local", "large-v3", "int8")
+
+
 def test_max_llm_windows_must_be_positive() -> None:
     assert Settings().max_llm_windows == 8
     with pytest.raises(ValidationError):

@@ -28,12 +28,55 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 `/srv/clipper/.env` exists only on the server and is never committed. It holds:
 
 - `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`
-- `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `PEXELS_API_KEY`, `PIXABAY_API_KEY`
+- `ANTHROPIC_API_KEY`, `PEXELS_API_KEY`, `PIXABAY_API_KEY`
+- `GROQ_API_KEY`, only with `transcriber: groq` (transcription runs locally by default; see [Local transcription](#local-transcription))
 - `DISCORD_WEBHOOK_URL`, `DISCORD_ALERTS_WEBHOOK_URL`, `HEALTHCHECK_URL_*`
 - `REVIEW_PASSWORD_HASH`, `SESSION_SECRET`, `RCLONE_REMOTE`
 - the restic credentials
 
 GitHub Actions secrets contain only the SSH key, host, and user.
+
+## Local transcription
+
+The worker transcribes with faster-whisper on CPU (`transcriber: local`, the default).
+
+- **Models**: only the pinned names in `clipper.config.WHISPER_MODELS` are accepted (tiny,
+  base, small, medium, large-v3, large-v3-turbo), each at a fixed Hugging Face commit. The
+  first job downloads the snapshot into `CLIPPER_MODELS_DIR` (`/app/data/models` on the
+  data volume in compose), which needs outbound HTTPS to huggingface.co once. Download
+  size: tiny 75 MB, medium 1.5 GB, large-v3-turbo 1.6 GB, large-v3 3.1 GB. After that,
+  transcription runs offline (`HF_HUB_OFFLINE=1`).
+- **Isolation**: each 10 min chunk runs in its own child process (`python -I -m
+  clipper.pipeline.local_asr`), one at a time, with a hard timeout, an allowlisted
+  environment (no API keys) and a 12 GiB address-space limit. The model is loaded per chunk
+  (a few seconds from the page cache) and its memory is freed when the child exits.
+  `HF_ENDPOINT`, `HF_TOKEN` and proxy variables from `.env` never reach the download
+  child; it always uses `https://huggingface.co` without a token, and the pinned commit
+  is checked by the Hub client.
+- **RAM** (peak RSS of one child, int8, measured in the image): tiny 0.3 GB, medium 2.9 GB,
+  large-v3-turbo 2.6 GB, large-v3 5.1 GB. The worker's `mem_limit: 8g` fits any of them.
+- **CPU**: `whisper_cpu_threads` (default 4) threads per child. Keep it at or below the
+  worker's `cpus: 6` quota.
+- **Speed** (real-time factor = wall time / audio length, model load included, int8,
+  4 threads, 61 s of English speech, measured 2026-10-22):
+
+  | Model | Apple M-series, native | Same Mac, Docker (arm64) |
+  |---|---|---|
+  | tiny | 0.03 | 0.03 |
+  | medium | 0.34 | n/a |
+  | large-v3-turbo | 0.30 | 0.23 |
+  | large-v3 | 0.64 | 0.49 |
+
+  Expect a shared VPS vCPU to be roughly 2–3x slower (an estimate, not measured). **Use `large-v3-turbo` on
+  the VPS**: large-v3 can approach real time there. Each 10 min chunk may run for
+  `max(15 min, 3 x chunk length)` = 30 min (`LOCAL_RTF_BUDGET`), within the stage's
+  100 min budget; a run that hits the budget resumes from the cached chunks.
+- **Downloads are verified**: after the fetch, the required files must be present and
+  model.bin must match the pinned SHA-256; only then is `.clipper-complete` written into the
+  snapshot. A snapshot without that marker is fetched again, and one that fails
+  verification is discarded and fetched once more before the job retries later.
+- **Image**: faster-whisper and its native wheels (CTranslate2, onnxruntime, PyAV) add
+  about 320 MB to the image.
 
 ## CI/CD
 

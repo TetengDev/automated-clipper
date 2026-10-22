@@ -26,6 +26,9 @@ The first run downloads the pinned model (about 1.6 GB for large-v3-turbo) into
 notes are in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#local-transcription). Compare models on
 a sample with `uv run clipper bench-transcribe audio.flac --models large-v3-turbo,large-v3`.
 
+Install with uv only: `pyproject.toml` overrides scenedetect's GUI `opencv-python` dependency
+so that only `opencv-python-headless` is installed, and pip does not honour that override.
+
 ## Adding a creator
 
 1. Add an entry to `config/creators.yaml`.

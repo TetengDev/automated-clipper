@@ -7,8 +7,10 @@ from pydantic import ValidationError
 
 from clipper.config import (
     ConfigError,
+    CreatorOverrides,
     MissingSecretError,
     Secrets,
+    Settings,
     load_config,
 )
 
@@ -256,3 +258,11 @@ def test_transcriber_per_creator_override(tmp_path: Path) -> None:
     a, b = cfg.effective_settings("A"), cfg.effective_settings("B")
     assert (a.transcriber, a.whisper_model, a.whisper_compute_type) == ("groq", "tiny", "float32")
     assert (b.transcriber, b.whisper_model, b.whisper_compute_type) == ("local", "large-v3", "int8")
+
+
+def test_max_llm_windows_must_be_positive() -> None:
+    assert Settings().max_llm_windows == 8
+    with pytest.raises(ValidationError):
+        Settings(max_llm_windows=0)
+    with pytest.raises(ValidationError):
+        CreatorOverrides(max_llm_windows=0)

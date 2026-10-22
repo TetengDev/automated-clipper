@@ -189,6 +189,14 @@ def test_run_command_passes_only_allowlisted_env(monkeypatch: pytest.MonkeyPatch
     assert set(env) - {"__CF_USER_TEXT_ENCODING", "LC_CTYPE"} <= set(ytdlp.CHILD_ENV_ALLOWLIST)
 
 
+def test_run_command_adds_extra_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-not-leak")
+    code = "import json, os; print(json.dumps(dict(os.environ)))"
+    out = run_command([sys.executable, "-c", code], 30, env={"MALLOC_ARENA_MAX": "2"}).stdout
+    env = json.loads(out)
+    assert env["MALLOC_ARENA_MAX"] == "2" and "ANTHROPIC_API_KEY" not in env
+
+
 def test_run_command_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
     marker = tmp_path / "grandchild-alive"
     grandchild = f"import time; time.sleep(1.5); open({str(marker)!r}, 'w').write('x')"

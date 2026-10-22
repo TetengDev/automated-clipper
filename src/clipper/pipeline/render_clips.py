@@ -56,8 +56,8 @@ from clipper.pipeline.common import (
 )
 from clipper.pipeline.jumpcuts import (
     SILENCE_TIMEOUT_S,
-    apply_cuts,
     crop_on_output,
+    cut_clip,
     detect_silences,
     plan_cuts,
 )
@@ -224,21 +224,22 @@ def _rejected(edl: EDL, what: str, fallback: str, exc: ValueError) -> EDL:
     return edl
 
 
-def _jump_cut(edl: EDL, mode: JumpCuts, media_dir: Path, deadline: Deadline) -> EDL:
-    """The EDL with the jump cuts of `mode` (v2 segments and cut records); as is when
-    nothing is cut or the result is invalid."""
+def _jump_cut(edl: EDL, mode: JumpCuts, min_s: float, media_dir: Path, deadline: Deadline) -> EDL:
+    """The EDL with the jump cuts of `mode` (v2 segments and cut records), never shorter
+    than `min_s` through them; as is when nothing is cut or anything is invalid."""
     silences = detect_silences(resolve_source(edl, media_dir), deadline) or []
-    cuts = plan_cuts(edl.words, silences, mode)
-    if not cuts:
-        return edl
-    segments = apply_cuts((edl.source.in_s, edl.source.out_s), cuts)
-    props = {**edl.to_props(), "cuts": [c.model_dump(mode="json") for c in cuts]}
-    if len(segments) > 1:
-        props["source"] = {**props["source"], "in_s": segments[0][0], "out_s": segments[-1][1]}
-        props["segments"] = [{"in_s": a, "out_s": b} for a, b in segments]
     try:
+        cuts = plan_cuts(edl.words, silences, mode)
+        if not cuts:
+            return edl
+        cuts, segments = cut_clip((edl.source.in_s, edl.source.out_s), cuts, min_s)
+        props = {**edl.to_props(), "cuts": [c.model_dump(mode="json") for c in cuts]}
+        if len(segments) > 1:
+            source = {**props["source"], "in_s": segments[0][0], "out_s": segments[-1][1]}
+            props["source"] = source
+            props["segments"] = [{"in_s": a, "out_s": b} for a, b in segments]
         return parse_edl(props)
-    except ValueError as exc:  # pydantic's ValidationError
+    except ValueError as exc:  # pydantic's ValidationError too
         return _rejected(edl, "jump cuts", "no cuts", exc)
 
 
@@ -297,7 +298,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 logger.warning("%s; rendering the requested range", reason)
             if settings.jump_cuts != "off":
                 shift = start - edl.source.in_s  # source time = section time + shift
-                edl = _jump_cut(edl, settings.jump_cuts, ctx.media_dir, deadline)
+                edl = _jump_cut(edl, settings.jump_cuts, limits[0], ctx.media_dir, deadline)
                 start = round(edl.source.in_s + shift, 3)
                 end = round(edl.source.out_s + shift, 3)
             if settings.reframe == "auto" and _detectable(section):

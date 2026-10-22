@@ -49,6 +49,8 @@ WORD_END_PAD_S = 0.06
 SILENCE_TOLERANCE_S = 0.05
 """Slack between transcript and silencedetect times when checking that a cut is silent."""
 STUTTER_GAP_S = 0.5
+STUTTER_SHORT = 0.6
+"""A stutter's first word is cut short: at most this share of the second's length."""
 FILLER_PAUSE_S = 0.2
 """A filler needs a pause at least this long on each side; otherwise it is speech."""
 RETAKE_JACCARD = 0.34
@@ -65,10 +67,14 @@ MAX_REASON_CHARS = 200
 
 _FILLER = re.compile(r"u+m+|u+h+|e+h+|a+h+")
 _EDGE = re.compile(r"^\W+|\W+$")
-_SILENCE = re.compile(r"silence_(start|end)[:=]\s*(-?[\d.]+(?:e[-+]?\d+)?)")
+_SILENCE = re.compile(r"^lavfi\.silence_(start|end)=(-?[\d.]+(?:e[-+]?\d+)?)$", re.MULTILINE)
 _TAGALOG_WORDS = "ano yung iyong yun iyon parang kasi naman talaga ganun ganon diba lang sige"
-NEVER_CUT = frozenset(_TAGALOG_WORDS.split())
-"""Real Tagalog words, never a filler or a stutter."""
+_REDUPLICATED = "araw isa dahan gabi unti sabay iba buo tig paulit taon linggo buwan bahay"
+_EMPHATIC = "no yes yeah yep nope very really so bye go come now wait hey oh ha haha okay ok"
+_EMPHATIC += " please more too never well right sure fast slow"
+NEVER_CUT = frozenset(f"{_TAGALOG_WORDS} {_REDUPLICATED} {_EMPHATIC}".split())
+"""Real Tagalog words, roots Tagalog doubles ("araw araw") and English words doubled for
+emphasis ("no no"): never a filler or a stutter."""
 _ENGLISH_STOP = (
     "a an and are as at be but by for from i if in is it of on or so that the this to was"
     " we with you your they their there what when where why how like um uh just really"
@@ -88,15 +94,22 @@ def _token(text: str) -> str:
 
 def _cut(
     a: float, b: float, kind: CutKind, confidence: float, reason: str, *, applied: bool = True
-) -> Cut:
-    return Cut(
-        in_s=round(a, 3),
-        out_s=round(b, 3),
-        kind=kind,
-        confidence=round(confidence, 3),
-        reason=reason[:MAX_REASON_CHARS],
-        applied=applied,
-    )
+) -> list[Cut]:
+    """The cut [a, b], or none when it rounds to nothing (e.g. two phrases that Whisper
+    started at one time)."""
+    a, b = round(a, 3), round(b, 3)
+    if b <= a:
+        return []
+    return [
+        Cut(
+            in_s=a,
+            out_s=b,
+            kind=kind,
+            confidence=round(confidence, 3),
+            reason=reason[:MAX_REASON_CHARS],
+            applied=applied,
+        )
+    ]
 
 
 def _silent(silences: Sequence[Span], a: float, b: float) -> bool:
@@ -118,7 +131,7 @@ def silence_cuts(words: Sequence[Word], silences: Sequence[Span]) -> list[Cut]:
         keep = LONG_BREATH_S if gap >= LONG_GAP_S else SENTENCE_BREATH_S if sentence else BREATH_S
         a, b = _pause(prev, nxt, keep)
         if _silent(silences, a, b):
-            cuts.append(_cut(a, b, CutKind.SILENCE, 1.0, f"pause {gap:.2f}s -> {keep:.2f}s"))
+            cuts += _cut(a, b, CutKind.SILENCE, 1.0, f"pause {gap:.2f}s -> {keep:.2f}s")
     return cuts
 
 
@@ -131,11 +144,9 @@ def stutter_cuts(words: Sequence[Word]) -> list[Cut]:
             and token not in NEVER_CUT
             and token == _token(b.text)
             and b.start_s - a.end_s < STUTTER_GAP_S
-            and b.start_s - a.start_s >= 0.001
+            and a.end_s - a.start_s <= STUTTER_SHORT * (b.end_s - b.start_s)
         ):
-            cuts.append(
-                _cut(a.start_s, b.start_s, CutKind.STUTTER, 0.9, f'repeated "{token[:40]}"')
-            )
+            cuts += _cut(a.start_s, b.start_s, CutKind.STUTTER, 0.9, f'repeated "{token[:40]}"')
     return cuts
 
 
@@ -151,7 +162,7 @@ def filler_cuts(words: Sequence[Word], silences: Sequence[Span]) -> list[Cut]:
             continue
         a, b = _pause(prev, nxt, BREATH_S)
         if _silent(silences, a, word.start_s) and _silent(silences, word.end_s, b):
-            cuts.append(_cut(a, b, CutKind.FILLER, 0.8, f'filler "{token}"'))
+            cuts += _cut(a, b, CutKind.FILLER, 0.8, f'filler "{token}"')
     return cuts
 
 
@@ -197,8 +208,8 @@ def retake_candidates(words: Sequence[Word]) -> list[Cut]:
             short = first[-1].end_s - first[0].start_s < 6 and gap < 12
             kind = CutKind.FALSE_START if same_opening and short else CutKind.RETAKE
             reason = f"phrase {i + 1} ~ {j + 1} (jaccard {score:.2f})"
-            cuts.append(
-                _cut(first[0].start_s, phrases[j][0].start_s, kind, score, reason, applied=False)
+            cuts += _cut(
+                first[0].start_s, phrases[j][0].start_s, kind, score, reason, applied=False
             )
     return cuts
 
@@ -245,6 +256,36 @@ def apply_cuts(span: Span, cuts: Sequence[Cut]) -> list[Span]:
     return [(a / FPS, b / FPS) for a, b in keep]
 
 
+def _removed(span: Span, segments: Sequence[Span]) -> list[tuple[int, int]]:
+    """The frame ranges of `span` that `segments` leave out."""
+    edges = [frames(span[0]), *(frames(t) for seg in segments for t in seg), frames(span[1])]
+    return [(a, b) for a, b in zip(edges[::2], edges[1::2], strict=True) if b > a]
+
+
+def cut_clip(span: Span, cuts: Sequence[Cut], min_s: float = 0.0) -> tuple[list[Cut], list[Span]]:
+    """`apply_cuts`, keeping the clip at `min_s` or more: the applied cuts go back least
+    confident first (then shortest) until it is. Each cut comes back with `applied` true
+    only if it really removed something (a cut merged back is not applied)."""
+    active = [c for c in cuts if c.applied]
+    segments = apply_cuts(span, active)
+    for c in sorted(active, key=lambda c: (c.confidence, c.out_s - c.in_s)):
+        if sum(b - a for a, b in segments) >= min_s - 1e-9:
+            break
+        active.remove(c)
+        segments = apply_cuts(span, active)
+    removed = _removed(span, segments) if len(segments) > 1 else []
+    settled = [
+        c.model_copy(
+            update={
+                "applied": c in active
+                and any(frames(c.in_s) < b and frames(c.out_s) > a for a, b in removed)
+            }
+        )
+        for c in cuts
+    ]
+    return settled, segments
+
+
 def crop_on_output(
     keys: Sequence[tuple[float, float]], segments: Sequence[Span], origin: float
 ) -> list[tuple[float, float]]:
@@ -261,13 +302,13 @@ def crop_on_output(
         return x0 + (x1 - x0) * (t - t0) / (t1 - t0)
 
     out: list[tuple[float, float]] = []
-    o = 0.0
+    start = 0  # output frame of the segment's first frame: joins land exactly on from/FPS
     for a, b in segments:
-        a, b = a - origin, b - origin
+        o, a, b = start / FPS, a - origin, b - origin
         out.append((o, at(a)))
         out += [(o + t - a, x) for t, x in keys if a < t < b]
-        o += b - a
-        out.append((o, at(b, left=True)))
+        start += frames(b - a)
+        out.append((start / FPS, at(b, left=True)))
     return out
 
 

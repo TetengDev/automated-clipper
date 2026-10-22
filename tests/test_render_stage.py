@@ -1019,7 +1019,8 @@ def test_jump_cut_edl_the_validator_rejects_keeps_the_clip_whole(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     silences.append((0.0, 1000.0))
-    monkeypatch.setattr(rc, "apply_cuts", lambda span, cuts: [(2.0, 2.4), (3.0, 3.4)])
+    bad = [(2.0, 2.4), (3.0, 3.4)]  # under the EDL's 1 s minimum
+    monkeypatch.setattr(rc, "cut_clip", lambda span, cuts, min_s: (list(cuts), bad))
     _setup(media, [_highlight(1, 10.0, 40.0)], words=_gap_words())
     rc.render_clips(job, _ctx(media, conn))
     assert fake.calls[0]["edl"].segments is None

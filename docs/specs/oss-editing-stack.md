@@ -52,6 +52,7 @@ Make the clipper free to run apart from Claude, and raise clip quality, using on
 - Runs in the render stage on the padded section that has already been downloaded, before the EDL is built.
 - Scene snap: run PySceneDetect `ContentDetector` on the padded section, downscaled. If a cut lies within ±1.0 s of the clip start or end, move that boundary onto the cut, but only if the result stays on a word boundary and within `[clip_min_seconds, clip_max_seconds]`.
 - Dead-air trim: start no more than 0.25 s before the first word, and end no more than 0.4 s after the last word.
+- Order: a trim that knows about cuts runs first, then the snap. The trim stops at a cut between an edge and the nearest word, so it never leaves a flash of another shot at the edge. The snap never adds or drops a whole word, and an end snapped to a cut stops half a frame before it. The result is that every edge lands either on a cut or at the trim limit (changed in review from "snap, then trim").
 - Both steps are pure functions over (boundaries, words, cut list) and are unit-tested. Scene detection gets a hard timeout. On a timeout or error the clip renders with the original boundaries and a warning is logged.
 - Tests:
   - unit tests for snapping: a cut inside or outside the tolerance, a snap that would break min/max, a snap that would land mid-word;

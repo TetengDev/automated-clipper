@@ -22,7 +22,7 @@ import sqlite3
 import tempfile
 import time as _time
 import unicodedata
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
@@ -144,14 +144,18 @@ def run_media(
     *,
     runner: Runner | None = None,
     on_stderr_line: Callable[[str], None] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> RunResult:
-    """Run an ffmpeg/ffprobe argv; non-zero exit or timeout -> `MediaError`."""
+    """Run an ffmpeg/ffprobe argv; non-zero exit or timeout -> `MediaError`. `env` is added
+    to the runner's allowlisted environment."""
     run = runner if runner is not None else default_runner()
+    extra: dict[str, Any] = {}
+    if on_stderr_line is not None:
+        extra["on_stderr_line"] = on_stderr_line
+    if env:
+        extra["env"] = env
     try:
-        if on_stderr_line is None:
-            result = run(args, timeout_s)
-        else:
-            result = run(args, timeout_s, on_stderr_line=on_stderr_line)
+        result = run(args, timeout_s, **extra)
     except CommandTimeout as exc:
         raise MediaError(f"{what}: {exc}") from None
     if result.returncode != 0:

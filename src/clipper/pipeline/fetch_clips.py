@@ -187,6 +187,7 @@ def _download(
                 f"({probe.duration:.1f}s < {end - start:.1f}s)"
             )
         (clip_dir / SIDECAR).unlink(missing_ok=True)
+        dest.with_name(f"{dest.name}.cuts.json").unlink(missing_ok=True)  # CLP-68 scene cuts
         os.replace(tmp, dest)
         write_json_atomic(clip_dir / SIDECAR, _sidecar(canonical_url(job.ref), section))
         return probe

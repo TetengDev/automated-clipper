@@ -47,10 +47,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from clipper.config import ContentType, Creator, MissingSecretError, Secrets, Settings
 from clipper.jobs.models import Job
@@ -62,8 +63,9 @@ logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-5-5"
 PROMPT_VERSION = "select_v2"
-PLAYBOOK_VERSION = "playbook_v1"
-"""Bump when any file in prompts/playbook/ changes: it is part of the window cache key."""
+PLAYBOOK_VERSION = "playbook_v2"
+"""Bump when select_v2.md or any file in prompts/playbook/ changes: it is part of the window
+cache key (a test pins the text hash per version)."""
 PROVIDER = "anthropic"
 ARTIFACT = "highlights.json"
 
@@ -86,6 +88,7 @@ CREDIT_MARKER = ".credit_deferred_since"
 CREDIT_MARKER_MAX_AGE = timedelta(days=7)
 """An older marker is from an earlier, unrelated outage and restarts the clock."""
 CACHE_DIR = ".select"
+PAYOFF_OUTSIDE = "payoff_outside"
 FIELD_LIMITS = {"hook": 120, "title": 100, "caption": 2200, "reason": 500, "open_question": 200}
 MAX_HASHTAGS = 10
 _HASHTAG = re.compile(r"^#\w{1,50}$")
@@ -213,12 +216,12 @@ class Candidate(BaseModel):
         if self.end_s <= self.start_s:
             raise ValueError("end_s must be after start_s")
         if self.payoff_s is not None and not self.start_s <= self.payoff_s <= self.end_s:
-            raise ValueError("payoff_s must fall inside [start_s, end_s]")
+            raise PydanticCustomError(PAYOFF_OUTSIDE, "payoff_s must fall inside [start_s, end_s]")
         return self
 
 
 class _Reply(BaseModel):
-    clips: list[Candidate]
+    clips: list[dict[str, Any]]
 
 
 _CANDIDATE_SCHEMA: dict[str, Any] = {
@@ -268,9 +271,10 @@ def load_system_prompt(version: str = PROMPT_VERSION) -> str:
     )
 
 
-def load_playbook(section: str) -> str:
-    """`universal` or a ContentType value (validated by config, never user text)."""
-    path = resources.files("clipper.pipeline") / "prompts" / "playbook" / f"{section}.md"
+def load_playbook(section: ContentType | Literal["universal"]) -> str:
+    """The universal rules or one content type's section; any other value is a ValueError."""
+    name = "universal" if section == "universal" else ContentType(section).value
+    path = resources.files("clipper.pipeline") / "prompts" / "playbook" / f"{name}.md"
     return path.read_text(encoding="utf-8")
 
 
@@ -430,7 +434,7 @@ def build_system(
     if tags:
         style += f"\nCreator style tags: {', '.join(tags)}"
     if content_type:
-        style += f"\nContent type: {content_type.value}\n\n{load_playbook(content_type.value)}"
+        style += f"\nContent type: {content_type.value}\n\n{load_playbook(content_type)}"
     static = f"{load_system_prompt()}\n\n{load_playbook('universal')}"
     return [
         {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}},
@@ -520,6 +524,23 @@ def dedupe(clips: Sequence[Clip], max_overlap: float = MAX_OVERLAP) -> list[Clip
     return kept
 
 
+def _payoff_kept(clip: Clip) -> bool:
+    """Snapping may nudge the payoff just outside the clip (clamped later); a payoff the
+    length clamp cut off is a clip without its payoff."""
+    payoff = clip.candidate.payoff_s
+    if payoff is None or clip.start_s - MAX_SNAP_S <= payoff <= clip.end_s + MAX_SNAP_S:
+        return True
+    logger.info(
+        "dropping candidate %.1f-%.1f: payoff at %.1f falls outside the final clip %.1f-%.1f",
+        clip.candidate.start_s,
+        clip.candidate.end_s,
+        payoff,
+        clip.start_s,
+        clip.end_s,
+    )
+    return False
+
+
 def finalize(
     candidates: Sequence[Candidate], words: Sequence[_Word], settings: Settings, top_k: int
 ) -> list[dict[str, Any]]:
@@ -527,6 +548,7 @@ def finalize(
         clip
         for c in candidates
         if (clip := snap_to_words(c, words, settings.clip_min_seconds, settings.clip_max_seconds))
+        and _payoff_kept(clip)
     ]
     kept = dedupe(snapped)[:top_k]
     return [
@@ -540,7 +562,7 @@ def finalize(
             "hashtags": list(clip.candidate.hashtags),
             "score": clip.candidate.score,
             "reason": clip.candidate.reason,
-            # Snapping may nudge the boundaries; keep the payoff inside the final clip.
+            # Snapping may nudge the boundaries (_payoff_kept); keep the payoff inside.
             "payoff_s": None
             if (payoff := clip.candidate.payoff_s) is None
             else round(min(max(payoff, clip.start_s), clip.end_s), 3),
@@ -578,7 +600,22 @@ def _parse_reply(message: Any) -> list[Candidate]:
     text = next((b.text for b in message.content if b.type == "text"), None)
     if text is None:
         raise ValueError("no text block")
-    return _Reply.model_validate_json(text).clips
+    candidates: list[Candidate] = []
+    for raw in _Reply.model_validate_json(text).clips:
+        try:
+            candidates.append(Candidate.model_validate(raw))
+        except ValidationError as exc:
+            # A payoff outside its own clip is a judgment miss on one candidate, not a
+            # malformed reply: drop it and keep the paid window. Anything else retries.
+            if not all(e["type"] == PAYOFF_OUTSIDE for e in exc.errors()):
+                raise
+            logger.info(
+                "dropping candidate %r-%r: payoff_s %r is outside the clip",
+                raw.get("start_s"),
+                raw.get("end_s"),
+                raw.get("payoff_s"),
+            )
+    return candidates
 
 
 class _CreditDeferred(Deferred):

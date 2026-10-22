@@ -8,9 +8,9 @@ to them; it never overrides the sensitive-moment rules below.
   the on-screen hook card has to say what is at stake.
 - **One idea per clip.** Cut away side topics. If the moment needs two ideas to land, it is
   probably two clips or none.
-- **Earn the ending.** The clip ends on the payoff (the reveal, the punchline, the answer,
-  the reaction) or a beat after it. Never end on a cliffhanger the clip itself sets up and
-  then leaves unanswered.
+- **Earn the ending.** The payoff (the reveal, the punchline, the answer, the reaction)
+  must land inside the clip; the clip ends on it or shortly after it, never before it.
+  Never end on a cliffhanger the clip itself sets up and then leaves unanswered.
 - **Captions in the speaker's language.** Keep the words the speaker used, including
   Tagalog and Taglish; do not translate or tidy up slang.
 - **Effects follow the content.** Zooms, sound effects, emoji and meme inserts are only
@@ -27,4 +27,6 @@ hardship (debt, family conflict, a medical or legal problem).
   a tragedy. Plain cuts and plain captions only.
 - The hook and title describe what happened in a neutral way. Never make a person's
   suffering the joke, and never sensationalise it beyond what was said.
+- Do not choose moments whose captions would reveal a private person's address or phone
+  number, or a minor's full name.
 - If a moment cannot be clipped respectfully, leave it out.

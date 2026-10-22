@@ -105,8 +105,10 @@ def _plan(
         raise PermanentError(f"clip {rank}: no highlight")
     texts = [clip.get(k) for k in ("title", "caption", "reason", "hook")]
     score, hashtags = clip.get("score"), clip.get("hashtags", [])
+    sensitive = clip.get("sensitive", False)  # absent in v1 highlights
     if (
-        any(t is not None and not isinstance(t, str) for t in texts)
+        not isinstance(sensitive, bool)
+        or any(t is not None and not isinstance(t, str) for t in texts)
         or not (score is None or _number(score))
         or not isinstance(hashtags, list)
         or not all(isinstance(t, str) for t in hashtags)
@@ -143,6 +145,7 @@ def _plan(
         reason=reason,
         prompt_version=_version(selection.get("prompt_version")),
         playbook_version=_version(selection.get("playbook_version")),
+        sensitive=sensitive,
     )
     return rank, edl, start, end, meta
 

@@ -13,4 +13,4 @@ Avoid:
 - Explaining the joke in the hook or title, or spoiling the punchline.
 - Inside jokes that need earlier context to land.
 - Jokes at the expense of a victim, a minor or a tragedy, even when the creator made
-  them; leave those out or mark them `sensitive` with no effects.
+  them. Leave those moments out.

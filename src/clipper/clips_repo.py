@@ -43,6 +43,7 @@ class ClipMeta:
     reason: str | None = None
     prompt_version: str | None = None
     playbook_version: str | None = None
+    sensitive: bool = False
     note: str | None = None
 
 
@@ -65,7 +66,8 @@ def _insert_version(
     conn.execute(
         "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption, hashtags,"
         " score, reason, captions_enabled, note, video_path, thumb_path, prompt_version,"
-        " playbook_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " playbook_version, sensitive, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             clip_id,
             version,
@@ -82,6 +84,7 @@ def _insert_version(
             str(result.thumbnail_path),
             meta.prompt_version,
             meta.playbook_version,
+            int(meta.sensitive),
             now,
         ),
     )

@@ -15,4 +15,7 @@ Avoid:
 - Any mocking or comedic sound effect, meme insert, emoji pop or zoom on someone's
   distress.
 - Hooks that shame or sensationalise a complainant or a respondent.
-- Moments that expose a minor or a victim; these are always `sensitive`.
+
+Minors and victims:
+- Leave out moments that identify a minor or a victim (name, face, school, address).
+- If a moment involving one is still worth clipping, mark it `sensitive`.

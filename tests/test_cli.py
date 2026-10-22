@@ -267,6 +267,8 @@ def test_bench_transcribe_prints_rtf_and_preview(
     ]
     chunks = fake.chunk_calls()
     assert [c[2] for c in chunks] == ["2", "2"]  # --cpu-threads reaches the child
+    timeouts = [t for a, t in fake.calls if a[0] != "fetch"]
+    assert timeouts == [tr.call_timeout(tr.FasterWhisperTranscriber(model="tiny"), 30.0)] * 2
     assert chunks[0][4] == str(audio.resolve())
     lines = result.output.splitlines()
     assert any(line.startswith("tiny") and "rtf=" in line for line in lines)
@@ -313,6 +315,7 @@ def test_bench_transcribe_rejects_bad_language_and_unreadable_audio(tmp_path: Pa
 def test_bench_transcribe_zero_duration_and_model_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from asr_support import install_fake_asr
     from clipper.pipeline import transcribe as tr
     from clipper.pipeline import ytdlp
 
@@ -323,10 +326,8 @@ def test_bench_transcribe_zero_duration_and_model_errors(
     assert zero.exit_code == 1 and "no audio" in zero.output
 
     monkeypatch.setattr(tr, "probe_duration", lambda audio: 30.0)
-    monkeypatch.setenv("CLIPPER_MODELS_DIR", str(tmp_path / "models"))
-    snap = tmp_path / "models" / "models--Systran--faster-whisper-tiny" / "snapshots"
-    (snap / tr.WHISPER_MODELS["tiny"][1]).mkdir(parents=True)
-    (snap / tr.WHISPER_MODELS["tiny"][1] / "model.bin").write_bytes(b"corrupt")
+    install_fake_asr(monkeypatch, tmp_path / "models")
+    tr.FasterWhisperTranscriber(model="tiny").ensure_model()  # complete, verified snapshot
     broken = ytdlp.RunResult(3, "", "cannot load model: RuntimeError: Unable to open file")
     monkeypatch.setattr(ytdlp, "run_command", lambda args, timeout_s, **kw: broken)
     failed = runner.invoke(app, ["bench-transcribe", str(audio), "--models", "tiny"])

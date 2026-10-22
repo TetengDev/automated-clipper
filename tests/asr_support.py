@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
+import os
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -18,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from clipper import config
 from clipper.pipeline import local_asr, ytdlp
 from clipper.pipeline import transcribe as tr
 
@@ -88,9 +91,37 @@ class FakeWhisperModel:
         return iter(list(self.segments)), SimpleNamespace(language=language or self.language)
 
 
+FAKE_MODEL_BIN = b"fake ctranslate2 weights"
+FAKE_MODEL_SHA256 = hashlib.sha256(FAKE_MODEL_BIN).hexdigest()
+
+
+def write_snapshot(
+    models_dir: Path,
+    repo: str,
+    revision: str,
+    *,
+    model_bin: bytes = FAKE_MODEL_BIN,
+    files: Sequence[str] = ("config.json", "tokenizer.json", "vocabulary.txt"),
+) -> Path:
+    """What `snapshot_download` leaves: content-addressed blobs, snapshot symlinks."""
+    repo_dir = models_dir / f"models--{repo.replace('/', '--')}"
+    snap = repo_dir / "snapshots" / revision
+    (repo_dir / "blobs").mkdir(parents=True, exist_ok=True)
+    snap.mkdir(parents=True, exist_ok=True)
+    for name, data in [("model.bin", model_bin), *((f, b"{}") for f in files)]:
+        digest = hashlib.sha256(data).hexdigest()
+        (repo_dir / "blobs" / digest).write_bytes(data)
+        link = snap / name
+        if not link.is_symlink():
+            os.symlink(os.path.relpath(repo_dir / "blobs" / digest, snap), link)
+    return snap
+
+
 class FakeAsr:
     def __init__(self, inner: Callable[..., ytdlp.RunResult]) -> None:
         self.inner = inner
+        self.fetch_plan: list[str] = []
+        """Per fetch: "ok", "partial" (no tokenizer.json) or "corrupt" (model.bin hash)."""
         self.calls: list[tuple[list[str], float]] = []
         self.active = 0
         self.max_active = 0
@@ -107,9 +138,16 @@ class FakeAsr:
         try:
             if argv[0] == "fetch":
                 _, repo, sha, models_dir = argv
-                snap = Path(models_dir) / f"models--{repo.replace('/', '--')}" / "snapshots" / sha
-                snap.mkdir(parents=True)
-                (snap / "model.bin").write_bytes(b"fake")
+                plan = self.fetch_plan.pop(0) if self.fetch_plan else "ok"
+                snap = write_snapshot(
+                    Path(models_dir),
+                    repo,
+                    sha,
+                    model_bin=b"truncated" if plan == "corrupt" else FAKE_MODEL_BIN,
+                    files=("config.json", "vocabulary.txt")
+                    if plan == "partial"
+                    else ("config.json", "tokenizer.json", "vocabulary.txt"),
+                )
                 return ytdlp.RunResult(0, str(snap), "")
             time.sleep(0.02)  # let a second worker thread overlap, if there were one
             out = io.StringIO()
@@ -131,6 +169,8 @@ def install_fake_asr(monkeypatch: pytest.MonkeyPatch, models_dir: Path) -> FakeA
     FakeWhisperModel.segments = [seg("kumusta mga lods", 0.0), seg("salamat po", 3.0)]
     FakeWhisperModel.language = "tl"
     monkeypatch.setenv("CLIPPER_MODELS_DIR", str(models_dir))
+    for name, pin in list(config.WHISPER_MODELS.items()):  # the fake weights are "pinned"
+        monkeypatch.setitem(config.WHISPER_MODELS, name, pin._replace(sha256=FAKE_MODEL_SHA256))
     fake = FakeAsr(ytdlp.run_command)
     monkeypatch.setattr(ytdlp, "run_command", fake)
     return fake

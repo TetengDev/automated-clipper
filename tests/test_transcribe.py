@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import inspect
 import io
 import json
@@ -17,7 +18,14 @@ import httpx
 import pytest
 import respx
 
-from asr_support import FakeAsr, FakeWhisperModel, install_fake_asr, seg
+from asr_support import (
+    FAKE_MODEL_SHA256,
+    FakeAsr,
+    FakeWhisperModel,
+    install_fake_asr,
+    seg,
+    write_snapshot,
+)
 from clipper.config import AppConfig, load_config
 from clipper.db import connect, migrate
 from clipper.jobs import Deferred, Job, PermanentError, SkipJob, StageContext, enqueue
@@ -819,15 +827,25 @@ def test_child_latin_filter_follows_creator_or_detected_language() -> None:
     assert _chunk(cjk, language=None, detected="en")["dropped"] == {"segments": 1, "words": 2}
 
 
-def test_child_main_loads_model_with_exact_kwargs() -> None:
+@pytest.fixture
+def model_dir(tmp_path: Path) -> Path:
+    """A snapshot dir with the files the child requires (contents are never parsed)."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    for name in ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt"):
+        (snap / name).write_bytes(b"x")
+    return snap
+
+
+def test_child_main_loads_model_with_exact_kwargs(model_dir: Path) -> None:
     FakeWhisperModel.instances = []
     FakeWhisperModel.segments = [seg("hello there", 0.0)]
     out = io.StringIO()
-    code = local_asr.main(["/m/snap", "float32", "3", "en", "/x/c.flac"], out=out,
+    code = local_asr.main([str(model_dir), "float32", "3", "en", "/x/c.flac"], out=out,
                           model_class=FakeWhisperModel)  # fmt: skip
     assert code == 0
     (model,) = FakeWhisperModel.instances
-    assert model.model == "/m/snap"
+    assert model.model == str(model_dir)
     assert model.kwargs == {
         "device": "cpu",
         "compute_type": "float32",
@@ -847,7 +865,7 @@ def test_child_main_loads_model_with_exact_kwargs() -> None:
     ]
     body = json.loads(out.getvalue())
     assert [w["word"] for w in body["words"]] == ["hello", "there"]
-    local_asr.main(["/m/snap", "int8", "1", "-", "/x/c.flac"], out=io.StringIO(),
+    local_asr.main([str(model_dir), "int8", "1", "-", "/x/c.flac"], out=io.StringIO(),
                    model_class=FakeWhisperModel)  # fmt: skip
     assert FakeWhisperModel.instances[1].calls[0][1]["language"] is None  # "-" = auto-detect
 
@@ -871,14 +889,64 @@ def test_child_main_rejects_bad_arguments(argv: list[str]) -> None:
     )
 
 
-def test_child_model_load_failure_exits_with_model_code(monkeypatch: pytest.MonkeyPatch) -> None:
-    def broken(*a, **kw):
-        raise RuntimeError("Unable to open file 'model.bin'")
+@pytest.mark.parametrize(
+    "missing", ["model.bin", "config.json", "tokenizer.json", "vocabulary.txt"]
+)
+def test_child_missing_model_files_are_permanent(model_dir: Path, missing: str) -> None:
+    (model_dir / missing).unlink()
+    argv = [str(model_dir), "int8", "1", "en", "c.flac"]
+    assert local_asr.main(argv, out=io.StringIO(), model_class=FakeWhisperModel) == (
+        local_asr.EXIT_MODEL
+    )
+    assert FakeWhisperModel.instances == [] or all(
+        m.model != str(model_dir) for m in FakeWhisperModel.instances
+    )
 
-    argv = ["/m", "int8", "1", "en", "c.flac"]
-    assert local_asr.main(argv, out=io.StringIO(), model_class=broken) == local_asr.EXIT_MODEL
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (ImportError("no faster_whisper"), local_asr.EXIT_MODEL),
+        (ValueError("Requested float16 compute type, but the target device"), local_asr.EXIT_MODEL),
+        (MemoryError(), local_asr.EXIT_RETRY),
+        (RuntimeError("aligned_alloc: failed to allocate memory"), local_asr.EXIT_RETRY),
+        (OSError("No space left on device"), local_asr.EXIT_RETRY),
+    ],
+)
+def test_child_load_failure_mapping(model_dir: Path, error: BaseException, code: int) -> None:
+    def broken(*a, **kw):
+        raise error
+
+    argv = [str(model_dir), "int8", "1", "en", "c.flac"]
+    assert local_asr.main(argv, out=io.StringIO(), model_class=broken) == code
+
+
+def test_child_without_faster_whisper_is_permanent(
+    model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setitem(sys.modules, "faster_whisper", None)  # not installed
+    argv = [str(model_dir), "int8", "1", "en", "c.flac"]
     assert local_asr.main(argv, out=io.StringIO()) == local_asr.EXIT_MODEL
+
+
+def test_child_stdout_carries_only_the_json(
+    model_dir: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    class Noisy(FakeWhisperModel):
+        def __init__(self, *a, **kw) -> None:
+            print("loading weights...")  # a library printing to sys.stdout
+            os.write(1, b"[ctranslate2] fd-level chatter\n")  # or straight to fd 1
+            super().__init__(*a, **kw)
+
+    FakeWhisperModel.segments = [seg("hello", 0.0)]
+    argv = [str(model_dir), "int8", "1", "en", "c.flac"]
+    code = local_asr.run_with_json_stdout(lambda out: local_asr.main(argv, out, Noisy))
+    captured = capfd.readouterr()
+    assert code == 0
+    assert json.loads(captured.out)["words"][0]["word"] == "hello"
+    assert "loading weights" in captured.err and "fd-level chatter" in captured.err
+    print("stdout restored")
+    assert capfd.readouterr().out == "stdout restored\n"
 
 
 def test_backend_runs_one_child_per_chunk(
@@ -915,13 +983,48 @@ def test_backend_child_timeout_is_retryable(monkeypatch: pytest.MonkeyPatch, tmp
     assert not isinstance(exc.value, PermanentError)
 
 
-@pytest.mark.parametrize("stdout", ["garbage", "[]", '{"words": [{"word": "x"}]}'])
+@pytest.mark.parametrize(
+    ("returncode", "permanent"),
+    [(local_asr.EXIT_MODEL, True), (local_asr.EXIT_USAGE, True), (local_asr.EXIT_RETRY, False)],
+)
+def test_backend_maps_child_exit_codes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int, permanent: bool
+) -> None:
+    result = ytdlp.RunResult(returncode, "", "local_asr: something went wrong")
+    monkeypatch.setattr(ytdlp, "run_command", lambda a, t, **kw: result)
+    with pytest.raises(MediaError if not permanent else PermanentError) as exc:
+        local(models_dir=tmp_path).transcribe(tmp_path / "c.flac", language="en")
+    assert isinstance(exc.value, PermanentError) is permanent
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "garbage",
+        "[]",
+        '{"words": [{"word": "x"}]}',
+        '{"words": [{"word": "x", "start": NaN, "end": 1.0}], "segments": []}',
+        '{"words": [], "segments": [{"start": 0, "end": Infinity, "text": "x"}]}',
+    ],
+)
 def test_backend_unusable_child_output(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stdout: str
 ) -> None:
     monkeypatch.setattr(ytdlp, "run_command", lambda a, t, **kw: ytdlp.RunResult(0, stdout, ""))
     with pytest.raises(tr.BilledChunkError, match="local transcription output unusable"):
         local(models_dir=tmp_path).transcribe(tmp_path / "c.flac", language="en")
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_parse_rejects_non_finite_timestamps(bad: float) -> None:
+    body = fixture("verbose_chunk.json")
+    body["words"][0]["start"] = bad
+    with pytest.raises(ValueError):
+        tr._parse_verbose_json(body)
+    body = fixture("verbose_chunk.json")
+    body["segments"][0]["end"] = bad
+    with pytest.raises(ValueError):
+        tr._parse_verbose_json(body)
 
 
 def test_backend_child_crash_is_retryable_and_redacted(
@@ -942,33 +1045,104 @@ def test_real_child_with_missing_model_is_permanent(tmp_path: Path, audio_30s: P
         local(models_dir=tmp_path).transcribe(audio_30s, language="en", timeout_s=120)
 
 
-def test_ensure_model_fetches_the_pinned_revision_once(fake_asr: FakeAsr, tmp_path: Path):
+def _snapshot(models: Path) -> Path:
+    return models / "models--Systran--faster-whisper-tiny" / "snapshots" / TINY[1]
+
+
+def test_ensure_model_fetches_verifies_and_marks_once(fake_asr: FakeAsr, tmp_path: Path):
     backend = local()
     snapshot = backend.ensure_model(timeout_s=99)
-    assert (
-        snapshot
-        == tmp_path / "models" / "models--Systran--faster-whisper-tiny" / "snapshots" / TINY[1]
-    )
-    assert backend.ensure_model() == snapshot
+    assert snapshot == _snapshot(tmp_path / "models")
+    assert (snapshot / tr.COMPLETE_MARKER).read_text().strip() == FAKE_MODEL_SHA256
+    assert backend.ensure_model() == snapshot  # the marker skips the fetch
     assert fake_asr.fetch_calls() == [["fetch", *TINY, str(tmp_path / "models")]]
     assert fake_asr.calls[0][1] == 99
 
 
-def test_ensure_model_without_model_bin_is_retryable(
+def test_partial_snapshot_without_marker_is_fetched_again(fake_asr: FakeAsr, tmp_path: Path):
+    # An interrupted earlier fetch left model.bin but no tokenizer and no marker.
+    write_snapshot(tmp_path / "models", *TINY, files=("config.json",))
+    snapshot = local().ensure_model()
+    assert len(fake_asr.fetch_calls()) == 1
+    assert (snapshot / "tokenizer.json").is_file() and (snapshot / tr.COMPLETE_MARKER).is_file()
+
+
+def test_incomplete_fetch_is_retried_once(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    fake_asr.fetch_plan = ["partial", "ok"]
+    snapshot = local().ensure_model()
+    assert len(fake_asr.fetch_calls()) == 2
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+
+
+def test_hash_mismatch_is_never_marked_complete(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    fake_asr.fetch_plan = ["corrupt", "corrupt"]
+    with pytest.raises(MediaError, match="sha256") as exc:
+        local().ensure_model()
+    assert not isinstance(exc.value, PermanentError)  # retryable: the next run fetches again
+    assert len(fake_asr.fetch_calls()) == 2
+    snapshot = _snapshot(tmp_path / "models")
+    assert not (snapshot / tr.COMPLETE_MARKER).exists()
+    blobs = snapshot.parents[1] / "blobs"
+    assert not (blobs / hashlib.sha256(b"truncated").hexdigest()).exists()  # bad blob removed
+    fake_asr.fetch_plan = ["ok"]
+    assert (local().ensure_model() / tr.COMPLETE_MARKER).is_file()
+
+
+def test_marker_with_swapped_model_bin_is_fetched_again(fake_asr: FakeAsr, tmp_path: Path):
+    snapshot = local().ensure_model()
+    link = snapshot / "model.bin"
+    blobs = snapshot.parents[1] / "blobs"
+    (blobs / ("0" * 64)).write_bytes(b"other")
+    link.unlink()
+    os.symlink(os.path.relpath(blobs / ("0" * 64), snapshot), link)  # marker still there
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2
+    assert link.resolve().name == FAKE_MODEL_SHA256
+
+
+def test_ensure_model_fetch_failure_is_retryable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(ytdlp, "run_command", lambda a, t, **kw: ytdlp.RunResult(0, "", ""))
-    with pytest.raises(MediaError, match="no model.bin"):
+    with pytest.raises(MediaError, match="model.bin") as exc:
         local(models_dir=tmp_path).ensure_model()
+    assert not isinstance(exc.value, PermanentError)
+
+
+def test_local_chunk_timeout_scales_with_chunk_length() -> None:
+    assert tr.LOCAL_RTF_BUDGET == 3
+    backend = local()
+    assert tr.call_timeout(backend, 600.0) == 1800.0  # 10 min chunk: 30 min
+    assert tr.call_timeout(backend, 30.0) == tr.CHUNK_CALL_TIMEOUT_S  # never below 15 min
+    assert tr.call_timeout(groq(), 600.0) == tr.CHUNK_CALL_TIMEOUT_S
+
+
+@needs_ffmpeg
+def test_stage_local_chunk_timeouts_use_the_rtf_budget(
+    ctx: StageContext, fake_asr: FakeAsr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tr, "CHUNK_CALL_TIMEOUT_S", 5.0)
+    tr.transcribe(make_job(ctx.conn), ctx, chunk_s=10.0, overlap_s=2.0)
+    timeouts = [t for a, t in fake_asr.calls if a[0] != "fetch"]
+    assert timeouts == pytest.approx([30.0, 30.0, 30.0, 18.0], abs=1.0)  # 3 x chunk seconds
+    monkeypatch.setattr(tr, "Deadline", lambda: Deadline(budget_s=20.0))
+    shutil.rmtree(ctx.media_dir / ".transcribe", ignore_errors=True)
+    (ctx.media_dir / "transcript.json").unlink()
+    tr.transcribe(make_job(ctx.conn), ctx, chunk_s=10.0, overlap_s=2.0)
+    assert all(t <= 20.0 for a, t in fake_asr.calls[-4:])  # still capped by the deadline
 
 
 def test_whisper_model_allowlist_is_pinned() -> None:
     from clipper.config import WHISPER_MODELS
 
     assert {"large-v3-turbo", "large-v3", "medium", "tiny"} <= set(WHISPER_MODELS)
-    for repo, sha in WHISPER_MODELS.values():
-        assert re.fullmatch(r"[\w.-]+/[\w.-]+", repo) and re.fullmatch(r"[0-9a-f]{40}", sha)
-    assert WHISPER_MODELS["tiny"] == TINY
+    for repo, revision, sha256 in WHISPER_MODELS.values():
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+", repo)
+        assert re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9a-f]{64}", sha256)
+    assert WHISPER_MODELS["tiny"][:2] == TINY
+    assert WHISPER_MODELS["large-v3-turbo"].sha256 == (
+        "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da"
+    )
     with pytest.raises(ValueError, match="unknown whisper model"):
         tr.FasterWhisperTranscriber(model="../../etc")
 
@@ -990,7 +1164,7 @@ def test_local_costs_nothing() -> None:
     assert backend.billed_seconds([600.0, 30.0]) == pytest.approx(630.0)
 
 
-def test_cache_key_includes_compute_type_and_guard_version(
+def test_cache_key_includes_compute_type_commit_and_guard_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     chunk = Chunk(0, 0.0, 10.0)
@@ -1000,8 +1174,14 @@ def test_cache_key_includes_compute_type_and_guard_version(
 
     a = key(local(compute_type="int8"))
     assert key(local(compute_type="float32")) != a
+    from clipper import config
+
+    pin = config.WHISPER_MODELS["tiny"]
+    monkeypatch.setitem(config.WHISPER_MODELS, "tiny", pin._replace(revision="f" * 40))
+    b = key(local(compute_type="int8"))
+    assert b != a  # another pinned commit is another model
     monkeypatch.setattr(local_asr, "GUARD_VERSION", local_asr.GUARD_VERSION + 1)
-    assert key(local(compute_type="int8")) != a
+    assert key(local(compute_type="int8")) not in (a, b)
 
 
 def test_module_imports_without_faster_whisper() -> None:

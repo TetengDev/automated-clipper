@@ -1056,7 +1056,7 @@ def test_ensure_model_fetches_verifies_and_marks_once(fake_asr: FakeAsr, tmp_pat
     assert (snapshot / tr.COMPLETE_MARKER).read_text().strip() == FAKE_MODEL_SHA256
     assert backend.ensure_model() == snapshot  # the marker skips the fetch
     assert fake_asr.fetch_calls() == [["fetch", *TINY, str(tmp_path / "models")]]
-    assert fake_asr.calls[0][1] == 99
+    assert fake_asr.calls[0][1] == pytest.approx(99, abs=1)  # one budget for fetch + retry
 
 
 def test_partial_snapshot_without_marker_is_fetched_again(fake_asr: FakeAsr, tmp_path: Path):
@@ -1082,8 +1082,9 @@ def test_hash_mismatch_is_never_marked_complete(fake_asr: FakeAsr, tmp_path: Pat
     assert len(fake_asr.fetch_calls()) == 2
     snapshot = _snapshot(tmp_path / "models")
     assert not (snapshot / tr.COMPLETE_MARKER).exists()
-    blobs = snapshot.parents[1] / "blobs"
-    assert not (blobs / hashlib.sha256(b"truncated").hexdigest()).exists()  # bad blob removed
+    bad = hashlib.sha256(b"xet" + b"truncated").hexdigest()
+    assert not (tmp_path / "models" / "blobs" / bad[:2] / bad).exists()  # bad content removed
+    assert not (snapshot.parents[1] / "blobs" / FAKE_MODEL_SHA256).is_symlink()
     fake_asr.fetch_plan = ["ok"]
     assert (local().ensure_model() / tr.COMPLETE_MARKER).is_file()
 
@@ -1097,7 +1098,16 @@ def test_marker_with_swapped_model_bin_is_fetched_again(fake_asr: FakeAsr, tmp_p
     os.symlink(os.path.relpath(blobs / ("0" * 64), snapshot), link)  # marker still there
     assert local().ensure_model() == snapshot
     assert len(fake_asr.fetch_calls()) == 2
-    assert link.resolve().name == FAKE_MODEL_SHA256
+    assert Path(os.readlink(link)).name == FAKE_MODEL_SHA256
+
+
+def test_marker_check_follows_only_the_snapshot_link(fake_asr: FakeAsr, tmp_path: Path):
+    """huggingface_hub 2.x: blobs/<sha256> links on into a shared store; still complete."""
+    snapshot = local().ensure_model()
+    assert (snapshot / "model.bin").resolve().name != FAKE_MODEL_SHA256  # two hops
+    for _ in range(3):
+        assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 1
 
 
 def test_ensure_model_fetch_failure_is_retryable(

@@ -103,17 +103,30 @@ def write_snapshot(
     model_bin: bytes = FAKE_MODEL_BIN,
     files: Sequence[str] = ("config.json", "tokenizer.json", "vocabulary.txt"),
 ) -> Path:
-    """What `snapshot_download` leaves: content-addressed blobs, snapshot symlinks."""
+    """What huggingface_hub 2.x `snapshot_download` leaves: snapshot links to repo blobs
+    named by the server's etag (model.bin: the LFS sha256, which the fake server always
+    reports as FAKE_MODEL_SHA256, whatever arrives), and LFS/xet blobs that are themselves
+    links into a shared store at the cache root (`<models>/blobs/<xx>/<id>`)."""
     repo_dir = models_dir / f"models--{repo.replace('/', '--')}"
     snap = repo_dir / "snapshots" / revision
     (repo_dir / "blobs").mkdir(parents=True, exist_ok=True)
     snap.mkdir(parents=True, exist_ok=True)
     for name, data in [("model.bin", model_bin), *((f, b"{}") for f in files)]:
-        digest = hashlib.sha256(data).hexdigest()
-        (repo_dir / "blobs" / digest).write_bytes(data)
+        blob = repo_dir / "blobs" / hashlib.sha1(data).hexdigest()  # noqa: S324 - git oid
+        if name == "model.bin":
+            blob = repo_dir / "blobs" / FAKE_MODEL_SHA256
+            store_id = hashlib.sha256(b"xet" + data).hexdigest()
+            store = models_dir / "blobs" / store_id[:2] / store_id
+            store.parent.mkdir(parents=True, exist_ok=True)
+            store.write_bytes(data)
+            if not blob.is_symlink() or not blob.exists():
+                blob.unlink(missing_ok=True)
+                os.symlink(os.path.relpath(store, blob.parent), blob)
+        else:
+            blob.write_bytes(data)
         link = snap / name
         if not link.is_symlink():
-            os.symlink(os.path.relpath(repo_dir / "blobs" / digest, snap), link)
+            os.symlink(os.path.relpath(blob, snap), link)
     return snap
 
 

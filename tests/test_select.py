@@ -923,10 +923,20 @@ def test_choose_windows(windows, peaks, limit, expected):
         {"loudness_peaks": _peaks(*range(10_001))},
     ],
 )
-def test_invalid_signals_are_a_permanent_error(conn, media, raw):
+def test_invalid_signals_are_ignored_not_fatal(conn, media, raw, caplog):
+    # signals are optional hints: a bad point must not fail the job, only drop the hints
+    caplog.set_level(logging.WARNING, logger="clipper.pipeline.select")
     (media / "signals.json").write_text(json.dumps(raw))
-    with pytest.raises(PermanentError, match="invalid input artifact"):
-        run(make_job(conn), make_ctx(conn, media), FakeAnthropic())
+    fake = FakeAnthropic()
+    run(make_job(conn), make_ctx(conn, media), fake)
+    assert fake.requests
+    assert "signals.json is invalid" in caplog.text
+
+
+def test_all_zero_signals_send_every_window():
+    # signals present but carrying no information must not silently drop the tail
+    zero = [{"start_s": w.start_s, "end_s": w.end_s, "value": 0.0} for w in _SIX]
+    assert select.choose_windows(_SIX, _signals(heatmap=zero), 2) == list(range(6))
 
 
 def test_heat_values_are_clamped_to_0_1():

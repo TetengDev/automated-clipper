@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple
 
@@ -148,6 +149,16 @@ class CreatorOverrides(_Strict):
     max_llm_windows: int | None = Field(None, ge=1)
 
 
+class ContentType(StrEnum):
+    """Picks the playbook section the highlight prompt follows (CLP-51)."""
+
+    CHALLENGE_STUNT = "challenge_stunt"
+    STREAMER_REACTION = "streamer_reaction"
+    PUBLIC_SERVICE = "public_service"
+    VLOG_LIFESTYLE = "vlog_lifestyle"
+    COMEDY = "comedy"
+
+
 class YouTubeChannel(_Strict):
     handle: str = Field(pattern=r"^@[\w.\-]{3,100}$")
     channel_id: str | None = Field(None, pattern=r"^UC[\w-]{22}$")
@@ -163,6 +174,7 @@ class Creator(_Strict):
     region: Literal["global", "ph"]
     language: str = Field("en", pattern=r"^[a-z]{2,3}$")
     tags: tuple[str, ...] = ()
+    content_type: ContentType | None = None
     youtube: YouTubeChannel | None = None
     twitch: TwitchChannel | None = None
     overrides: CreatorOverrides = CreatorOverrides()

@@ -6,9 +6,10 @@ in the job's media dir. For each section the EDL cuts the requested range out of
 and the transcript words that overlap the clip, shifted into the section's timeline.
 `clipper.render.render_clip` writes `clips/<rank>/v1.{mp4,jpg,json}` and
 `clips_repo.insert_pending_clip` records it with the highlight's title, caption, hashtags,
-score and reason. Before the EDL is final, dead air is trimmed and the clip edges are
-snapped to scene cuts (CLP-68, `clipper.pipeline.boundaries`); a failed or skipped scene
-detection (sections over MAX_DETECT_PIXELS) leaves only the trim.
+score, reason, and the prompt and playbook versions it was selected with. Before the EDL
+is final, dead air is trimmed and the clip edges are snapped to scene cuts (CLP-68,
+`clipper.pipeline.boundaries`); a failed or skipped scene detection (sections over
+MAX_DETECT_PIXELS) leaves only the trim.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
 rerun after a crash renders only the clips without a row. The row's start_s/end_s are the
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -64,6 +66,14 @@ CLIP_WORST_CASE_S = DETECT_TIMEOUT_S + DEFAULT_RENDER_TIMEOUT_S + 4 * DEFAULT_FF
 """Scene detection, Remotion and the four ffmpeg steps of `render_clip`, each at its timeout."""
 assert CLIP_WORST_CASE_S < STAGE_BUDGET_S / 2, "a stage run must fit at least two clips"
 MAX_REASON_CHARS = 300
+_VERSION = re.compile(r"^[\w.-]{1,64}$")
+
+
+def _version(value: Any) -> str | None:
+    """A version label from highlights.json; anything else (stale or hand-edited) is dropped."""
+    return value if isinstance(value, str) and _VERSION.fullmatch(value) else None
+
+
 MAX_DETECT_PIXELS = 4096 * 2160
 """Larger sections are not scene-detected (decoder cost and attack surface)."""
 
@@ -98,7 +108,7 @@ def _plan(
     section: Any,
     highlights: dict[Any, Any],
     transcript: Any,
-    prompt_version: str | None,
+    selection: dict[str, Any],
     bounds: tuple[float, float] | None = None,
 ) -> tuple[int, EDL, float, float, ClipMeta]:
     """(rank, EDL, source start, source end, meta) for one section; PermanentError if invalid.
@@ -111,8 +121,10 @@ def _plan(
         raise PermanentError(f"clip {rank}: no highlight")
     texts = [clip.get(k) for k in ("title", "caption", "reason", "hook")]
     score, hashtags = clip.get("score"), clip.get("hashtags", [])
+    sensitive = clip.get("sensitive", False)  # absent in v1 highlights
     if (
-        any(t is not None and not isinstance(t, str) for t in texts)
+        not isinstance(sensitive, bool)
+        or any(t is not None and not isinstance(t, str) for t in texts)
         or not (score is None or _number(score))
         or not isinstance(hashtags, list)
         or not all(isinstance(t, str) for t in hashtags)
@@ -147,7 +159,9 @@ def _plan(
         hashtags=tuple(t for t in tags if t),
         score=score,
         reason=reason,
-        prompt_version=prompt_version,
+        prompt_version=_version(selection.get("prompt_version")),
+        playbook_version=_version(selection.get("playbook_version")),
+        sensitive=sensitive,
     )
     return rank, edl, start, end, meta
 
@@ -200,9 +214,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
     retry: RenderError | None = None
     for section in sections:
         try:
-            rank, edl, start, end, meta = _plan(
-                section, highlights, transcript, selection.get("prompt_version")
-            )
+            rank, edl, start, end, meta = _plan(section, highlights, transcript, selection)
             if rank in done:
                 continue
             if deadline.remaining() < CLIP_WORST_CASE_S:
@@ -210,7 +222,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             bounds = _polish(edl, start, section, transcript, limits, ctx.media_dir, deadline)
             try:
                 rank, edl, start, end, meta = _plan(
-                    section, highlights, transcript, selection.get("prompt_version"), bounds
+                    section, highlights, transcript, selection, bounds
                 )
             except PermanentError as exc:  # e.g. rounding nudged it past an EDL limit
                 reason = redact(strip_control(str(exc)))[:MAX_REASON_CHARS]

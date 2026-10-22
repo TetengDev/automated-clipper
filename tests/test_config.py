@@ -266,3 +266,46 @@ def test_max_llm_windows_must_be_positive() -> None:
         Settings(max_llm_windows=0)
     with pytest.raises(ValidationError):
         CreatorOverrides(max_llm_windows=0)
+
+
+# --- CLP-51: content_type per creator ------------------------------------------------------------
+
+
+def test_shipped_creators_have_their_content_type() -> None:
+    cfg = load_config(SHIPPED_CONFIG)
+    assert {c.name: c.content_type for c in cfg.creators} == {
+        "MrBeast": "challenge_stunt",
+        "IShowSpeed": "streamer_reaction",
+        "Kai Cenat": "streamer_reaction",
+        "Raffy Tulfo in Action": "public_service",
+        "Ivana Alawi": "vlog_lifestyle",
+        "Cong TV": "comedy",
+    }
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["challenge_stunt", "streamer_reaction", "public_service", "vlog_lifestyle", "comedy"],
+)
+def test_valid_content_types_accepted(tmp_path: Path, content_type: str) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "creators:\n  - {name: X, region: global, youtube: {handle: '@xxx'},"
+        f" content_type: {content_type}}}\n"
+    )
+    assert load_config(path).creator("X").content_type == content_type
+
+
+def test_content_type_is_optional(config_file: Path) -> None:
+    assert load_config(config_file).creator("MrBeast").content_type is None
+
+
+@pytest.mark.parametrize("bad", ["horror", "Comedy", "''", "[comedy]"])
+def test_invalid_content_type_rejected(tmp_path: Path, bad: str) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "creators:\n  - {name: X, region: global, youtube: {handle: '@xxx'},"
+        f" content_type: {bad}}}\n"
+    )
+    with pytest.raises(ConfigError, match="content_type"):
+        load_config(path)

@@ -25,7 +25,7 @@ import stat
 import sys
 import tempfile
 import time
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -34,7 +34,7 @@ import httpx
 
 from clipper.edl import FPS, MAX_CROP_KEYS, Layout
 from clipper.pipeline.boundaries import cached_child, harden
-from clipper.pipeline.common import Deadline
+from clipper.pipeline.common import Deadline, strip_control
 from clipper.pipeline.ytdlp import Runner
 from clipper.redact import redact
 
@@ -51,6 +51,7 @@ MODEL_URL = (
 )
 MODEL_SHA256 = "b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2380b0152f"
 MODEL_MAX_BYTES = 1024 * 1024
+MAX_REASON_CHARS = 300
 MODEL_RETRY_S = 600.0
 """After a failed or mismatched fetch, no new fetch for this long (in this process)."""
 MAX_SAMPLES = 3000
@@ -65,7 +66,12 @@ MAX_SPEED = 0.03
 PAIR_RATIO = 0.6
 """Two faces are framed together when the smaller has at least this share of the area..."""
 PAIR_FIT = 0.8
-"""...and both centres fit in this central share of the crop window."""
+"""...and both centres fit in this central share of the crop window (to start pairing)..."""
+PAIR_KEEP = 0.9
+"""...or this share (to keep pairing): hysteresis, so the target does not flip-flop."""
+SWITCH_RATIO = 1.25
+SWITCH_SAMPLES = 3
+"""The crop leaves its face for one SWITCH_RATIO larger for this many samples in a row."""
 FACE_SHARE = 0.6
 CUT_EPS_FRAMES = 0.05
 """Cut times are rounded to ms: a cut this close past a frame still starts on that frame."""
@@ -84,17 +90,40 @@ class Faces(NamedTuple):
     """(seconds in the section, faces) per sampled frame."""
 
 
-def face_target(faces: Sequence[Face], half_width: float = 0.5) -> float | None:
-    """The crop target for one sample: the largest face's centre, or the centroid of the two
-    largest when the smaller is at least PAIR_RATIO of the larger and both fit the window
-    (`half_width` is half the crop width); None without faces."""
-    if not faces:
-        return None
-    big, *rest = sorted(faces, key=lambda f: f[1], reverse=True)
-    pair = rest and rest[0][1] >= PAIR_RATIO * big[1]
-    if pair and abs(big[0] - rest[0][0]) <= 2 * half_width * PAIR_FIT:
-        return (big[0] + rest[0][0]) / 2
-    return big[0]
+def face_targets(
+    samples: Sequence[tuple[float, Sequence[Face]]], cuts: Sequence[float], half_width: float = 0.5
+) -> list[tuple[float, float | None]]:
+    """The crop target per sample (time kept; None without faces), from the two largest faces.
+
+    Two faces of similar size (the smaller at least PAIR_RATIO of the larger) that fit the
+    window (`half_width` is half the crop width) give their centroid; pairing starts within
+    PAIR_FIT of the window and stops only beyond PAIR_KEEP. Otherwise one face is locked and
+    followed by nearest x; the lock moves to the other face only once that one is at least
+    SWITCH_RATIO larger for SWITCH_SAMPLES samples in a row, so noisy sizes never flip it.
+    All of this resets at a cut."""
+    cuts = sorted(cuts)
+    out: list[tuple[float, float | None]] = []
+    shot, lock, paired, streak = -1, None, False, 0
+    for t, faces in samples:
+        if (here := bisect_right(cuts, t)) != shot:
+            shot, lock, paired, streak = here, None, False, 0
+        top = sorted(faces, key=lambda f: f[1], reverse=True)[:2]
+        fit = 2 * half_width * (PAIR_KEEP if paired else PAIR_FIT)
+        paired = len(top) == 2 and (
+            top[1][1] >= PAIR_RATIO * top[0][1] and abs(top[0][0] - top[1][0]) <= fit
+        )
+        if not top or paired:
+            lock, streak = None, 0
+            out.append((t, (top[0][0] + top[1][0]) / 2 if paired else None))
+            continue
+        mine = top[0] if lock is None else min(top, key=lambda f: abs(f[0] - lock))
+        other = next((f for f in top if f is not mine), None)
+        streak = streak + 1 if other and other[1] >= SWITCH_RATIO * mine[1] else 0
+        if other and streak >= SWITCH_SAMPLES:
+            mine, streak = other, 0
+        lock = mine[0]
+        out.append((t, lock))
+    return out
 
 
 def choose_layout(samples: Sequence[tuple[float, float | None]]) -> Layout:
@@ -162,11 +191,8 @@ def plan_reframe(
     # Remotion trims the video to whole frames with Math.round (half up, not to even).
     origin = math.floor(in_s * FPS + 0.5) / FPS
     half = faces.height * 9 / 16 / faces.width / 2
-    samples = [
-        (t - origin, face_target(found, half))
-        for t, found in faces.samples
-        if in_s - 1 / SAMPLE_FPS < t <= out_s
-    ]
+    clip = [(t - origin, f) for t, f in faces.samples if in_s - 1 / SAMPLE_FPS < t <= out_s]
+    samples = face_targets(clip, [c - origin for c in cuts], half)
     if half >= 0.5 or choose_layout(samples) is Layout.BLURRED_FILL:
         return Layout.BLURRED_FILL, None  # also a source already as narrow as 9:16
     keys = crop_path(samples, [c - origin for c in cuts], out_s - in_s, half)
@@ -180,19 +206,21 @@ def models_dir() -> Path:
 
 
 def download(url: str, timeout_s: float) -> bytes:
-    """GET `url` with no redirects, at most MODEL_MAX_BYTES within `timeout_s` in all: each
-    phase (connect, headers, a body read) gets a third, and no body read starts after two
-    thirds."""
+    """GET `url` with no redirects, at most MODEL_MAX_BYTES, in about `timeout_s`: each phase
+    (TCP connect, TLS, headers, a body read) gets a quarter, and no body read starts after
+    three quarters. DNS resolution is not covered by these timeouts."""
     data = bytearray()
-    end = time.monotonic() + timeout_s * 2 / 3
+    end = time.monotonic() + timeout_s * 3 / 4
     with httpx.stream(
-        "GET", url, timeout=httpx.Timeout(timeout_s / 3), follow_redirects=False
+        "GET", url, timeout=httpx.Timeout(timeout_s / 4), follow_redirects=False
     ) as response:
         response.raise_for_status()
         for chunk in response.iter_bytes():
             data += chunk
-            if len(data) > MODEL_MAX_BYTES or time.monotonic() > end:
-                raise ValueError("face model download is too large or too slow")
+            if len(data) > MODEL_MAX_BYTES:
+                raise ValueError("face model download is too large")
+            if time.monotonic() > end:
+                raise TimeoutError("face model download is too slow")
     return bytes(data)
 
 
@@ -204,9 +232,12 @@ def read_model(path: Path) -> bytes | None:
     except OSError:
         return None
     with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            data = fh.read(MODEL_MAX_BYTES + 1)
+        except OSError:  # e.g. EIO: no face tracking, never a failed clip
             return None
-        data = fh.read(MODEL_MAX_BYTES + 1)
     return data if hashlib.sha256(data).hexdigest() == MODEL_SHA256 else None
 
 
@@ -239,8 +270,12 @@ def ensure_model(
         finally:
             Path(tmp).unlink(missing_ok=True)
     except Exception as exc:
-        _fetch_failed_at = time.monotonic()
-        reason = redact(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
+        # A timeout under a shortened deadline says nothing about the network: retry later.
+        short = timeout_s < MODEL_TIMEOUT_S
+        if not (short and isinstance(exc, httpx.TimeoutException | TimeoutError)):
+            _fetch_failed_at = time.monotonic()
+        text = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        reason = redact(strip_control(text))[:MAX_REASON_CHARS]
         logger.warning("face model fetch failed, face tracking off: %s", reason)
         return None
     _fetch_failed_at = None

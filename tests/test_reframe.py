@@ -105,6 +105,63 @@ def test_clear_sustained_size_change_switches_faces() -> None:
     assert [x for _, x in rf.face_targets(blip, [], HALF)][-2:] == [0.3, 0.3]
 
 
+TWO = [(0.3, 0.01), (0.7, 0.009)]
+
+
+def test_single_missed_detection_keeps_the_lock() -> None:
+    samples = [(i / 5, TWO) for i in range(40)]
+    samples[20] = (4.0, [(0.7, 0.009)])  # the locked 0.3 face is missed once
+    assert {x for _, x in rf.face_targets(samples, [], HALF)} == {0.3}
+
+
+def test_zero_face_sample_keeps_the_lock() -> None:
+    samples = [(i / 5, TWO) for i in range(40)]
+    samples[20] = (4.0, [])
+    samples[21] = (4.2, [(0.3, 0.009), (0.7, 0.01)])  # 0.7 now (slightly) the largest
+    xs = [x for _, x in rf.face_targets(samples, [], HALF)]
+    assert xs[20] is None  # no detection: not counted as a face for the layout choice
+    assert {x for x in xs if x is not None} == {0.3}
+    _, keys = rf.plan_reframe(rf.Faces(1280, 720, samples), [], 0.0, 8.0)
+    assert keys is not None and {x for _, x in keys} == {0.3}
+
+
+def test_third_similar_face_causes_no_jumps() -> None:
+    rng = random.Random(7)  # noqa: S311 - seeded test noise
+    samples = [
+        (i / 5, [(x, 0.01 * rng.uniform(0.9, 1.1)) for x in (0.2, 0.5, 0.8)]) for i in range(150)
+    ]
+    xs = [x for _, x in rf.face_targets(samples, [], HALF)]
+    assert len(set(xs)) == 1
+
+
+def test_noisy_two_shot_with_dropouts_barely_crosses() -> None:
+    rng = random.Random(58)  # noqa: S311 - seeded test noise
+    samples = [
+        (
+            i / 5,
+            [
+                (x, 0.01 * rng.uniform(0.9, 1.1))
+                for x in (0.3, 0.7)
+                if rng.random() > 0.1  # each face missed 10% of the time
+            ],
+        )
+        for i in range(150)
+    ]
+    _, keys = rf.plan_reframe(rf.Faces(1280, 720, samples), [], 0.0, 30.0)
+    assert keys is not None
+    sides = [x > 0.5 for _, x in keys]
+    assert sum(a != b for a, b in zip(sides, sides[1:], strict=False)) <= 1
+
+
+def test_lock_moves_when_the_face_really_leaves() -> None:
+    samples = [(i / 5, TWO) for i in range(10)]
+    samples += [(2.0 + i / 5, [(0.7, 0.009)]) for i in range(10)]
+    xs = [x for _, x in rf.face_targets(samples, [], HALF)]
+    g = rf.LOCK_GRACE_SAMPLES
+    assert xs[: 10 + g] == [0.3] * (10 + g)  # held through the grace period
+    assert xs[10 + g :] == [0.7] * (10 - g)
+
+
 def test_face_lock_resets_at_a_cut() -> None:
     before = [(i / 5, [(0.3, 0.01), (0.7, 0.009)]) for i in range(10)]
     after = [(2.0 + i / 5, [(0.3, 0.009), (0.7, 0.01)]) for i in range(5)]

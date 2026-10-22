@@ -1077,7 +1077,9 @@ def test_any_jump_cut_error_keeps_the_clip_whole(
     monkeypatch.setattr(rc, "plan_cuts", boom)
     edl = _render_mode(conn, tmp_path, fake, "silences", "aaaaaaaaaaa", _gap_words())
     assert (edl.segments, edl.cuts) == (None, ())
-    assert "jump cuts rejected" in caplog.text
+    (record,) = [r for r in caplog.records if "jump cuts rejected" in r.getMessage()]
+    # A logic bug must not hide behind the fallback: the traceback is logged.
+    assert record.levelname == "WARNING" and record.exc_info is not None
     assert len(_rows(conn)) == 1
 
 

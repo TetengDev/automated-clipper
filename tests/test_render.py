@@ -490,9 +490,8 @@ def test_render_passes_the_output_join_times_to_finalize(
     assert chain.index("volume=") < chain.index("loudnorm=")
 
 
-@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
-def test_join_fade_dips_the_audio_to_silence(tmp_path: Path) -> None:
-    """A real sample-level fade: near-silent at the join, untouched 50 ms away."""
+def _assert_fade_dips(tmp_path: Path, joins: tuple[float, ...]) -> None:
+    """Real finalize argv (PCM out): near-silent at the join at 0.5 s, untouched 60 ms away."""
     src, dst = tmp_path / "in.mp4", tmp_path / "out.mp4"
     subprocess.run(  # noqa: S603
         [  # noqa: S607
@@ -503,12 +502,13 @@ def test_join_fade_dips_the_audio_to_silence(tmp_path: Path) -> None:
         ],
         check=True, capture_output=True, timeout=60,
     )  # fmt: skip
-    argv = render.finalize_argv("ffmpeg", src, dst, None, joins=(0.5,))
+    argv = render.finalize_argv("ffmpeg", src, dst, None, joins=joins)
     # PCM instead of AAC, so the samples at the join are exact.
     del argv[argv.index("-b:a") : argv.index("-b:a") + 2]
     argv[argv.index("aac")] = "pcm_s16le"
     argv[argv.index("-f") + 1] = "mov"
-    subprocess.run(argv, check=True, capture_output=True, timeout=60)  # noqa: S603
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, check=False)  # noqa: S603
+    assert proc.returncode == 0, proc.stderr[-500:]
     pcm = subprocess.run(  # noqa: S603
         ["ffmpeg", "-v", "error", "-i", str(dst), "-f", "s16le", "-ac", "1", "-"],  # noqa: S607
         check=True, capture_output=True, timeout=60,
@@ -521,6 +521,23 @@ def test_join_fade_dips_the_audio_to_silence(tmp_path: Path) -> None:
 
     assert peak(0.5) < 0.1 * peak(0.3)
     assert peak(0.56) > 0.9 * peak(0.3)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_join_fade_dips_the_audio_to_silence(tmp_path: Path) -> None:
+    """A real sample-level fade: near-silent at the join, untouched 60 ms away."""
+    _assert_fade_dips(tmp_path, (0.5,))
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_join_fade_survives_600_joins(tmp_path: Path) -> None:
+    """ffmpeg's evaluator fails on one product of ~98 terms: the fade is chunked."""
+    joins = (0.5, *(10.0 + 0.3 * i for i in range(599)))
+    argv = render.finalize_argv("ffmpeg", Path("in"), Path("out"), None, joins=joins)
+    chain = argv[argv.index("-af") + 1]
+    assert chain.count("asetnsamples") == 1
+    assert chain.count("volume=") == 15  # 600 joins, at most 40 a filter
+    _assert_fade_dips(tmp_path, joins)
 
 
 def test_thumbnail_failure_publishes_nothing(

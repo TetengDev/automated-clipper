@@ -137,6 +137,14 @@ def test_trim_takes_a_cut_just_inside_the_first_or_last_word(
     assert bd.trim_dead_air(10.0, 30.0, words, cuts) == pytest.approx(expected)
 
 
+def test_cut_inside_a_short_edge_word_never_drops_it() -> None:
+    # Words shorter than WORD_EPS_S: a cut past the edge word must not drop it.
+    first_short = [(10.3, 10.38), (10.42, 11.0), (30.0, 39.0)]
+    assert bd.polish(10.0, 40.0, [10.40], first_short, MIN, MAX)[0] <= 10.3
+    last_short = [(10.0, 11.0), (19.0, 19.58), (19.62, 19.7)]
+    assert bd.trim_dead_air(5.0, 21.0, last_short, [19.61])[1] >= 19.7
+
+
 def test_edge_on_a_cut_is_not_snapped_away() -> None:
     # The trim put the start on the cut at 10.4 (inside the first word); a valid cut at 9.6
     # within the tolerance must not pull the start back over the 0.8 s of the other shot.
@@ -356,3 +364,23 @@ def test_detects_a_hard_cut(tmp_path: Path) -> None:
     assert cut == pytest.approx(2.0, abs=0.1)
     (cut,) = bd.detect_cuts(path, Deadline())  # through the bounded subprocess
     assert cut == pytest.approx(2.0, abs=0.1)
+
+
+def test_cache_read_is_bounded_even_if_the_file_grows(tmp_path: Path) -> None:
+    # The size cap is enforced on the bytes read, not on an earlier stat().
+    section = tmp_path / "source.mp4"
+    section.write_bytes(b"x")
+    cache = tmp_path / "source.mp4.cuts.json"
+    cache.write_text(" " * (bd.MAX_CACHE_BYTES + 10) + "{}")
+    assert bd._read_cache(cache) is None
+
+
+def test_extra_child_env_cannot_override_the_allowlist() -> None:
+    from clipper.pipeline import ytdlp
+
+    with pytest.raises(ValueError):
+        ytdlp.run_command(["true"], 5.0, env={"PATH": "/evil"})
+    with pytest.raises(ValueError):
+        ytdlp.run_command(["true"], 5.0, env={"LD_PRELOAD": "/x.so"})
+    with pytest.raises(TypeError):
+        bd.CHILD_ENV["X"] = "1"  # type: ignore[index]

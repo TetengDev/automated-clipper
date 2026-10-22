@@ -2,9 +2,6 @@
 // with vitest. The video, the captions and the crop all run on the same whole frames.
 import type { Edl, Segment, Word } from "./types";
 
-/** About 25 ms of audio fade on each side of a join (a click-free jump cut). */
-export const JOIN_FADE_S = 0.025;
-
 /** One kept segment in frames: where it starts in the source, its length, where it plays. */
 export type FrameSegment = {
   trimBefore: number;
@@ -58,20 +55,3 @@ export const outputWords = (
       start_s: toOutputTime(word.start_s, segs, fps),
       end_s: toOutputTime(word.end_s, segs, fps),
     }));
-
-/** Volume for frame `frame` of a segment: a short ramp at the edges that are joins,
- * sampled at the frame's middle (Remotion sets volume per frame). */
-export const joinVolume = (
-  frame: number,
-  durationInFrames: number,
-  fadeIn: boolean,
-  fadeOut: boolean,
-  fps: number,
-): number => {
-  const sinceStart = (frame + 0.5) / fps;
-  const untilEnd = (durationInFrames - frame - 0.5) / fps;
-  let volume = 1;
-  if (fadeIn) volume = Math.min(volume, sinceStart / JOIN_FADE_S);
-  if (fadeOut) volume = Math.min(volume, untilEnd / JOIN_FADE_S);
-  return Math.min(1, Math.max(0, volume));
-};

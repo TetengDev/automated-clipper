@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   frameSegments,
-  joinVolume,
   outputWords,
   segmentsOf,
   toOutputTime,
@@ -131,22 +130,5 @@ describe("outputWords", () => {
   it("is a plain copy with one segment from 0", () => {
     const words = [{ text: "hi", start_s: 0.2, end_s: 0.5 }];
     expect(outputWords(words, frameSegments([{ in_s: 0, out_s: 5 }], FPS), FPS)).toEqual(words);
-  });
-});
-
-describe("joinVolume", () => {
-  it("is 1 away from a join and with no join", () => {
-    expect(joinVolume(10, 60, true, true, FPS)).toBe(1);
-    expect(joinVolume(0, 60, false, false, FPS)).toBe(1);
-    expect(joinVolume(59, 60, false, false, FPS)).toBe(1);
-  });
-
-  it("fades about 25 ms in after a join and out before one", () => {
-    const fadeIn = joinVolume(0, 60, true, false, FPS);
-    const fadeOut = joinVolume(59, 60, false, true, FPS);
-    expect(fadeIn).toBeGreaterThan(0);
-    expect(fadeIn).toBeLessThan(1);
-    expect(fadeOut).toBeCloseTo(fadeIn, 9);
-    expect(joinVolume(1, 60, true, true, FPS)).toBe(1); // 50 ms in: past the fade
   });
 });

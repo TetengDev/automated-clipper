@@ -36,12 +36,13 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import accumulate
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
-from clipper.edl import EDL, FPS, HEIGHT, WIDTH, parse_edl
+from clipper.edl import EDL, FPS, HEIGHT, WIDTH, frames, parse_edl
 from clipper.redact import redact
 
 log = logging.getLogger(__name__)
@@ -72,6 +73,8 @@ DEFAULT_FFMPEG_TIMEOUT_S = 300.0
 STDERR_TAIL_CHARS = 4000
 # Below this the input is effectively silent; loudnorm cannot (and should not) boost it.
 SILENCE_LUFS = -70.0
+JOIN_FADE_S = 0.025
+"""Audio fade out, then back in, on each side of a jump-cut join."""
 _LOUDNORM_JSON = re.compile(r"\{[^{}]*\"input_i\"[^{}]*\}", re.DOTALL)
 _BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
@@ -380,23 +383,40 @@ def parse_loudnorm(stderr: str) -> dict[str, float]:
         raise RenderError(f"unexpected loudnorm output: {raw}") from exc
 
 
+def join_times(edl: EDL) -> list[float]:
+    """Output seconds of each jump-cut join (whole frames, as Remotion plays them)."""
+    ends = list(accumulate(frames(b - a) for a, b in edl.spans))
+    return [f / FPS for f in ends[:-1]]
+
+
 def finalize_argv(
-    ffmpeg: str, src: Path, dst: Path, measured: dict[str, float] | None
+    ffmpeg: str,
+    src: Path,
+    dst: Path,
+    measured: dict[str, float] | None,
+    joins: Sequence[float] = (),
 ) -> list[str]:
-    """Copy video, loudness-normalize audio (2nd loudnorm pass), move moov to the front."""
+    """Copy video, fade the audio out and back in over JOIN_FADE_S around each jump-cut
+    join (a hard cut in a waveform clicks), loudness-normalize audio (2nd loudnorm pass),
+    move moov to the front. The fade gain is evaluated per 1 ms block of samples."""
     argv = [ffmpeg, "-hide_banner", "-nostats", "-y", *FFMPEG_INPUT_GUARD, "-i", str(src)]
     argv += ["-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy"]
+    filters = []
+    if joins:
+        gain = "*".join(f"min(1,abs(t-{t:.6f})/{JOIN_FADE_S:g})" for t in joins)
+        filters += ["asetnsamples=n=48:p=0", f"volume='{gain}':eval=frame"]
     if measured is not None:
-        argv += [
-            "-af",
+        filters.append(
             f"loudnorm=I={TARGET_LUFS:g}:TP={TARGET_TRUE_PEAK:g}:LRA={TARGET_LRA:g}"
             f":measured_I={measured['input_i']:.2f}"
             f":measured_TP={measured['input_tp']:.2f}"
             f":measured_LRA={measured['input_lra']:.2f}"
             f":measured_thresh={measured['input_thresh']:.2f}"
             f":offset={measured['target_offset']:.2f}"
-            ":linear=true:print_format=summary",
-        ]
+            ":linear=true:print_format=summary"
+        )
+    if filters:
+        argv += ["-af", ",".join(filters)]
     argv += ["-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", AUDIO_SAMPLE_RATE]
     argv += ["-movflags", "+faststart", "-f", "mp4", str(dst)]
     return argv
@@ -584,7 +604,13 @@ def render_clip(
                 )
             _run(
                 runner,
-                finalize_argv(ffmpeg, raw_video, staged_video, None if silent else measured),
+                finalize_argv(
+                    ffmpeg,
+                    raw_video,
+                    staged_video,
+                    None if silent else measured,
+                    join_times(edl),
+                ),
                 step="loudnorm + faststart",
                 timeout_s=ffmpeg_timeout_s,
                 env=env,

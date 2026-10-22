@@ -1,7 +1,8 @@
 // The `Clip` composition: layout + hook card + captions + progress bar, driven by the EDL.
 // With jump cuts (EDL v2) the video is a <Series> of the kept segments, each trimmed to
-// whole frames from the one pre-cut file (never a pre-cut per segment: lip-sync drift),
-// with a short audio fade at each join. Everything else runs on the output timeline.
+// whole frames from the one pre-cut file (never a pre-cut per segment: lip-sync drift).
+// The audio fades at each join are sample-level, in the ffmpeg finalize pass
+// (clipper.render). Everything else runs on the output timeline.
 import type React from "react";
 import { useMemo } from "react";
 import { AbsoluteFill, Series, staticFile, useVideoConfig } from "remotion";
@@ -12,7 +13,7 @@ import { toClipWords } from "./captionTiming";
 import { HookCard } from "./HookCard";
 import { loadFonts } from "./fonts";
 import { ProgressBar } from "./ProgressBar";
-import { frameSegments, joinVolume, outputWords, segmentsOf } from "./timeline";
+import { frameSegments, outputWords, segmentsOf } from "./timeline";
 import type { Edl } from "./types";
 
 loadFonts();
@@ -31,28 +32,15 @@ export const Clip: React.FC<Edl> = (edl) => {
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
       <Series>
-        {segs.map((seg, i) => {
-          const volume =
-            segs.length > 1
-              ? (f: number) =>
-                  joinVolume(f, seg.durationInFrames, i > 0, i < segs.length - 1, fps)
-              : undefined;
-          return (
-            <Series.Sequence key={seg.from} durationInFrames={seg.durationInFrames}>
-              {edl.layout === "face_track" && edl.crop !== null ? (
-                <FaceTrack
-                  src={src}
-                  trimBefore={seg.trimBefore}
-                  crop={edl.crop}
-                  from={seg.from}
-                  volume={volume}
-                />
-              ) : (
-                <BlurredFill src={src} trimBefore={seg.trimBefore} volume={volume} />
-              )}
-            </Series.Sequence>
-          );
-        })}
+        {segs.map((seg) => (
+          <Series.Sequence key={seg.from} durationInFrames={seg.durationInFrames}>
+            {edl.layout === "face_track" && edl.crop !== null ? (
+              <FaceTrack src={src} trimBefore={seg.trimBefore} crop={edl.crop} from={seg.from} />
+            ) : (
+              <BlurredFill src={src} trimBefore={seg.trimBefore} />
+            )}
+          </Series.Sequence>
+        ))}
       </Series>
       {edl.captions_enabled && clipWords.length > 0 ? (
         <Captions words={clipWords} styleId={edl.caption_style} />

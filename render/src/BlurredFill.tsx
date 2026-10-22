@@ -2,15 +2,14 @@
 // The background copy is rendered at quarter size and scaled up, so the CSS blur runs on
 // 1/16th of the pixels (blur hides the upscale anyway).
 import type React from "react";
-import { AbsoluteFill, OffthreadVideo, type VolumeProp } from "remotion";
+import { AbsoluteFill, OffthreadVideo } from "remotion";
 import { HEIGHT, WIDTH } from "./types";
 
 const BG_SCALE = 4;
 
-export const BlurredFill: React.FC<{ src: string; trimBefore: number; volume?: VolumeProp }> = ({
+export const BlurredFill: React.FC<{ src: string; trimBefore: number }> = ({
   src,
   trimBefore,
-  volume,
 }) => {
   return (
     <AbsoluteFill style={{ backgroundColor: "#000", overflow: "hidden" }}>
@@ -43,7 +42,6 @@ export const BlurredFill: React.FC<{ src: string; trimBefore: number; volume?: V
         <OffthreadVideo
           src={src}
           trimBefore={trimBefore}
-          volume={volume}
           style={{ width: "100%", height: "100%", objectFit: "contain" }}
         />
       </AbsoluteFill>

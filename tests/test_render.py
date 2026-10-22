@@ -504,8 +504,9 @@ def test_join_fade_dips_the_audio_to_silence(tmp_path: Path) -> None:
         check=True, capture_output=True, timeout=60,
     )  # fmt: skip
     argv = render.finalize_argv("ffmpeg", src, dst, None, joins=(0.5,))
-    argv[argv.index("-c:a") + 1 : argv.index("-c:a") + 3] = ["pcm_s16le", "-ar"]
-    argv = [a for a in argv if a not in ("-b:a", render.AUDIO_BITRATE)]
+    # PCM instead of AAC, so the samples at the join are exact.
+    del argv[argv.index("-b:a") : argv.index("-b:a") + 2]
+    argv[argv.index("aac")] = "pcm_s16le"
     argv[argv.index("-f") + 1] = "mov"
     subprocess.run(argv, check=True, capture_output=True, timeout=60)  # noqa: S603
     pcm = subprocess.run(  # noqa: S603

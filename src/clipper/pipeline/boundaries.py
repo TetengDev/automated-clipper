@@ -25,6 +25,7 @@ import sys
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from clipper.pipeline.common import Deadline, run_media, write_json_atomic
@@ -47,7 +48,7 @@ FRAME_GUARD_S = 1 / 60
 WORD_EPS_S = 0.15
 """The trim may cut this far into the first or last word to land on a scene cut."""
 MAX_CACHE_BYTES = 1024 * 1024
-CHILD_ENV = {"MALLOC_ARENA_MAX": "2"}
+CHILD_ENV = MappingProxyType({"MALLOC_ARENA_MAX": "2"})
 """Extra env for the detection child (glibc reads it at startup, so not in `harden`)."""
 
 Words = Sequence[tuple[float, float]]
@@ -103,9 +104,14 @@ def trim_dead_air(
     inside = [(ws, we) for ws, we in words if we > start and ws < end]
     if not inside:
         return start, end
-    first, last = min(ws for ws, _ in inside), max(we for _, we in inside)
-    a_cut = max([start, *(c for c in cuts if start <= c < first + WORD_EPS_S)])
-    b_cut = min([end, *(c - FRAME_GUARD_S for c in cuts if last - WORD_EPS_S < c <= end)])
+    first_ws, first_we = min(inside)
+    last_ws, last_we = max(inside, key=lambda w: (w[1], w[0]))
+    first, last = first_ws, last_we
+    # A cut may land up to WORD_EPS_S into the edge word, but never past it (short words).
+    a_lim = min(first + WORD_EPS_S, first_we)
+    b_lim = max(last - WORD_EPS_S, last_ws)
+    a_cut = max([start, *(c for c in cuts if start <= c < a_lim)])
+    b_cut = min([end, *(c - FRAME_GUARD_S for c in cuts if b_lim < c <= end)])
     a, b = max(a_cut, first - LEAD_IN_S), min(b_cut, last + TAIL_S)
     tries = ((a, b), (a, b_cut), (a_cut, b), (a_cut, b_cut), (a_cut, end), (start, b_cut))
     return next(((x, y) for x, y in tries if y - x >= min_s), (start, end))
@@ -135,16 +141,24 @@ def _cut_list(data: Any) -> list[float]:
     return [float(c) for c in data]
 
 
+def _read_cache(cache: Path) -> Any:
+    """The parsed cache, or None if it is missing, too big or not JSON. The size cap is
+    applied to the bytes actually read, so a file that grows after a stat() is still bounded."""
+    with suppress(OSError, ValueError, RecursionError), cache.open("rb") as fh:
+        raw = fh.read(MAX_CACHE_BYTES + 1)
+        if len(raw) <= MAX_CACHE_BYTES:
+            return json.loads(raw)
+    return None
+
+
 def detect_cuts(section: Path, deadline: Deadline, *, runner: Runner | None = None) -> list[float]:
     """Scene-cut times (seconds) in `section`; [] with a warning on any failure (failures are
     not cached, so a later run tries again)."""
     cache = section.with_name(f"{section.name}.cuts.json")
     with suppress(OSError, ValueError, TypeError, KeyError, RecursionError):
         key = _key(section)
-        if cache.stat().st_size > MAX_CACHE_BYTES:
-            raise ValueError("cache file too large")
-        cached = json.loads(cache.read_text(encoding="utf-8"))
-        if {k: cached[k] for k in key} == key:
+        cached = _read_cache(cache)
+        if cached is not None and {k: cached[k] for k in key} == key:
             return _cut_list(cached["cuts"])
     args = [sys.executable, "-I", "-m", __name__, str(section)]
     try:

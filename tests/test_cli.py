@@ -246,53 +246,54 @@ def test_retry_missing_job_fails_cleanly(tmp_path: Path) -> None:
 def test_bench_transcribe_prints_rtf_and_preview(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from types import SimpleNamespace
-
+    from asr_support import FakeWhisperModel, install_fake_asr, seg
     from clipper.pipeline import transcribe as tr
 
-    loaded: list[str] = []
-
-    class Model:
-        def __init__(self, model: str, **kwargs) -> None:
-            loaded.append(model)
-            self.model = model
-
-        def transcribe(self, audio, **kwargs):
-            words = [
-                SimpleNamespace(word=f" {self.model}{i}", start=i, end=i + 0.5) for i in range(200)
-            ]
-            segment = SimpleNamespace(
-                start=0.0,
-                end=100.0,
-                text="",
-                words=words,
-                no_speech_prob=0.0,
-                avg_logprob=-0.1,
-                compression_ratio=1.0,
-            )
-            return iter([segment]), SimpleNamespace(language="en")
-
-    monkeypatch.setattr(tr, "_whisper_model_class", lambda: Model)
+    fake = install_fake_asr(monkeypatch, tmp_path / "models")
+    words = [(f" w{i}", i * 0.5, i * 0.5 + 0.4) for i in range(200)]
+    words[0] = (" \x1b[31mred\x1b]0;title\x07", 0.0, 0.4)  # terminal escapes from the model
+    FakeWhisperModel.segments = [seg("", 0.0, words=words)]
+    FakeWhisperModel.language = "en"
     monkeypatch.setattr(tr, "probe_duration", lambda audio: 30.0)
     audio = tmp_path / "a.flac"
     audio.write_bytes(b"fLaC")
-    result = runner.invoke(app, ["bench-transcribe", str(audio), "--models", "tiny,base.en"])
+    result = runner.invoke(
+        app, ["bench-transcribe", str(audio), "--models", "tiny,medium", "--cpu-threads", "2"]
+    )
     assert result.exit_code == 0, result.output
-    assert loaded == ["tiny", "base.en"]
+    assert [c[1] for c in fake.fetch_calls()] == [
+        "Systran/faster-whisper-tiny",
+        "Systran/faster-whisper-medium",
+    ]
+    chunks = fake.chunk_calls()
+    assert [c[2] for c in chunks] == ["2", "2"]  # --cpu-threads reaches the child
+    assert chunks[0][4] == str(audio.resolve())
     lines = result.output.splitlines()
     assert any(line.startswith("tiny") and "rtf=" in line for line in lines)
-    assert any(line.startswith("base.en") and "rtf=" in line for line in lines)
-    preview = next(line for line in lines if "tiny0" in line).strip()
-    assert preview.startswith("tiny0 tiny1") and len(preview) == 300
+    assert any(line.startswith("medium") and "rtf=" in line for line in lines)
+    assert "\x1b" not in result.output and "\x07" not in result.output
+    preview = next(line for line in lines if "w1 w2" in line).strip()
+    assert 290 <= len(preview) <= 300  # first 300 characters
 
 
-@pytest.mark.parametrize("models", ["../etc,tiny", "org/model", "https://x.example/m", ","])
-def test_bench_transcribe_rejects_unsafe_model_names(tmp_path: Path, models: str) -> None:
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--models", "../etc,tiny"],
+        ["--models", "org/model"],
+        ["--models", "https://x.example/m"],
+        ["--models", ","],
+        ["--models", "small.en"],
+        ["--compute-type", "int4"],
+        ["--cpu-threads", "0"],
+    ],
+)
+def test_bench_transcribe_rejects_bad_options(tmp_path: Path, args: list[str]) -> None:
     audio = tmp_path / "a.flac"
     audio.write_bytes(b"fLaC")
-    result = runner.invoke(app, ["bench-transcribe", str(audio), "--models", models])
+    result = runner.invoke(app, ["bench-transcribe", str(audio), *args])
     assert result.exit_code != 0
-    assert "invalid model" in result.output
+    assert "invalid" in result.output
 
 
 def test_bench_transcribe_needs_existing_audio(tmp_path: Path) -> None:
@@ -307,3 +308,28 @@ def test_bench_transcribe_rejects_bad_language_and_unreadable_audio(tmp_path: Pa
     assert bad_lang.exit_code != 0 and "invalid language" in bad_lang.output
     unreadable = runner.invoke(app, ["bench-transcribe", str(audio), "--models", "tiny"])
     assert unreadable.exit_code == 1 and "bench-transcribe:" in unreadable.output
+
+
+def test_bench_transcribe_zero_duration_and_model_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clipper.pipeline import transcribe as tr
+    from clipper.pipeline import ytdlp
+
+    audio = tmp_path / "a.flac"
+    audio.write_bytes(b"fLaC")
+    monkeypatch.setattr(tr, "probe_duration", lambda audio: 0.0)
+    zero = runner.invoke(app, ["bench-transcribe", str(audio), "--models", "tiny"])
+    assert zero.exit_code == 1 and "no audio" in zero.output
+
+    monkeypatch.setattr(tr, "probe_duration", lambda audio: 30.0)
+    monkeypatch.setenv("CLIPPER_MODELS_DIR", str(tmp_path / "models"))
+    snap = tmp_path / "models" / "models--Systran--faster-whisper-tiny" / "snapshots"
+    (snap / tr.WHISPER_MODELS["tiny"][1]).mkdir(parents=True)
+    (snap / tr.WHISPER_MODELS["tiny"][1] / "model.bin").write_bytes(b"corrupt")
+    broken = ytdlp.RunResult(3, "", "cannot load model: RuntimeError: Unable to open file")
+    monkeypatch.setattr(ytdlp, "run_command", lambda args, timeout_s, **kw: broken)
+    failed = runner.invoke(app, ["bench-transcribe", str(audio), "--models", "tiny"])
+    assert failed.exit_code == 1
+    assert "bench-transcribe:" in failed.output and "cannot load the model" in failed.output
+    assert "Traceback" not in failed.output

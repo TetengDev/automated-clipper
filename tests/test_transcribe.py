@@ -1,9 +1,14 @@
+import dataclasses
+import inspect
+import io
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,10 +17,12 @@ import httpx
 import pytest
 import respx
 
+from asr_support import FakeAsr, FakeWhisperModel, install_fake_asr, seg
 from clipper.config import AppConfig, load_config
 from clipper.db import connect, migrate
 from clipper.jobs import Deferred, Job, PermanentError, SkipJob, StageContext, enqueue
 from clipper.jobs.models import JobStatus
+from clipper.pipeline import local_asr, ytdlp
 from clipper.pipeline import transcribe as tr
 from clipper.pipeline.common import (
     Deadline,
@@ -505,8 +512,6 @@ def test_stale_work_dirs_are_removed_and_bad_cache_entries_repaid(ctx: StageCont
 
 @needs_ffmpeg
 def test_probe_timeout_is_retryable(ctx: StageContext, monkeypatch: pytest.MonkeyPatch) -> None:
-    from clipper.pipeline import ytdlp
-
     def hang(args, timeout_s, **kw):
         raise ytdlp.CommandTimeout("ffprobe timed out after 60s")
 
@@ -714,55 +719,16 @@ def test_unknown_or_invalid_language_is_not_a_detection() -> None:
 
 # --------------------------------------------------------------------------- local whisper (CLP-35)
 
-
-def seg(text: str, start: float = 0.0, *, words=None, **probs):
-    """A faster-whisper Segment look-alike (only the attributes the backend reads)."""
-    from types import SimpleNamespace
-
-    if words is None:
-        words = [
-            (f" {w}", start + i * 0.4, start + i * 0.4 + 0.3) for i, w in enumerate(text.split())
-        ]
-    return SimpleNamespace(
-        start=start,
-        end=start + 2.0,
-        text=f" {text}",
-        words=[SimpleNamespace(word=w, start=a, end=b) for w, a, b in words],
-        no_speech_prob=probs.get("no_speech_prob", 0.01),
-        avg_logprob=probs.get("avg_logprob", -0.2),
-        compression_ratio=probs.get("compression_ratio", 1.4),
-    )
-
-
-class FakeWhisperModel:
-    """Stands in for faster_whisper.WhisperModel: never downloads anything."""
-
-    instances: list["FakeWhisperModel"] = []
-    segments: list = []
-    language = "tl"
-
-    def __init__(self, model_size_or_path: str, **kwargs) -> None:
-        self.model = model_size_or_path
-        self.kwargs = kwargs
-        self.calls: list[tuple[Path, dict]] = []
-        FakeWhisperModel.instances.append(self)
-
-    def transcribe(self, audio, **kwargs):
-        from types import SimpleNamespace
-
-        self.calls.append((Path(audio), kwargs))
-        return iter(list(self.segments)), SimpleNamespace(language=self.language)
+TINY = ("Systran/faster-whisper-tiny", "d90ca5fe260221311c53c58e660288d3deb8d356")
 
 
 @pytest.fixture
-def fake_whisper(monkeypatch: pytest.MonkeyPatch) -> type[FakeWhisperModel]:
-    FakeWhisperModel.instances = []
-    FakeWhisperModel.segments = [seg("kumusta mga lods", 0.0), seg("salamat po", 3.0)]
-    FakeWhisperModel.language = "tl"
-    monkeypatch.setattr(tr, "_whisper_model_class", lambda: FakeWhisperModel)
-    tr._local_transcriber.cache_clear()
-    yield FakeWhisperModel
-    tr._local_transcriber.cache_clear()
+def fake_asr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> FakeAsr:
+    return install_fake_asr(monkeypatch, tmp_path / "models")
+
+
+def local(**kw) -> tr.FasterWhisperTranscriber:
+    return tr.FasterWhisperTranscriber(**{"model": "tiny", **kw})
 
 
 @pytest.mark.parametrize(
@@ -794,112 +760,267 @@ def test_keep_segment_guard(no_speech: float, logprob: float, ratio: float, keep
         ("...", True),
         ("—", True),
         ("100%!", True),
+        ("Hawaiʻi", True),  # U+02BB modifier letter
+        ("kaʼ", True),  # U+02BC modifier letter apostrophe
+        ("1ª", True),
+        ("nº", True),
+        ("5µm", True),  # micro sign (NFKC would make it Greek mu)
+        ("ｈｅｌｌｏ", True),  # fullwidth Latin
+        ("１２３", True),  # fullwidth digits
+        ("ｱｲｳ", False),  # halfwidth katakana
         ("你好", False),
         ("привет", False),
         ("こんにちは", False),
         ("abcд", False),
         ("مرحبا", False),
+        ("μm", False),  # real Greek mu
     ],
 )
 def test_latin_word_guard(word: str, latin: bool) -> None:
     assert tr.latin_word(word) is latin
 
 
-def test_local_model_is_lazy_and_loaded_once(
-    fake_whisper: type[FakeWhisperModel], tmp_path: Path
-) -> None:
-    backend = tr.FasterWhisperTranscriber(
-        model="small", compute_type="int8_float16", download_root=tmp_path / "models"
+def _chunk(segments, *, language: str | None, detected: str = "tl") -> dict:
+    FakeWhisperModel.segments = segments
+    FakeWhisperModel.language = detected
+    model = FakeWhisperModel(
+        "/m", device="cpu", compute_type="int8", cpu_threads=1, local_files_only=True
     )
-    assert fake_whisper.instances == []  # nothing loaded until the first chunk
-    audio = tmp_path / "c.flac"
-    audio.write_bytes(b"fLaC")
-    backend.transcribe(audio, language="tl")
-    backend.transcribe(audio, language="tl")
-    (model,) = fake_whisper.instances
-    assert model.model == "small"
-    assert model.kwargs["device"] == "cpu"
-    assert model.kwargs["compute_type"] == "int8_float16"
-    assert model.kwargs["download_root"] == str(tmp_path / "models")
-    assert model.kwargs["cpu_threads"] >= 0
-    assert len(model.calls) == 2
-    path, kwargs = model.calls[0]
-    assert path == audio
-    assert kwargs["language"] == "tl"
-    assert kwargs["word_timestamps"] is True
-    assert kwargs["vad_filter"] is True
-    assert kwargs["condition_on_previous_text"] is False
+    return local_asr.transcribe_chunk(model, "c.flac", language)
 
 
-def test_local_result_has_the_groq_chunk_shape(
-    fake_whisper: type[FakeWhisperModel], tmp_path: Path
-) -> None:
-    fake_whisper.segments = [
-        seg("kumusta mga lods", 0.0),
-        seg("Thank you for watching", 5.0, no_speech_prob=0.9, avg_logprob=-1.5),
-        seg("na na na na na na", 8.0, compression_ratio=3.1),
-        seg("sobrang saya", 12.0, words=[(" sobrang", 12.0, 12.4), (" 你好", 12.5, 12.8)]),
-        seg("谢谢", 15.0),  # every word dropped -> no segment
-    ]
-    backend = tr.FasterWhisperTranscriber(model="tiny", download_root=tmp_path)
-    result = backend.transcribe(tmp_path / "c.flac", language="tl")
-    assert isinstance(result, ChunkTranscript)
+def test_child_guards_keep_the_groq_chunk_shape() -> None:
+    body = _chunk(
+        [
+            seg("kumusta mga lods", 0.0),
+            seg("Thank you for watching", 5.0, no_speech_prob=0.9, avg_logprob=-1.5),
+            seg("na na na na na na", 8.0, compression_ratio=3.1),
+            seg("sobrang", 12.0, words=[(" 你好", 12.0, 12.4), (" sobrang", 12.5, 12.9)]),
+            seg("谢谢", 15.0),  # every word dropped -> no segment
+        ],
+        language="tl",
+    )
+    assert body["dropped"] == {"segments": 3, "words": 2}
+    result = tr._parse_verbose_json(body)
     assert result.language == "tl"
     assert [w.word for w in result.words] == ["kumusta", "mga", "lods", "sobrang"]
     assert result.words[0] == Word("kumusta", 0.0, 0.3)
-    assert [(s.start, s.text) for s in result.segments] == [
-        (0.0, "kumusta mga lods"),
-        (12.0, "sobrang"),
+    assert result.segments == (
+        Segment(0.0, 2.0, "kumusta mga lods"),  # untouched: Whisper's own bounds
+        Segment(12.5, 12.9, "sobrang"),  # narrowed to the kept words
+    )
+
+
+def test_child_latin_filter_follows_creator_or_detected_language() -> None:
+    cjk = [seg("こんにちは 世界", 0.0)]
+    assert _chunk(cjk, language="ja")["words"]  # creator language outside en/tl: kept
+    assert _chunk(cjk, language=None, detected="ja")["words"]  # auto-detected ja: kept
+    assert _chunk(cjk, language=None, detected="tl")["words"] == []  # auto-detected tl
+    assert _chunk(cjk, language=None, detected="en")["dropped"] == {"segments": 1, "words": 2}
+
+
+def test_child_main_loads_model_with_exact_kwargs() -> None:
+    FakeWhisperModel.instances = []
+    FakeWhisperModel.segments = [seg("hello there", 0.0)]
+    out = io.StringIO()
+    code = local_asr.main(["/m/snap", "float32", "3", "en", "/x/c.flac"], out=out,
+                          model_class=FakeWhisperModel)  # fmt: skip
+    assert code == 0
+    (model,) = FakeWhisperModel.instances
+    assert model.model == "/m/snap"
+    assert model.kwargs == {
+        "device": "cpu",
+        "compute_type": "float32",
+        "cpu_threads": 3,
+        "local_files_only": True,
+    }
+    assert model.calls == [
+        (
+            "/x/c.flac",
+            {
+                "language": "en",
+                "word_timestamps": True,
+                "vad_filter": True,
+                "condition_on_previous_text": False,
+            },
+        )
     ]
+    body = json.loads(out.getvalue())
+    assert [w["word"] for w in body["words"]] == ["hello", "there"]
+    local_asr.main(["/m/snap", "int8", "1", "-", "/x/c.flac"], out=io.StringIO(),
+                   model_class=FakeWhisperModel)  # fmt: skip
+    assert FakeWhisperModel.instances[1].calls[0][1]["language"] is None  # "-" = auto-detect
 
 
-def test_local_keeps_other_scripts_for_other_languages(
-    fake_whisper: type[FakeWhisperModel], tmp_path: Path
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["/m", "int8", "1", "en"],
+        ["/m", "bogus", "1", "en", "c.flac"],
+        ["/m", "int8", "0", "en", "c.flac"],
+        ["/m", "int8", "x", "en", "c.flac"],
+        ["/m", "int8", "1", "../en", "c.flac"],
+        ["fetch", "evil/repo", "main", "/m"],
+        ["fetch", "Systran/x", "d90ca5fe", "/m"],
+    ],
+)
+def test_child_main_rejects_bad_arguments(argv: list[str]) -> None:
+    assert local_asr.main(argv, out=io.StringIO(), model_class=FakeWhisperModel) == (
+        local_asr.EXIT_USAGE
+    )
+
+
+def test_child_model_load_failure_exits_with_model_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*a, **kw):
+        raise RuntimeError("Unable to open file 'model.bin'")
+
+    argv = ["/m", "int8", "1", "en", "c.flac"]
+    assert local_asr.main(argv, out=io.StringIO(), model_class=broken) == local_asr.EXIT_MODEL
+    monkeypatch.setitem(sys.modules, "faster_whisper", None)  # not installed
+    assert local_asr.main(argv, out=io.StringIO()) == local_asr.EXIT_MODEL
+
+
+def test_backend_runs_one_child_per_chunk(
+    fake_asr: FakeAsr, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    fake_whisper.segments = [seg("こんにちは 世界", 0.0)]
-    fake_whisper.language = "ja"
-    backend = tr.FasterWhisperTranscriber(model="tiny", download_root=tmp_path)
-    for language in ("ja", None):
-        result = backend.transcribe(tmp_path / "c.flac", language=language)
-        assert [w.word for w in result.words] == ["こんにちは", "世界"]
-        assert result.language == "ja"
-    assert fake_whisper.instances[0].calls[1][1]["language"] is None  # auto-detect
+    caplog.set_level(logging.INFO)
+    FakeWhisperModel.segments = [seg("kumusta", 0.0), seg("x", 2.0, compression_ratio=9.0)]
+    backend = local(compute_type="int8_float16", cpu_threads=2)
+    snapshot = backend.ensure_model()
+    result = backend.transcribe(tmp_path / "chunk_0001.flac", language="tl", timeout_s=42.0)
+    assert result == ChunkTranscript(
+        "tl", (Word("kumusta", 0.0, 0.3),), (Segment(0.0, 2.0, "kumusta"),)
+    )
+    argv, timeout = fake_asr.calls[-1]
+    assert argv == [str(snapshot), "int8_float16", "2", "tl", str(tmp_path / "chunk_0001.flac")]
+    assert timeout == 42.0
+    assert "chunk_0001.flac: guards dropped 1 segment(s), 0 word(s)" in caplog.text
+    backend.transcribe(tmp_path / "c.flac", language=None)
+    assert fake_asr.calls[-1][0][3] == "-"
+    assert len(FakeWhisperModel.instances) == 2  # loaded per child; freed when it exits
 
 
-def test_local_costs_nothing(fake_whisper: type[FakeWhisperModel]) -> None:
-    backend = tr.FasterWhisperTranscriber()
-    assert (backend.provider, backend.model) == ("local", "large-v3-turbo")
-    assert backend.cost_usd([600.0, 30.0]) == 0.0
-    assert backend.billed_seconds([600.0, 30.0]) == pytest.approx(630.0)
-    assert backend.download_root == tr.MODELS_DIR == Path("data/models")
+def test_asr_command_is_isolated_python() -> None:
+    assert (sys.executable, "-I", "-m", "clipper.pipeline.local_asr") == tr.ASR_COMMAND
 
 
-def test_local_timeout_is_retryable(fake_whisper: type[FakeWhisperModel], tmp_path: Path) -> None:
-    backend = tr.FasterWhisperTranscriber(model="tiny", download_root=tmp_path)
-    with pytest.raises(StageTimeout):
-        backend.transcribe(tmp_path / "c.flac", language="tl", timeout_s=1e-9)
+def test_backend_child_timeout_is_retryable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    def hang(args, timeout_s, **kw):
+        raise ytdlp.CommandTimeout("python timed out after 5s")
+
+    monkeypatch.setattr(ytdlp, "run_command", hang)
+    with pytest.raises(MediaError, match="timed out") as exc:
+        local(models_dir=tmp_path).transcribe(tmp_path / "c.flac", language="en", timeout_s=5)
+    assert not isinstance(exc.value, PermanentError)
 
 
-def test_local_module_imports_without_faster_whisper(
+@pytest.mark.parametrize("stdout", ["garbage", "[]", '{"words": [{"word": "x"}]}'])
+def test_backend_unusable_child_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stdout: str
+) -> None:
+    monkeypatch.setattr(ytdlp, "run_command", lambda a, t, **kw: ytdlp.RunResult(0, stdout, ""))
+    with pytest.raises(tr.BilledChunkError, match="local transcription output unusable"):
+        local(models_dir=tmp_path).transcribe(tmp_path / "c.flac", language="en")
+
+
+def test_backend_child_crash_is_retryable_and_redacted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import sys
+    result = ytdlp.RunResult(-9, "", f"Killed; Authorization: Bearer {KEY}")
+    monkeypatch.setattr(ytdlp, "run_command", lambda a, t, **kw: result)
+    with pytest.raises(MediaError, match="exit -9") as exc:
+        local(models_dir=tmp_path).transcribe(tmp_path / "c.flac", language="en")
+    assert not isinstance(exc.value, PermanentError)
+    assert KEY not in str(exc.value)
 
-    monkeypatch.setitem(sys.modules, "faster_whisper", None)  # import raises ImportError
-    backend = tr.FasterWhisperTranscriber(model="tiny", download_root=tmp_path)  # no import yet
-    with pytest.raises(PermanentError, match="faster-whisper is not installed"):
-        backend.transcribe(tmp_path / "c.flac", language="en")
+
+def test_real_child_with_missing_model_is_permanent(tmp_path: Path, audio_30s: Path) -> None:
+    """Runs the real child process (no download: the snapshot dir does not exist)."""
+    pytest.importorskip("faster_whisper")
+    with pytest.raises(PermanentError, match="cannot load the model"):
+        local(models_dir=tmp_path).transcribe(audio_30s, language="en", timeout_s=120)
 
 
-def test_default_transcriber_local_needs_no_key(fake_whisper: type[FakeWhisperModel]) -> None:
+def test_ensure_model_fetches_the_pinned_revision_once(fake_asr: FakeAsr, tmp_path: Path):
+    backend = local()
+    snapshot = backend.ensure_model(timeout_s=99)
+    assert (
+        snapshot
+        == tmp_path / "models" / "models--Systran--faster-whisper-tiny" / "snapshots" / TINY[1]
+    )
+    assert backend.ensure_model() == snapshot
+    assert fake_asr.fetch_calls() == [["fetch", *TINY, str(tmp_path / "models")]]
+    assert fake_asr.calls[0][1] == 99
+
+
+def test_ensure_model_without_model_bin_is_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(ytdlp, "run_command", lambda a, t, **kw: ytdlp.RunResult(0, "", ""))
+    with pytest.raises(MediaError, match="no model.bin"):
+        local(models_dir=tmp_path).ensure_model()
+
+
+def test_whisper_model_allowlist_is_pinned() -> None:
+    from clipper.config import WHISPER_MODELS
+
+    assert {"large-v3-turbo", "large-v3", "medium", "tiny"} <= set(WHISPER_MODELS)
+    for repo, sha in WHISPER_MODELS.values():
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+", repo) and re.fullmatch(r"[0-9a-f]{40}", sha)
+    assert WHISPER_MODELS["tiny"] == TINY
+    with pytest.raises(ValueError, match="unknown whisper model"):
+        tr.FasterWhisperTranscriber(model="../../etc")
+
+
+def test_models_dir_is_absolute_and_configurable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assert tr.models_dir() == tmp_path / "data" / "models"  # tests run in tmp_path
+    assert tr.models_dir().is_absolute()
+    monkeypatch.setenv("CLIPPER_MODELS_DIR", "rel/models")
+    assert tr.models_dir() == tmp_path / "rel" / "models"
+    assert local().models_dir == tmp_path / "rel" / "models"
+
+
+def test_local_costs_nothing() -> None:
+    backend = tr.FasterWhisperTranscriber()
+    assert (backend.provider, backend.model, backend.cpu_threads) == ("local", "large-v3-turbo", 4)
+    assert backend.cost_usd([600.0, 30.0]) == 0.0
+    assert backend.billed_seconds([600.0, 30.0]) == pytest.approx(630.0)
+
+
+def test_cache_key_includes_compute_type_and_guard_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chunk = Chunk(0, 0.0, 10.0)
+
+    def key(backend) -> Path:
+        return tr._cache_path(tmp_path, chunk, backend, "tl", (1, 2))
+
+    a = key(local(compute_type="int8"))
+    assert key(local(compute_type="float32")) != a
+    monkeypatch.setattr(local_asr, "GUARD_VERSION", local_asr.GUARD_VERSION + 1)
+    assert key(local(compute_type="int8")) != a
+
+
+def test_module_imports_without_faster_whisper() -> None:
+    code = (
+        "import sys; sys.modules['faster_whisper'] = None; sys.modules['huggingface_hub'] = None\n"
+        "import clipper.pipeline.transcribe, clipper.pipeline.local_asr, clipper.cli"
+    )
+    subprocess.run([sys.executable, "-I", "-c", code], check=True)  # noqa: S603
+
+
+def test_default_transcriber_local_needs_no_key() -> None:
     from clipper.config import Settings
 
-    settings = Settings(whisper_model="small", whisper_compute_type="float32")
+    settings = Settings(
+        whisper_model="medium", whisper_compute_type="float32", whisper_cpu_threads=6
+    )
     backend = tr.default_transcriber(settings)
     assert isinstance(backend, tr.FasterWhisperTranscriber)
-    assert (backend.model, backend.compute_type) == ("small", "float32")
-    assert tr.default_transcriber(settings) is backend  # one instance (one model) per process
-    assert tr.default_transcriber(Settings(whisper_model="tiny")) is not backend
+    assert (backend.model, backend.compute_type, backend.cpu_threads) == ("medium", "float32", 6)
 
 
 def test_default_transcriber_groq_needs_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -914,9 +1035,7 @@ def test_default_transcriber_groq_needs_key(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @needs_ffmpeg
-def test_stage_uses_creator_transcriber_override(
-    ctx: StageContext, fake_whisper: type[FakeWhisperModel]
-) -> None:
+def test_stage_uses_creator_transcriber_override(ctx: StageContext, fake_asr: FakeAsr) -> None:
     overrides = ctx.config.creator(PH).overrides.model_copy(update={"transcriber": "groq"})
     creators = tuple(
         c.model_copy(update={"overrides": overrides}) if c.name == PH else c
@@ -928,19 +1047,21 @@ def test_stage_uses_creator_transcriber_override(
         tr.transcribe(make_job(ctx.conn), groq_ctx)
     other, _ = enqueue(ctx.conn, SourceRef("youtube", "aaaaaaaaaaa"), T0, creator="MrBeast")
     tr.transcribe(other, groq_ctx)  # no override: still local
-    assert fake_whisper.instances
+    assert fake_asr.chunk_calls()
 
 
 @needs_ffmpeg
 def test_stage_local_default_writes_same_schema_and_free_spend(
-    ctx: StageContext, fake_whisper: type[FakeWhisperModel]
+    ctx: StageContext, fake_asr: FakeAsr, tmp_path: Path
 ) -> None:
     job = make_job(ctx.conn)
     tr.transcribe(job, ctx, chunk_s=10.0, overlap_s=2.0)  # no key, no transcriber passed
 
-    (model,) = fake_whisper.instances
-    assert model.model == "large-v3-turbo" and model.kwargs["compute_type"] == "int8"
-    assert len(model.calls) == 4
+    turbo = ("dropbox-dash/faster-whisper-large-v3-turbo", tr.WHISPER_MODELS["large-v3-turbo"][1])
+    assert fake_asr.fetch_calls() == [["fetch", *turbo, str(tmp_path / "models")]]
+    chunks = fake_asr.chunk_calls()
+    assert len(chunks) == 4 and fake_asr.max_active == 1  # sequential, one child at a time
+    assert all(c[1:4] == ["int8", "4", "tl"] for c in chunks)
     data = json.loads((ctx.media_dir / "transcript.json").read_text())
     assert set(data) == {"language", "duration_s", "model", "segments", "words"}
     assert data["language"] == "tl" and data["model"] == "large-v3-turbo"
@@ -957,28 +1078,58 @@ def test_stage_local_default_writes_same_schema_and_free_spend(
     assert row["audio_seconds"] == pytest.approx(36.0)  # 10+10+10+6
 
 
+@needs_ffmpeg
+def test_stage_local_runs_when_daily_cap_is_spent(ctx: StageContext, fake_asr: FakeAsr) -> None:
+    ctx.conn.execute(
+        "INSERT INTO spend (provider, kind, usd, created_at) VALUES"
+        " ('groq', 'transcribe', 7.5, '2026-10-21T01:00:00Z')"  # over the $5 cap
+    )
+    tr.transcribe(make_job(ctx.conn), ctx)
+    assert (ctx.media_dir / "transcript.json").is_file()
+    rows = spend_rows(ctx.conn)
+    assert [(r["provider"], r["usd"]) for r in rows] == [("groq", 7.5), ("local", 0.0)]
+
+
+def test_faster_whisper_contract(audio_30s: Path) -> None:
+    """The real library still accepts exactly what the child passes and returns the fields
+    it reads (no model download). Decoding catches PyAV breaks like av 19."""
+    fw = pytest.importorskip("faster_whisper")
+    from faster_whisper.audio import decode_audio
+    from faster_whisper.transcribe import Segment as FwSegment
+    from faster_whisper.transcribe import TranscriptionInfo
+    from faster_whisper.transcribe import Word as FwWord
+
+    inspect.signature(fw.WhisperModel.__init__).bind(
+        None, "/m", **local_asr.model_kwargs("int8", 4)
+    )
+    inspect.signature(fw.WhisperModel.transcribe).bind(
+        None, "c.flac", language="tl", **local_asr.TRANSCRIBE_KWARGS
+    )
+    fields = {f.name for f in dataclasses.fields(FwSegment)}
+    assert {"start", "end", "words", "no_speech_prob", "avg_logprob", "compression_ratio"} <= fields
+    assert {"start", "end", "word"} <= {f.name for f in dataclasses.fields(FwWord)}
+    assert "language" in {f.name for f in dataclasses.fields(TranscriptionInfo)}
+    samples = decode_audio(str(audio_30s))
+    assert len(samples) == pytest.approx(30 * 16000, abs=1600)
+
+
 SLOW_MODEL_DIR = Path(__file__).resolve().parents[1] / "data" / "models"
-
-
-def _tiny_available() -> bool:
-    if os.environ.get("CLIPPER_SLOW_TESTS") != "1":
-        return False
-    try:
-        from faster_whisper.utils import download_model
-
-        download_model("tiny", local_files_only=True, cache_dir=str(SLOW_MODEL_DIR))
-    except Exception:  # not installed or not downloaded yet
-        return False
-    return True
 
 
 @pytest.mark.slow
 @needs_ffmpeg
-def test_local_tiny_model_transcribes_the_fixture(ctx: StageContext) -> None:
-    if not _tiny_available():
+def test_local_tiny_model_transcribes_the_fixture(
+    ctx: StageContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = SLOW_MODEL_DIR / "models--Systran--faster-whisper-tiny" / "snapshots" / TINY[1]
+    if os.environ.get("CLIPPER_SLOW_TESTS") != "1" or not (snapshot / "model.bin").is_file():
         pytest.skip("set CLIPPER_SLOW_TESTS=1 and download `tiny` into data/models")
-    backend = tr.FasterWhisperTranscriber(model="tiny", download_root=SLOW_MODEL_DIR)
-    tr.transcribe(make_job(ctx.conn, creator="MrBeast"), ctx, transcriber=backend)
+    monkeypatch.setenv("CLIPPER_MODELS_DIR", str(SLOW_MODEL_DIR))
+    settings = ctx.config.settings.model_copy(update={"whisper_model": "tiny"})
+    ctx = StageContext(
+        ctx.media_dir, ctx.conn, ctx.config.model_copy(update={"settings": settings}), ctx.clock
+    )
+    tr.transcribe(make_job(ctx.conn, creator="MrBeast"), ctx)  # the real child process
     data = json.loads((ctx.media_dir / "transcript.json").read_text())
     assert set(data) == {"language", "duration_s", "model", "segments", "words"}
     assert data["model"] == "tiny" and data["language"] == "en"

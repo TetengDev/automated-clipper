@@ -1184,6 +1184,7 @@ def test_load_playbook_rejects_unknown_sections(bad):
 
 PLAYBOOK_HASHES = {
     "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
+    "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
 }
 
 
@@ -1254,3 +1255,42 @@ def test_leftover_v1_cache_entry_is_a_miss_not_a_crash(conn, media):
     out = run(make_job(conn), make_ctx(conn, media), fake)
     assert len(fake.requests) == 1 and out["clips"][0]["payoff_s"] == 410.1
     assert not (media / ".select").exists()
+
+
+def test_victims_minors_and_complainants_are_never_named():
+    universal = select.load_playbook("universal")
+    assert "Never put the name, school, workplace, address or phone number of a victim" in universal
+    assert 'This overrides "the hook names the\n  person"' in universal
+    prompt = select.load_system_prompt()
+    assert "never name a victim, a minor or a private\n  complainant" in prompt
+    public = select.load_playbook("public_service")
+    assert "does not identify them and is still worth" in public
+    assert "Any moment with a minor on screen or named is always `sensitive`." in public
+
+
+def test_payoff_after_a_clamped_end_drops_the_candidate():
+    # 100-200 clamped to 60 s ends near 160; a payoff at 162 is cut off, not "nudged".
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(300)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    cut_off = Candidate(start_s=100.0, end_s=200.0, payoff_s=162.0, **base)
+    assert select.finalize([cut_off], words, Settings(), 3) == []
+
+
+def test_negative_payoff_drops_only_that_candidate(conn, media):
+    reply = _message(
+        [
+            _cand(30.1, 60.6, hook="bad", payoff_s=-5.0, open_question="", sensitive=False),
+            _cand(200.1, 235.6, hook="good", payoff_s=210.0, open_question="", sensitive=False),
+        ]
+    )
+    fake = FakeAnthropic((200, reply))
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 1
+    assert [c["hook"] for c in out["clips"]] == ["good"]
+
+
+@pytest.mark.parametrize("payoff", [float("nan"), float("inf")])
+def test_non_finite_payoff_is_rejected(payoff):
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    with pytest.raises(ValueError):
+        Candidate(start_s=10, end_s=30, payoff_s=payoff, **base)

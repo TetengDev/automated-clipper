@@ -87,6 +87,9 @@ def test_sensitive_badge_on_detail_page_only_for_sensitive_clips(
 
     assert 'class="badge sensitive"' in client.get(f"/clip/{flagged}").text
     assert 'class="badge sensitive"' not in client.get(f"/clip/{plain}").text
+    assert "check for names, faces or identifiers of victims and minors" in (
+        client.get(f"/clip/{flagged}").text
+    )
 
 
 def test_youtube_source_link_has_timestamp(client: TestClient, env: Env) -> None:

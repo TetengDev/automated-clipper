@@ -211,3 +211,4 @@ def test_sensitive_badge_only_on_sensitive_cards(client: TestClient, env: Env) -
     assert len(cards) == 2
     assert f'data-clip-id="{flagged}"' in cards[0] and 'class="badge sensitive"' in cards[0]
     assert 'class="badge sensitive"' not in cards[1]
+    assert "check for names, faces or identifiers of victims and minors" in cards[0]

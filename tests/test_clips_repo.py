@@ -153,3 +153,16 @@ def test_sensitive_flag_round_trips(conn: sqlite3.Connection, tmp_path: Path) ->
         (plain.clip_id, 1, 0),
         (flagged.clip_id, again.version, 1),
     ]
+
+
+def test_new_version_keeps_the_sensitive_flag(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), meta=ClipMeta(sensitive=True)
+    )
+    v2 = add_clip_version(conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"))
+    row = conn.execute(
+        "SELECT sensitive FROM clip_versions WHERE clip_id = ? AND version = ?",
+        (ref.clip_id, v2.version),
+    ).fetchone()
+    assert row[0] == 1

@@ -44,6 +44,11 @@ TAIL_S = 0.4
 """Most silence kept after the last word."""
 FRAME_GUARD_S = 1 / 60
 """An end on a cut stops this much before it: half a frame at 30 fps."""
+WORD_EPS_S = 0.15
+"""The trim may cut this far into the first or last word to land on a scene cut."""
+MAX_CACHE_BYTES = 1024 * 1024
+CHILD_ENV = {"MALLOC_ARENA_MAX": "2"}
+"""Extra env for the detection child (glibc reads it at startup, so not in `harden`)."""
 
 Words = Sequence[tuple[float, float]]
 
@@ -61,7 +66,9 @@ def snap_to_cuts(
 ) -> tuple[float, float]:
     """Move each edge to the nearest cut within `tol` (an end to just before it) if the new
     edge is not inside a word, no whole word lies between the old and new edge (a snap never
-    adds or drops a word), the clip stays within [min_s, max_s] and inside `section`."""
+    adds or drops a word), the clip stays within [min_s, max_s] and inside `section`. An edge
+    already on a cut stays. An outward snap may add back up to `tol` of silence after a
+    trim; that is deliberate: an edge on a cut beats a tight edge."""
 
     def ok(a: float, b: float, old: float, new: float) -> bool:
         lo, hi = sorted((old, new))
@@ -72,6 +79,8 @@ def snap_to_cuts(
         )
 
     def best(edge: float, shift: float, valid: Callable[[float], bool]) -> float:
+        if any(abs(c - shift - edge) < 1e-9 for c in cuts):
+            return edge
         near = sorted(
             (c - shift for c in cuts if abs(c - edge) <= tol), key=lambda c: abs(c - edge)
         )
@@ -86,16 +95,20 @@ def trim_dead_air(
     start: float, end: float, words: Words, cuts: Sequence[float] = (), *, min_s: float = 0.0
 ) -> tuple[float, float]:
     """Start at most LEAD_IN_S before the first word in the clip and end at most TAIL_S
-    after the last one; a cut in that dead air moves the edge onto it (the last cut before
-    the first word, the first after the last word), so no sliver of another shot is left.
-    Only shrinks; no words in range or a result under `min_s` keeps the clip as it is."""
+    after the last one; a cut in that dead air (or up to WORD_EPS_S into the first or last
+    word) moves the edge onto it (the last such cut at the start, the first at the end), so
+    no sliver of another shot is left. Only shrinks; no words in range keeps the clip. If
+    the result is under `min_s`, the cut-driven moves are kept first and the dead-air trim
+    is tried on one edge at a time, before falling back to the untrimmed clip."""
     inside = [(ws, we) for ws, we in words if we > start and ws < end]
     if not inside:
         return start, end
     first, last = min(ws for ws, _ in inside), max(we for _, we in inside)
-    a = max([start, first - LEAD_IN_S, *(c for c in cuts if start <= c < first)])
-    b = min([end, last + TAIL_S, *(c - FRAME_GUARD_S for c in cuts if last < c <= end)])
-    return (a, b) if b - a >= min_s else (start, end)
+    a_cut = max([start, *(c for c in cuts if start <= c < first + WORD_EPS_S)])
+    b_cut = min([end, *(c - FRAME_GUARD_S for c in cuts if last - WORD_EPS_S < c <= end)])
+    a, b = max(a_cut, first - LEAD_IN_S), min(b_cut, last + TAIL_S)
+    tries = ((a, b), (a, b_cut), (a_cut, b), (a_cut, b_cut), (a_cut, end), (start, b_cut))
+    return next(((x, y) for x, y in tries if y - x >= min_s), (start, end))
 
 
 def polish(
@@ -126,32 +139,42 @@ def detect_cuts(section: Path, deadline: Deadline, *, runner: Runner | None = No
     """Scene-cut times (seconds) in `section`; [] with a warning on any failure (failures are
     not cached, so a later run tries again)."""
     cache = section.with_name(f"{section.name}.cuts.json")
-    with suppress(OSError, ValueError, TypeError, KeyError):
-        stat = section.stat()
-        key = {"v": CACHE_VERSION, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    with suppress(OSError, ValueError, TypeError, KeyError, RecursionError):
+        key = _key(section)
+        if cache.stat().st_size > MAX_CACHE_BYTES:
+            raise ValueError("cache file too large")
         cached = json.loads(cache.read_text(encoding="utf-8"))
         if {k: cached[k] for k in key} == key:
             return _cut_list(cached["cuts"])
     args = [sys.executable, "-I", "-m", __name__, str(section)]
     try:
-        out = run_media(args, deadline.timeout(DETECT_TIMEOUT_S), "scene detection", runner=runner)
+        key = _key(section)
+        timeout_s = deadline.timeout(DETECT_TIMEOUT_S)
+        out = run_media(args, timeout_s, "scene detection", runner=runner, env=CHILD_ENV)
         cuts = _cut_list(json.loads(out.stdout))
-        stat = section.stat()
+        unchanged = _key(section) == key  # not replaced while it was being read
     except Exception as exc:
         reason = redact(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
         logger.warning("scene detection failed for %s, edges kept: %s", section, reason)
         logger.debug("scene detection failure", exc_info=True)
         return []
-    entry = {"v": CACHE_VERSION, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "cuts": cuts}
-    with suppress(OSError):  # the cache is best effort
-        write_json_atomic(cache, entry, indent=None)
+    if unchanged:
+        with suppress(OSError):  # the cache is best effort
+            write_json_atomic(cache, {**key, "cuts": cuts}, indent=None)
     return cuts
 
 
+def _key(section: Path) -> dict[str, int]:
+    stat = section.stat()
+    return {"v": CACHE_VERSION, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
 def harden() -> None:
-    """Child-side limits, set before cv2 loads: local files only, one BLAS thread, and a
+    """Child-side limits, set before cv2 loads: local files only, two decoder threads, one
+    BLAS thread, and a
     capped address space where the OS allows it (macOS refuses RLIMIT_AS)."""
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "protocol_whitelist;file"
+    # `key;value|key;value` (OpenCV hands it to av_dict_parse_string with ";" and "|").
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "protocol_whitelist;file|threads;2"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     try:
         import resource

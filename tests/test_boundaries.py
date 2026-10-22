@@ -108,7 +108,8 @@ def test_trim_without_words_in_range_keeps_the_clip(words: list[tuple[float, flo
 
 
 def test_trim_never_goes_below_min() -> None:
-    assert bd.trim_dead_air(10.0, 40.0, [(20.0, 21.0)], min_s=20) == (10.0, 40.0)
+    assert bd.trim_dead_air(10.0, 40.0, [(25.0, 26.0)], min_s=20) == (10.0, 40.0)
+    assert bd.trim_dead_air(10.0, 40.0, [(20.0, 21.0)], min_s=20) == (19.75, 40.0)  # one edge
     assert bd.trim_dead_air(10.0, 40.0, [(12.0, 35.0)], min_s=20) == (11.75, 35.4)
 
 

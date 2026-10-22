@@ -208,9 +208,13 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             if deadline.remaining() < CLIP_WORST_CASE_S:
                 raise StageTimeout(f"stage budget left too small for clip {rank}; resuming later")
             bounds = _polish(edl, start, section, transcript, limits, ctx.media_dir, deadline)
-            rank, edl, start, end, meta = _plan(
-                section, highlights, transcript, selection.get("prompt_version"), bounds
-            )
+            try:
+                rank, edl, start, end, meta = _plan(
+                    section, highlights, transcript, selection.get("prompt_version"), bounds
+                )
+            except PermanentError as exc:  # e.g. rounding nudged it past an EDL limit
+                reason = redact(strip_control(str(exc)))[:MAX_REASON_CHARS]
+                logger.warning("%s; rendering the requested range", reason)
             result = render_clip(
                 edl,
                 ctx.media_dir,

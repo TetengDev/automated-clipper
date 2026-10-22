@@ -84,6 +84,7 @@ class Runner(Protocol):
         timeout_s: float,
         *,
         on_stderr_line: Callable[[str], None] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult: ...
 
 
@@ -208,15 +209,16 @@ def run_command(
     timeout_s: float,
     *,
     on_stderr_line: Callable[[str], None] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> RunResult:
-    """Default `Runner`: argument list (no shell), no stdin, allowlisted env, own process
-    group (killed as a whole on timeout), bounded stdout/stderr."""
+    """Default `Runner`: argument list (no shell), no stdin, allowlisted env (plus `env`),
+    own process group (killed as a whole on timeout), bounded stdout/stderr."""
     proc = subprocess.Popen(  # noqa: S603 - argument list, never a shell
         list(args),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=child_env(),
+        env={**child_env(), **(env or {})},
         start_new_session=True,
     )
     out, err = _Tail(STDOUT_LIMIT_BYTES), _Tail(STDERR_LIMIT_BYTES)

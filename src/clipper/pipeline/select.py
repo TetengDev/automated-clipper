@@ -142,20 +142,28 @@ class _Transcript(BaseModel):
     words: list[_Word] = []
 
 
+MAX_SIGNAL_POINTS = 10_000
+
+
 class _HeatPoint(BaseModel):
-    start_s: float
-    end_s: float
-    value: float
+    start_s: float = Field(ge=0, allow_inf_nan=False)
+    end_s: float = Field(ge=0, allow_inf_nan=False)
+    value: float = Field(allow_inf_nan=False)
+
+    @field_validator("value", mode="after")
+    @classmethod
+    def _clamp(cls, value: float) -> float:
+        return min(max(value, 0.0), 1.0)
 
 
 class _LoudPeak(BaseModel):
-    t_s: float
-    lufs: float
+    t_s: float = Field(ge=0, allow_inf_nan=False)
+    lufs: float = Field(allow_inf_nan=False)
 
 
 class _Signals(BaseModel):
-    heatmap: list[_HeatPoint] = []
-    loudness_peaks: list[_LoudPeak] = []
+    heatmap: list[_HeatPoint] = Field([], max_length=MAX_SIGNAL_POINTS)
+    loudness_peaks: list[_LoudPeak] = Field([], max_length=MAX_SIGNAL_POINTS)
 
 
 # --- model output ------------------------------------------------------------------------
@@ -288,18 +296,22 @@ def _normalised(values: list[float]) -> list[float]:
 
 
 def rank_windows(windows: Sequence[Window], signals: _Signals) -> list[float]:
-    """Engagement score per window: the mean of its top-3 heatmap values plus its
-    loudness peaks per minute, each normalised 0-1 (divided by the source's maximum)."""
-    heat, loud = [], []
+    """Engagement score per window, 0-2: the mean of its top-3 heatmap values divided by
+    the source's highest heatmap value, plus its loudness-peak density divided by the
+    source's highest density. Density is per full window length, so a short tail window
+    (mostly overlap) is not inflated."""
+    top_heat = max((h.value for h in signals.heatmap), default=0.0)
+    heat: list[float] = []
+    loud: list[float] = []
     for w in windows:
         values = sorted(
             (h.value for h in signals.heatmap if h.end_s > w.start_s and h.start_s < w.end_s),
             reverse=True,
         )[:3]
-        heat.append(sum(values) / len(values) if values else 0.0)
+        heat.append(sum(values) / len(values) / top_heat if values and top_heat > 0 else 0.0)
         peaks = sum(1 for p in signals.loudness_peaks if w.start_s <= p.t_s < w.end_s)
-        loud.append(peaks * 60 / (w.end_s - w.start_s) if w.end_s > w.start_s else 0.0)
-    return [h + lo for h, lo in zip(_normalised(heat), _normalised(loud), strict=True)]
+        loud.append(peaks / max(w.end_s - w.start_s, WINDOW_S))
+    return [h + lo for h, lo in zip(heat, _normalised(loud), strict=True)]
 
 
 def choose_windows(windows: Sequence[Window], signals: _Signals, limit: int) -> list[int]:
@@ -703,19 +715,7 @@ def _select(
     duration = meta.get("duration_s") or transcript.duration_s
     windows = make_windows(transcript.segments, duration_s=float(duration) if duration else None)
     chosen = set(choose_windows(windows, signals, settings.max_llm_windows))
-    if len(chosen) < len(windows):
-        logger.info(
-            "job %s: %d windows exceed max_llm_windows=%d; low-engagement windows skipped "
-            "unless already cached: %s",
-            job.id,
-            len(windows),
-            settings.max_llm_windows,
-            ", ".join(
-                f"#{i} {fmt_ts(w.start_s)}-{fmt_ts(w.end_s)}"
-                for i, w in enumerate(windows)
-                if i not in chosen
-            ),
-        )
+    skipped: list[str] = []
     cache_dir = ctx.media_dir / CACHE_DIR
     cache_dir.mkdir(exist_ok=True)
     candidates: list[Candidate] = []
@@ -723,15 +723,24 @@ def _select(
         prompt = build_user_prompt(window, signals, meta, settings, feedback_examples)
         cache = _window_cache(cache_dir, index, system, prompt, settings)
         found = _load_window(cache)
-        if found is None and index not in chosen:
-            continue  # not worth a call; a window paid for earlier is still used, for free
-        if found is None:
+        if found is None:  # a window paid for earlier is used even if not chosen: it is free
+            if index not in chosen:
+                skipped.append(f"#{index} {fmt_ts(window.start_s)}-{fmt_ts(window.end_s)}")
+                continue
             _check_budget(ctx, cap)
             if client is None:
                 client = _make_client()
             found = _select_window(client, system, prompt, job, ctx, cap)
             write_json_atomic(cache, {"clips": [c.model_dump() for c in found]})
         candidates += found
+    if skipped:
+        logger.info(
+            "job %s: %d windows exceed max_llm_windows=%d; skipped low-engagement windows %s",
+            job.id,
+            len(windows),
+            settings.max_llm_windows,
+            ", ".join(skipped),
+        )
 
     words = sorted(transcript.words, key=lambda w: w.start)
     clips = finalize(candidates, words, settings, top_k)

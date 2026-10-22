@@ -185,7 +185,14 @@ def _heatmap(raw: Any) -> list[dict[str, float]]:
             continue
         start, end, value = (_finite(item.get(k)) for k in ("start_time", "end_time", "value"))
         if start is not None and end is not None and value is not None:
-            out.append({"start_s": start, "end_s": end, "value": value})
+            # select.py's bounds: times >= 0, value 0-1
+            out.append(
+                {
+                    "start_s": max(start, 0.0),
+                    "end_s": max(end, 0.0),
+                    "value": min(max(value, 0.0), 1.0),
+                }
+            )
     return out
 
 

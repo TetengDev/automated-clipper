@@ -21,11 +21,12 @@ import json
 import logging
 import math
 import os
+import stat
 import sys
 import tempfile
 import time
+from bisect import bisect_left
 from collections.abc import Callable, Sequence
-from contextlib import suppress
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -50,6 +51,8 @@ MODEL_URL = (
 )
 MODEL_SHA256 = "b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2380b0152f"
 MODEL_MAX_BYTES = 1024 * 1024
+MODEL_RETRY_S = 600.0
+"""After a failed or mismatched fetch, no new fetch for this long (in this process)."""
 MAX_SAMPLES = 3000
 """10 minutes at SAMPLE_FPS; a section is one clip plus padding."""
 MAX_FACES = 4
@@ -60,13 +63,18 @@ DEAD_ZONE = 0.05
 MAX_SPEED = 0.03
 """Most the crop centre moves in one output frame (share of the frame width)."""
 PAIR_RATIO = 0.6
-"""Two faces are framed together when the smaller has at least this share of the area."""
+"""Two faces are framed together when the smaller has at least this share of the area..."""
+PAIR_FIT = 0.8
+"""...and both centres fit in this central share of the crop window."""
 FACE_SHARE = 0.6
 CUT_EPS_FRAMES = 0.05
 """Cut times are rounded to ms: a cut this close past a frame still starts on that frame."""
 
 Face = tuple[float, float]
 """(centre x, area), as shares of the frame width and area."""
+
+
+_fetch_failed_at: float | None = None
 
 
 class Faces(NamedTuple):
@@ -76,13 +84,15 @@ class Faces(NamedTuple):
     """(seconds in the section, faces) per sampled frame."""
 
 
-def face_target(faces: Sequence[Face]) -> float | None:
+def face_target(faces: Sequence[Face], half_width: float = 0.5) -> float | None:
     """The crop target for one sample: the largest face's centre, or the centroid of the two
-    largest when the smaller is at least PAIR_RATIO of the larger; None without faces."""
+    largest when the smaller is at least PAIR_RATIO of the larger and both fit the window
+    (`half_width` is half the crop width); None without faces."""
     if not faces:
         return None
     big, *rest = sorted(faces, key=lambda f: f[1], reverse=True)
-    if rest and rest[0][1] >= PAIR_RATIO * big[1]:
+    pair = rest and rest[0][1] >= PAIR_RATIO * big[1]
+    if pair and abs(big[0] - rest[0][0]) <= 2 * half_width * PAIR_FIT:
         return (big[0] + rest[0][0]) / 2
     return big[0]
 
@@ -115,7 +125,8 @@ def crop_path(
     within [half_width, 1 - half_width]. One key per sample interval, plus the cut keys and
     the last frame."""
     lo, hi = (half_width, 1 - half_width) if half_width < 0.5 else (0.5, 0.5)
-    seen = [(t, x) for t, x in samples if x is not None]
+    seen = sorted((t, x) for t, x in samples if x is not None)
+    times = [t for t, _ in seen]
     frames = max(1, math.floor(duration_s * fps + 0.5))
     marks = sorted((min(max(math.ceil(c * fps - CUT_EPS_FRAMES), 0), frames), c) for c in cuts)
     first = max((c for f, c in marks if f == 0), default=-math.inf)
@@ -123,7 +134,7 @@ def crop_path(
     x = min(max(seen[0][1] if seen else 0.5, lo), hi)
     xs: list[float] = []
     for (f0, c0), (f1, c1) in zip(bounds, bounds[1:], strict=False):
-        shot = [(t, v) for t, v in seen if c0 <= t < c1]
+        shot = seen[bisect_left(times, c0) : bisect_left(times, c1)]
         ema = shot[0][1] if shot else x
         x, i = min(max(ema, lo), hi), 0
         for f in range(f0, f1):
@@ -148,13 +159,14 @@ def plan_reframe(
     faces: Faces, cuts: Sequence[float], in_s: float, out_s: float
 ) -> tuple[Layout, list[tuple[float, float]] | None]:
     """(layout, crop keys or None) for the clip [in_s, out_s] of the section (seconds)."""
-    origin = round(in_s * FPS) / FPS  # Remotion trims the video to whole frames
+    # Remotion trims the video to whole frames with Math.round (half up, not to even).
+    origin = math.floor(in_s * FPS + 0.5) / FPS
+    half = faces.height * 9 / 16 / faces.width / 2
     samples = [
-        (t - origin, face_target(found))
+        (t - origin, face_target(found, half))
         for t, found in faces.samples
         if in_s - 1 / SAMPLE_FPS < t <= out_s
     ]
-    half = faces.height * 9 / 16 / faces.width / 2
     if half >= 0.5 or choose_layout(samples) is Layout.BLURRED_FILL:
         return Layout.BLURRED_FILL, None  # also a source already as narrow as 9:16
     keys = crop_path(samples, [c - origin for c in cuts], out_s - in_s, half)
@@ -168,10 +180,14 @@ def models_dir() -> Path:
 
 
 def download(url: str, timeout_s: float) -> bytes:
-    """GET `url` with no redirects, at most MODEL_MAX_BYTES within `timeout_s` in all."""
+    """GET `url` with no redirects, at most MODEL_MAX_BYTES within `timeout_s` in all: each
+    phase (connect, headers, a body read) gets a third, and no body read starts after two
+    thirds."""
     data = bytearray()
-    end = time.monotonic() + timeout_s
-    with httpx.stream("GET", url, timeout=timeout_s, follow_redirects=False) as response:
+    end = time.monotonic() + timeout_s * 2 / 3
+    with httpx.stream(
+        "GET", url, timeout=httpx.Timeout(timeout_s / 3), follow_redirects=False
+    ) as response:
         response.raise_for_status()
         for chunk in response.iter_bytes():
             data += chunk
@@ -180,8 +196,18 @@ def download(url: str, timeout_s: float) -> bytes:
     return bytes(data)
 
 
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def read_model(path: Path) -> bytes | None:
+    """The model bytes if `path` is a regular file (not a symlink, FIFO or device) matching
+    MODEL_SHA256; else None. Read once, at most MODEL_MAX_BYTES."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = fh.read(MODEL_MAX_BYTES + 1)
+    return data if hashlib.sha256(data).hexdigest() == MODEL_SHA256 else None
 
 
 def ensure_model(
@@ -192,16 +218,18 @@ def ensure_model(
 ) -> Path | None:
     """The verified model file, fetched from MODEL_URL if missing or changed; None with a
     warning if it cannot be fetched or does not match MODEL_SHA256 (nothing unverified is
-    kept)."""
+    kept). After a failure, fetches are skipped for MODEL_RETRY_S (one warning, not one
+    timeout per clip)."""
+    global _fetch_failed_at
     path = (directory or models_dir()) / MODEL_NAME
-    with suppress(OSError), path.open("rb") as fh:
-        if _sha256(fh.read(MODEL_MAX_BYTES + 1)) == MODEL_SHA256:
-            return path
+    if read_model(path) is not None:
+        return path
+    if _fetch_failed_at is not None and time.monotonic() - _fetch_failed_at < MODEL_RETRY_S:
+        return None
     try:
         data = fetch(MODEL_URL, timeout_s)
-        if _sha256(data) != MODEL_SHA256:
-            logger.warning("face model checksum mismatch for %s, face tracking off", MODEL_URL)
-            return None
+        if hashlib.sha256(data).hexdigest() != MODEL_SHA256:
+            raise ValueError(f"checksum mismatch for {MODEL_URL}")
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{MODEL_NAME}.", suffix=".tmp")
         try:
@@ -211,9 +239,11 @@ def ensure_model(
         finally:
             Path(tmp).unlink(missing_ok=True)
     except Exception as exc:
+        _fetch_failed_at = time.monotonic()
         reason = redact(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
-        logger.warning("face model download failed, face tracking off: %s", reason)
+        logger.warning("face model fetch failed, face tracking off: %s", reason)
         return None
+    _fetch_failed_at = None
     return path
 
 
@@ -254,6 +284,9 @@ def scan(model: Path, path: Path) -> dict[str, Any]:
     import mediapipe as mp
     from mediapipe.tasks.python import BaseOptions, vision
 
+    model_data = read_model(model)  # checked again here: the file may change after the parent
+    if model_data is None:
+        raise ValueError("face model checksum mismatch")
     cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -263,7 +296,7 @@ def scan(model: Path, path: Path) -> dict[str, Any]:
     scale = min(1.0, SAMPLE_WIDTH / width)
     size = (max(1, round(width * scale)), max(1, round(height * scale)))
     options = vision.FaceDetectorOptions(
-        base_options=BaseOptions(model_asset_path=str(model), delegate=BaseOptions.Delegate.CPU)
+        base_options=BaseOptions(model_asset_buffer=model_data, delegate=BaseOptions.Delegate.CPU)
     )
     samples: list[list[Any]] = []
     index, due = 0, 0.0

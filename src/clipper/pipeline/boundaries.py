@@ -48,6 +48,8 @@ FRAME_GUARD_S = 1 / 60
 WORD_EPS_S = 0.15
 """The trim may cut this far into the first or last word to land on a scene cut."""
 MAX_CACHE_BYTES = 1024 * 1024
+MAX_CUTS = 5000
+"""Cuts kept per section (sorted, unique), so the work done on them stays bounded."""
 CHILD_ENV = MappingProxyType({"MALLOC_ARENA_MAX": "2"})
 """Extra env for the detection child (glibc reads it at startup, so not in `harden`)."""
 
@@ -138,7 +140,7 @@ def _cut_list(data: Any) -> list[float]:
         for c in data
     ):
         raise ValueError("not a list of cut times")
-    return [float(c) for c in data]
+    return sorted({float(c) for c in data})[:MAX_CUTS]
 
 
 def _read_cache(cache: Path) -> Any:

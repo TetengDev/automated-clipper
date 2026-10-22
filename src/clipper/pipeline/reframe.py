@@ -35,6 +35,7 @@ import httpx
 from clipper.edl import FPS, MAX_CROP_KEYS, Layout
 from clipper.pipeline.boundaries import cached_child, harden
 from clipper.pipeline.common import Deadline, strip_control
+from clipper.pipeline.transcribe import models_dir
 from clipper.pipeline.ytdlp import Runner
 from clipper.redact import redact
 
@@ -217,10 +218,6 @@ def plan_reframe(
     if len(keys) > MAX_CROP_KEYS:
         return Layout.BLURRED_FILL, None
     return Layout.FACE_TRACK, keys
-
-
-def models_dir() -> Path:
-    return Path(os.environ.get("CLIPPER_MODELS_DIR") or "data/models")
 
 
 def download(url: str, timeout_s: float) -> bytes:

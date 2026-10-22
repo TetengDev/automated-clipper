@@ -110,12 +110,10 @@ def test_cut_between_samples_jumps_to_the_first_sample_after_it() -> None:
 
 
 def test_crop_window_is_clamped_inside_the_frame() -> None:
-    assert {x for _, x in rf.crop_path(_samples(lambda t: 0.02, 2.0), [], 2.0, HALF)} == {
-        pytest.approx(HALF)
-    }
-    assert {x for _, x in rf.crop_path(_samples(lambda t: 0.99, 2.0), [], 2.0, HALF)} == {
-        pytest.approx(1 - HALF)
-    }
+    left = rf.crop_path(_samples(lambda t: 0.02, 2.0), [], 2.0, HALF)
+    right = rf.crop_path(_samples(lambda t: 0.99, 2.0), [], 2.0, HALF)
+    assert [x for _, x in left] == pytest.approx([HALF] * len(left))
+    assert [x for _, x in right] == pytest.approx([1 - HALF] * len(right))
 
 
 def test_faces_missing_hold_the_last_position_and_start_on_the_first_face() -> None:
@@ -372,8 +370,9 @@ def test_crop_follows_a_moving_face(tmp_path: Path) -> None:
 
     cuts = detect_cuts(path, Deadline())
     assert cuts == [pytest.approx(4.0, abs=0.1)]
-    faces = rf.detect_faces(path, model, Deadline())
+    faces = rf.detect_faces(path, model, Deadline())  # through the hardened child
     assert faces is not None
+    assert rf._faces(rf.scan(model, path)) == faces  # in process, the same result
 
     layout, keys = rf.plan_reframe(faces, cuts, 0.0, 8.0)
 

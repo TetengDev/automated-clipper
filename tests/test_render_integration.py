@@ -161,3 +161,47 @@ def test_ts_rejects_invalid_props(tmp_path: Path) -> None:
     assert proc.returncode != 0
     assert "invalid clip props" in proc.stdout + proc.stderr
     assert not (tmp_path / "x.mp4").exists()
+
+
+def _mean_rgb(path: Path, at_s: float) -> tuple[float, float, float]:
+    raw = subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "ffmpeg", "-v", "error", "-ss", f"{at_s:.3f}", "-i", str(path), "-frames:v", "1",
+            "-vf", "scale=1:1:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ],
+        capture_output=True,
+        check=True,
+        timeout=60,
+    ).stdout  # fmt: skip
+    return raw[0], raw[1], raw[2]
+
+
+def test_render_face_track(tmp_path: Path) -> None:
+    """The 9:16 window follows the crop keys and jumps at a cut: a red left half, then (after
+    the keys jump at 1.5 s) the blue right half fills the whole frame."""
+    media_root = tmp_path / "media"
+    (media_root / "src").mkdir(parents=True)
+    _run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=red:s=1280x720:r=30:d=3",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+            "-vf", "drawbox=x=640:y=0:w=640:h=720:color=blue:t=fill",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+            str(media_root / "src" / "halves.mp4"),
+        ]
+    )  # fmt: skip
+    crop = [(0.0, 0.25), (1.5, 0.25), (1.5, 0.75), (2.9, 0.75)]
+    edl = parse_edl(
+        {
+            "source": {"path": "src/halves.mp4", "in_s": 0.0, "out_s": 3.0},
+            "layout": "face_track",
+            "crop": [{"t_s": t, "x_center": x} for t, x in crop],
+            "progress_bar": False,
+        }
+    )
+    result = render_clip(edl, media_root, tmp_path / "out", timeout_s=600)
+
+    red, blue = _mean_rgb(result.video_path, 0.5), _mean_rgb(result.video_path, 2.5)
+    assert red[0] > 200 and red[2] < 40  # all red: no blue, no black bars
+    assert blue[2] > 200 and blue[0] < 40

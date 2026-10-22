@@ -60,6 +60,8 @@ class Settings(_Strict):
     disk_budget_gb: int = Field(150, ge=1)
     media_retention_hours: int = Field(48, ge=1)
     review_expiry_days: int = Field(7, ge=1)
+    reframe: Literal["auto", "blurred_fill"] = "auto"
+    """auto: a face-tracked 9:16 crop when faces are found, else blurred fill (CLP-58)."""
 
     @model_validator(mode="after")
     def _clip_range(self) -> Settings:
@@ -78,6 +80,7 @@ class CreatorOverrides(_Strict):
     max_clips_per_source: int | None = Field(None, ge=1)
     max_clips_per_stream: int | None = Field(None, ge=1)
     max_source_hours_per_day: float | None = Field(None, gt=0)
+    reframe: Literal["auto", "blurred_fill"] | None = None
 
 
 class YouTubeChannel(_Strict):

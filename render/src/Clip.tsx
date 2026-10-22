@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { AbsoluteFill, staticFile, useVideoConfig } from "remotion";
 import { BlurredFill } from "./BlurredFill";
 import { Captions } from "./Captions";
+import { FaceTrack } from "./FaceTrack";
 import { toClipWords } from "./captionTiming";
 import { HookCard } from "./HookCard";
 import { loadFonts } from "./fonts";
@@ -26,7 +27,11 @@ export const Clip: React.FC<Edl> = (edl) => {
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
-      {edl.layout === "blurred_fill" ? <BlurredFill src={src} trimBefore={trimBefore} /> : null}
+      {edl.layout === "face_track" && edl.crop !== null ? (
+        <FaceTrack src={src} trimBefore={trimBefore} crop={edl.crop} />
+      ) : (
+        <BlurredFill src={src} trimBefore={trimBefore} />
+      )}
       {edl.captions_enabled && clipWords.length > 0 ? (
         <Captions words={clipWords} styleId={edl.caption_style} />
       ) : null}

@@ -702,8 +702,9 @@ def test_sections_without_clips_list_is_permanent(
 
 def _faces(share: float, x: float = 0.3, n: int = 300) -> rf.Faces:
     """Samples every 0.2 s over the section, with a face at x in `share` of them."""
-    hits = round(share * n)
-    return rf.Faces(1280, 720, [(i / 5, [(x, 0.02)] if i < hits else []) for i in range(n)])
+    return rf.Faces(
+        1280, 720, [(i / 5, [(x, 0.02)] if i % 10 < share * 10 else []) for i in range(n)]
+    )
 
 
 def test_faces_found_give_a_face_tracked_clip(
@@ -763,6 +764,23 @@ def test_face_tracking_failure_never_fails_the_clip(
     assert fake.calls[0]["edl"].layout == "blurred_fill"
     assert len(faces.calls) == (failure == "detection")
     assert len(_rows(conn)) == 1
+
+
+def test_crop_the_edl_rejects_keeps_blurred_fill(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    faces: FakeFaces,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    faces.result = _faces(1.0)
+    monkeypatch.setattr(rc, "plan_reframe", lambda *a: (rf.Layout.FACE_TRACK, [(0.0, 1.5)]))
+    rc.render_clips(job, _ctx(media, conn))
+    assert fake.calls[0]["edl"].layout == "blurred_fill"
+    assert "face track rejected" in caplog.text
 
 
 def test_creator_can_opt_out_of_face_tracking(

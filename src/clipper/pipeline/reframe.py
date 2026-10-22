@@ -1,0 +1,298 @@
+"""Face-tracked 9:16 reframe (CLP-58).
+
+`detect_faces` runs the MediaPipe Tasks face detector (BlazeFace short range) on the padded
+section, SAMPLE_FPS frames a second downscaled to SAMPLE_WIDTH px, in a child process with
+the same limits, timeout, cache (`<section>.faces.json`) and fail-open path as scene
+detection (`boundaries.cached_child`). The model is fetched once into the models dir
+(CLIPPER_MODELS_DIR, else data/models) from a pinned URL and its SHA-256 is checked before
+every use (`ensure_model`).
+
+`plan_reframe` is pure: per sample the largest face's centre (or the centroid of two faces
+of similar size); `crop_path` smooths that per output frame (EMA, dead-zone, speed cap),
+jumps at scene cuts and keeps the 9:16 window inside the frame; `choose_layout` picks
+face_track only when faces are in at least FACE_SHARE of the samples. Any failure means
+blurred_fill: a clip never fails for want of faces.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import os
+import sys
+import tempfile
+import time
+from collections.abc import Callable, Sequence
+from contextlib import suppress
+from pathlib import Path
+from typing import Any, NamedTuple
+
+import httpx
+
+from clipper.edl import FPS, MAX_CROP_KEYS, Layout
+from clipper.pipeline.boundaries import cached_child, harden
+from clipper.pipeline.common import Deadline
+from clipper.pipeline.ytdlp import Runner
+from clipper.redact import redact
+
+logger = logging.getLogger(__name__)
+
+SAMPLE_FPS = 5.0
+SAMPLE_WIDTH = 640
+FACE_TIMEOUT_S = 120.0
+MODEL_TIMEOUT_S = 30.0
+MODEL_NAME = "blaze_face_short_range.tflite"
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/"
+    f"float16/1/{MODEL_NAME}"
+)
+MODEL_SHA256 = "b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2380b0152f"
+MODEL_MAX_BYTES = 1024 * 1024
+MAX_SAMPLES = 3000
+"""10 minutes at SAMPLE_FPS; a section is one clip plus padding."""
+MAX_FACES = 4
+"""Faces kept per sample (the largest); only the two largest are ever used."""
+EMA_ALPHA = 0.3
+DEAD_ZONE = 0.05
+"""No move while the target is this close to the crop centre (share of the frame width)."""
+MAX_SPEED = 0.03
+"""Most the crop centre moves in one output frame (share of the frame width)."""
+PAIR_RATIO = 0.6
+"""Two faces are framed together when the smaller has at least this share of the area."""
+FACE_SHARE = 0.6
+CUT_EPS_FRAMES = 0.05
+"""Cut times are rounded to ms: a cut this close past a frame still starts on that frame."""
+
+Face = tuple[float, float]
+"""(centre x, area), as shares of the frame width and area."""
+
+
+class Faces(NamedTuple):
+    width: int
+    height: int
+    samples: list[tuple[float, list[Face]]]
+    """(seconds in the section, faces) per sampled frame."""
+
+
+def face_target(faces: Sequence[Face]) -> float | None:
+    """The crop target for one sample: the largest face's centre, or the centroid of the two
+    largest when the smaller is at least PAIR_RATIO of the larger; None without faces."""
+    if not faces:
+        return None
+    big, *rest = sorted(faces, key=lambda f: f[1], reverse=True)
+    if rest and rest[0][1] >= PAIR_RATIO * big[1]:
+        return (big[0] + rest[0][0]) / 2
+    return big[0]
+
+
+def choose_layout(samples: Sequence[tuple[float, float | None]]) -> Layout:
+    """face_track when a face is in at least FACE_SHARE of the samples."""
+    hits = sum(x is not None for _, x in samples)
+    return (
+        Layout.FACE_TRACK if samples and hits >= FACE_SHARE * len(samples) else Layout.BLURRED_FILL
+    )
+
+
+def crop_path(
+    samples: Sequence[tuple[float, float | None]],
+    cuts: Sequence[float],
+    duration_s: float,
+    half_width: float,
+    *,
+    alpha: float = EMA_ALPHA,
+    dead_zone: float = DEAD_ZONE,
+    max_speed: float = MAX_SPEED,
+    fps: int = FPS,
+) -> list[tuple[float, float]]:
+    """Crop-centre keys (clip seconds, share of the width) for a clip of `duration_s`.
+
+    `samples` are (clip seconds, target or None) and `cuts` clip seconds. Per output frame
+    the EMA of the targets moves the centre at most `max_speed`, and only while it is more
+    than `dead_zone` away. Each shot starts on its first face (no easing across a cut: two
+    keys at the cut's frame, old then new); without faces the centre holds. The centre stays
+    within [half_width, 1 - half_width]. One key per sample interval, plus the cut keys and
+    the last frame."""
+    lo, hi = (half_width, 1 - half_width) if half_width < 0.5 else (0.5, 0.5)
+    seen = [(t, x) for t, x in samples if x is not None]
+    frames = max(1, math.floor(duration_s * fps + 0.5))
+    marks = sorted((min(max(math.ceil(c * fps - CUT_EPS_FRAMES), 0), frames), c) for c in cuts)
+    first = max((c for f, c in marks if f == 0), default=-math.inf)
+    bounds = [(0, first), *((f, c) for f, c in marks if 0 < f < frames), (frames, math.inf)]
+    x = min(max(seen[0][1] if seen else 0.5, lo), hi)
+    xs: list[float] = []
+    for (f0, c0), (f1, c1) in zip(bounds, bounds[1:], strict=False):
+        shot = [(t, v) for t, v in seen if c0 <= t < c1]
+        ema = shot[0][1] if shot else x
+        x, i = min(max(ema, lo), hi), 0
+        for f in range(f0, f1):
+            while i < len(shot) and shot[i][0] <= f / fps:
+                ema += alpha * (shot[i][1] - ema)
+                i += 1
+            if abs(ema - x) > dead_zone:
+                x = min(max(x + max(-max_speed, min(max_speed, ema - x)), lo), hi)
+            xs.append(x)
+    every = max(1, round(fps / SAMPLE_FPS))
+    jumps = {f for f, _ in bounds[1:-1]}
+    keys: list[tuple[float, float]] = []
+    for f, x in enumerate(xs):
+        if f in jumps:
+            keys.append((f / fps, xs[f - 1]))
+        if f % every == 0 or f in jumps or f == frames - 1:
+            keys.append((f / fps, x))
+    return keys
+
+
+def plan_reframe(
+    faces: Faces, cuts: Sequence[float], in_s: float, out_s: float
+) -> tuple[Layout, list[tuple[float, float]] | None]:
+    """(layout, crop keys or None) for the clip [in_s, out_s] of the section (seconds)."""
+    origin = round(in_s * FPS) / FPS  # Remotion trims the video to whole frames
+    samples = [
+        (t - origin, face_target(found))
+        for t, found in faces.samples
+        if in_s - 1 / SAMPLE_FPS < t <= out_s
+    ]
+    half = faces.height * 9 / 16 / faces.width / 2
+    if half >= 0.5 or choose_layout(samples) is Layout.BLURRED_FILL:
+        return Layout.BLURRED_FILL, None  # also a source already as narrow as 9:16
+    keys = crop_path(samples, [c - origin for c in cuts], out_s - in_s, half)
+    if len(keys) > MAX_CROP_KEYS:
+        return Layout.BLURRED_FILL, None
+    return Layout.FACE_TRACK, keys
+
+
+def models_dir() -> Path:
+    return Path(os.environ.get("CLIPPER_MODELS_DIR") or "data/models")
+
+
+def download(url: str, timeout_s: float) -> bytes:
+    """GET `url` with no redirects, at most MODEL_MAX_BYTES within `timeout_s` in all."""
+    data = bytearray()
+    end = time.monotonic() + timeout_s
+    with httpx.stream("GET", url, timeout=timeout_s, follow_redirects=False) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            data += chunk
+            if len(data) > MODEL_MAX_BYTES or time.monotonic() > end:
+                raise ValueError("face model download is too large or too slow")
+    return bytes(data)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def ensure_model(
+    directory: Path | None = None,
+    *,
+    fetch: Callable[[str, float], bytes] = download,
+    timeout_s: float = MODEL_TIMEOUT_S,
+) -> Path | None:
+    """The verified model file, fetched from MODEL_URL if missing or changed; None with a
+    warning if it cannot be fetched or does not match MODEL_SHA256 (nothing unverified is
+    kept)."""
+    path = (directory or models_dir()) / MODEL_NAME
+    with suppress(OSError), path.open("rb") as fh:
+        if _sha256(fh.read(MODEL_MAX_BYTES + 1)) == MODEL_SHA256:
+            return path
+    try:
+        data = fetch(MODEL_URL, timeout_s)
+        if _sha256(data) != MODEL_SHA256:
+            logger.warning("face model checksum mismatch for %s, face tracking off", MODEL_URL)
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{MODEL_NAME}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, path)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+    except Exception as exc:
+        reason = redact(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
+        logger.warning("face model download failed, face tracking off: %s", reason)
+        return None
+    return path
+
+
+def _number(value: Any, hi: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not 0 <= value <= hi:
+        raise ValueError("not face data")
+    return float(value)
+
+
+def _faces(data: Any) -> Faces:
+    width, height, samples = data["width"], data["height"], data["samples"]
+    if not (isinstance(samples, list) and len(samples) <= MAX_SAMPLES) or not all(
+        isinstance(v, int) and not isinstance(v, bool) and 0 < v <= 16384 for v in (width, height)
+    ):
+        raise ValueError("not face data")
+    out: list[tuple[float, list[Face]]] = []
+    for t, found in samples:
+        if not isinstance(found, list) or len(found) > MAX_FACES:
+            raise ValueError("not face data")
+        out.append((_number(t, 1e6), [(_number(x, 1), _number(a, 1)) for x, a in found]))
+    return Faces(width, height, out)
+
+
+def detect_faces(
+    section: Path, model: Path, deadline: Deadline, *, runner: Runner | None = None
+) -> Faces | None:
+    """Faces sampled over `section`; None with a warning on any failure."""
+    args = [sys.executable, "-I", "-m", __name__, str(model), str(section)]
+    return cached_child(
+        section, "faces", args, _faces, deadline,
+        what="face detection", fallback="blurred fill", timeout_s=FACE_TIMEOUT_S, runner=runner,
+    )  # fmt: skip
+
+
+def scan(model: Path, path: Path) -> dict[str, Any]:
+    """Run the face detector in this process (the child side of `detect_faces`)."""
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks.python import BaseOptions, vision
+
+    cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if not (cap.isOpened() and 0 < fps <= 1000 and width > 0 and height > 0):
+        raise ValueError("cannot read the video")
+    scale = min(1.0, SAMPLE_WIDTH / width)
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    options = vision.FaceDetectorOptions(
+        base_options=BaseOptions(model_asset_path=str(model), delegate=BaseOptions.Delegate.CPU)
+    )
+    samples: list[list[Any]] = []
+    index, due = 0, 0.0
+    with vision.FaceDetector.create_from_options(options) as detector:
+        while len(samples) < MAX_SAMPLES and cap.grab():
+            if index >= due:
+                due += fps / SAMPLE_FPS
+                ok, frame = cap.retrieve()
+                if ok:
+                    small = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+                    image = mp.Image(
+                        image_format=mp.ImageFormat.SRGB,
+                        data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB),
+                    )
+                    boxes = [d.bounding_box for d in detector.detect(image).detections]
+                    found = [
+                        (
+                            min(max((b.origin_x + b.width / 2) / size[0], 0.0), 1.0),
+                            min(b.width * b.height / (size[0] * size[1]), 1.0),
+                        )
+                        for b in boxes
+                    ]
+                    found.sort(key=lambda f: f[1], reverse=True)
+                    faces = [[round(x, 4), round(a, 6)] for x, a in found[:MAX_FACES]]
+                    samples.append([round(index / fps, 3), faces])
+            index += 1
+    return {"width": width, "height": height, "samples": samples}
+
+
+if __name__ == "__main__":  # pragma: no cover - child process of detect_faces
+    harden()
+    print(json.dumps(scan(Path(sys.argv[1]), Path(sys.argv[2]))))

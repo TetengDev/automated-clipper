@@ -151,31 +151,52 @@ def _read_cache(cache: Path) -> Any:
     return None
 
 
-def detect_cuts(section: Path, deadline: Deadline, *, runner: Runner | None = None) -> list[float]:
-    """Scene-cut times (seconds) in `section`; [] with a warning on any failure (failures are
-    not cached, so a later run tries again)."""
-    cache = section.with_name(f"{section.name}.cuts.json")
+def cached_child[T](
+    section: Path,
+    field: str,
+    args: Sequence[str],
+    parse: Callable[[Any], T],
+    deadline: Deadline,
+    *,
+    what: str,
+    fallback: str,
+    timeout_s: float,
+    runner: Runner | None = None,
+) -> T | None:
+    """`parse` of the JSON a hardened child (`args`) prints about `section`, cached as
+    `<section>.<field>.json` keyed by the file's size and mtime; None with a warning on any
+    failure (failures are not cached, so a later run tries again)."""
+    cache = section.with_name(f"{section.name}.{field}.json")
     with suppress(OSError, ValueError, TypeError, KeyError, RecursionError):
         key = _key(section)
         cached = _read_cache(cache)
         if cached is not None and {k: cached[k] for k in key} == key:
-            return _cut_list(cached["cuts"])
-    args = [sys.executable, "-I", "-m", __name__, str(section)]
+            return parse(cached[field])
     try:
         key = _key(section)
-        timeout_s = deadline.timeout(DETECT_TIMEOUT_S)
-        out = run_media(args, timeout_s, "scene detection", runner=runner, env=CHILD_ENV)
-        cuts = _cut_list(json.loads(out.stdout))
+        out = run_media(args, deadline.timeout(timeout_s), what, runner=runner, env=CHILD_ENV)
+        data = json.loads(out.stdout)
+        result = parse(data)
         unchanged = _key(section) == key  # not replaced while it was being read
     except Exception as exc:
         reason = redact(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
-        logger.warning("scene detection failed for %s, edges kept: %s", section, reason)
-        logger.debug("scene detection failure", exc_info=True)
-        return []
+        logger.warning("%s failed for %s, %s: %s", what, section, fallback, reason)
+        logger.debug("%s failure", what, exc_info=True)
+        return None
     if unchanged:
         with suppress(OSError):  # the cache is best effort
-            write_json_atomic(cache, {**key, "cuts": cuts}, indent=None)
-    return cuts
+            write_json_atomic(cache, {**key, field: data}, indent=None)
+    return result
+
+
+def detect_cuts(section: Path, deadline: Deadline, *, runner: Runner | None = None) -> list[float]:
+    """Scene-cut times (seconds) in `section`; [] with a warning on any failure."""
+    args = [sys.executable, "-I", "-m", __name__, str(section)]
+    cuts = cached_child(
+        section, "cuts", args, _cut_list, deadline,
+        what="scene detection", fallback="edges kept", timeout_s=DETECT_TIMEOUT_S, runner=runner,
+    )  # fmt: skip
+    return cuts or []
 
 
 def _key(section: Path) -> dict[str, int]:

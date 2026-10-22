@@ -17,6 +17,7 @@ settings:
   disk_budget_gb: 150
   media_retention_hours: 48
   review_expiry_days: 7
+  reframe: auto                   # auto = face-tracked crop when faces are found; or blurred_fill
 
 creators:
   # --- Global ---

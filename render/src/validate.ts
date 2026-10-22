@@ -30,7 +30,7 @@ const validateSchema = ajv.compile(schema);
 
 const semanticErrors = (edl: Edl): string[] => {
   const errors: string[] = [];
-  const { source, hook, words } = edl;
+  const { source, hook, words, crop } = edl;
   if (source.path.split("/").includes("..")) {
     errors.push("source.path must not contain '..' segments");
   }
@@ -53,6 +53,18 @@ const semanticErrors = (edl: Edl): string[] => {
   if (hook !== null && hook.duration_s > duration) {
     errors.push("hook.duration_s must not exceed the clip duration");
   }
+  if ((edl.layout === "face_track") !== (crop !== null)) {
+    errors.push(
+      crop === null
+        ? "crop is required when layout is face_track"
+        : "crop is only allowed when layout is face_track",
+    );
+  }
+  crop?.forEach((key, index) => {
+    if (index > 0 && key.t_s < crop[index - 1]!.t_s) {
+      errors.push(`crop must be sorted by t_s (index ${index})`);
+    }
+  });
   return errors;
 };
 

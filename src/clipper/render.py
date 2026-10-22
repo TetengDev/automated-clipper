@@ -75,6 +75,9 @@ STDERR_TAIL_CHARS = 4000
 SILENCE_LUFS = -70.0
 JOIN_FADE_S = 0.025
 """Audio fade out, then back in, on each side of a jump-cut join."""
+JOINS_PER_FILTER = 40
+"""ffmpeg's expression evaluator fails on one product of ~98 terms: one volume filter per
+40 joins."""
 _LOUDNORM_JSON = re.compile(r"\{[^{}]*\"input_i\"[^{}]*\}", re.DOTALL)
 _BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
@@ -403,8 +406,12 @@ def finalize_argv(
     argv += ["-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy"]
     filters = []
     if joins:
-        gain = "*".join(f"min(1,abs(t-{t:.6f})/{JOIN_FADE_S:g})" for t in joins)
-        filters += ["asetnsamples=n=48:p=0", f"volume='{gain}':eval=frame"]
+        filters.append("asetnsamples=n=48:p=0")
+        for i in range(0, len(joins), JOINS_PER_FILTER):
+            gain = "*".join(
+                f"min(1,abs(t-{t:.6f})/{JOIN_FADE_S:g})" for t in joins[i : i + JOINS_PER_FILTER]
+            )
+            filters.append(f"volume='{gain}':eval=frame")
     if measured is not None:
         filters.append(
             f"loudnorm=I={TARGET_LUFS:g}:TP={TARGET_TRUE_PEAK:g}:LRA={TARGET_LRA:g}"

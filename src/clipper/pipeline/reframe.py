@@ -100,27 +100,31 @@ def face_targets(
     Two faces of similar size (the smaller at least PAIR_RATIO of the larger) that fit the
     window (`half_width` is half the crop width) give their centroid; pairing starts within
     PAIR_FIT of the window and stops only beyond PAIR_KEEP. Otherwise one face is locked and
-    followed: the nearest face within `half_width` of the lock. While no face is that near
-    (a missed detection, or none at all) the lock holds for LOCK_GRACE_SAMPLES, then moves to
-    the largest face. The lock moves to another face early only once the largest other face
-    is at least SWITCH_RATIO larger for SWITCH_SAMPLES samples in a row, so noisy sizes never
-    flip it. All of this resets at a cut."""
+    followed: the nearest face within `half_width` of the lock and at least PAIR_RATIO of its
+    last area. While no face matches (a missed detection, or none at all) the lock holds for
+    LOCK_GRACE_SAMPLES, then moves to the largest face. The lock moves to another face early
+    only once the largest other face is at least SWITCH_RATIO larger for SWITCH_SAMPLES
+    samples in a row, so noisy sizes never flip it. All of this resets at a cut."""
     cuts = sorted(cuts)
     out: list[tuple[float, float | None]] = []
-    shot, lock, paired, streak, missed = -1, None, False, 0, 0
+    shot, lock, size, paired, streak, missed = -1, None, 0.0, False, 0, 0
     for t, faces in samples:
         if (here := bisect_right(cuts, t)) != shot:
-            shot, lock, paired, streak, missed = here, None, False, 0, 0
+            shot, lock, size, paired, streak, missed = here, None, 0.0, False, 0, 0
         top = sorted(faces, key=lambda f: f[1], reverse=True)[:2]
         fit = 2 * half_width * (PAIR_KEEP if paired else PAIR_FIT)
         paired = len(top) == 2 and (
             top[1][1] >= PAIR_RATIO * top[0][1] and abs(top[0][0] - top[1][0]) <= fit
         )
         if paired:
-            lock, streak, missed = None, 0, 0
+            lock, size, streak, missed = None, 0.0, 0, 0
             out.append((t, (top[0][0] + top[1][0]) / 2))
             continue
-        near = [f for f in faces if lock is not None and abs(f[0] - lock) <= half_width]
+        near = [
+            f
+            for f in faces
+            if lock is not None and abs(f[0] - lock) <= half_width and f[1] >= PAIR_RATIO * size
+        ]
         if lock is not None and not near:
             missed += 1
             if missed <= LOCK_GRACE_SAMPLES or not faces:
@@ -135,7 +139,7 @@ def face_targets(
         streak = streak + 1 if rival and rival[1] >= SWITCH_RATIO * mine[1] else 0
         if rival and streak >= SWITCH_SAMPLES:
             mine, streak = rival, 0
-        lock = mine[0]
+        lock, size = mine
         out.append((t, lock))
     return out
 

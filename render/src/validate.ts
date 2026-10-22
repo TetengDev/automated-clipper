@@ -3,10 +3,14 @@
 // Keep `semanticErrors` in sync with the `_check` validators in src/clipper/edl.py.
 import Ajv2020 from "ajv/dist/2020.js";
 import schema from "../schema/edl.schema.json";
-import type { Edl } from "./types";
+import { frameSegments, segmentsOf } from "./timeline";
+import { FPS, type Edl } from "./types";
 
 const MIN_CLIP_SECONDS = 1;
 const MAX_CLIP_SECONDS = 180;
+const MIN_SEGMENT_SECONDS = 0.3;
+const GRID_TOLERANCE_S = 0.001;
+const EPS = 1e-6;
 
 export class EdlValidationError extends Error {
   readonly errors: string[];
@@ -30,14 +34,48 @@ const validateSchema = ajv.compile(schema);
 
 const semanticErrors = (edl: Edl): string[] => {
   const errors: string[] = [];
-  const { source, hook, words, crop } = edl;
+  const { source, hook, words, crop, segments } = edl;
   if (source.path.split("/").includes("..")) {
     errors.push("source.path must not contain '..' segments");
   }
-  const duration = source.out_s - source.in_s;
-  if (duration < MIN_CLIP_SECONDS || duration > MAX_CLIP_SECONDS) {
+  const span = source.out_s - source.in_s;
+  if (span < MIN_CLIP_SECONDS || span > MAX_CLIP_SECONDS) {
     errors.push(
       `source.out_s - source.in_s must be between ${MIN_CLIP_SECONDS} and ${MAX_CLIP_SECONDS} seconds`,
+    );
+  }
+  if (edl.schema_version === 1 && (segments !== null || edl.cuts.length > 0)) {
+    errors.push("segments and cuts need schema_version 2");
+  }
+  const segs = segments ?? [];
+  segs.forEach((seg, index) => {
+    const offGrid = (t: number) => Math.abs(t * FPS - Math.round(t * FPS)) > GRID_TOLERANCE_S * FPS;
+    if (offGrid(seg.in_s) || offGrid(seg.out_s)) {
+      errors.push(`segments[${index}]: segment edges must be on the frame grid`);
+    }
+    if (seg.out_s - seg.in_s < MIN_SEGMENT_SECONDS - EPS) {
+      errors.push(`segments[${index}]: segments must be at least ${MIN_SEGMENT_SECONDS} seconds`);
+    }
+    if (index > 0 && seg.in_s < segs[index - 1]!.out_s) {
+      errors.push("segments must be sorted and must not overlap");
+    }
+  });
+  if (
+    segs.length > 0 &&
+    (Math.abs(segs[0]!.in_s - source.in_s) > EPS ||
+      Math.abs(segs.at(-1)!.out_s - source.out_s) > EPS)
+  ) {
+    errors.push("segments must span source from in_s to out_s");
+  }
+  edl.cuts.forEach((cut, index) => {
+    if (cut.out_s <= cut.in_s) {
+      errors.push(`cuts[${index}]: cut out_s must be > in_s`);
+    }
+  });
+  const duration = segmentsOf(edl).reduce((sum, seg) => sum + seg.out_s - seg.in_s, 0);
+  if (duration < MIN_CLIP_SECONDS - EPS || duration > MAX_CLIP_SECONDS) {
+    errors.push(
+      `the segments must total between ${MIN_CLIP_SECONDS} and ${MAX_CLIP_SECONDS} seconds`,
     );
   }
   let previous = -1;
@@ -86,4 +124,7 @@ export const parseEdl = (input: unknown): Edl => {
 };
 
 export const durationInFrames = (edl: Edl, fps: number): number =>
-  Math.max(1, Math.round((edl.source.out_s - edl.source.in_s) * fps));
+  Math.max(
+    1,
+    frameSegments(segmentsOf(edl), fps).reduce((sum, seg) => sum + seg.durationInFrames, 0),
+  );

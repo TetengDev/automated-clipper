@@ -211,10 +211,10 @@ def test_v1_cannot_carry_segments_or_cuts() -> None:
 
 
 def test_segments_set_the_duration() -> None:
-    edl = parse_edl(_v2([(1.0, 3.0), (90 * F, 6.0)], cuts=[_cut(in_s=3.0, out_s=90 * F)]))
-    assert edl.spans == ((1.0, 3.0), (90 * F, 6.0))
-    assert edl.duration_s == pytest.approx(2.0 + 3.0)
-    assert edl.duration_in_frames == 60 + 90
+    edl = parse_edl(_v2([(1.0, 3.0), (130 * F, 6.0)], cuts=[_cut(in_s=3.0, out_s=130 * F)]))
+    assert edl.spans == ((1.0, 3.0), (130 * F, 6.0))
+    assert edl.duration_s == pytest.approx(2.0 + 5 / 3)
+    assert edl.duration_in_frames == 60 + 50
     assert edl.cuts[0].kind == "silence" and edl.cuts[0].applied is True
 
 

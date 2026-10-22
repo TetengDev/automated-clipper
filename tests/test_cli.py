@@ -20,6 +20,7 @@ COMMANDS = [
     "retry",
     "migrate",
     "check-config",
+    "bench-transcribe",
 ]
 
 
@@ -240,3 +241,60 @@ def test_retry_missing_job_fails_cleanly(tmp_path: Path) -> None:
     assert result.exit_code == 1
     assert "job 42 not found" in result.stderr
     assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_bench_transcribe_prints_rtf_and_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from clipper.pipeline import transcribe as tr
+
+    loaded: list[str] = []
+
+    class Model:
+        def __init__(self, model: str, **kwargs) -> None:
+            loaded.append(model)
+            self.model = model
+
+        def transcribe(self, audio, **kwargs):
+            words = [
+                SimpleNamespace(word=f" {self.model}{i}", start=i, end=i + 0.5) for i in range(200)
+            ]
+            segment = SimpleNamespace(
+                start=0.0,
+                end=100.0,
+                text="",
+                words=words,
+                no_speech_prob=0.0,
+                avg_logprob=-0.1,
+                compression_ratio=1.0,
+            )
+            return iter([segment]), SimpleNamespace(language="en")
+
+    monkeypatch.setattr(tr, "_whisper_model_class", lambda: Model)
+    monkeypatch.setattr(tr, "probe_duration", lambda audio: 30.0)
+    audio = tmp_path / "a.flac"
+    audio.write_bytes(b"fLaC")
+    result = runner.invoke(app, ["bench-transcribe", str(audio), "--models", "tiny,base.en"])
+    assert result.exit_code == 0, result.output
+    assert loaded == ["tiny", "base.en"]
+    lines = result.output.splitlines()
+    assert any(line.startswith("tiny") and "rtf=" in line for line in lines)
+    assert any(line.startswith("base.en") and "rtf=" in line for line in lines)
+    preview = next(line for line in lines if "tiny0" in line).strip()
+    assert preview.startswith("tiny0 tiny1") and len(preview) == 300
+
+
+@pytest.mark.parametrize("models", ["../etc,tiny", "org/model", "https://x.example/m", ","])
+def test_bench_transcribe_rejects_unsafe_model_names(tmp_path: Path, models: str) -> None:
+    audio = tmp_path / "a.flac"
+    audio.write_bytes(b"fLaC")
+    result = runner.invoke(app, ["bench-transcribe", str(audio), "--models", models])
+    assert result.exit_code != 0
+    assert "invalid model" in result.output
+
+
+def test_bench_transcribe_needs_existing_audio(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["bench-transcribe", str(tmp_path / "missing.flac")])
+    assert result.exit_code != 0

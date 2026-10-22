@@ -234,7 +234,7 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _worker(conn: sqlite3.Connection, media_root: Path) -> Worker:
-    config = AppConfig(settings=Settings(min_duration_seconds=10))
+    config = AppConfig(settings=Settings(min_duration_seconds=10, transcriber="groq"))
     return Worker(
         conn=conn,
         config=config,

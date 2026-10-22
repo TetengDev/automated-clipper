@@ -187,3 +187,53 @@ def test_rclone_remote_validated(monkeypatch: pytest.MonkeyPatch, remote: str) -
 def test_rclone_remote_valid(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RCLONE_REMOTE", "gdrive:clips/ready")
     assert Secrets().rclone_remote == "gdrive:clips/ready"
+
+
+# --------------------------------------------------------------------------- transcriber (CLP-35)
+
+
+def test_transcriber_defaults_to_local_whisper() -> None:
+    from clipper.config import Settings
+
+    s = Settings()
+    assert (s.transcriber, s.whisper_model, s.whisper_compute_type) == (
+        "local",
+        "large-v3-turbo",
+        "int8",
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["../models/x", "/etc/passwd", "org/model", "https://evil.example/m", "a b", ".hidden", ""],
+)
+def test_whisper_model_cannot_be_a_path_or_url(model: str) -> None:
+    from clipper.config import CreatorOverrides, Settings
+
+    with pytest.raises(ValidationError):
+        Settings(whisper_model=model)
+    with pytest.raises(ValidationError):
+        CreatorOverrides(whisper_model=model)
+
+
+@pytest.mark.parametrize("field", ["transcriber", "whisper_compute_type"])
+def test_transcriber_choices_are_closed(field: str) -> None:
+    from clipper.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(**{field: "bogus"})
+
+
+def test_transcriber_per_creator_override(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "settings: {whisper_model: large-v3}\n"
+        "creators:\n"
+        "  - {name: A, region: global, youtube: {handle: '@aaa'},"
+        " overrides: {transcriber: groq, whisper_model: tiny}}\n"
+        "  - {name: B, region: global, youtube: {handle: '@bbb'}}\n"
+    )
+    cfg = load_config(path)
+    a, b = cfg.effective_settings("A"), cfg.effective_settings("B")
+    assert (a.transcriber, a.whisper_model) == ("groq", "tiny")
+    assert (b.transcriber, b.whisper_model) == ("local", "large-v3")

@@ -11,7 +11,7 @@
     <span>{{ card.creator }} · {{ "%d" % card.duration_s }}s · score {{ "%.1f" % card.score if card.score is not none else "–" }}</span>
     {% if card.source_title %}<span class="muted">{{ card.source_title }}</span>{% endif %}
     <span class="badge status-{{ card.status }}">{{ card.status | replace("_", " ") }}</span>
-    {% if card.sensitive %}<span class="badge sensitive" title="Involves a victim, a minor or a tragedy: no effects, review with care">Sensitive</span>{% endif %}
+    {% if card.sensitive %}<span class="badge sensitive" title="Involves a victim, a minor or a tragedy: no effects, review with care; check for names, faces or identifiers of victims and minors">Sensitive</span>{% endif %}
   </div>
 </a>
 {% endfor %}

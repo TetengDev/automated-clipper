@@ -32,7 +32,10 @@ spelling.
   "anyway").
 - **The hook names the person or thing.** The first line (and the `hook` you write) says
   who or what this is about: a name, an object, a number, a place. Not "you won't
-  believe this" or "this is crazy".
+  believe this" or "this is crazy". Exception: never name a victim, a minor or a private
+  complainant (and never give their school, workplace, address or phone number) in the
+  hook, title, caption or hashtags; refer to them by role, such as "a complainant" or "a
+  15-year-old".
 - **No vague teasing, no promises the footage can't keep.** Reject hooks and titles that
   hide what happens to create curiosity, and anything that promises a result, a fight, a
   reveal or a reaction the clip does not actually contain.

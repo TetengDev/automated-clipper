@@ -27,6 +27,10 @@ hardship (debt, family conflict, a medical or legal problem).
   a tragedy. Plain cuts and plain captions only.
 - The hook and title describe what happened in a neutral way. Never make a person's
   suffering the joke, and never sensationalise it beyond what was said.
+- Never put the name, school, workplace, address or phone number of a victim, a minor or
+  a private complainant in the hook, title, caption or hashtags. Refer to them by role
+  (for example "a complainant", "a 15-year-old"). This overrides "the hook names the
+  person".
 - Do not choose moments whose captions would reveal a private person's address or phone
   number, or a minor's full name.
 - If a moment cannot be clipped respectfully, leave it out.

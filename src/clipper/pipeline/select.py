@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-5-5"
 PROMPT_VERSION = "select_v2"
-PLAYBOOK_VERSION = "playbook_v2"
+PLAYBOOK_VERSION = "playbook_v3"
 """Bump when select_v2.md or any file in prompts/playbook/ changes: it is part of the window
 cache key (a test pins the text hash per version)."""
 PROVIDER = "anthropic"
@@ -189,7 +189,8 @@ class Candidate(BaseModel):
     score: int = Field(ge=0, le=100)
     reason: str
     # v2 fields; defaults keep v1 replies and cached v1 windows loadable.
-    payoff_s: float | None = Field(None, ge=0)
+    # No ge=0: a negative payoff fails the range check below and drops only its candidate.
+    payoff_s: float | None = Field(None, allow_inf_nan=False)
     open_question: str = ""
     sensitive: bool = False
 
@@ -524,11 +525,13 @@ def dedupe(clips: Sequence[Clip], max_overlap: float = MAX_OVERLAP) -> list[Clip
     return kept
 
 
-def _payoff_kept(clip: Clip) -> bool:
+def _payoff_kept(clip: Clip, max_s: float) -> bool:
     """Snapping may nudge the payoff just outside the clip (clamped later); a payoff the
-    length clamp cut off is a clip without its payoff."""
+    length clamp cut off is a clip without its payoff, so a clamped clip gets no slack."""
     payoff = clip.candidate.payoff_s
-    if payoff is None or clip.start_s - MAX_SNAP_S <= payoff <= clip.end_s + MAX_SNAP_S:
+    clamped = clip.candidate.end_s - clip.candidate.start_s > max_s
+    slack = 0.0 if clamped else MAX_SNAP_S
+    if payoff is None or clip.start_s - slack <= payoff <= clip.end_s + slack:
         return True
     logger.info(
         "dropping candidate %.1f-%.1f: payoff at %.1f falls outside the final clip %.1f-%.1f",
@@ -548,7 +551,7 @@ def finalize(
         clip
         for c in candidates
         if (clip := snap_to_words(c, words, settings.clip_min_seconds, settings.clip_max_seconds))
-        and _payoff_kept(clip)
+        and _payoff_kept(clip, settings.clip_max_seconds)
     ]
     kept = dedupe(snapped)[:top_k]
     return [

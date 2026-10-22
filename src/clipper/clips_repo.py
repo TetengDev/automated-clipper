@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 
@@ -153,13 +153,18 @@ def add_clip_version(
         if exists is None:
             raise KeyError(f"clip {clip_id} not found")
         version = int(row[0]) + 1
+        # A re-render or edit never clears the sensitive flag an earlier version carried.
+        flagged = conn.execute(
+            "SELECT COALESCE(MAX(sensitive), 0) FROM clip_versions WHERE clip_id = ?", (clip_id,)
+        ).fetchone()[0]
+        meta = meta or ClipMeta()
         _insert_version(
             conn,
             clip_id=clip_id,
             version=version,
             edl=edl,
             result=result,
-            meta=meta or ClipMeta(),
+            meta=replace(meta, sensitive=meta.sensitive or bool(flagged)),
             now=stamp,
         )
         conn.execute(

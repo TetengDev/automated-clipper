@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -38,25 +39,79 @@ def _xs(keys: list[tuple[float, float]], until: float) -> list[float]:
 # --- per-sample target and layout choice ------------------------------------------------
 
 
+def _one(faces: list[tuple[float, float]], half: float = 0.5) -> float | None:
+    """The target for a single sample (no history)."""
+    return rf.face_targets([(0.0, faces)], [], half)[0][1]
+
+
 def test_face_target() -> None:
-    assert rf.face_target([]) is None
-    assert rf.face_target([(0.3, 0.02)]) == 0.3
+    assert _one([]) is None
+    assert _one([(0.3, 0.02)]) == 0.3
     # Two faces of similar size (the smaller at least 60% of the larger): their centroid.
-    assert rf.face_target([(0.2, 0.010), (0.6, 0.006)]) == pytest.approx(0.4)
-    assert rf.face_target([(0.6, 0.006), (0.2, 0.010)]) == pytest.approx(0.4)
+    assert _one([(0.2, 0.010), (0.6, 0.006)]) == pytest.approx(0.4)
+    assert _one([(0.6, 0.006), (0.2, 0.010)]) == pytest.approx(0.4)
     # A much smaller second face (a background person): the largest face only.
-    assert rf.face_target([(0.2, 0.010), (0.6, 0.0059)]) == 0.2
+    assert _one([(0.2, 0.010), (0.6, 0.0059)]) == 0.2
     # More than two: the two largest.
-    assert rf.face_target([(0.9, 0.001), (0.2, 0.010), (0.6, 0.008)]) == pytest.approx(0.4)
+    assert _one([(0.9, 0.001), (0.2, 0.010), (0.6, 0.008)]) == pytest.approx(0.4)
 
 
 def test_pair_too_far_apart_for_the_window_frames_the_largest() -> None:
     # Two similar faces at 0.25 and 0.75 cannot both fit a 9:16 window of a 16:9 frame:
     # centring on the empty gap between them would frame neither.
-    assert rf.face_target([(0.25, 0.010), (0.75, 0.009)], HALF) == 0.25
-    assert rf.face_target([(0.75, 0.009), (0.25, 0.010)], HALF) == 0.25
+    assert _one([(0.25, 0.010), (0.75, 0.009)], HALF) == 0.25
+    assert _one([(0.75, 0.009), (0.25, 0.010)], HALF) == 0.25
     # Close enough to share the window: their centroid.
-    assert rf.face_target([(0.45, 0.010), (0.55, 0.009)], HALF) == pytest.approx(0.5)
+    assert _one([(0.45, 0.010), (0.55, 0.009)], HALF) == pytest.approx(0.5)
+
+
+def test_noisy_two_shot_stays_on_one_face() -> None:
+    # Similar faces at 0.3 and 0.7, areas jittering by 10%: "largest" flips sample to
+    # sample, but the crop locks onto one face and never wanders between them.
+    rng = random.Random(58)  # noqa: S311 - seeded test noise
+    samples = [
+        (i / 5, [(0.3, 0.01 * rng.uniform(0.9, 1.1)), (0.7, 0.01 * rng.uniform(0.9, 1.1))])
+        for i in range(150)
+    ]
+    _, keys = rf.plan_reframe(rf.Faces(1280, 720, samples), [], 0.0, 30.0)
+    assert keys is not None
+    xs = {x for _, x in keys}
+    assert xs in ({0.3}, {0.7})
+
+
+def test_pair_near_the_fit_threshold_does_not_flip_flop() -> None:
+    window = 2 * HALF
+    # dx hovers around 0.8 of the window (between the 0.8 start and the 0.9 stop).
+    dxs = [window * (0.78 if i == 0 else 0.8 + 0.06 * (-1) ** i) for i in range(100)]
+    samples = [(i / 5, [(0.5 - dx / 2, 0.01), (0.5 + dx / 2, 0.009)]) for i, dx in enumerate(dxs)]
+    targets = rf.face_targets(samples, [], HALF)
+    assert {round(x, 9) for _, x in targets if x is not None} == {0.5}
+    # Past the stop threshold the pair is dropped for the largest face.
+    far = [*samples[:5], (1.0, [(0.5 - window * 0.47, 0.01), (0.5 + window * 0.47, 0.009)])]
+    assert rf.face_targets(far, [], HALF)[-1][1] == pytest.approx(0.5 - window * 0.47)
+
+
+def test_clear_sustained_size_change_switches_faces() -> None:
+    small, big = 0.01, 0.01 * rf.SWITCH_RATIO * 1.01
+    samples = [(i / 5, [(0.3, 0.01), (0.7, 0.009)]) for i in range(10)]
+    samples += [(2.0 + i / 5, [(0.3, small), (0.7, big)]) for i in range(10)]
+    xs = [x for _, x in rf.face_targets(samples, [], HALF)]
+    assert xs[:10] == [0.3] * 10
+    # A brief challenge does not switch; a sustained one does, after SWITCH_SAMPLES.
+    n = rf.SWITCH_SAMPLES
+    assert xs[10 : 10 + n - 1] == [0.3] * (n - 1)
+    assert xs[10 + n - 1 :] == [0.7] * (10 - n + 1)
+    blip = [*samples[:10], (2.0, [(0.3, small), (0.7, big)]), (2.2, [(0.3, 0.01), (0.7, 0.009)])]
+    assert [x for _, x in rf.face_targets(blip, [], HALF)][-2:] == [0.3, 0.3]
+
+
+def test_face_lock_resets_at_a_cut() -> None:
+    before = [(i / 5, [(0.3, 0.01), (0.7, 0.009)]) for i in range(10)]
+    after = [(2.0 + i / 5, [(0.3, 0.009), (0.7, 0.01)]) for i in range(5)]
+    xs = [x for _, x in rf.face_targets(before + after, [2.0], HALF)]
+    assert xs[:10] == [0.3] * 10 and xs[10:] == [0.7] * 5  # the new shot's largest face
+    xs = [x for _, x in rf.face_targets(before + after, [], HALF)]
+    assert xs[10:] == [0.3] * 5  # without the cut, the lock holds
 
 
 def test_plan_reframe_frames_the_largest_of_a_distant_pair() -> None:
@@ -280,6 +335,56 @@ def test_failed_fetch_is_not_retried_for_a_while(
     assert rf._fetch_failed_at is None
 
 
+@pytest.mark.parametrize(
+    ("error", "timeout_s", "remembered"),
+    [
+        (httpx.ReadTimeout("slow"), 1.5, False),  # this job's deadline was nearly spent
+        (TimeoutError("face model download too slow"), 1.5, False),
+        (httpx.ReadTimeout("slow"), rf.MODEL_TIMEOUT_S, True),  # a real full-length timeout
+        (httpx.ConnectError("refused"), 1.5, True),
+        (ValueError("face model download is too large"), 1.5, True),
+    ],
+)
+def test_only_real_fetch_failures_are_remembered(
+    tmp_path: Path, pinned: str, error: Exception, timeout_s: float, remembered: bool
+) -> None:
+    def fail(url: str, t: float) -> bytes:
+        raise error
+
+    assert rf.ensure_model(tmp_path, fetch=fail, timeout_s=timeout_s) is None
+    assert (rf._fetch_failed_at is not None) is remembered
+
+
+def test_short_timeout_mismatch_is_still_remembered(tmp_path: Path, pinned: str) -> None:
+    assert rf.ensure_model(tmp_path, fetch=lambda u, t: b"tampered", timeout_s=1.5) is None
+    assert rf._fetch_failed_at is not None
+
+
+def test_fetch_warning_is_cleaned_and_bounded(
+    tmp_path: Path, pinned: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fail(url: str, t: float) -> bytes:
+        raise ValueError("bad\x1b[31m\u202e" + "x" * 2000)
+
+    assert rf.ensure_model(tmp_path, fetch=fail) is None
+    (warning,) = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert "\x1b" not in warning and "\u202e" not in warning
+    assert len(warning) < 400
+
+
+def test_model_read_error_never_fails_the_clip(
+    tmp_path: Path, pinned: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / rf.MODEL_NAME).write_bytes(GOOD)
+
+    def eio(fd: int) -> Any:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(rf.os, "fstat", eio)
+    assert rf.read_model(tmp_path / rf.MODEL_NAME) is None
+    assert rf.ensure_model(tmp_path, fetch=lambda u, t: b"tampered") is None  # no raise
+
+
 def test_model_read_refuses_symlinks_and_fifos(tmp_path: Path, pinned: str) -> None:
     real = tmp_path / "elsewhere.tflite"
     real.write_bytes(GOOD)
@@ -318,9 +423,10 @@ def test_download_timeout_covers_every_phase(monkeypatch: pytest.MonkeyPatch) ->
         respx.get(rf.MODEL_URL).mock(return_value=httpx.Response(200, content=GOOD))
         rf.download(rf.MODEL_URL, 30.0)
     (timeout,) = seen
-    # Connect, headers and the body each get a third: never more than 30 s in all.
+    # A quarter per phase: TCP connect and TLS each get the connect timeout, then headers,
+    # then body reads (none starts after three quarters).
     assert isinstance(timeout, httpx.Timeout)
-    assert timeout.connect == timeout.read == timeout.write == timeout.pool == 10.0
+    assert timeout.connect == timeout.read == timeout.write == timeout.pool == 7.5
 
 
 @respx.mock

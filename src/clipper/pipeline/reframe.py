@@ -69,6 +69,8 @@ PAIR_FIT = 0.8
 """...and both centres fit in this central share of the crop window (to start pairing)..."""
 PAIR_KEEP = 0.9
 """...or this share (to keep pairing): hysteresis, so the target does not flip-flop."""
+LOCK_GRACE_SAMPLES = 5
+"""Samples (1 s at SAMPLE_FPS) the lock holds while its face is not detected."""
 SWITCH_RATIO = 1.25
 SWITCH_SAMPLES = 3
 """The crop leaves its face for one SWITCH_RATIO larger for this many samples in a row."""
@@ -93,34 +95,46 @@ class Faces(NamedTuple):
 def face_targets(
     samples: Sequence[tuple[float, Sequence[Face]]], cuts: Sequence[float], half_width: float = 0.5
 ) -> list[tuple[float, float | None]]:
-    """The crop target per sample (time kept; None without faces), from the two largest faces.
+    """The crop target per sample (time kept; None without faces).
 
     Two faces of similar size (the smaller at least PAIR_RATIO of the larger) that fit the
     window (`half_width` is half the crop width) give their centroid; pairing starts within
     PAIR_FIT of the window and stops only beyond PAIR_KEEP. Otherwise one face is locked and
-    followed by nearest x; the lock moves to the other face only once that one is at least
-    SWITCH_RATIO larger for SWITCH_SAMPLES samples in a row, so noisy sizes never flip it.
-    All of this resets at a cut."""
+    followed: the nearest face within `half_width` of the lock. While no face is that near
+    (a missed detection, or none at all) the lock holds for LOCK_GRACE_SAMPLES, then moves to
+    the largest face. The lock moves to another face early only once the largest other face
+    is at least SWITCH_RATIO larger for SWITCH_SAMPLES samples in a row, so noisy sizes never
+    flip it. All of this resets at a cut."""
     cuts = sorted(cuts)
     out: list[tuple[float, float | None]] = []
-    shot, lock, paired, streak = -1, None, False, 0
+    shot, lock, paired, streak, missed = -1, None, False, 0, 0
     for t, faces in samples:
         if (here := bisect_right(cuts, t)) != shot:
-            shot, lock, paired, streak = here, None, False, 0
+            shot, lock, paired, streak, missed = here, None, False, 0, 0
         top = sorted(faces, key=lambda f: f[1], reverse=True)[:2]
         fit = 2 * half_width * (PAIR_KEEP if paired else PAIR_FIT)
         paired = len(top) == 2 and (
             top[1][1] >= PAIR_RATIO * top[0][1] and abs(top[0][0] - top[1][0]) <= fit
         )
-        if not top or paired:
-            lock, streak = None, 0
-            out.append((t, (top[0][0] + top[1][0]) / 2 if paired else None))
+        if paired:
+            lock, streak, missed = None, 0, 0
+            out.append((t, (top[0][0] + top[1][0]) / 2))
             continue
-        mine = top[0] if lock is None else min(top, key=lambda f: abs(f[0] - lock))
-        other = next((f for f in top if f is not mine), None)
-        streak = streak + 1 if other and other[1] >= SWITCH_RATIO * mine[1] else 0
-        if other and streak >= SWITCH_SAMPLES:
-            mine, streak = other, 0
+        near = [f for f in faces if lock is not None and abs(f[0] - lock) <= half_width]
+        if lock is not None and not near:
+            missed += 1
+            if missed <= LOCK_GRACE_SAMPLES or not faces:
+                out.append((t, lock if faces else None))  # None: no face for the layout share
+                continue
+        if not faces:
+            out.append((t, None))
+            continue
+        mine = min(near, key=lambda f: abs(f[0] - lock)) if near else top[0]
+        missed = 0
+        rival = max((f for f in faces if f is not mine), key=lambda f: f[1], default=None)
+        streak = streak + 1 if rival and rival[1] >= SWITCH_RATIO * mine[1] else 0
+        if rival and streak >= SWITCH_SAMPLES:
+            mine, streak = rival, 0
         lock = mine[0]
         out.append((t, lock))
     return out

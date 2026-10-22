@@ -11,7 +11,7 @@
     },
     {
       "type": "text",
-      "text": "{\"clips\": [{\"start_s\": 50.0, \"end_s\": 200.0, \"hook\": \"Hook 1\", \"title\": \"Title 1\", \"caption\": \"Caption 1\", \"hashtags\": [\"#clip\", \"#n1\"], \"score\": 80, \"reason\": \"Reason 1\"}, {\"start_s\": 300.0, \"end_s\": 305.0, \"hook\": \"Hook 2\", \"title\": \"Title 2\", \"caption\": \"Caption 2\", \"hashtags\": [\"#clip\", \"#n2\"], \"score\": 70, \"reason\": \"Reason 2\"}, {\"start_s\": 450.33, \"end_s\": 482.77, \"hook\": \"Hook 3\", \"title\": \"Title 3\", \"caption\": \"Caption 3\", \"hashtags\": [\"#clip\", \"#n3\"], \"score\": 60, \"reason\": \"Reason 3\"}]}"
+      "text": "{\"clips\": [{\"start_s\": 50.0, \"end_s\": 200.0, \"hook\": \"Hook 1\", \"title\": \"Title 1\", \"caption\": \"Caption 1\", \"hashtags\": [\"#clip\", \"#n1\"], \"score\": 80, \"reason\": \"Reason 1\", \"payoff_s\": 60.0, \"open_question\": \"What happens after Hook 1?\", \"sensitive\": false}, {\"start_s\": 300.0, \"end_s\": 305.0, \"hook\": \"Hook 2\", \"title\": \"Title 2\", \"caption\": \"Caption 2\", \"hashtags\": [\"#clip\", \"#n2\"], \"score\": 70, \"reason\": \"Reason 2\", \"payoff_s\": 302.5, \"open_question\": \"What happens after Hook 2?\", \"sensitive\": false}, {\"start_s\": 450.33, \"end_s\": 482.77, \"hook\": \"Hook 3\", \"title\": \"Title 3\", \"caption\": \"Caption 3\", \"hashtags\": [\"#clip\", \"#n3\"], \"score\": 60, \"reason\": \"Reason 3\", \"payoff_s\": 460.33, \"open_question\": \"What happens after Hook 3?\", \"sensitive\": false}]}"
     }
   ],
   "stop_reason": "end_turn",

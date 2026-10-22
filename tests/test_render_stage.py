@@ -86,6 +86,7 @@ def _setup(
     highlights: list[dict[str, Any]],
     sections: list[dict[str, Any]] | None = None,
     words: list[dict[str, Any]] | None = None,
+    versions: dict[str, Any] | None = None,
 ) -> None:
     if sections is None:
         sections = [_section(h["rank"], h["start_s"], h["end_s"]) for h in highlights]
@@ -96,7 +97,9 @@ def _setup(
         words = [{"word": f" w{i}", "start": i + 0.1, "end": i + 0.6} for i in range(60)]
     (media / "transcript.json").write_text(json.dumps({"language": "en", "words": words}))
     (media / "highlights.json").write_text(
-        json.dumps({"model": "m", "prompt_version": "select_v1", "clips": highlights})
+        json.dumps(
+            {"model": "m", **(versions or {"prompt_version": "select_v1"}), "clips": highlights}
+        )
     )
     (media / "sections.json").write_text(json.dumps({"clips": sections}))
 
@@ -179,6 +182,7 @@ def test_renders_each_section_into_a_pending_clip(
     )
     assert json.loads(one["hashtags"]) == ["#clip", "#r1"]
     assert one["prompt_version"] == "select_v1"
+    assert one["playbook_version"] is None  # v1 highlights carry no playbook
     # Stored range is the position in the source video (the review page links there).
     assert (one["start_s"], one["end_s"]) == (10.0, 15.0)
     assert one["video_path"] == str(media / "clips/1/v1.mp4")
@@ -490,3 +494,27 @@ def test_sections_without_clips_list_is_permanent(
     (media / "sections.json").write_text("[]")
     with pytest.raises(PermanentError, match="sections.json has no clips list"):
         rc.render_clips(job, _ctx(media, conn))
+
+
+def test_records_prompt_and_playbook_version(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    versions = {"prompt_version": "select_v2", "playbook_version": "playbook_v1"}
+    _setup(media, [_highlight(1, 10.0, 15.0)], versions=versions)
+    rc.render_clips(job, _ctx(media, conn))
+    row = _rows(conn)[0]
+    assert (row["prompt_version"], row["playbook_version"]) == ("select_v2", "playbook_v1")
+
+
+@pytest.mark.parametrize("bad", [{"x": 1}, ["a"], 7, "v" * 200])
+def test_malformed_versions_are_not_stored(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, bad: Any
+) -> None:
+    _setup(
+        media,
+        [_highlight(1, 10.0, 15.0)],
+        versions={"prompt_version": bad, "playbook_version": bad},
+    )
+    rc.render_clips(job, _ctx(media, conn))
+    row = _rows(conn)[0]
+    assert row["prompt_version"] is None and row["playbook_version"] is None

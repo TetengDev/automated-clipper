@@ -19,10 +19,12 @@ docker compose build              # image with ffmpeg + yt-dlp
 ```
 
 Transcription runs locally with faster-whisper by default (`transcriber: local`,
-`whisper_model: large-v3-turbo` in `config/creators.yaml`, also per creator). The model is
-downloaded once into `data/models/`. `GROQ_API_KEY` is needed only with `transcriber: groq`.
-Compare models on a sample with `uv run clipper bench-transcribe audio.flac --models
-large-v3-turbo,large-v3`.
+`whisper_model: large-v3-turbo` in `config/creators.yaml`; transcriber, model and compute
+type can be set per creator). `GROQ_API_KEY` is needed only with `transcriber: groq`.
+The first run downloads the pinned model (about 1.6 GB for large-v3-turbo) into
+`CLIPPER_MODELS_DIR` (default `data/models/`), so it needs network access once. Resource
+notes are in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#local-transcription). Compare models on
+a sample with `uv run clipper bench-transcribe audio.flac --models large-v3-turbo,large-v3`.
 
 ## Adding a creator
 

@@ -23,14 +23,13 @@ import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
-import unicodedata
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from functools import cache
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -44,24 +43,29 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from clipper.config import MissingSecretError, Secrets, Settings
+from clipper.config import WHISPER_MODELS, MissingSecretError, Secrets, Settings
 from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
+from clipper.pipeline import local_asr
 from clipper.pipeline.common import (
     PROTOCOL_WHITELIST,
     REDACT_LIMIT_CHARS,
     Deadline,
     MediaError,
     NoDuration,
-    StageTimeout,
     creator_for,
+    default_runner,
     ffprobe_duration,
     read_json,
     reserve_spend,
     run_media,
     settings_for,
+    stderr_tail,
     write_json_atomic,
 )
+from clipper.pipeline.local_asr import keep_segment as keep_segment  # re-export: guards
+from clipper.pipeline.local_asr import latin_word as latin_word  # run in the child
+from clipper.pipeline.ytdlp import CommandTimeout, RunResult
 from clipper.redact import redact
 
 logger = logging.getLogger(__name__)
@@ -94,15 +98,11 @@ GROQ_MIN_BILLED_SECONDS = 10.0
 GROQ_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_RETRY_AFTER_SECONDS = 60.0
 
-MODELS_DIR = Path("data/models")
-"""faster-whisper model cache (relative to the working dir: /app/data/models, the data
-volume, in compose), so models are downloaded once and survive container restarts."""
-# Hallucination guards (Whisper's own thresholds): silence the model talked over, and
-# repetition loops. Words outside the Latin script are dropped for these languages.
-NO_SPEECH_PROB = 0.6
-LOW_AVG_LOGPROB = -1.0
-MAX_COMPRESSION_RATIO = 2.4
-LATIN_LANGUAGES = frozenset({"en", "tl"})
+DEFAULT_MODELS_DIR = Path("data/models")
+"""Local Whisper model cache when CLIPPER_MODELS_DIR is unset (next to data/state.db)."""
+ASR_COMMAND = (sys.executable, "-I", "-m", "clipper.pipeline.local_asr")
+"""The local ASR child: isolated Python (no PYTHON* env, no cwd on sys.path)."""
+MODEL_FETCH_TIMEOUT_S = 30 * 60.0
 
 # verbose_json reports the language by name; transcript.json uses ISO-639-1 codes.
 _LANGUAGE_CODES = {
@@ -364,40 +364,40 @@ def normalize_language(value: str) -> str:
 # --------------------------------------------------------------------------- local whisper
 
 
-def keep_segment(no_speech_prob: float, avg_logprob: float, compression_ratio: float) -> bool:
-    """False for a likely hallucination: speech "heard" in silence, or a repetition loop."""
-    if no_speech_prob > NO_SPEECH_PROB and avg_logprob < LOW_AVG_LOGPROB:
-        return False
-    return compression_ratio <= MAX_COMPRESSION_RATIO
+def models_dir() -> Path:
+    """Absolute model cache dir: CLIPPER_MODELS_DIR, else ./data/models."""
+    return Path(os.environ.get("CLIPPER_MODELS_DIR") or DEFAULT_MODELS_DIR).resolve()
 
 
-def latin_word(word: str) -> bool:
-    """Every letter is Latin script (diacritics like ñ/é included); digits and punctuation
-    pass. Whisper sometimes "translates" Taglish into CJK/Cyrillic fragments."""
-    return all(not ch.isalpha() or unicodedata.name(ch, "").startswith("LATIN") for ch in word)
-
-
-def _whisper_model_class() -> Any:
-    """Imported lazily: the module (and the Groq path) work without faster-whisper."""
+def _run_asr(args: Sequence[str], timeout_s: float, what: str) -> RunResult:
+    """Run the ASR child like ffmpeg (`run_media`), but tell a model that cannot be loaded
+    (permanent) apart from a crash, OOM kill or timeout (retryable)."""
     try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        raise PermanentError("faster-whisper is not installed; set transcriber: groq") from None
-    return WhisperModel
+        result = default_runner()(args, timeout_s)
+    except CommandTimeout as exc:
+        raise MediaError(f"{what}: {exc}") from None
+    if result.returncode == local_asr.EXIT_MODEL:
+        raise PermanentError(f"{what}: cannot load the model: {stderr_tail(result.stderr)}")
+    if result.returncode != 0:
+        raise MediaError(f"{what} failed (exit {result.returncode}): {stderr_tail(result.stderr)}")
+    return result
 
 
 @dataclass
 class FasterWhisperTranscriber:
-    """Local faster-whisper (CTranslate2) on CPU. The model is loaded on the first chunk and
-    reused by every later one; `default_transcriber` reuses the instance per process."""
+    """Local faster-whisper (CTranslate2) on CPU. Each chunk runs in its own child process
+    (`local_asr`) that loads the pinned model snapshot from disk, offline; the stage runs
+    chunks one at a time, so at most one model is in memory and it is freed per chunk."""
 
     model: str = "large-v3-turbo"
     compute_type: str = "int8"
-    download_root: Path = MODELS_DIR
-    cpu_threads: int = field(default_factory=lambda: os.cpu_count() or 0)
+    cpu_threads: int = 4
+    models_dir: Path = field(default_factory=models_dir)
     provider: str = "local"
-    _model: Any = field(default=None, init=False, repr=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.model not in WHISPER_MODELS:
+            raise ValueError(f"unknown whisper model: {self.model}")
 
     def billed_seconds(self, chunk_seconds: Sequence[float]) -> float:
         return float(sum(chunk_seconds))
@@ -405,51 +405,45 @@ class FasterWhisperTranscriber:
     def cost_usd(self, chunk_seconds: Sequence[float]) -> float:
         return 0.0
 
-    def load(self) -> Any:
-        """The WhisperModel, created (and downloaded if needed) on first use."""
-        with self._lock:
-            if self._model is None:
-                self._model = _whisper_model_class()(
-                    self.model,
-                    device="cpu",
-                    compute_type=self.compute_type,
-                    download_root=str(self.download_root),
-                    cpu_threads=self.cpu_threads,
-                )
-            return self._model
+    @property
+    def snapshot_dir(self) -> Path:
+        repo, sha = WHISPER_MODELS[self.model]
+        return self.models_dir / f"models--{repo.replace('/', '--')}" / "snapshots" / sha
+
+    def ensure_model(self, timeout_s: float = MODEL_FETCH_TIMEOUT_S) -> Path:
+        """Download the pinned snapshot once (in a child, bounded by `timeout_s`)."""
+        snapshot = self.snapshot_dir
+        if not (snapshot / "model.bin").is_file():
+            repo, sha = WHISPER_MODELS[self.model]
+            self.models_dir.mkdir(parents=True, exist_ok=True)
+            args = [*ASR_COMMAND, "fetch", repo, sha, str(self.models_dir)]
+            _run_asr(args, timeout_s, f"downloading whisper model {self.model}")
+            if not (snapshot / "model.bin").is_file():
+                raise MediaError(f"whisper model {self.model}: download left no model.bin")
+        return snapshot
 
     def transcribe(
         self, audio: Path, *, language: str | None, timeout_s: float | None = None
     ) -> ChunkTranscript:
-        started = time.monotonic()
-        segments, info = self.load().transcribe(
+        args = [
+            *ASR_COMMAND,
+            str(self.snapshot_dir),
+            self.compute_type,
+            str(self.cpu_threads),
+            language or "-",
             str(audio),
-            language=language,
-            word_timestamps=True,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-        latin_only = language in LATIN_LANGUAGES
-        words: list[Word] = []
-        kept: list[Segment] = []
-        for s in segments:  # lazy: decoding happens while iterating
-            if timeout_s is not None and time.monotonic() - started > timeout_s:
-                raise StageTimeout(f"local transcription exceeded {timeout_s:.0f} s")
-            if not keep_segment(s.no_speech_prob, s.avg_logprob, s.compression_ratio):
-                continue
-            raw = [
-                w
-                for w in s.words or ()
-                if w.word.strip() and (not latin_only or latin_word(w.word))
-            ]
-            text = "".join(w.word for w in raw).strip()  # Whisper's own spacing
-            if text:
-                words.extend(Word(w.word.strip(), float(w.start), float(w.end)) for w in raw)
-                kept.append(Segment(float(s.start), float(s.end), text))
-        detected = normalize_language(info.language) if info.language else "unknown"
-        return ChunkTranscript(
-            None if detected == "unknown" else detected, tuple(words), tuple(kept)
-        )
+        ]
+        timeout = CHUNK_CALL_TIMEOUT_S if timeout_s is None else timeout_s
+        result = _run_asr(args, timeout, f"local transcription of {audio.name}")
+        try:
+            body = json.loads(result.stdout)
+            chunk = _parse_verbose_json(body)
+            dropped = body.get("dropped") or {}
+            segments, words = int(dropped.get("segments", 0)), int(dropped.get("words", 0))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise BilledChunkError("local transcription output unusable") from None
+        logger.info("%s: guards dropped %d segment(s), %d word(s)", audio.name, segments, words)
+        return chunk
 
 
 # --------------------------------------------------------------------------- chunking
@@ -513,17 +507,18 @@ def _cache_path(
     language: str | None,
     fingerprint: tuple[int, int],
 ) -> Path:
-    key = json.dumps(
-        [
-            chunk.index,
-            chunk.offset,
-            chunk.duration,
-            backend.provider,
-            backend.model,
-            language,
-            *fingerprint,
-        ]
-    )
+    parts: list[Any] = [
+        chunk.index,
+        chunk.offset,
+        chunk.duration,
+        backend.provider,
+        backend.model,
+        language,
+        *fingerprint,
+    ]
+    if isinstance(backend, FasterWhisperTranscriber):  # Groq keys stay as they were
+        parts += [backend.compute_type, local_asr.GUARD_VERSION]
+    key = json.dumps(parts)
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
     return cache_dir / f"{chunk.index:04d}-{digest}.json"
 
@@ -634,15 +629,14 @@ def creator_language(job: Job, ctx: StageContext) -> str | None:
     return creator.language if creator else None
 
 
-@cache
-def _local_transcriber(model: str, compute_type: str) -> FasterWhisperTranscriber:
-    return FasterWhisperTranscriber(model=model, compute_type=compute_type)
-
-
 def default_transcriber(settings: Settings) -> Transcriber:
     """The configured backend; GROQ_API_KEY is needed only for `transcriber: groq`."""
     if settings.transcriber == "local":
-        return _local_transcriber(settings.whisper_model, settings.whisper_compute_type)
+        return FasterWhisperTranscriber(
+            model=settings.whisper_model,
+            compute_type=settings.whisper_compute_type,
+            cpu_threads=settings.whisper_cpu_threads,
+        )
     try:
         key = Secrets().require("GROQ_API_KEY")
     except MissingSecretError as exc:
@@ -670,6 +664,9 @@ def transcribe(
     if transcriber is None:
         transcriber = default_transcriber(settings_for(job, ctx.config))
     backend = transcriber
+    local = isinstance(backend, FasterWhisperTranscriber)
+    if local:
+        max_concurrency = 1  # one model in memory; it already uses whisper_cpu_threads
     language = creator_language(job, ctx)
     fingerprint = audio_fingerprint(audio)
     deadline = Deadline()
@@ -684,6 +681,8 @@ def transcribe(
     todo = [c for c in chunks if cached[c.index] is None]
     results: dict[int, ChunkTranscript] = {i: r for i, r in cached.items() if r is not None}
     if todo:
+        if local:  # outside the per-chunk timeouts, inside the stage budget
+            backend.ensure_model(deadline.timeout(MODEL_FETCH_TIMEOUT_S))
         _transcribe_chunks(
             job,
             ctx,

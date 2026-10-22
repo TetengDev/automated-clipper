@@ -380,46 +380,59 @@ def bench_transcribe(
         Path, typer.Argument(exists=True, dir_okay=False, readable=True, help="Audio file.")
     ],
     models: Annotated[
-        str, typer.Option(help="Comma-separated faster-whisper model names.")
+        str, typer.Option(help="Comma-separated local Whisper model names.")
     ] = "large-v3-turbo,large-v3",
     compute_type: Annotated[str, typer.Option(help="int8, int8_float16, float16, float32.")] = (
         "int8"
     ),
+    cpu_threads: Annotated[int, typer.Option(help="CPU threads per model run.")] = 4,
     language: Annotated[
         str | None, typer.Option(help="Language code (e.g. tl); default: auto-detect.")
     ] = None,
 ) -> None:
-    """Compare local Whisper models: real-time factor and a transcript preview each."""
+    """Compare local Whisper models: real-time factor and a transcript preview each.
+
+    Runs the pipeline's own child process (model load included), on the whole file."""
     import time
 
     from clipper.config import Settings
     from clipper.jobs import PermanentError
     from clipper.pipeline import transcribe as tr
-    from clipper.pipeline.common import MediaError
+    from clipper.pipeline.common import MediaError, strip_control
 
     try:
         settings = [
-            Settings(whisper_model=m.strip(), whisper_compute_type=compute_type)
+            Settings(
+                whisper_model=m.strip(),
+                whisper_compute_type=compute_type,
+                whisper_cpu_threads=cpu_threads,
+            )
             for m in models.split(",")
         ]
-    except ValidationError:
-        _fail(f"invalid model or compute type: {models!r} / {compute_type!r}")
+    except ValidationError as exc:
+        problems = "; ".join(e["msg"] for e in exc.errors())
+        _fail(f"invalid model, compute type or thread count: {problems}")
     if language is not None and not re.fullmatch(r"[a-z]{2,3}", language):
         _fail(f"invalid language code: {language!r}")
     try:
         duration = tr.probe_duration(audio)
+        if duration <= 0:
+            _fail(f"bench-transcribe: {audio.name} has no audio")
         for s in settings:
-            backend = tr.FasterWhisperTranscriber(
-                model=s.whisper_model, compute_type=s.whisper_compute_type
-            )
-            backend.load()  # download/load outside the timed run
+            backend = tr.default_transcriber(s)
+            assert isinstance(backend, tr.FasterWhisperTranscriber)
+            backend.ensure_model()  # a first-run download is not timed
             started = time.monotonic()
-            result = backend.transcribe(audio, language=language)
+            result = backend.transcribe(
+                audio.resolve(),
+                language=language,
+                timeout_s=max(tr.CHUNK_CALL_TIMEOUT_S, duration * 4),
+            )
             rtf = (time.monotonic() - started) / duration
-            text = " ".join(seg.text for seg in result.segments)
+            text = strip_control(" ".join(seg.text for seg in result.segments))
             typer.echo(f"{s.whisper_model}  rtf={rtf:.3f}  words={len(result.words)}")
             typer.echo(f"  {text[:300]}")
-    except (PermanentError, MediaError) as exc:
+    except (PermanentError, MediaError, tr.BilledChunkError) as exc:
         _fail(f"bench-transcribe: {exc}")
 
 

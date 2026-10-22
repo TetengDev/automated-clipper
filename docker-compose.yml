@@ -17,9 +17,10 @@ x-clipper: &clipper
   environment:
     CLIPPER_CONFIG: /app/config/creators.yaml
     CLIPPER_DB: /app/data/state.db
+    # Local Whisper models (pinned snapshots), downloaded once onto the data volume.
+    CLIPPER_MODELS_DIR: /app/data/models
   volumes:
     - ./config:/app/config:ro
-    # data/models holds the faster-whisper model cache (downloaded once, kept across restarts).
     - ./data:/app/data
     - ./output:/app/output
   user: "10001:10001"
@@ -57,6 +58,8 @@ services:
   worker:
     <<: [*clipper, *after-migrate]
     command: ["run-worker"]
+    # Local transcription runs one Whisper child at a time with whisper_cpu_threads
+    # (default 4) threads; keep that at or below this CPU quota.
     mem_limit: 8g
     cpus: 6
 

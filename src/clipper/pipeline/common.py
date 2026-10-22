@@ -262,7 +262,7 @@ def reserve_spend(
     cap can never fit -> `SkipJob`. A DB error while settling after a failure is logged,
     never raised over the original exception.
     """
-    if estimate_usd > cap_usd:
+    if estimate_usd > cap_usd:  # never for a free (local) run: 0 > cap is impossible
         raise SkipJob(f"{label} cost ${estimate_usd:.2f} exceeds the daily cap ${cap_usd:.2f}")
     start, end = _utc_day(now)
     with transaction(conn):
@@ -282,7 +282,7 @@ def reserve_spend(
                 (kind, start, end),
             ).fetchone()[0]
         )
-        if spent + estimate_usd > cap_usd:
+        if estimate_usd > 0 and spent + estimate_usd > cap_usd:  # free runs always proceed
             raise Deferred(
                 next_utc_midnight(now),
                 f"daily {label} budget reached (${spent:.2f} of ${cap_usd:.2f} spent,"

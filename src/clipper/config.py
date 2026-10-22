@@ -9,10 +9,11 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -28,10 +29,32 @@ MIN_SESSION_SECRET_LENGTH = 32
 # Letters/digits first; then letters, digits, space and a few punctuation marks. No path
 # separators, no leading dot/dash, no control characters.
 CREATOR_NAME_PATTERN = r"^\w[\w .'&()-]{0,99}$"
-# A faster-whisper model *name* (tiny, base.en, large-v3-turbo, distil-large-v3): no '/',
-# ':' or leading dot, so it can never be a local path or a URL / Hub repo id.
-WHISPER_MODEL_PATTERN = r"^[a-z0-9][a-z0-9.-]{0,39}$"
+# Local Whisper models: name -> (Hugging Face repo, pinned commit). Repos are the ones
+# faster-whisper 1.2.1 maps these names to (large-v3-turbo's moved from mobiuslabsgmbh to
+# dropbox-dash). Commits checked on the Hub API 2026-10-22. Only these names are accepted,
+# so a setting can never point at a local path, a URL or an unpinned repo.
+WHISPER_MODELS: dict[str, tuple[str, str]] = {
+    "tiny": ("Systran/faster-whisper-tiny", "d90ca5fe260221311c53c58e660288d3deb8d356"),
+    "base": ("Systran/faster-whisper-base", "ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66"),
+    "small": ("Systran/faster-whisper-small", "536b0662742c02347bc0e980a01041f333bce120"),
+    "medium": ("Systran/faster-whisper-medium", "08e178d48790749d25932bbc082711ddcfdfbc4f"),
+    "large-v3": ("Systran/faster-whisper-large-v3", "edaa852ec7e145841d8ffdb056a99866b5f0a478"),
+    "large-v3-turbo": (
+        "dropbox-dash/faster-whisper-large-v3-turbo",
+        "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+    ),
+}
 _RCLONE_REMOTE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*:\S*$")
+
+
+def _pinned_whisper_model(value: str) -> str:
+    if value not in WHISPER_MODELS:
+        raise ValueError(f"whisper_model must be one of: {', '.join(WHISPER_MODELS)}")
+    return value
+
+
+WhisperModelName = Annotated[str, AfterValidator(_pinned_whisper_model)]
+ComputeType = Literal["int8", "int8_float16", "float16", "float32"]
 
 
 class ConfigError(Exception):
@@ -64,8 +87,9 @@ class Settings(_Strict):
     media_retention_hours: int = Field(48, ge=1)
     review_expiry_days: int = Field(7, ge=1)
     transcriber: Literal["local", "groq"] = "local"
-    whisper_model: str = Field("large-v3-turbo", pattern=WHISPER_MODEL_PATTERN)
-    whisper_compute_type: Literal["int8", "int8_float16", "float16", "float32"] = "int8"
+    whisper_model: WhisperModelName = "large-v3-turbo"
+    whisper_compute_type: ComputeType = "int8"
+    whisper_cpu_threads: int = Field(4, ge=1, le=64)
 
     @model_validator(mode="after")
     def _clip_range(self) -> Settings:
@@ -85,7 +109,8 @@ class CreatorOverrides(_Strict):
     max_clips_per_stream: int | None = Field(None, ge=1)
     max_source_hours_per_day: float | None = Field(None, gt=0)
     transcriber: Literal["local", "groq"] | None = None
-    whisper_model: str | None = Field(None, pattern=WHISPER_MODEL_PATTERN)
+    whisper_model: WhisperModelName | None = None
+    whisper_compute_type: ComputeType | None = None
 
 
 class YouTubeChannel(_Strict):

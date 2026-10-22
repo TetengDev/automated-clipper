@@ -39,9 +39,7 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    CLIPPER_RENDER_DIR=/app/render \
-    HF_HOME=/tmp/huggingface \
-    HF_HUB_DISABLE_TELEMETRY=1
+    CLIPPER_RENDER_DIR=/app/render
 
 WORKDIR /app
 

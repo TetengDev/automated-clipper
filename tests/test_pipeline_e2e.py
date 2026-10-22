@@ -28,6 +28,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
+from asr_support import FakeWhisperModel, install_fake_asr, seg
 from clipper.config import AppConfig, Settings
 from clipper.db import connect, migrate
 from clipper.jobs import Job, JobStatus, Worker, enqueue, get_job
@@ -239,8 +240,8 @@ def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     c.close()
 
 
-def _worker(conn: sqlite3.Connection, media_root: Path) -> Worker:
-    config = AppConfig(settings=Settings(min_duration_seconds=10))
+def _worker(conn: sqlite3.Connection, media_root: Path, transcriber: str = "groq") -> Worker:
+    config = AppConfig(settings=Settings(min_duration_seconds=10, transcriber=transcriber))
     return Worker(
         conn=conn,
         config=config,
@@ -394,6 +395,41 @@ def test_job_walks_the_pipeline_to_clips_ready(
     assert _spend(conn) == [("transcribe", "groq", 1), ("llm", "anthropic", 1)]
     assert (len(yt.of("probe")), len(yt.of("audio")), len(yt.of("section"))) == (1, 1, 2)
     assert (groq.call_count, claude.requests) == (1, 1)
+
+
+def test_job_walks_the_pipeline_with_the_default_local_transcriber(
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    world: tuple[FakeYtdlpWorld, FakeAnthropic, Any],
+    fake_render: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    yt, claude, groq = world
+    monkeypatch.delenv("GROQ_API_KEY")
+    asr = install_fake_asr(monkeypatch, tmp_path / "models")  # wraps the fake yt-dlp runner
+    FakeWhisperModel.language = "en"
+    FakeWhisperModel.segments = [
+        seg(s["text"], s["start"], words=[(w["word"], w["start"], w["end"]) for w in words])
+        for s in _groq_body()["segments"]
+        if (words := [w for w in _groq_body()["words"] if s["start"] <= w["start"] < s["end"]])
+    ]
+    enqueue(conn, YT, T0, creator="manual")
+
+    statuses = _drain(_worker(conn, tmp_path / "media", transcriber="local"))
+
+    assert statuses[-1] is JobStatus.CLIPS_READY and _job(conn).last_error is None
+    transcript = json.loads((tmp_path / "media" / YT.key / "transcript.json").read_text())
+    assert set(transcript) == {"language", "duration_s", "model", "segments", "words"}
+    assert (transcript["language"], transcript["model"]) == ("en", "large-v3-turbo")
+    assert len(transcript["words"]) == VIDEO_S - 1
+    _assert_clips(conn, tmp_path / "media" / YT.key)
+    assert (len(asr.fetch_calls()), len(asr.chunk_calls()), groq.call_count) == (1, 1, 0)
+    rows = conn.execute("SELECT kind, provider, usd FROM spend ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("transcribe", "local", 0.0),
+        ("llm", "anthropic", rows[1][2]),
+    ]
+    assert claude.requests == 1 and yt.of("audio")
 
 
 def test_crashes_resume_without_redoing_completed_work(

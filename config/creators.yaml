@@ -15,6 +15,10 @@ settings:
   daily_llm_usd_cap: 10.0
   max_llm_windows: 8             # long sources: only the most engaging windows go to Claude
   daily_transcribe_usd_cap: 5.0
+  transcriber: local              # local (faster-whisper, free) | groq (needs GROQ_API_KEY)
+  whisper_model: large-v3-turbo   # pinned: tiny base small medium large-v3 large-v3-turbo
+  whisper_compute_type: int8
+  whisper_cpu_threads: 4          # per local ASR child; keep <= the worker CPU quota
   disk_budget_gb: 150
   media_retention_hours: 48
   review_expiry_days: 7

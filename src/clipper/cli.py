@@ -11,7 +11,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, NoReturn
 
 import typer
 from pydantic import ValidationError
@@ -27,8 +27,15 @@ from clipper.config import (
 )
 from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version, migrate
 from clipper.export import DEFAULT_OUTPUT_DIR
+from clipper.monitor import CycleReport, FirstRun, YouTubeMonitor
 from clipper.pipeline import build_stages
 from clipper.urls import InvalidSourceURL, parse_source_url
+
+if TYPE_CHECKING:
+    import httpx
+
+    from clipper.resolve import Resolved
+    from clipper.sources.youtube import MetadataProvider, YouTubeSource
 
 EXIT_NOT_IMPLEMENTED = 70  # EX_SOFTWARE; distinct from Click's usage-error code 2
 MANUAL_CREATOR = "manual"
@@ -75,6 +82,10 @@ def _not_implemented(issue: str) -> NoReturn:
 
 def _setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # httpx logs every request URL at INFO; URLs may carry credentials (signed media URLs,
+    # query-string keys), so only its warnings are kept.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 @app.command("check-config")
@@ -109,10 +120,97 @@ def migrate_cmd(ctx: typer.Context) -> None:
         typer.echo(f"schema up to date (version {version})")
 
 
+def _youtube_source(secrets: Secrets, http: httpx.Client, cancel: threading.Event) -> YouTubeSource:
+    """RSS gate plus `_youtube_provider`'s metadata; `cancel` kills a running yt-dlp child.
+    A seam for tests."""
+    from clipper.sources.youtube import YouTubeSource
+
+    return YouTubeSource(http, _youtube_provider(secrets, http, cancel))
+
+
+def _print_cycle(report: CycleReport) -> None:
+    from clipper.pipeline.common import strip_control
+
+    for poll in report.polls:
+        first = " (first poll)" if poll.first_run else ""
+        typer.echo(f"{poll.creator}: {poll.new} new{first}")
+        for job_id, video_id, title in poll.enqueued:
+            typer.echo(f"  enqueued job {job_id}: {video_id} {strip_control(title or '')}")
+    for name in report.unresolved:
+        typer.echo(f"{name}: no channel_id; run `clipper resolve`")
+    for error in report.errors:
+        item = f" {error['item']}" if "item" in error else ""
+        typer.echo(f"{error['creator']}{item}: error: {error['error']}", err=True)
+    typer.echo(
+        f"cycle done: {report.items_new} job(s) enqueued, {report.quota_units} quota unit(s),"
+        f" {len(report.errors)} error(s)"
+    )
+
+
 @app.command("run-monitor")
-def run_monitor() -> None:
-    """Poll creators 24/7 and enqueue new content."""
-    _not_implemented("CLP-24")
+def run_monitor(
+    ctx: typer.Context,
+    once: Annotated[bool, typer.Option(help="Run a single poll cycle, then exit.")] = False,
+    creator: Annotated[
+        list[str] | None,
+        typer.Option("--creator", help="Only poll this creator (repeatable)."),
+    ] = None,
+    first_run: Annotated[
+        FirstRun | None,
+        typer.Option(
+            "--first-run", help="Override first_run_mode for creators polled the first time."
+        ),
+    ] = None,
+) -> None:
+    """Poll creators 24/7 and enqueue new content.
+
+    SIGTERM/SIGINT finish the current creator's poll, then exit."""
+    from clipper.pipeline.ytdlp import YtDlpError
+
+    app_ctx = _app(ctx)
+    try:
+        cfg = load_config(app_ctx.config_path)
+        secrets = Secrets()
+    except ConfigError as exc:
+        _fail(str(exc))
+    except ValidationError as exc:
+        _fail(f"run-monitor: {exc}")
+    creators = list(cfg.creators)
+    if creator:
+        try:
+            creators = list({c.name: c for c in map(cfg.creator, creator)}.values())
+        except KeyError as exc:
+            _fail(f"unknown creator: {exc.args[0]}")
+    _setup_logging()
+    conn = _open_db(app_ctx.db_path)
+    stop_event = threading.Event()
+    try:
+        with _http_client() as http:
+            try:
+                source = _youtube_source(secrets, http, stop_event)
+            except YtDlpError as exc:
+                _fail(f"run-monitor: {exc}")
+            monitor = YouTubeMonitor(conn, cfg, source, first_run_mode=first_run, stop=stop_event)
+            if once:
+                report = monitor.run_cycle(creators)
+                _print_cycle(report)
+                if report.errors:
+                    raise typer.Exit(code=1)
+                return
+
+            def request_stop(*_: object) -> None:
+                stop_event.set()  # ends the sleep and kills a running yt-dlp child
+
+            previous = {
+                sig: signal.signal(sig, request_stop) for sig in (signal.SIGTERM, signal.SIGINT)
+            }
+            try:
+                monitor.run_forever(creators)
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
+    finally:
+        conn.close()
 
 
 def _open_db(db_path: Path) -> sqlite3.Connection:
@@ -439,10 +537,91 @@ def bench_transcribe(
         _fail(f"bench-transcribe: {exc}")
 
 
+def _http_client() -> httpx.Client:
+    import httpx
+
+    from clipper.sources.youtube import HTTP_TIMEOUT
+
+    return httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False)
+
+
+def _youtube_provider(
+    secrets: Secrets, http: httpx.Client, cancel: threading.Event | None = None
+) -> MetadataProvider:
+    """Data API with YOUTUBE_API_KEY, else keyless yt-dlp (honours the yt-dlp cookie and
+    proxy env). A seam for tests."""
+    from clipper.pipeline.ytdlp import YtDlp, run_command
+    from clipper.sources.youtube import metadata_provider
+
+    return metadata_provider(secrets, http, YtDlp.from_env(run_command, cancel=cancel))
+
+
+def _describe(result: Resolved) -> str:
+    head = f"{result.creator}: {result.platform} {result.handle}"
+    if result.error is not None:
+        return f"{head}: error: {result.error}"
+    if not result.changed:
+        return f"{head} -> {result.new} (unchanged)"
+    return f"{head} -> {result.new} ({f'was {result.old}' if result.old else 'new'})"
+
+
 @app.command("resolve")
-def resolve() -> None:
-    """Resolve creator handles to stable channel / user IDs."""
-    _not_implemented("CLP-22")
+def resolve(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show what would change; write nothing.")
+    ] = False,
+) -> None:
+    """Resolve creator handles to stable channel / user IDs (written into creators.yaml).
+
+    Twitch logins are resolved only when TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET are set.
+    Exits non-zero if any handle failed; the others are still written."""
+    from clipper.pipeline.ytdlp import YtDlpError
+    from clipper.resolve import resolve_twitch, resolve_youtube, write_ids
+
+    path = _app(ctx).config_path
+    try:
+        cfg = load_config(path)
+        secrets = Secrets()
+    except ConfigError as exc:
+        _fail(str(exc))
+    except ValidationError as exc:
+        _fail(f"resolve: {exc}")
+    twitch_creators = [c for c in cfg.creators if c.twitch is not None]
+    twitch_id, twitch_secret = (
+        s.get_secret_value() if s else ""
+        for s in (secrets.twitch_client_id, secrets.twitch_client_secret)
+    )
+    with _http_client() as http:
+        try:
+            provider = _youtube_provider(secrets, http)
+        except YtDlpError as exc:
+            _fail(f"resolve: {exc}")
+        results = resolve_youtube(cfg.creators, provider)
+        if twitch_creators and twitch_id and twitch_secret:
+            results += resolve_twitch(twitch_creators, http, twitch_id, twitch_secret)
+    for result in results:
+        typer.echo(_describe(result), err=result.error is not None)
+    if twitch_creators and not (twitch_id and twitch_secret):
+        typer.echo(
+            f"twitch: skipped {len(twitch_creators)} creator(s)"
+            " (set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET to resolve user IDs)"
+        )
+    if provider.quota.units:
+        typer.echo(f"YouTube API quota units used: {provider.quota.units}")
+    changed = sum(r.changed for r in results)
+    if dry_run:
+        typer.echo(f"dry run: {changed} id(s) would change; nothing written")
+    elif changed:
+        try:
+            written = write_ids(path, results)
+        except (ValueError, OSError) as exc:
+            _fail(f"resolve: {exc}")
+        typer.echo(f"wrote {written} id(s) to {path}")
+    else:
+        typer.echo("nothing to write")
+    if any(r.error is not None for r in results):
+        raise typer.Exit(code=1)
 
 
 @app.command("status")

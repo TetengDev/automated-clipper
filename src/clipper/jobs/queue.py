@@ -24,6 +24,7 @@ BACKOFF_BASE = timedelta(minutes=1)
 BACKOFF_CAP = timedelta(hours=1)
 MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 2000
+MAX_TITLE_CHARS = 500
 RETRYABLE = frozenset({JobStatus.FAILED, JobStatus.SKIPPED})
 
 
@@ -40,28 +41,46 @@ def enqueue(
     is_stream: bool = False,
 ) -> tuple[Job, bool]:
     """Insert a `detected` job unless (platform, item_id) exists. Returns (job, created)."""
-    stamp = to_iso(now)
     with transaction(conn):
-        cur = conn.execute(
-            "INSERT INTO jobs (platform, item_id, creator, source_url, is_stream, status,"
-            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT (platform, item_id) DO NOTHING",
-            (
-                ref.platform,
-                ref.item_id,
-                creator,
-                canonical_url(ref),
-                int(is_stream),
-                JobStatus.DETECTED.value,
-                stamp,
-                stamp,
-            ),
-        )
-        created = cur.rowcount == 1
+        created = insert_job(conn, ref, now, creator=creator, is_stream=is_stream) is not None
         row = conn.execute(
             "SELECT * FROM jobs WHERE platform = ? AND item_id = ?", (ref.platform, ref.item_id)
         ).fetchone()
     return Job.from_row(row), created
+
+
+def insert_job(
+    conn: sqlite3.Connection,
+    ref: SourceRef,
+    now: datetime,
+    *,
+    creator: str,
+    is_stream: bool = False,
+    title: str | None = None,
+    duration_seconds: int | None = None,
+) -> int | None:
+    """`enqueue` without its own transaction: the caller holds one (the monitor records
+    the item as seen in the same transaction). Returns the new job id, or None if
+    (platform, item_id) was already queued."""
+    stamp = to_iso(now)
+    cur = conn.execute(
+        "INSERT INTO jobs (platform, item_id, creator, source_url, title, duration_seconds,"
+        " is_stream, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT (platform, item_id) DO NOTHING",
+        (
+            ref.platform,
+            ref.item_id,
+            creator,
+            canonical_url(ref),
+            title[:MAX_TITLE_CHARS] if title else None,
+            duration_seconds,
+            int(is_stream),
+            JobStatus.DETECTED.value,
+            stamp,
+            stamp,
+        ),
+    )
+    return cur.lastrowid if cur.rowcount == 1 else None
 
 
 def get_job(conn: sqlite3.Connection, job_id: int) -> Job | None:

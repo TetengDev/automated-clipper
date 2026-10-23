@@ -76,7 +76,9 @@ class RunResult:
 class Runner(Protocol):
     """`runner(args, timeout_s)`: run `args` (no shell), capture output, raise
     `CommandTimeout` if it runs longer than `timeout_s`. `on_stderr_line`, when given, is
-    called with every stderr line as it arrives (used for unbounded ffmpeg logs)."""
+    called with every stderr line as it arrives (used for unbounded ffmpeg logs). `cancel`,
+    when given and set, kills the child and raises `CommandCancelled` (only `YtDlp` with a
+    `cancel` event passes it)."""
 
     def __call__(
         self,
@@ -85,11 +87,20 @@ class Runner(Protocol):
         *,
         on_stderr_line: Callable[[str], None] | None = None,
         env: Mapping[str, str] | None = None,
+        cancel: threading.Event | None = None,
     ) -> RunResult: ...
 
 
 class CommandTimeout(Exception):
     """A subprocess exceeded its timeout and was killed (retryable)."""
+
+
+class CommandCancelled(Exception):
+    """The caller asked to stop (shutdown); the subprocess was killed."""
+
+
+CANCEL_POLL_S = 0.2
+"""How often a cancellable wait checks its event: the shutdown latency it adds."""
 
 
 class YtDlpError(RuntimeError):
@@ -101,7 +112,14 @@ class DownloadBlocked(YtDlpError):
 
 
 class Unavailable(PermanentError):
-    """The video cannot be fetched by anyone without special access; do not retry."""
+    """The video cannot be fetched by anyone without special access; do not retry.
+
+    `reason` is the matched category ("private", "members-only", "removed or
+    unavailable", "age", "requested format not available")."""
+
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 _UNSAFE_ENV_PREFIXES = ("LD_", "DYLD_", "PYTHON")
@@ -216,10 +234,11 @@ def run_command(
     env: Mapping[str, str] | None = None,
     stdin_path: Path | None = None,
     cwd: Path | None = None,
+    cancel: threading.Event | None = None,
 ) -> RunResult:
     """Default `Runner`: argument list (no shell), stdin from `stdin_path` (else none),
-    allowlisted env (plus `env`), own process group (killed as a whole on timeout), bounded
-    stdout/stderr."""
+    allowlisted env (plus `env`), own process group (killed as a whole on timeout or when
+    `cancel` is set), bounded stdout/stderr."""
     extra = dict(env or {})
     unsafe = [k for k in extra if k in CHILD_ENV_ALLOWLIST or k.startswith(_UNSAFE_ENV_PREFIXES)]
     if unsafe:
@@ -243,16 +262,38 @@ def run_command(
     for pump in pumps:
         pump.start()
     try:
-        proc.wait(timeout=timeout_s)
+        _wait(proc, timeout_s, cancel)
     except subprocess.TimeoutExpired:
         _kill_group(proc)
         _finish_pumps(proc, pumps, (out, err))
         raise CommandTimeout(f"{Path(args[0]).name} timed out after {timeout_s:.0f}s") from None
+    except CommandCancelled:
+        _kill_group(proc)
+        _finish_pumps(proc, pumps, (out, err))
+        raise
     except BaseException:
         _kill_group(proc)
         raise
     _finish_pumps(proc, pumps, (out, err))
     return RunResult(proc.returncode, out.text(), err.text())
+
+
+def _wait(proc: subprocess.Popen[bytes], timeout_s: float, cancel: threading.Event | None) -> None:
+    """`proc.wait(timeout_s)`, raising CommandCancelled soon after `cancel` is set."""
+    if cancel is None:
+        proc.wait(timeout=timeout_s)
+        return
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if cancel.is_set():
+            raise CommandCancelled(f"{Path(str(proc.args[0])).name} cancelled")
+        remaining = deadline - time.monotonic()
+        try:
+            proc.wait(timeout=max(0.0, min(CANCEL_POLL_S, remaining)))
+            return
+        except subprocess.TimeoutExpired:
+            if remaining <= CANCEL_POLL_S:
+                raise
 
 
 # Order matters: "Sign in to confirm your age" is permanent, the bot check is not.
@@ -296,7 +337,7 @@ def classify_error(stderr: str, *, secrets: Sequence[str] = ()) -> Exception:
         return DownloadBlocked(f"blocked by platform (rate limited): {tail}")
     for pattern, reason in _PERMANENT:
         if pattern.search(stderr):
-            return Unavailable(f"video not downloadable ({reason}): {tail}")
+            return Unavailable(f"video not downloadable ({reason}): {tail}", reason)
     if _BLOCKED.search(stderr):
         return DownloadBlocked(f"blocked by platform (bot check / rate limit): {tail}")
     return YtDlpError(f"yt-dlp failed: {tail or 'no error output'}")
@@ -330,6 +371,8 @@ class YtDlp:
     download_timeout_s: float = DOWNLOAD_TIMEOUT_S
     cap_timeout: Callable[[float], float] = _no_cap
     """Shrinks each call's timeout to what is left of the stage budget (`Deadline.timeout`)."""
+    cancel: threading.Event | None = None
+    """When set, a running call is killed and raises CommandCancelled (monitor shutdown)."""
 
     def base_args(self) -> list[str]:
         args = [
@@ -353,7 +396,9 @@ class YtDlp:
         args = [*self.base_args(), *extra, "--", url]
         secrets = proxy_secrets(self.proxy)
         try:
-            result = self.runner(args, self.cap_timeout(timeout_s))
+            # Only pass `cancel` when there is one: runners need not accept it otherwise.
+            extra_kwargs = {"cancel": self.cancel} if self.cancel is not None else {}
+            result = self.runner(args, self.cap_timeout(timeout_s), **extra_kwargs)
         except CommandTimeout as exc:
             raise YtDlpError(str(exc)) from None
         if result.returncode != 0:
@@ -361,15 +406,28 @@ class YtDlp:
         return result
 
     def probe(self, url: str) -> dict[str, Any]:
-        """Metadata only (`--dump-single-json --skip-download`); nothing is downloaded."""
-        result = self._run(["--dump-single-json", "--skip-download"], url, self.probe_timeout_s)
-        try:
-            info = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            raise YtDlpError("yt-dlp returned invalid JSON") from None
-        if not isinstance(info, dict):
-            raise YtDlpError("yt-dlp returned unexpected JSON")
-        return info
+        """Metadata only (`--dump-single-json --skip-download`); nothing is downloaded.
+
+        Never with `--ignore-no-formats-error`: yt-dlp would then downgrade private,
+        members-only, age-gate and bot-check failures to a warning and exit 0, so they
+        could not be classified."""
+        extra = ["--dump-single-json", "--skip-download"]
+        return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
+
+    def listing(
+        self, url: str, playlist_items: str, *, extractor_args: str | None = None
+    ) -> dict[str, Any]:
+        """A channel or playlist page, flat (`--flat-playlist`): one request for the page,
+        none per video. `playlist_items` is yt-dlp's selector, e.g. "1:15", or "0" for the
+        page's own metadata (channel_id) without any entries. `extractor_args` must be a
+        fixed string chosen by the caller."""
+        extra = [
+            "--flat-playlist", "--playlist-items", playlist_items, "--dump-single-json",
+            "--ignore-no-formats-error",
+        ]  # fmt: skip
+        if extractor_args:
+            extra += ["--extractor-args", extractor_args]
+        return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
     @classmethod
     def from_env(
@@ -378,6 +436,7 @@ class YtDlp:
         env: Mapping[str, str] | None = None,
         *,
         cap_timeout: Callable[[float], float] = _no_cap,
+        cancel: threading.Event | None = None,
     ) -> YtDlp:
         """Optional CLIPPER_YTDLP_COOKIES (path to a cookies.txt) and CLIPPER_YTDLP_PROXY."""
         env = os.environ if env is None else env
@@ -386,7 +445,9 @@ class YtDlp:
         if cookies is not None and not cookies.is_file():
             raise YtDlpError(f"{COOKIES_ENV} points to a missing file")
         proxy = env.get(PROXY_ENV, "").strip() or None
-        return cls(runner=runner, cookies=cookies, proxy=proxy, cap_timeout=cap_timeout)
+        return cls(
+            runner=runner, cookies=cookies, proxy=proxy, cap_timeout=cap_timeout, cancel=cancel
+        )
 
     def download_audio(
         self, url: str, out_dir: Path, stem: str, *, info_json: Path | None = None
@@ -436,6 +497,16 @@ class YtDlp:
         ]
         self._run(extra, url, self.download_timeout_s if timeout_s is None else timeout_s)
         return _downloaded(out_dir, stem)
+
+
+def _json_object(stdout: str) -> dict[str, Any]:
+    try:
+        info = json.loads(stdout)
+    except json.JSONDecodeError:
+        raise YtDlpError("yt-dlp returned invalid JSON") from None
+    if not isinstance(info, dict):
+        raise YtDlpError("yt-dlp returned unexpected JSON")
+    return info
 
 
 def _template(out_dir: Path, stem: str) -> str:

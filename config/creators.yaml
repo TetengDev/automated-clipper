@@ -34,6 +34,7 @@ creators:
     content_type: challenge_stunt
     youtube:
       handle: "@MrBeast"
+      channel_id: UCX6OQ3DkcsbYNE6H8uQQuVA
 
   - name: IShowSpeed
     region: global
@@ -41,6 +42,7 @@ creators:
     content_type: streamer_reaction
     youtube:
       handle: "@IShowSpeed"
+      channel_id: UCWsDFcIhY2DBi3GB5uykGXA
 
   - name: Kai Cenat
     region: global
@@ -50,6 +52,7 @@ creators:
       login: kaicenat
     youtube:
       handle: "@KaiCenat"
+      channel_id: UCoEmptob-eEGKk18c2VplJg
 
   # --- Philippines ---
   - name: Raffy Tulfo in Action
@@ -59,6 +62,7 @@ creators:
     content_type: public_service
     youtube:
       handle: "@RaffyTulfoInAction"
+      channel_id: UCxhygwqQ1ZMoBGQM2yEcNug
 
   - name: Ivana Alawi
     region: ph
@@ -67,6 +71,7 @@ creators:
     content_type: vlog_lifestyle
     youtube:
       handle: "@IvanaAlawi"
+      channel_id: UCypeLkg3Ne5-LIyiB41b1GQ
 
   - name: Cong TV
     region: ph
@@ -74,4 +79,5 @@ creators:
     tags: [vlog, comedy]
     content_type: comedy
     youtube:
-      handle: "@CongTV"
+      handle: "@CongTheVlogger"
+      channel_id: UC73zqrs0Th_a9dFUivEmv2A

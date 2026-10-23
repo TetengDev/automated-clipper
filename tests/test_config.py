@@ -11,6 +11,7 @@ from clipper.config import (
     MissingSecretError,
     Secrets,
     Settings,
+    YouTubeChannel,
     load_config,
 )
 
@@ -381,3 +382,21 @@ def test_claude_code_oauth_token_is_a_secret(monkeypatch: pytest.MonkeyPatch) ->
     secrets = Secrets()
     assert secrets.require("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-secret-value"
     assert "sk-ant-oat01-secret-value" not in repr(secrets)
+
+
+@pytest.mark.parametrize(
+    ("handle", "channel_id"),
+    [
+        ("@MrBeast", "UCХ6OQ3DkcsbYNE6H8uQQuVA"),  # Cyrillic Ha instead of X
+        ("@MrBеast", None),  # Cyrillic e
+        ("@١٢٣", None),  # Arabic-Indic digits are \w too
+    ],
+)
+def test_youtube_ids_are_ascii_only(handle: str, channel_id: str | None) -> None:
+    with pytest.raises(ValidationError):
+        YouTubeChannel(handle=handle, channel_id=channel_id)
+
+
+def test_ascii_youtube_ids_are_accepted() -> None:
+    channel = YouTubeChannel(handle="@Cong.TV_ph-1", channel_id="UCX6OQ3DkcsbYNE6H8uQ-_VA")
+    assert channel.channel_id == "UCX6OQ3DkcsbYNE6H8uQ-_VA"

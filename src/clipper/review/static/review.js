@@ -5,6 +5,8 @@
 
   function typing(target) {
     var tag = target && target.tagName;
+    // A checkbox (the sensitive-clip confirm box) takes no text: shortcuts still apply.
+    if (tag === "INPUT" && target.type === "checkbox") return false;
     return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (target && target.isContentEditable);
   }
 
@@ -18,13 +20,6 @@
     var reason = document.getElementById("reason-tag");
     // Sensitive clips: approving needs the faces check box ticked (CLP-87).
     var confirm = document.getElementById("confirm-sensitive");
-    if (key === "a" && confirm && target === confirm) {
-      // `a` in the ticked box approves; in the unticked box it does nothing.
-      var ok = usable("approve-btn");
-      if (!ok || !confirm.checked) return false;
-      ok.click();
-      return true;
-    }
     if (key === "r" && reason && target === reason) {
       // `r` pressed again in the reason picker submits once a reason is chosen.
       var submit = usable("reject-btn");

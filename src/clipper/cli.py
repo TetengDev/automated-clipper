@@ -347,6 +347,10 @@ def run_review(
             f" (got {host!r}) or with CLIPPER_DEV=1"
         )
     try:
+        config = load_config(_app(ctx).config_path)  # content types for the faces check
+    except ConfigError as exc:
+        _fail(f"run-review: {exc}")
+    try:
         secrets = Secrets()
         application = create_app(
             password_hash=secrets.require("REVIEW_PASSWORD_HASH"),
@@ -356,6 +360,7 @@ def run_review(
             media_root=media_dir.resolve(),
             output_dir=output_dir.resolve(),
             rclone_remote=secrets.rclone_remote,
+            config=config,
         )
     except (MissingSecretError, ValidationError, ValueError) as exc:
         _fail(f"run-review: {exc}")

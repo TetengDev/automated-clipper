@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Annotated
 from urllib.parse import urlencode
@@ -27,6 +28,7 @@ from clipper.clips import (
     InvalidTransition,
     QueueFilter,
 )
+from clipper.config import always_sensitive
 from clipper.db import connect
 from clipper.export import export_clip, sweep_staging
 from clipper.review.app import flash, get_db, render, require_user
@@ -114,7 +116,10 @@ def queue(
     page: Annotated[int, Query(ge=1, le=10_000)] = 1,
 ) -> Response:
     flt = _parse_filter(status, creator, min_score, sort)
-    cards = clips.list_queue(conn, flt, page=page)
+    cards = [
+        replace(c, sensitive=_sensitive(request, c.creator, c.sensitive))
+        for c in clips.list_queue(conn, flt, page=page)
+    ]
     total = clips.count_queue(conn, flt)
     has_more = page * clips.PAGE_SIZE < total
     ctx = {
@@ -142,6 +147,19 @@ def queue(
     return render(request, "queue.html", ctx)
 
 
+def _sensitive(request: Request, creator: str, flagged: bool) -> bool:
+    """Whether a clip gets the faces check (CLP-87): its stored flag, or its creator's rule.
+    Clips stored before the rule (no backfill) are covered too; a creator missing from the
+    config counts as sensitive (fails closed)."""
+    if flagged:
+        return True
+    try:
+        found = request.app.state.config.creator(creator)
+    except KeyError:
+        found = None
+    return always_sensitive(found)
+
+
 def _with_status(flt: QueueFilter, status: ClipStatus | None) -> QueueFilter:
     return QueueFilter(status=status, creator=flt.creator, min_score=flt.min_score, sort=flt.sort)
 
@@ -164,6 +182,7 @@ def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn) -> R
         "clip.html",
         {
             "clip": clip,
+            "sensitive": _sensitive(request, clip.creator, clip.current.sensitive),
             "reviews": reviews,
             "last_export_error": last_export_error,
             "next_id": clips.neighbour_pending(conn, clip_id, older=True),
@@ -201,16 +220,25 @@ def approve_clip(
     """Commit the approval (+ audit row) and return; the export runs after the response.
     Approving an already-approved clip (the "Retry export" button) re-schedules the export.
     A sensitive clip is approved only with `confirm_sensitive=1` (CLP-87): the model cannot
-    see the video, so the reviewer confirms the faces check."""
+    see the video, so the reviewer confirms the faces check; the audit row records it."""
     clip = clips.get_clip(conn, clip_id)
     if clip is None:
         raise HTTPException(status_code=404, detail="clip not found")
-    if clip.status in REVIEWABLE and clip.current.sensitive and confirm_sensitive != "1":
+    if version is not None and version != clip.current_version:  # a stale page: reload first
+        current = f"{clip.status} (version {clip.current_version})"
+        return _action_error(request, f"Cannot approve: clip is {current}.", 409)
+    check = clip.status in REVIEWABLE and _sensitive(request, clip.creator, clip.current.sensitive)
+    if check and confirm_sensitive != "1":
         return _action_error(request, SENSITIVE_UNCONFIRMED, 422)
-    # Pin the version checked above, so a newer one cannot slip in unconfirmed.
-    expected = version if version is not None else clip.current_version
     try:
-        result = clips.approve(conn, clip_id, _now(request), expected_version=expected)
+        # Pinned to the version checked above, so a newer one cannot slip in unconfirmed.
+        result = clips.approve(
+            conn,
+            clip_id,
+            _now(request),
+            expected_version=clip.current_version,
+            payload={"confirmed_sensitive": True} if check else None,
+        )
     except LookupError:
         raise HTTPException(status_code=404, detail="clip not found") from None
     except InvalidTransition as exc:

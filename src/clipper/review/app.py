@@ -40,7 +40,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from clipper.config import MIN_SESSION_SECRET_LENGTH
+from clipper.config import MIN_SESSION_SECRET_LENGTH, AppConfig
 from clipper.db import connect
 from clipper.export import DEFAULT_OUTPUT_DIR, ExportLocks, Runner, run_subprocess
 from clipper.jobs.worker import DEFAULT_MEDIA_ROOT
@@ -416,6 +416,7 @@ def create_app(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     rclone_remote: str | None = None,
     export_runner: Runner = run_subprocess,
+    config: AppConfig | None = None,
 ) -> FastAPI:
     """Build the review app. All config is passed in so tests need no environment.
 
@@ -424,6 +425,8 @@ def create_app(
     exported under `output_dir`/ready (and copied to `rclone_remote` via `export_runner`).
     `clock` (monotonic seconds) drives the login throttle; `wall_clock` (epoch seconds)
     stamps and ages sessions. Routes render templates with the module-level `render`.
+    `config` gives each creator's content type for the faces check (CLP-87); without it
+    every creator is unknown, so every clip needs the check (fails closed).
     """
     if not _BCRYPT_HASH.match(password_hash):
         raise ValueError("REVIEW_PASSWORD_HASH must be a bcrypt hash ($2b$...)")
@@ -449,6 +452,7 @@ def create_app(
     app.state.rclone_remote = rclone_remote
     app.state.export_runner = export_runner
     app.state.export_locks = ExportLocks()
+    app.state.config = config or AppConfig()
     app.state.wall_clock = wall_clock
     app.state.login_throttle = throttle
     app.state.session_policy = policy

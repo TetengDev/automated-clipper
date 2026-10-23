@@ -200,6 +200,13 @@ def test_empty_state_reflects_filters(
     assert card_ids(html) == []
 
 
+def test_card_shows_the_rendered_duration(client: TestClient, env: Env) -> None:
+    """Jump cuts: a 45 s source range rendered to 38 s shows 38 s."""
+    env.clip(start_s=125.0, end_s=170.0, duration_s=38.0)
+    html = client.get("/queue").text
+    assert "· 38s ·" in html and "45s" not in html
+
+
 def test_sensitive_badge_only_on_sensitive_cards(client: TestClient, env: Env) -> None:
     job = env.job("Raffy Tulfo in Action", title="Case")
     flagged = env.clip(job, title="Flagged one", sensitive=True, created_at="2027-01-02T00:00:00Z")

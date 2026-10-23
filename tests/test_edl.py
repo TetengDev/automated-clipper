@@ -4,7 +4,16 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from clipper.edl import EDL, MAX_CROP_KEYS, dump_json_schema, export_json_schema, parse_edl
+from clipper.edl import (
+    EDL,
+    EDL_SCHEMA_VERSION,
+    MAX_CROP_KEYS,
+    MAX_CUTS,
+    MAX_SEGMENTS,
+    dump_json_schema,
+    export_json_schema,
+    parse_edl,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 SCHEMA_FILE = REPO / "render" / "schema" / "edl.schema.json"
@@ -53,7 +62,7 @@ def test_schema_shape() -> None:
 def test_defaults_and_props() -> None:
     edl = parse_edl({"source": {"path": "a.mp4", "in_s": 0, "out_s": 5}})
     assert edl.to_props() == {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": {"path": "a.mp4", "in_s": 0.0, "out_s": 5.0},
         "layout": "blurred_fill",
         "hook": None,
@@ -62,6 +71,8 @@ def test_defaults_and_props() -> None:
         "caption_style": "bold_pop",
         "progress_bar": True,
         "crop": None,
+        "segments": None,
+        "cuts": [],
     }
     json.dumps(edl.to_props())  # JSON-serializable
 
@@ -153,3 +164,109 @@ def test_crop_validation(layout: str, crop: list[dict] | None, message: str) -> 
 def test_crop_key_limit() -> None:
     assert MAX_CROP_KEYS == 2000
     parse_edl(_face_track([{"t_s": i / 100, "x_center": 0.5} for i in range(MAX_CROP_KEYS)]))
+
+
+# --- EDL v2: segments and cuts (CLP-73) ---------------------------------------------------
+
+F = 1 / 30
+
+
+def _v2(segments: list[tuple[float, float]], **kw: object) -> dict:
+    return {
+        "source": {"path": "a.mp4", "in_s": segments[0][0], "out_s": segments[-1][1]},
+        "segments": [{"in_s": a, "out_s": b} for a, b in segments],
+        **kw,
+    }
+
+
+def _cut(**kw: object) -> dict:
+    return {
+        "in_s": 2.0,
+        "out_s": 3.0,
+        "kind": "silence",
+        "confidence": 1.0,
+        "reason": "pause 1.20s -> 0.14s",
+        "applied": True,
+        **kw,
+    }
+
+
+def test_schema_version_is_2_and_v1_still_parses() -> None:
+    assert EDL_SCHEMA_VERSION == 2
+    v1 = parse_edl({"schema_version": 1, "source": {"path": "a.mp4", "in_s": 1.0, "out_s": 6.0}})
+    # A v1 EDL migrates to one segment: the whole range.
+    assert v1.schema_version == 1 and v1.segments is None
+    assert v1.spans == ((1.0, 6.0),)
+    assert (v1.duration_s, v1.duration_in_frames) == (5.0, 150)
+
+
+def test_v1_cannot_carry_segments_or_cuts() -> None:
+    with pytest.raises(ValidationError, match="schema_version 2"):
+        parse_edl({**_v2([(0.0, 2.0), (3.0, 5.0)]), "schema_version": 1})
+    with pytest.raises(ValidationError, match="schema_version 2"):
+        parse_edl(
+            {"schema_version": 1, "source": {"path": "a.mp4", "in_s": 0, "out_s": 5},
+             "cuts": [_cut()]}
+        )  # fmt: skip
+
+
+def test_segments_set_the_duration() -> None:
+    edl = parse_edl(_v2([(1.0, 3.0), (130 * F, 6.0)], cuts=[_cut(in_s=3.0, out_s=130 * F)]))
+    assert edl.spans == ((1.0, 3.0), (130 * F, 6.0))
+    assert edl.duration_s == pytest.approx(2.0 + 5 / 3)
+    assert edl.duration_in_frames == 60 + 50
+    assert edl.cuts[0].kind == "silence" and edl.cuts[0].applied is True
+
+
+def test_hook_is_checked_against_the_cut_duration() -> None:
+    with pytest.raises(ValidationError, match="hook.duration_s"):
+        parse_edl(_v2([(0.0, 0.5), (5.0, 6.0)], hook={"text": "x", "duration_s": 2.0}))
+
+
+@pytest.mark.parametrize(
+    ("segments", "message"),
+    [
+        ([(0.0, 2.0), (1.5, 4.0)], "sorted and must not overlap"),
+        ([(2.0, 4.0), (0.0, 1.0)], "sorted and must not overlap"),
+        ([(0.0, 2.0), (3.0, 3.2)], "at least 0.3"),
+        ([(0.0, 2.0), (3.01, 4.0)], "frame grid"),
+        ([(0.0, 0.4), (1.0, 1.4)], "between 1 and 180"),
+    ],
+)
+def test_segment_rules(segments: list[tuple[float, float]], message: str) -> None:
+    data = _v2(segments)
+    data["source"]["in_s"] = min(seg[0] for seg in segments)
+    data["source"]["out_s"] = max(seg[1] for seg in segments)
+    with pytest.raises(ValidationError, match=message):
+        parse_edl(data)
+
+
+def test_segments_must_span_the_source() -> None:
+    data = _v2([(0.0, 2.0), (3.0, 5.0)])
+    data["source"]["out_s"] = 6.0
+    with pytest.raises(ValidationError, match="span source"):
+        parse_edl(data)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"kind": "laugh"},
+        {"confidence": 1.5},
+        {"confidence": -0.1},
+        {"reason": "x" * 201},
+        {"reason": " "},
+        {"in_s": 3.0, "out_s": 2.0},
+        {"applied": 1},
+        {"extra": True},
+    ],
+)
+def test_cut_rules(bad: dict) -> None:
+    with pytest.raises(ValidationError):
+        parse_edl(_v2([(0.0, 2.0), (3.0, 5.0)], cuts=[_cut(**bad)]))
+
+
+def test_segment_and_cut_limits() -> None:
+    assert (MAX_SEGMENTS, MAX_CUTS) == (600, 1000)
+    with pytest.raises(ValidationError):
+        parse_edl(_v2([(0.0, 5.0)], cuts=[_cut()] * (MAX_CUTS + 1)))

@@ -32,6 +32,63 @@
       "title": "CropKey",
       "type": "object"
     },
+    "Cut": {
+      "additionalProperties": false,
+      "description": "A range cut out of the clip (`applied`) or only proposed, seconds in the source.",
+      "properties": {
+        "applied": {
+          "title": "Applied",
+          "type": "boolean"
+        },
+        "confidence": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "in_s": {
+          "minimum": 0,
+          "title": "In S",
+          "type": "number"
+        },
+        "kind": {
+          "$ref": "#/$defs/CutKind"
+        },
+        "out_s": {
+          "exclusiveMinimum": 0,
+          "title": "Out S",
+          "type": "number"
+        },
+        "reason": {
+          "maxLength": 200,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "in_s",
+        "out_s",
+        "kind",
+        "confidence",
+        "reason",
+        "applied"
+      ],
+      "title": "Cut",
+      "type": "object"
+    },
+    "CutKind": {
+      "enum": [
+        "silence",
+        "stutter",
+        "retake",
+        "false_start",
+        "filler"
+      ],
+      "title": "CutKind",
+      "type": "string"
+    },
     "Hook": {
       "additionalProperties": false,
       "properties": {
@@ -78,6 +135,28 @@
       ],
       "title": "Layout",
       "type": "string"
+    },
+    "Segment": {
+      "additionalProperties": false,
+      "description": "A kept range of the clip, seconds in the source.",
+      "properties": {
+        "in_s": {
+          "minimum": 0,
+          "title": "In S",
+          "type": "number"
+        },
+        "out_s": {
+          "exclusiveMinimum": 0,
+          "title": "Out S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "in_s",
+        "out_s"
+      ],
+      "title": "Segment",
+      "type": "object"
     },
     "SourceSegment": {
       "additionalProperties": false,
@@ -172,6 +251,15 @@
       "default": null,
       "title": "Crop"
     },
+    "cuts": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Cut"
+      },
+      "maxItems": 1000,
+      "title": "Cuts",
+      "type": "array"
+    },
     "hook": {
       "anyOf": [
         {
@@ -193,10 +281,30 @@
       "type": "boolean"
     },
     "schema_version": {
-      "const": 1,
-      "default": 1,
+      "default": 2,
+      "enum": [
+        1,
+        2
+      ],
       "title": "Schema Version",
       "type": "integer"
+    },
+    "segments": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/Segment"
+          },
+          "maxItems": 600,
+          "minItems": 1,
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Segments"
     },
     "source": {
       "$ref": "#/$defs/SourceSegment"

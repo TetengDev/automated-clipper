@@ -164,10 +164,12 @@ def cached_child[T](
     fallback: str,
     timeout_s: float,
     runner: Runner | None = None,
+    read: Callable[[Any], Any] = lambda out: json.loads(out.stdout),
 ) -> T | None:
-    """`parse` of the JSON a hardened child (`args`) prints about `section`, cached as
-    `<section>.<field>.json` keyed by the file's size and mtime; None with a warning on any
-    failure (failures are not cached, so a later run tries again)."""
+    """`parse` of the JSON a hardened child (`args`) prints about `section` (or of what
+    `read` makes of its run result), cached as `<section>.<field>.json` keyed by the
+    file's size and mtime; None with a warning on any failure (failures are not cached,
+    so a later run tries again)."""
     cache = section.with_name(f"{section.name}.{field}.json")
     with suppress(OSError, ValueError, TypeError, KeyError, RecursionError):
         key = _key(section)
@@ -177,7 +179,7 @@ def cached_child[T](
     try:
         key = _key(section)
         out = run_media(args, deadline.timeout(timeout_s), what, runner=runner, env=CHILD_ENV)
-        data = json.loads(out.stdout)
+        data = read(out)
         result = parse(data)
         unchanged = _key(section) == key  # not replaced while it was being read
     except Exception as exc:

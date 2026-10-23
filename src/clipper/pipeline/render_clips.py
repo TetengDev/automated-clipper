@@ -9,9 +9,13 @@ and the transcript words that overlap the clip, shifted into the section's timel
 score, reason, and the prompt and playbook versions it was selected with. Before the EDL
 is final, dead air is trimmed and the clip edges are snapped to scene cuts (CLP-68,
 `clipper.pipeline.boundaries`); a failed or skipped scene detection (sections over
-MAX_DETECT_PIXELS) leaves only the trim. Then, unless the creator's `reframe` is
-blurred_fill, faces are detected on the section and a clip with faces in most frames gets a
-face-tracked 9:16 crop that jumps at the same scene cuts (CLP-58, `clipper.pipeline.reframe`);
+MAX_DETECT_PIXELS) leaves only the trim. Then, unless the
+creator's `jump_cuts` is off, silences (and in `full` stutters and fillers) inside the
+clip are cut and the EDL gets v2 segments plus the cut records (CLP-73,
+`clipper.pipeline.jumpcuts`); a failed silencedetect makes no silence cuts. Then, unless
+the creator's `reframe` is blurred_fill, faces are detected on the section and a clip with
+faces in most frames gets a face-tracked 9:16 crop that jumps at the same scene cuts
+(CLP-58, `clipper.pipeline.reframe`), on the output timeline (a jump at each join too);
 any failure keeps the blurred fill.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
@@ -39,7 +43,8 @@ from pathlib import Path
 from typing import Any
 
 from clipper.clips_repo import ClipMeta, insert_pending_clip
-from clipper.edl import EDL, MAX_CLIP_SECONDS, parse_edl
+from clipper.config import JumpCuts
+from clipper.edl import EDL, FPS, MAX_CLIP_SECONDS, frames, parse_edl
 from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
 from clipper.pipeline.boundaries import DETECT_TIMEOUT_S, detect_cuts, polish
@@ -50,6 +55,13 @@ from clipper.pipeline.common import (
     read_json,
     settings_for,
     strip_control,
+)
+from clipper.pipeline.jumpcuts import (
+    SILENCE_TIMEOUT_S,
+    crop_on_output,
+    cut_clip,
+    detect_silences,
+    plan_cuts,
 )
 from clipper.pipeline.reframe import (
     FACE_TIMEOUT_S,
@@ -74,13 +86,14 @@ MAX_WORD_CHARS = 64
 """EDL limit for one caption word."""
 CLIP_WORST_CASE_S = (
     DETECT_TIMEOUT_S
+    + SILENCE_TIMEOUT_S
     + MODEL_TIMEOUT_S
     + FACE_TIMEOUT_S
     + DEFAULT_RENDER_TIMEOUT_S
     + 4 * DEFAULT_FFMPEG_TIMEOUT_S
 )
-"""Scene detection, the face model fetch, face detection, Remotion and the four ffmpeg steps
-of `render_clip`, each at its timeout."""
+"""Scene detection, silencedetect, the face model fetch, face detection, Remotion and the
+four ffmpeg steps of `render_clip`, each at its timeout."""
 assert CLIP_WORST_CASE_S < STAGE_BUDGET_S / 2, "a stage run must fit at least two clips"
 MAX_REASON_CHARS = 300
 _VERSION = re.compile(r"^[\w.-]{1,64}$")
@@ -218,6 +231,36 @@ def _polish(
     return round(a, 3), math.floor(round(b * 1000, 6)) / 1000
 
 
+def _rejected(edl: EDL, what: str, fallback: str, exc: ValueError, *, trace: bool = False) -> EDL:
+    """`edl` unchanged, with a warning that the EDL with `what` was invalid (with the
+    traceback if `trace`, so a logic bug cannot hide behind the fallback)."""
+    reason = redact(strip_control(str(exc).splitlines()[0]))[:MAX_REASON_CHARS]
+    logger.warning(
+        "clip source %s: %s rejected, %s: %s", edl.source.path, what, fallback, reason,
+        exc_info=trace,
+    )  # fmt: skip
+    return edl
+
+
+def _jump_cut(edl: EDL, mode: JumpCuts, min_s: float, media_dir: Path, deadline: Deadline) -> EDL:
+    """The EDL with the jump cuts of `mode` (v2 segments and cut records), never shorter
+    than `min_s` through them; as is when nothing is cut or anything is invalid."""
+    silences = detect_silences(resolve_source(edl, media_dir), deadline) or []
+    try:
+        cuts = plan_cuts(edl.words, silences, mode)
+        if not cuts:
+            return edl
+        cuts, segments = cut_clip((edl.source.in_s, edl.source.out_s), cuts, min_s)
+        props = {**edl.to_props(), "cuts": [c.model_dump(mode="json") for c in cuts]}
+        if len(segments) > 1:
+            source = {**props["source"], "in_s": segments[0][0], "out_s": segments[-1][1]}
+            props["source"] = source
+            props["segments"] = [{"in_s": a, "out_s": b} for a, b in segments]
+        return parse_edl(props)
+    except ValueError as exc:  # pydantic's ValidationError too
+        return _rejected(edl, "jump cuts", "no cuts", exc, trace=True)
+
+
 def _reframe(edl: EDL, cuts: list[float], media_dir: Path, deadline: Deadline) -> EDL:
     """The EDL with a face-tracked crop when faces are found; else (or on any failure) as is."""
     model = ensure_model(timeout_s=deadline.timeout(MODEL_TIMEOUT_S))
@@ -227,15 +270,13 @@ def _reframe(edl: EDL, cuts: list[float], media_dir: Path, deadline: Deadline) -
     layout, crop = plan_reframe(faces, cuts, edl.source.in_s, edl.source.out_s)
     if crop is None:
         return edl
+    if edl.segments is not None:  # keys from the span's first frame, as plan_reframe has them
+        crop = crop_on_output(crop, edl.spans, frames(edl.source.in_s) / FPS)
     keys = [{"t_s": t, "x_center": x} for t, x in crop]
     try:
         return parse_edl({**edl.to_props(), "layout": layout.value, "crop": keys})
     except ValueError as exc:  # pydantic's ValidationError
-        reason = redact(strip_control(str(exc).splitlines()[0]))[:MAX_REASON_CHARS]
-        logger.warning(
-            "clip source %s: face track rejected, blurred fill: %s", edl.source.path, reason
-        )
-        return edl
+        return _rejected(edl, "face track", "blurred fill", exc)
 
 
 def _done(conn: sqlite3.Connection, job_id: int) -> set[int]:
@@ -271,6 +312,11 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             except PermanentError as exc:  # e.g. rounding nudged it past an EDL limit
                 reason = redact(strip_control(str(exc)))[:MAX_REASON_CHARS]
                 logger.warning("%s; rendering the requested range", reason)
+            if settings.jump_cuts != "off":
+                shift = start - edl.source.in_s  # source time = section time + shift
+                edl = _jump_cut(edl, settings.jump_cuts, limits[0], ctx.media_dir, deadline)
+                start = round(edl.source.in_s + shift, 3)
+                end = round(edl.source.out_s + shift, 3)
             if settings.reframe == "auto" and _detectable(section):
                 edl = _reframe(edl, cuts, ctx.media_dir, deadline)
             result = render_clip(

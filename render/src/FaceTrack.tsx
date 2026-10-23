@@ -6,14 +6,16 @@ import { AbsoluteFill, OffthreadVideo, useCurrentFrame, useVideoConfig } from "r
 import { cropXAt } from "./crop";
 import type { CropKey } from "./types";
 
-export const FaceTrack: React.FC<{ src: string; trimBefore: number; crop: CropKey[] }> = ({
-  src,
-  trimBefore,
-  crop,
-}) => {
+export const FaceTrack: React.FC<{
+  src: string;
+  trimBefore: number;
+  crop: CropKey[];
+  /** Output frame this segment starts at: the crop keys are on the output timeline. */
+  from?: number;
+}> = ({ src, trimBefore, crop, from = 0 }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
-  const x = cropXAt(crop, frame / fps);
+  const x = cropXAt(crop, (frame + from) / fps);
   return (
     <AbsoluteFill style={{ backgroundColor: "#000", overflow: "hidden" }}>
       <OffthreadVideo

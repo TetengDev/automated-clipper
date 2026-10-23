@@ -79,7 +79,7 @@ logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-5-5"
 PROMPT_VERSION = "select_v2"
-PLAYBOOK_VERSION = "playbook_v4"
+PLAYBOOK_VERSION = "playbook_v5"
 """Bump when select_v2.md or any file in prompts/playbook/ changes: it is part of the window
 cache key (a test pins the text hash per version)."""
 PROVIDER = "anthropic"

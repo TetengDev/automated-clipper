@@ -30,8 +30,8 @@ hardship (debt, family conflict, a medical or legal problem).
 - Protected people are a victim in any abuse, sexual (including rape), family or child
   case, and any minor. "Family" includes spouses, partners and unpaid support
   (sustento). Never choose a moment in which anyone, at any point, says something that
-  identifies them: the subtitles show every spoken word, so a role in the hook does not
-  hide it. That covers anything that, alone or together, tends to identify them: their
+  identifies them or shows their face: the subtitles show every spoken word, so a role in
+  the hook does not hide it. That covers anything that, alone or together, tends to identify them: their
   name or nickname; the name of a parent, spouse, partner or relative; the name of the
   respondent in an abuse, sexual, family/support or child case; their school,
   workplace, employer, barangay, town, address, phone or plate number; or a relationship

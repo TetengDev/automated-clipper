@@ -119,6 +119,9 @@ class FakeSource:
                 result.errors[vid] = answer
                 result.blocked.add(vid)
                 break
+            elif isinstance(answer, str) and answer.startswith("format"):
+                result.errors[vid] = answer
+                result.format_errors.add(vid)
             elif isinstance(answer, str):
                 result.errors[vid] = answer
             else:
@@ -491,6 +494,55 @@ def test_bot_check_is_retried_every_poll_and_never_gives_up(conn, cfg, source, c
     assert report.errors == [
         {"creator": "MrBeast", "item": V1, "error": "blocked by platform (bot check)"}
     ]
+
+
+def test_format_errors_are_retried_every_poll_and_never_given_up(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.meta[V1] = "format: Requested format is not available"
+    monitor = make(conn, cfg, source, clock)
+
+    for _ in range(MAX_METADATA_ATTEMPTS * 3):
+        report = monitor.run_cycle([cfg.creator("MrBeast")])
+        clock.now += timedelta(minutes=10)
+
+    assert calls_for(source, V1) == MAX_METADATA_ATTEMPTS * 3
+    assert V1 not in seen(conn) and monitor.failures == {}
+    assert report.errors == [
+        {"creator": "MrBeast", "item": V1, "error": "format: Requested format is not available"}
+    ]
+
+
+def test_upload_probed_during_a_player_breakage_is_still_enqueued(conn, cfg, source, clock) -> None:
+    from clipper.pipeline.ytdlp import RunResult, YtDlp
+
+    format_error = "ERROR: [youtube] x: Requested format is not available. Use --list-formats"
+    body = {"id": V1, "title": "Big video", "duration": 1500, "timestamp": T0.timestamp()}
+    body["formats"] = [{"format_id": "sb0", "ext": "mhtml", "url": "https://i.ytimg.com/sb"}]
+    fixed = False  # the breakage lasts 8 h: the re-probe fails too until then
+
+    def ytdlp(args, timeout_s):
+        if "--ignore-no-formats-error" not in args:
+            return RunResult(1, "", format_error)
+        if not fixed:
+            return RunResult(1, "", "ERROR: unable to download: Connection reset by peer")
+        return RunResult(0, json.dumps(body), "")
+
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.videos = YtDlpProvider(YtDlp(runner=ytdlp)).videos  # type: ignore[method-assign]
+    monitor = make(conn, cfg, source, clock)
+
+    for _ in range(8 * 6):
+        monitor.run_cycle([cfg.creator("MrBeast")])
+        clock.now += timedelta(minutes=10)
+    assert V1 not in seen(conn)
+
+    fixed = True
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert seen(conn) == {"zzzzzzzzzzz": "baseline", V1: "enqueued"}
+    assert report.items_new == 1
 
 
 def test_interrupted_emit_first_poll_keeps_its_lookback_after_restart(

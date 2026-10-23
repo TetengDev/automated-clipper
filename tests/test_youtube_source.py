@@ -277,16 +277,18 @@ def test_ytdlp_provider_stops_between_videos_when_asked() -> None:
 
 def test_ytdlp_provider_lists_channel_videos_tab_as_fallback() -> None:
     url = f"https://www.youtube.com/channel/{CHANNEL}/videos"
-    runner = FakeRunner(
-        {url: ok_json({"channel_id": CHANNEL, "entries": [{"id": V1}, {"id": "bad"}, {"id": V2}]})}
-    )
+    entries = [{"id": V1, "timestamp": 1792281600}, {"id": "bad"}, {"id": V2, "timestamp": True}]
+    runner = FakeRunner({url: ok_json({"channel_id": CHANNEL, "entries": entries})})
 
     uploads = YtDlpProvider(YtDlp(runner=runner)).uploads(CHANNEL)
 
-    assert uploads == [Upload(V1), Upload(V2)]
+    assert uploads == [Upload(V1, datetime(2026, 10, 17, tzinfo=UTC)), Upload(V2)]
     args = runner.calls[0]
     assert "--flat-playlist" in args
     assert args[args.index("--playlist-items") + 1] == f"1:{yt.FALLBACK_ITEMS}"
+    # "N weeks ago" -> a date never earlier than the real one, so the first-run lookback
+    # filter cannot drop a recent upload on it.
+    assert args[args.index("--extractor-args") + 1] == "youtubetab:approximate_date"
     assert args[-2:] == ["--", url]
 
 

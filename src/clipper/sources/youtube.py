@@ -34,7 +34,13 @@ from defusedxml.ElementTree import fromstring
 
 from clipper.config import Secrets
 from clipper.jobs.stages import PermanentError
-from clipper.pipeline.ytdlp import DownloadBlocked, Unavailable, YtDlp, YtDlpError
+from clipper.pipeline.ytdlp import (
+    CommandCancelled,
+    DownloadBlocked,
+    Unavailable,
+    YtDlp,
+    YtDlpError,
+)
 from clipper.redact import redact
 from clipper.urls import InvalidSourceURL, SourceRef, canonical_url
 
@@ -48,7 +54,8 @@ FALLBACK_ITEMS = 15
 FEED_MAX_BYTES = 2 * 1024 * 1024
 API_MAX_BYTES = 4 * 1024 * 1024
 """50 videos with full snippets stay well under 1 MiB."""
-HTTP_TIMEOUT = httpx.Timeout(20.0)
+HTTP_TIMEOUT = httpx.Timeout(8.0, connect=5.0)
+"""Short, so a request in flight cannot hold up shutdown for long (SIGTERM: 10 s)."""
 _HTTPX_ERRORS = (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, httpx.CookieConflict)
 """Everything httpx raises for a request; InvalidURL and StreamError are not HTTPErrors."""
 CHANNEL_ID = re.compile(r"UC[A-Za-z0-9_-]{22}")
@@ -273,6 +280,8 @@ class YtDlpProvider:
             url = canonical_url(SourceRef("youtube", video_id))
             try:
                 info = self.ytdlp.probe(url, ignore_no_formats=True)
+            except CommandCancelled:
+                break  # shutting down; this one and the rest wait for the next start
             except Unavailable as exc:
                 if exc.reason in GONE_REASONS:
                     logger.warning("%s: unavailable, not retried: %s", video_id, exc)
@@ -319,7 +328,7 @@ class YtDlpProvider:
             info = self.ytdlp.listing(
                 url, f"1:{FALLBACK_ITEMS}", extractor_args="youtubetab:approximate_date"
             )
-        except (YtDlpError, PermanentError) as exc:
+        except (YtDlpError, PermanentError, CommandCancelled) as exc:
             raise SourceError(f"yt-dlp listing failed: {exc}") from None
         entries = info.get("entries")
         rows = entries if isinstance(entries, list) else []

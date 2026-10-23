@@ -120,11 +120,12 @@ def migrate_cmd(ctx: typer.Context) -> None:
         typer.echo(f"schema up to date (version {version})")
 
 
-def _youtube_source(secrets: Secrets, http: httpx.Client) -> YouTubeSource:
-    """RSS gate plus `_youtube_provider`'s metadata. A seam for tests."""
+def _youtube_source(secrets: Secrets, http: httpx.Client, cancel: threading.Event) -> YouTubeSource:
+    """RSS gate plus `_youtube_provider`'s metadata; `cancel` kills a running yt-dlp child.
+    A seam for tests."""
     from clipper.sources.youtube import YouTubeSource
 
-    return YouTubeSource(http, _youtube_provider(secrets, http))
+    return YouTubeSource(http, _youtube_provider(secrets, http, cancel))
 
 
 def _print_cycle(report: CycleReport) -> None:
@@ -182,13 +183,14 @@ def run_monitor(
             _fail(f"unknown creator: {exc.args[0]}")
     _setup_logging()
     conn = _open_db(app_ctx.db_path)
+    stop_event = threading.Event()
     try:
         with _http_client() as http:
             try:
-                source = _youtube_source(secrets, http)
+                source = _youtube_source(secrets, http, stop_event)
             except YtDlpError as exc:
                 _fail(f"run-monitor: {exc}")
-            monitor = YouTubeMonitor(conn, cfg, source, first_run_mode=first_run)
+            monitor = YouTubeMonitor(conn, cfg, source, first_run_mode=first_run, stop=stop_event)
             if once:
                 report = monitor.run_cycle(creators)
                 _print_cycle(report)
@@ -196,10 +198,12 @@ def run_monitor(
                     raise typer.Exit(code=1)
                 return
 
-            def stop(*_: object) -> None:
-                monitor.stop.set()
+            def request_stop(*_: object) -> None:
+                stop_event.set()  # ends the sleep and kills a running yt-dlp child
 
-            previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+            previous = {
+                sig: signal.signal(sig, request_stop) for sig in (signal.SIGTERM, signal.SIGINT)
+            }
             try:
                 monitor.run_forever(creators)
             finally:
@@ -541,13 +545,15 @@ def _http_client() -> httpx.Client:
     return httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False)
 
 
-def _youtube_provider(secrets: Secrets, http: httpx.Client) -> MetadataProvider:
+def _youtube_provider(
+    secrets: Secrets, http: httpx.Client, cancel: threading.Event | None = None
+) -> MetadataProvider:
     """Data API with YOUTUBE_API_KEY, else keyless yt-dlp (honours the yt-dlp cookie and
     proxy env). A seam for tests."""
     from clipper.pipeline.ytdlp import YtDlp, run_command
     from clipper.sources.youtube import metadata_provider
 
-    return metadata_provider(secrets, http, YtDlp.from_env(run_command))
+    return metadata_provider(secrets, http, YtDlp.from_env(run_command, cancel=cancel))
 
 
 def _describe(result: Resolved) -> str:

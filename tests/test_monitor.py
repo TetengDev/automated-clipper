@@ -778,7 +778,9 @@ def test_stop_kills_an_in_flight_probe_and_the_monitor_exits_quickly(
     def slow_ytdlp(args, timeout_s, **kwargs):  # a yt-dlp probe that hangs
         return run_command([sys.executable, "-c", slow], timeout_s, **kwargs)
 
-    monitor = make(conn, cfg, source, clock, first_run_mode=FirstRun.EMIT)
+    # The monitor runs in its own thread; it gets its own connection to the same DB.
+    thread_conn = connect(tmp_path / "state.db", check_same_thread=False)
+    monitor = make(thread_conn, cfg, source, clock, first_run_mode=FirstRun.EMIT)
     provider = YtDlpProvider(YtDlp(runner=slow_ytdlp, cancel=monitor.stop))
     source.feeds[BEAST] = [Upload(V1, T0)]
     source.videos = provider.videos  # type: ignore[method-assign]
@@ -792,6 +794,7 @@ def test_stop_kills_an_in_flight_probe_and_the_monitor_exits_quickly(
     stopped_at = time.monotonic()
     monitor.stop.set()
     thread.join(10)
+    thread_conn.close()
 
     assert not thread.is_alive()
     assert time.monotonic() - stopped_at < 5

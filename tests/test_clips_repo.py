@@ -186,3 +186,60 @@ def test_new_version_keeps_the_sensitive_flag(conn: sqlite3.Connection, tmp_path
         (ref.clip_id, v2.version),
     ).fetchone()
     assert row[0] == 1
+
+
+# --- quality gates (CLP-74) -------------------------------------------------------------
+
+
+def _status_and_reasons(conn: sqlite3.Connection, clip_id: int) -> tuple[str, object]:
+    row = conn.execute(
+        "SELECT c.status, v.gate_reasons FROM clips c JOIN clip_versions v"
+        " ON v.clip_id = c.id AND v.version = c.current_version WHERE c.id = ?",
+        (clip_id,),
+    ).fetchone()
+    return row[0], None if row[1] is None else json.loads(row[1])
+
+
+@pytest.mark.parametrize(
+    ("reasons", "status"),
+    [
+        ((), "pending_review"),
+        (("gate_error",), "pending_review"),
+        (("loudness",), "needs_attention"),
+        (("word_crosses_join", "gate_error"), "needs_attention"),
+    ],
+)
+def test_gate_reasons_decide_the_first_status(
+    conn: sqlite3.Connection, tmp_path: Path, reasons: tuple[str, ...], status: str
+) -> None:
+    ref = insert_pending_clip(
+        conn,
+        job_id=1,
+        rank=1,
+        edl=parse_edl(EDL_DATA),
+        result=_result(tmp_path),
+        meta=ClipMeta(gate_reasons=reasons),
+    )
+    assert _status_and_reasons(conn, ref.clip_id) == (status, list(reasons))
+
+
+def test_ungated_version_stores_no_reasons(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    """A re-render is not gated yet: NULL, not an empty (passed) list."""
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path),
+        meta=ClipMeta(gate_reasons=("loudness",)),
+    )  # fmt: skip
+    add_clip_version(conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"))
+    assert _status_and_reasons(conn, ref.clip_id) == ("pending_review", None)
+
+
+def test_gate_reasons_reach_the_clip_detail(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    from clipper import clips
+
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=parse_edl(EDL_DATA), result=_result(tmp_path),
+        meta=ClipMeta(gate_reasons=("late_speech",)),
+    )  # fmt: skip
+    detail = clips.get_clip(conn, ref.clip_id)
+    assert detail is not None and detail.current.gate_reasons == ("late_speech",)

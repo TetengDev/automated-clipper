@@ -1,5 +1,6 @@
 """`clipper resolve` (CLP-22): handles -> stable IDs, written back into creators.yaml."""
 
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -68,10 +69,15 @@ class FakeProvider:
         raise AssertionError
 
 
+def unresolved_shipped() -> str:
+    """The shipped config as written by hand: handles only, no resolved IDs."""
+    return re.sub(r"(?m)^ +(channel_id|user_id): .*\n", "", SHIPPED_CONFIG.read_text())
+
+
 @pytest.fixture
 def shipped(tmp_path: Path) -> Path:
     path = tmp_path / "creators.yaml"
-    path.write_text(SHIPPED_CONFIG.read_text())
+    path.write_text(unresolved_shipped())
     return path
 
 
@@ -280,9 +286,11 @@ def test_cli_resolve_writes_then_rerun_is_a_byte_identical_no_op(
     assert second.exit_code == 0, second.output
     assert "(unchanged)" in second.output and "nothing to write" in second.output
     assert shipped.read_bytes() == after_first
-    # Only the inserted lines differ from the hand-written file.
-    added = set(after_first.decode().splitlines()) - set(SHIPPED_CONFIG.read_text().splitlines())
+    # Only the inserted lines differ from the hand-written file ...
+    added = set(after_first.decode().splitlines()) - set(unresolved_shipped().splitlines())
     assert added == {f"      channel_id: {cid}" for cid in IDS.values()}
+    # ... and the result is exactly the committed config (resolved for real).
+    assert after_first == SHIPPED_CONFIG.read_bytes()
 
 
 def test_cli_rerun_after_handle_change_updates_the_id(

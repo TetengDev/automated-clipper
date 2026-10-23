@@ -12,7 +12,9 @@ logged and recorded there; the others are still polled.
 Per creator:
 - First poll (no seen_items for the creator yet): `baseline` marks every listed item as
   seen without any metadata call; `emit` handles items published within `lookback_days`
-  like new ones and marks the older ones seen.
+  like new ones and marks the older ones seen. On every poll, items published before the
+  cutoff (the first poll's time, minus lookback_days for emit) are marked seen, so an
+  interrupted first poll never lets old items through later.
 - Otherwise only unseen IDs get metadata. Then: live, upcoming, or a finished stream
   whose VOD is still processing -> `waiting_vod`, not enqueued (the S3 live-VOD work,
   CLP-26, rechecks these); shorter than min_duration_seconds (Shorts) -> `skipped_short`;
@@ -37,7 +39,7 @@ from typing import Protocol
 
 from clipper.config import AppConfig, Creator, Settings
 from clipper.db import transaction
-from clipper.jobs.models import Clock, to_iso, utcnow
+from clipper.jobs.models import Clock, from_iso, to_iso, utcnow
 from clipper.jobs.queue import insert_job
 from clipper.redact import redact
 from clipper.sources.youtube import NOT_FINISHED, Metadata, Upload, VideoMeta
@@ -184,7 +186,16 @@ class YouTubeMonitor:
         mode = self.first_run_mode or FirstRun(settings.first_run_mode)
         now = self.clock()
         uploads = self.source.recent_uploads(channel_id)
-        poll.first_run = not self._has_history(creator.name)
+        history_start = self._history_start(creator.name)
+        poll.first_run = history_start is None
+        # The cutoff hangs off the creator's first poll, not this one, so a first poll that
+        # was interrupted (SIGTERM, crash, error) cannot let old items through later:
+        # baseline -> anything published before the first poll; emit -> before the first
+        # poll minus lookback_days.
+        start = history_start or now
+        cutoff = (
+            start if mode is FirstRun.BASELINE else start - timedelta(days=settings.lookback_days)
+        )
         fresh = [u for u in uploads if not self._is_seen(u.video_id)]
         poll.new = len(fresh)
         if poll.first_run and mode is FirstRun.BASELINE:
@@ -195,13 +206,11 @@ class YouTubeMonitor:
                     "%s: first poll, %d item(s) recorded as baseline", creator.name, poll.new
                 )
             return
-        cutoff = now - timedelta(days=settings.lookback_days) if poll.first_run else None
-        if cutoff is not None:
-            # Feed dates spare a metadata call for items clearly outside the lookback.
-            old = {u.video_id for u in fresh if u.published is not None and u.published < cutoff}
-            for video_id in old:
-                self._record(creator.name, video_id, SeenStatus.BASELINE, now)
-            fresh = [u for u in fresh if u.video_id not in old]
+        # Listing dates spare a metadata call for items clearly before the cutoff.
+        old = {u.video_id for u in fresh if u.published is not None and u.published < cutoff}
+        for video_id in old:
+            self._record(creator.name, video_id, SeenStatus.BASELINE, now)
+        fresh = [u for u in fresh if u.video_id not in old]
         listed = {u.video_id for u in uploads}
         for video_id, failure in list(self.failures.items()):
             if failure.creator == creator.name and video_id not in listed:
@@ -237,7 +246,7 @@ class YouTubeMonitor:
         failure = self.failures.get(video_id) or _Failure(creator, 0, now)
         failure.attempts += 1
         if failure.attempts >= MAX_METADATA_ATTEMPTS:
-            del self.failures[video_id]
+            self.failures.pop(video_id, None)
             logger.warning(
                 "%s: %s: metadata failed %d times; giving up (enqueue it by hand if wanted)",
                 creator,
@@ -254,11 +263,14 @@ class YouTubeMonitor:
         creator: str,
         video: VideoMeta,
         settings: Settings,
-        cutoff: datetime | None,
+        cutoff: datetime,
         now: datetime,
         poll: CreatorPoll,
     ) -> None:
-        if cutoff is not None and (video.published is None or video.published < cutoff):
+        # Undated: on the first poll it could be old -> baseline; later polls only list
+        # recent uploads, so it is treated as new.
+        old = poll.first_run if video.published is None else video.published < cutoff
+        if old:
             status = SeenStatus.BASELINE
         elif video.live_status in NOT_FINISHED:
             status = SeenStatus.WAITING_VOD
@@ -273,12 +285,13 @@ class YouTubeMonitor:
             poll.enqueued.append((job_id, video.video_id, video.title))
             logger.info("%s: enqueued job %d for %s", creator, job_id, video.video_id)
 
-    def _has_history(self, creator: str) -> bool:
+    def _history_start(self, creator: str) -> datetime | None:
+        """When the creator was first polled (its oldest seen item); None: never."""
         row = self.conn.execute(
-            "SELECT 1 FROM seen_items WHERE platform = ? AND creator = ? LIMIT 1",
+            "SELECT MIN(first_seen_at) FROM seen_items WHERE platform = ? AND creator = ?",
             (PLATFORM, creator),
         ).fetchone()
-        return row is not None
+        return from_iso(row[0])
 
     def _is_seen(self, video_id: str) -> bool:
         row = self.conn.execute(

@@ -4,8 +4,10 @@ replays recorded-style responses from tests/fixtures/anthropic/."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -47,7 +49,20 @@ from clipper.urls import SourceRef
 FIXTURES = Path(__file__).parent / "fixtures" / "anthropic"
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 YT = SourceRef("youtube", "dQw4w9WgXcQ")
-CLIP_KEYS = {"rank", "start_s", "end_s", "hook", "title", "caption", "hashtags", "score", "reason"}
+CLIP_KEYS = {
+    "rank",
+    "start_s",
+    "end_s",
+    "hook",
+    "title",
+    "caption",
+    "hashtags",
+    "score",
+    "reason",
+    "payoff_s",
+    "open_question",
+    "sensitive",
+}
 
 
 def fixture(name: str) -> dict[str, Any]:
@@ -162,7 +177,8 @@ def test_valid_output_writes_highlights_contract(conn, media):
     out = run(make_job(conn), make_ctx(conn, media), fake)
 
     assert out["model"] == MODEL == "claude-sonnet-5-5"
-    assert out["prompt_version"] == PROMPT_VERSION == "select_v1"
+    assert out["prompt_version"] == PROMPT_VERSION == "select_v2"
+    assert out["playbook_version"] == select.PLAYBOOK_VERSION
     assert [c["rank"] for c in out["clips"]] == [1, 2, 3]
     assert [c["score"] for c in out["clips"]] == [92, 88, 75]  # ranked by score
     for clip in out["clips"]:
@@ -172,6 +188,8 @@ def test_valid_output_writes_highlights_contract(conn, media):
         assert all(isinstance(tag, str) for tag in clip["hashtags"])
     top = out["clips"][0]
     assert (top["start_s"], top["end_s"], top["hook"]) == (400.1, 445.6, "Hook 3")
+    assert (top["payoff_s"], top["open_question"]) == (410.1, "What happens after Hook 3?")
+    assert top["sensitive"] is False
     assert len(fake.requests) == 1
     assert not list(media.glob(".*.tmp"))  # atomic write leaves no temp file
 
@@ -189,7 +207,7 @@ def test_request_uses_cached_system_prompt_and_json_schema(conn, media):
     assert body["model"] == "claude-sonnet-5-5"
     system = body["system"]
     assert system[0]["cache_control"] == {"type": "ephemeral"}
-    assert system[0]["text"] == select.load_system_prompt()
+    assert system[0]["text"].startswith(select.load_system_prompt())  # + universal playbook
     assert "MrBeast" in system[1]["text"]
     fmt = body["output_config"]["format"]
     assert fmt["type"] == "json_schema"
@@ -803,3 +821,476 @@ def test_unknown_transcript_language_falls_back_to_creator_language(conn, media)
     plain = FakeAnthropic("valid.json")
     run(make_job(conn), make_ctx(conn, media), plain)  # unknown creator: stays "unknown"
     assert "Video language: unknown" in plain.requests[0]["system"][1]["text"]
+
+
+# --- CLP-36: rank windows by engagement signals ------------------------------------------------
+
+LONG_S = 41_000  # 24 windows of 30 min, 29 min apart
+HOT = [3, 5, 7, 9, 11, 13, 15]  # windows with heatmap peaks at their centre
+_WINDOW_START = re.compile(r"\(seconds (\d+)-")
+
+
+def _window(start: float, end: float) -> select.Window:
+    return select.Window(start, end, ())
+
+
+def _signals(**raw: Any) -> select._Signals:
+    return select._Signals.model_validate(raw)
+
+
+def _hot_signals() -> dict[str, Any]:
+    step = select.WINDOW_S - select.OVERLAP_S
+    return {
+        "heatmap": [
+            {"start_s": k * step + 900, "end_s": k * step + 910, "value": 0.9} for k in HOT
+        ],
+        "loudness_peaks": [],
+    }
+
+
+@pytest.fixture
+def long_media(media: Path) -> Path:
+    write_transcript(media, seconds=LONG_S)
+    _set_meta_duration(media, LONG_S)
+    (media / "signals.json").write_text(json.dumps(_hot_signals()))
+    return media
+
+
+def _sent_windows(fake: FakeAnthropic) -> list[int]:
+    step = select.WINDOW_S - select.OVERLAP_S
+    starts = [int(_WINDOW_START.search(r["messages"][0]["content"])[1]) for r in fake.requests]
+    return [round(s / step) for s in starts]
+
+
+def _empty(n: int) -> FakeAnthropic:
+    return FakeAnthropic(*[(200, _message([]))] * n)
+
+
+def test_rank_windows_mixes_top3_heatmap_and_loudness_density():
+    windows = [_window(0, 100), _window(100, 200), _window(200, 300)]
+    signals = _signals(
+        heatmap=[
+            {"start_s": 10, "end_s": 20, "value": 0.2},
+            *(
+                {"start_s": 110 + i, "end_s": 111 + i, "value": v}
+                for i, v in enumerate([1, 0.8, 0.6, 0.1])
+            ),
+        ],
+        loudness_peaks=[{"t_s": 50, "lufs": -9}, *({"t_s": 210 + i, "lufs": -9} for i in range(4))],
+    )
+    # heat: mean of top-3 values / source max value (1.0) -> 0.2 / 0.8 / 0
+    # loudness: peaks per full window, normalised by the max -> 1/4 / 0 / 4/4
+    assert select.rank_windows(windows, signals) == pytest.approx([0.45, 0.8, 1.0])
+    assert select.rank_windows(windows, _signals()) == [0.0, 0.0, 0.0]
+
+
+def test_rank_windows_normalises_heat_by_the_source_max_value():
+    windows = [_window(0, 100), _window(100, 200)]
+    heat = [
+        {"start_s": 10 + i, "end_s": 11 + i, "value": v} for i, v in enumerate([0.8, 0.0, 0.0])
+    ] + [{"start_s": 110, "end_s": 120, "value": 0.4}]
+    # top-3 / 0.8 -> mean(1, 0, 0) = 1/3 and 0.5 (not re-scaled so the best window is 1)
+    assert select.rank_windows(windows, _signals(heatmap=heat)) == pytest.approx([1 / 3, 0.5])
+
+
+def _peaks(*times: float) -> list[dict[str, float]]:
+    return [{"t_s": t, "lufs": -9} for t in times]
+
+
+_SIX = [_window(i * 100, i * 100 + 100) for i in range(6)]
+_FULL = select.WINDOW_S
+
+
+@pytest.mark.parametrize(
+    ("windows", "peaks", "limit", "expected"),
+    [
+        (_SIX, _peaks(450, 451, 250), 3, [0, 2, 4]),  # first kept, then the best
+        (_SIX, [p * 100 + 50 for p in range(6)], 3, [0, 1, 2]),  # ties broken by index
+        (_SIX, _peaks(450), 6, list(range(6))),  # all fit
+        (_SIX, [], 2, list(range(6))),  # no signals: every window
+        (_SIX, _peaks(450), 1, [0]),
+        (_SIX, _peaks(50, 51, 52, 350), 3, [0, 1, 3]),  # window 0 is the top scorer
+        ([], _peaks(10), 2, []),
+        # a ~61 s tail window with 1 peak must not beat a full window with 10 peaks
+        (
+            [
+                _window(0, _FULL),
+                _window(_FULL - 60, 2 * _FULL - 60),
+                _window(2 * _FULL - 120, 2 * _FULL - 59),
+            ],
+            _peaks(*(_FULL + i for i in range(10)), 2 * _FULL - 60),
+            2,
+            [0, 1],
+        ),
+    ],
+)
+def test_choose_windows(windows, peaks, limit, expected):
+    if peaks and not isinstance(peaks[0], dict):
+        peaks = _peaks(*peaks)
+    assert select.choose_windows(windows, _signals(loudness_peaks=peaks), limit) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"heatmap": [{"start_s": 0, "end_s": 1, "value": float("nan")}]},
+        {"heatmap": [{"start_s": -1, "end_s": 1, "value": 0.5}]},
+        {"loudness_peaks": [{"t_s": float("inf"), "lufs": -9}]},
+        {"loudness_peaks": [{"t_s": 1, "lufs": float("nan")}]},
+        {"loudness_peaks": _peaks(*range(10_001))},
+    ],
+)
+def test_invalid_signals_are_ignored_not_fatal(conn, media, raw, caplog):
+    # signals are optional hints: a bad point must not fail the job, only drop the hints
+    caplog.set_level(logging.WARNING, logger="clipper.pipeline.select")
+    (media / "signals.json").write_text(json.dumps(raw))
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic("overlap.json"))
+    assert out["clips"]
+    assert "signals.json is invalid" in caplog.text
+
+
+def test_all_zero_signals_send_every_window():
+    # signals present but carrying no information must not silently drop the tail
+    zero = [{"start_s": w.start_s, "end_s": w.end_s, "value": 0.0} for w in _SIX]
+    assert select.choose_windows(_SIX, _signals(heatmap=zero), 2) == list(range(6))
+
+
+def test_heat_values_are_clamped_to_0_1():
+    heat = [{"start_s": 0, "end_s": 1, "value": v} for v in (1.7, -0.2)]
+    assert [h.value for h in _signals(heatmap=heat).heatmap] == [1.0, 0.0]
+
+
+def test_long_source_with_signals_sends_only_the_best_windows(
+    conn, long_media, caplog, monkeypatch
+):
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    estimated: list[str] = []
+    real = select.estimate_call_usd
+
+    def spy(system: Any, prompt: str) -> float:
+        estimated.append(prompt)
+        return real(system, prompt)
+
+    monkeypatch.setattr(select, "estimate_call_usd", spy)
+    fake = _empty(8)
+    run(make_job(conn, is_stream=True), make_ctx(conn, long_media), fake)
+    assert len(fake.requests) == 8
+    assert _sent_windows(fake) == [0, *HOT]  # first window kept, sent in time order
+    assert estimated == [r["messages"][0]["content"] for r in fake.requests]  # budget: chosen only
+    assert conn.execute("SELECT COUNT(*) FROM spend").fetchone()[0] == 8
+    assert "#1 [29:00]-[59:00]" in caplog.text  # skipped windows logged with their range
+    assert "#3 " not in caplog.text
+
+
+@pytest.mark.parametrize("signals", [None, {"heatmap": [], "loudness_peaks": []}])
+def test_long_source_without_signals_sends_every_window(conn, long_media, signals):
+    path = long_media / "signals.json"
+    path.unlink()
+    if signals is not None:
+        path.write_text(json.dumps(signals))
+    fake = _empty(24)
+    run(make_job(conn, is_stream=True), make_ctx(conn, long_media), fake)
+    assert _sent_windows(fake) == list(range(24))
+
+
+def test_cached_unchosen_window_is_used_and_not_rebilled(conn, long_media, caplog):
+    (long_media / "signals.json").unlink()
+    job = make_job(conn, is_stream=True)
+    paid = (200, _message([_cand(2000.1, 2030.6, hook="from-cache", score=99)]))
+    overloaded = (529, _error("overloaded_error", "Overloaded"))
+    with pytest.raises(RuntimeError):
+        run(job, make_ctx(conn, long_media), FakeAnthropic((200, _message([])), paid, overloaded))
+    assert conn.execute("SELECT COUNT(*) FROM spend").fetchone()[0] == 2
+
+    (long_media / "signals.json").write_text(json.dumps(_hot_signals()))
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    fake = _empty(7)
+    out = run(job, make_ctx(conn, long_media), fake)
+
+    assert _sent_windows(fake) == HOT  # windows 0 and 1 came from the cache
+    assert conn.execute("SELECT COUNT(*) FROM spend").fetchone()[0] == 2 + 7
+    assert [c["hook"] for c in out["clips"]] == ["from-cache"]
+    assert "#2 [58:00]" in caplog.text
+    assert "#1 " not in caplog.text  # cached, so not skipped
+
+
+def test_max_llm_windows_creator_override(conn, long_media):
+    config = AppConfig.model_validate(
+        {
+            "settings": {"max_llm_windows": 8},
+            "creators": [
+                {
+                    "name": "MrBeast",
+                    "region": "global",
+                    "youtube": {"handle": "@MrBeast"},
+                    "overrides": {"max_llm_windows": 3},
+                }
+            ],
+        }
+    )
+    fake = _empty(3)
+    run(
+        make_job(conn, is_stream=True),
+        StageContext(long_media, conn, config, clock=lambda: T0),
+        fake,
+    )
+    assert _sent_windows(fake) == [0, 3, 5]
+
+
+# --- CLP-51: select_v2 prompt, playbook and content types ---------------------------------------
+
+CONTENT_TYPES = [
+    "challenge_stunt",
+    "streamer_reaction",
+    "public_service",
+    "vlog_lifestyle",
+    "comedy",
+]
+
+
+def _creator_ctx(conn, media, content_type: str | None) -> StageContext:
+    creator: dict[str, Any] = {
+        "name": "MrBeast",
+        "region": "global",
+        "youtube": {"handle": "@MrBeast"},
+    }
+    if content_type is not None:
+        creator["content_type"] = content_type
+    config = AppConfig.model_validate({"creators": [creator]})
+    return StageContext(media, conn, config, clock=lambda: T0)
+
+
+def test_v2_prompt_carries_the_short_form_rules():
+    prompt = select.load_system_prompt().lower()
+    assert select.PROMPT_VERSION == "select_v2"
+    for rule in (
+        "3-second test",
+        "vague teas",
+        "names the person or thing",
+        "payoff_s",
+        "call to action",
+    ):
+        assert rule in prompt, rule
+    assert "open_question" in prompt and "sensitive" in prompt
+    assert "untrusted data" in prompt  # the v1 injection guard is kept
+
+
+def test_v1_prompt_still_loads():
+    assert "Output rules" in select.load_system_prompt("select_v1")
+
+
+@pytest.mark.parametrize("content_type", CONTENT_TYPES)
+def test_playbook_has_a_section_per_content_type(content_type):
+    text = select.load_playbook(content_type)
+    assert text.strip() and "Allowed" in text and "Avoid" in text
+
+
+def test_playbook_universal_rules_cover_sensitive_moments():
+    text = select.load_playbook("universal").lower()
+    assert "sensitive" in text and "minor" in text and "tragedy" in text
+
+
+def test_system_prompt_has_static_rules_first_and_content_type_second(conn, media):
+    fake = FakeAnthropic("valid.json")
+    run(make_job(conn), _creator_ctx(conn, media, "public_service"), fake)
+    system = fake.requests[0]["system"]
+    assert all(block["cache_control"] == {"type": "ephemeral"} for block in system)
+    assert system[0]["text"].startswith(select.load_system_prompt())
+    assert select.load_playbook("universal") in system[0]["text"]
+    assert "public_service" not in system[0]["text"]  # per-creator parts stay out of block 0
+    assert "Content type: public_service" in system[1]["text"]
+    assert select.load_playbook("public_service") in system[1]["text"]
+    assert select.load_playbook("comedy") not in system[1]["text"]
+
+
+def test_static_system_block_is_shared_across_content_types(conn, media):
+    first, second = FakeAnthropic("valid.json"), FakeAnthropic("valid.json")
+    run(make_job(conn), _creator_ctx(conn, media, "comedy"), first)
+    (media / ARTIFACT).unlink()
+    run(make_job(conn), _creator_ctx(conn, media, None), second)
+    assert first.requests[0]["system"][0] == second.requests[0]["system"][0]
+    assert "Content type" not in second.requests[0]["system"][1]["text"]
+
+
+def test_output_schema_has_payoff_open_question_and_sensitive():
+    props = select.OUTPUT_SCHEMA["properties"]["clips"]["items"]["properties"]
+    assert props["payoff_s"] == {"type": "number"}
+    assert props["open_question"] == {"type": "string"}
+    assert props["sensitive"] == {"type": "boolean"}
+    required = select.OUTPUT_SCHEMA["properties"]["clips"]["items"]["required"]
+    assert {"payoff_s", "open_question", "sensitive"} <= set(required)
+
+
+@pytest.mark.parametrize("payoff", [9.9, 30.1, -1.0])
+def test_candidate_model_rejects_payoff_outside_the_clip(payoff):
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    with pytest.raises(ValueError):
+        Candidate(start_s=10, end_s=30, payoff_s=payoff, **base)
+    for inside in (10, 20.5, 30):
+        assert Candidate(start_s=10, end_s=30, payoff_s=inside, **base).payoff_s == inside
+
+
+def test_open_question_is_limited_and_sanitized():
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    c = Candidate(start_s=1, end_s=30, open_question="q\x00" + "x" * 500, **base)
+    assert len(c.open_question) == select.FIELD_LIMITS["open_question"]
+    assert "\x00" not in c.open_question
+
+
+@pytest.mark.parametrize("payoff", [0.0, 70.0])
+def test_payoff_outside_its_clip_drops_only_that_candidate(conn, media, caplog, payoff):
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    reply = _message(
+        [
+            _cand(30.1, 60.6, hook="bad", payoff_s=payoff, open_question="", sensitive=False),
+            _cand(200.1, 235.6, hook="good", payoff_s=210.0, open_question="", sensitive=False),
+        ]
+    )
+    fake = FakeAnthropic((200, reply))  # a retry call would fail: nothing else is queued
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 1
+    assert [c["hook"] for c in out["clips"]] == ["good"]
+    assert "payoff_s" in caplog.text and "30.1" in caplog.text
+
+
+def test_malformed_reply_still_goes_through_the_retry_path(conn, media):
+    fake = FakeAnthropic("invalid.json", "valid.json")
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 2 and len(out["clips"]) == 3
+
+
+def test_payoff_cut_off_by_the_length_clamp_drops_the_candidate(caplog):
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(300)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    cut_off = Candidate(start_s=100.0, end_s=200.0, payoff_s=190.0, **base)
+    assert select.finalize([cut_off], words, Settings(), 3) == []
+    assert "payoff" in caplog.text
+
+
+def test_payoff_nudged_by_snapping_is_clamped_not_dropped():
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(300)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    edge = Candidate(start_s=100.0, end_s=130.0, payoff_s=100.0, **base)
+    (clip,) = select.finalize([edge], words, Settings(), 3)
+    assert clip["start_s"] == 100.1 and clip["payoff_s"] == 100.1
+
+
+@pytest.mark.parametrize("bad", ["../select_v1", "playbook/universal", "Comedy", ""])
+def test_load_playbook_rejects_unknown_sections(bad):
+    with pytest.raises(ValueError):
+        select.load_playbook(bad)
+
+
+PLAYBOOK_HASHES = {
+    "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
+    "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
+}
+
+
+def test_playbook_version_is_bumped_when_the_prompt_or_playbook_changes():
+    """If this fails after editing the playbook or select_v2.md, bump PLAYBOOK_VERSION and
+    add its new hash here (cached windows are keyed by the version, not the text)."""
+    root = Path(select.__file__).parent / "prompts"
+    digest = hashlib.sha256()
+    for path in sorted([*root.glob("playbook/*.md"), root / "select_v2.md"]):
+        rel = path.relative_to(root).as_posix().encode()
+        digest.update(rel + b"\0" + path.read_bytes() + b"\0")
+    assert PLAYBOOK_HASHES.get(select.PLAYBOOK_VERSION) == digest.hexdigest()
+
+
+def test_playbook_wording_review_fixes():
+    assert "or mark them" not in select.load_playbook("comedy")
+    public = select.load_playbook("public_service")
+    assert "Leave out moments that identify a minor or a victim" in public
+    assert "address or phone" in select.load_playbook("universal")
+
+
+def test_v1_recorded_reply_still_parses(conn, media):
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic("valid_v1.json"))
+    assert [c["score"] for c in out["clips"]] == [92, 88, 75]
+    for clip in out["clips"]:
+        assert clip["payoff_s"] is None
+        assert clip["open_question"] == ""
+        assert clip["sensitive"] is False
+
+
+def test_payoff_stays_inside_the_snapped_clip(conn, media):
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic("clamp.json"))
+    for clip in out["clips"]:
+        assert clip["start_s"] <= clip["payoff_s"] <= clip["end_s"]
+
+
+def test_sensitive_flag_is_passed_through_to_highlights(conn, media):
+    reply = (200, _message([_cand(30.1, 60.6, payoff_s=40.0, open_question="", sensitive=True)]))
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic(reply))
+    assert out["clips"][0]["sensitive"] is True
+
+
+def test_window_cache_key_includes_prompt_and_playbook_version(tmp_path, monkeypatch):
+    settings = Settings()
+    system = [{"type": "text", "text": "s"}]
+    base = select._window_cache(tmp_path, 0, system, "p", settings)
+    monkeypatch.setattr(select, "PLAYBOOK_VERSION", "playbook_v999")
+    other_playbook = select._window_cache(tmp_path, 0, system, "p", settings)
+    monkeypatch.setattr(select, "PROMPT_VERSION", "select_v999")
+    other_prompt = select._window_cache(tmp_path, 0, system, "p", settings)
+    assert len({base, other_playbook, other_prompt}) == 3
+
+
+def test_cached_v1_window_artifact_still_loads(tmp_path):
+    path = tmp_path / "000-abc.json"
+    v1 = json.loads(fixture("valid_v1.json")["content"][-1]["text"])
+    path.write_text(json.dumps(v1))
+    found = select._load_window(path)
+    assert found is not None and len(found) == 3
+    assert all(c.payoff_s is None and c.open_question == "" for c in found)
+
+
+def test_leftover_v1_cache_entry_is_a_miss_not_a_crash(conn, media):
+    (media / ".select").mkdir()
+    v1 = json.loads(fixture("valid_v1.json")["content"][-1]["text"])
+    (media / ".select" / "000-0123456789abcdef.json").write_text(json.dumps(v1))
+    fake = FakeAnthropic("valid.json")
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 1 and out["clips"][0]["payoff_s"] == 410.1
+    assert not (media / ".select").exists()
+
+
+def test_victims_minors_and_complainants_are_never_named():
+    universal = select.load_playbook("universal")
+    assert "Never put the name, school, workplace, address or phone number of a victim" in universal
+    assert 'This overrides "the hook names the\n  person"' in universal
+    prompt = select.load_system_prompt()
+    assert "never name a victim, a minor or a private\n  complainant" in prompt
+    public = select.load_playbook("public_service")
+    assert "does not identify them and is still worth" in public
+    assert "Any moment with a minor on screen or named is always `sensitive`." in public
+
+
+def test_payoff_after_a_clamped_end_drops_the_candidate():
+    # 100-200 clamped to 60 s ends near 160; a payoff at 162 is cut off, not "nudged".
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(300)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    cut_off = Candidate(start_s=100.0, end_s=200.0, payoff_s=162.0, **base)
+    assert select.finalize([cut_off], words, Settings(), 3) == []
+
+
+def test_negative_payoff_drops_only_that_candidate(conn, media):
+    reply = _message(
+        [
+            _cand(30.1, 60.6, hook="bad", payoff_s=-5.0, open_question="", sensitive=False),
+            _cand(200.1, 235.6, hook="good", payoff_s=210.0, open_question="", sensitive=False),
+        ]
+    )
+    fake = FakeAnthropic((200, reply))
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 1
+    assert [c["hook"] for c in out["clips"]] == ["good"]
+
+
+@pytest.mark.parametrize("payoff", [float("nan"), float("inf")])
+def test_non_finite_payoff_is_rejected(payoff):
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    with pytest.raises(ValueError):
+        Candidate(start_s=10, end_s=30, payoff_s=payoff, **base)

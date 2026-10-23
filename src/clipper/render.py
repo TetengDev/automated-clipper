@@ -11,14 +11,14 @@ succeeded:
     clip.json        sidecar: EDL, file names, loudness measurements, timings
 
 `edl.source.path` is resolved under `media_root` (and must stay inside it). The segment
-[in_s, out_s] is first cut out with ffmpeg into a private work dir (frame-accurate, CFR
-30 fps, at most 1080 px wide) written straight into `work/public/`, Remotion's public dir;
-props, raw render and temp files live outside it. (A symlink would be nicer, but Remotion's
-static server refuses symlinks with a 404.) Remotion copies served media into its temp dir
-before decoding, so it must never see a multi-GB VOD, and decoding a small 1080-wide
-segment keeps a 30 s clip well inside the render budget. Children get
-TMPDIR=`work/tmp`, so the final rmtree of the work dir removes Remotion's bundle and frame
-caches too.
+[in_s, out_s] (with jump cuts, the span of all kept segments) is first cut out with ffmpeg
+into a private work dir (frame-accurate, CFR 30 fps, at most 1080 px wide) written straight
+into `work/public/`, Remotion's public dir; props, raw render and temp files live outside
+it. (A symlink would be nicer, but Remotion's static server refuses symlinks with a 404.)
+Remotion copies served media into its temp dir before decoding, so it must never see a
+multi-GB VOD, and decoding a small 1080-wide segment keeps a 30 s clip well inside the
+render budget. Children get TMPDIR=`work/tmp`, so the final rmtree of the work dir removes
+Remotion's bundle and frame caches too.
 """
 
 from __future__ import annotations
@@ -36,12 +36,14 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import accumulate
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
-from clipper.edl import EDL, FPS, HEIGHT, WIDTH, parse_edl
+from clipper.edl import EDL, FPS, HEIGHT, WIDTH, frames, parse_edl
+from clipper.redact import redact
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +73,11 @@ DEFAULT_FFMPEG_TIMEOUT_S = 300.0
 STDERR_TAIL_CHARS = 4000
 # Below this the input is effectively silent; loudnorm cannot (and should not) boost it.
 SILENCE_LUFS = -70.0
+JOIN_FADE_S = 0.025
+"""Audio fade out, then back in, on each side of a jump-cut join."""
+JOINS_PER_FILTER = 40
+"""ffmpeg's expression evaluator fails on one product of ~98 terms: one volume filter per
+40 joins."""
 _LOUDNORM_JSON = re.compile(r"\{[^{}]*\"input_i\"[^{}]*\}", re.DOTALL)
 _BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
@@ -82,6 +89,12 @@ class RenderError(Exception):
         self.stderr_tail = stderr_tail
         detail = f"\n--- stderr (tail) ---\n{stderr_tail}" if stderr_tail else ""
         super().__init__(f"{message}{detail}")
+
+
+class InvalidClipError(RenderError):
+    """The clip's own input is bad (EDL, source path escaping the media root, props Remotion
+    rejects): rendering it again unchanged fails the same way. Other RenderErrors may be
+    transient."""
 
 
 @dataclass(frozen=True)
@@ -209,16 +222,16 @@ def _run(
         proc = runner(list(argv), cwd=cwd, env=dict(env), timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
         tail = _tail(exc.stderr)
-        log.error("render step %s timed out after %ss\n%s", step, timeout_s, tail)
+        log.error("render step %s timed out after %ss\n%s", step, timeout_s, redact(tail))
         raise RenderError(f"{step} timed out after {timeout_s:g}s", tail) from exc
     except OSError as exc:
         raise RenderError(f"{step} could not start: {exc}") from exc
     tail = _tail(proc.stderr)
     if proc.returncode != 0:
-        log.error("render step %s failed (exit %s)\n%s", step, proc.returncode, tail)
+        log.error("render step %s failed (exit %s)\n%s", step, proc.returncode, redact(tail))
         raise RenderError(f"{step} failed with exit code {proc.returncode}", tail)
     if tail:
-        log.debug("render step %s stderr:\n%s", step, tail)
+        log.debug("render step %s stderr:\n%s", step, redact(tail))
     return proc
 
 
@@ -265,12 +278,14 @@ def precut_argv(ffmpeg: str, src: Path, dst: Path, in_s: float, duration_s: floa
 
 
 def segment_props(edl: EDL) -> dict[str, Any]:
-    """Composition props for the pre-cut segment: source starts at 0, words shifted to match.
+    """Composition props for the pre-cut segment: source starts at 0, words (and jump-cut
+    segments) shifted to match. The span is pre-cut once, never per segment (lip-sync
+    drift); Remotion plays the segments from it. The cut records stay in the sidecar.
 
     Words that end before the cut or start after it are dropped; boundary words are clamped.
     The result is re-validated, so Remotion never receives props pydantic would reject.
     """
-    in_s, duration = edl.source.in_s, edl.duration_s
+    in_s, duration = edl.source.in_s, edl.source.duration_s
     words = []
     for word in edl.words:
         start, end = word.start_s - in_s, word.end_s - in_s
@@ -281,15 +296,20 @@ def segment_props(edl: EDL) -> dict[str, Any]:
     props = edl.to_props()
     props["source"] = {"path": SEGMENT_NAME, "in_s": 0.0, "out_s": duration}
     props["words"] = words
+    props["cuts"] = []
+    if edl.segments is not None:
+        props["segments"] = [
+            {"in_s": max(0.0, a - in_s), "out_s": min(duration, b - in_s)} for a, b in edl.spans
+        ]
     return parse_edl(props).to_props()
 
 
-def _resolve_source(edl: EDL, media_root: Path) -> Path:
+def resolve_source(edl: EDL, media_root: Path) -> Path:
     root = media_root.resolve()
     source = (root / edl.source.path).resolve()
     if not source.is_relative_to(root):
-        raise RenderError(f"source path escapes media root: {edl.source.path}")
-    if not source.is_file():
+        raise InvalidClipError(f"source path escapes media root: {edl.source.path}")
+    if not source.is_file():  # retryable: the volume may be briefly unavailable
         raise RenderError(f"source media not found: {source}")
     return source
 
@@ -366,23 +386,44 @@ def parse_loudnorm(stderr: str) -> dict[str, float]:
         raise RenderError(f"unexpected loudnorm output: {raw}") from exc
 
 
+def join_times(edl: EDL) -> list[float]:
+    """Output seconds of each jump-cut join (whole frames, as Remotion plays them)."""
+    ends = list(accumulate(frames(b - a) for a, b in edl.spans))
+    return [f / FPS for f in ends[:-1]]
+
+
 def finalize_argv(
-    ffmpeg: str, src: Path, dst: Path, measured: dict[str, float] | None
+    ffmpeg: str,
+    src: Path,
+    dst: Path,
+    measured: dict[str, float] | None,
+    joins: Sequence[float] = (),
 ) -> list[str]:
-    """Copy video, loudness-normalize audio (2nd loudnorm pass), move moov to the front."""
+    """Copy video, fade the audio out and back in over JOIN_FADE_S around each jump-cut
+    join (a hard cut in a waveform clicks), loudness-normalize audio (2nd loudnorm pass),
+    move moov to the front. The fade gain is evaluated per 1 ms block of samples."""
     argv = [ffmpeg, "-hide_banner", "-nostats", "-y", *FFMPEG_INPUT_GUARD, "-i", str(src)]
     argv += ["-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy"]
+    filters = []
+    if joins:
+        filters.append("asetnsamples=n=48:p=0")
+        for i in range(0, len(joins), JOINS_PER_FILTER):
+            gain = "*".join(
+                f"min(1,abs(t-{t:.6f})/{JOIN_FADE_S:g})" for t in joins[i : i + JOINS_PER_FILTER]
+            )
+            filters.append(f"volume='{gain}':eval=frame")
     if measured is not None:
-        argv += [
-            "-af",
+        filters.append(
             f"loudnorm=I={TARGET_LUFS:g}:TP={TARGET_TRUE_PEAK:g}:LRA={TARGET_LRA:g}"
             f":measured_I={measured['input_i']:.2f}"
             f":measured_TP={measured['input_tp']:.2f}"
             f":measured_LRA={measured['input_lra']:.2f}"
             f":measured_thresh={measured['input_thresh']:.2f}"
             f":offset={measured['target_offset']:.2f}"
-            ":linear=true:print_format=summary",
-        ]
+            ":linear=true:print_format=summary"
+        )
+    if filters:
+        argv += ["-af", ",".join(filters)]
     argv += ["-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", AUDIO_SAMPLE_RATE]
     argv += ["-movflags", "+faststart", "-f", "mp4", str(dst)]
     return argv
@@ -486,8 +527,8 @@ def render_clip(
         try:
             edl = parse_edl(edl)
         except ValidationError as exc:
-            raise RenderError(f"invalid EDL: {exc}") from exc
-    source = _resolve_source(edl, media_root)
+            raise InvalidClipError(f"invalid EDL: {exc}") from exc
+    source = resolve_source(edl, media_root)
     render_dir = (render_dir or default_render_dir()).resolve()
     entry = "src/index.ts"
     if not (render_dir / entry).is_file():
@@ -519,29 +560,40 @@ def render_clip(
         try:
             _run(
                 runner,
-                precut_argv(ffmpeg, source, segment, edl.source.in_s, edl.duration_s),
+                precut_argv(ffmpeg, source, segment, edl.source.in_s, edl.source.duration_s),
                 step="pre-cut",
                 timeout_s=ffmpeg_timeout_s,
                 env=env,
             )
             _write_json(props_file, segment_props(edl))
-            _run(
-                runner,
-                remotion_argv(
-                    node=node,
-                    cli=cli,
-                    entry=entry,
-                    output=raw_video,
-                    props_file=props_file,
-                    public_dir=work_dir / "public",
-                    concurrency=concurrency,
+            try:
+                _run(
+                    runner,
+                    remotion_argv(
+                        node=node,
+                        cli=cli,
+                        entry=entry,
+                        output=raw_video,
+                        props_file=props_file,
+                        public_dir=work_dir / "public",
+                        concurrency=concurrency,
+                        timeout_s=timeout_s,
+                    ),
+                    step="remotion render",
                     timeout_s=timeout_s,
-                ),
-                step="remotion render",
-                timeout_s=timeout_s,
-                env=env,
-                cwd=render_dir,
-            )
+                    env=env,
+                    cwd=render_dir,
+                )
+            except RenderError as exc:
+                # validate.ts throws EdlValidationError("invalid clip props: <errors>"), one line.
+                marker = "EdlValidationError: invalid clip props:"
+                line = next((ln for ln in exc.stderr_tail.splitlines() if marker in ln), None)
+                if line is None:
+                    raise
+                detail = line.split(marker, 1)[1].strip()[:500]
+                raise InvalidClipError(
+                    f"Remotion rejected the clip props: {detail}", exc.stderr_tail
+                ) from exc
             remotion_seconds = time.monotonic() - started  # includes the pre-cut
 
             measure = _run(
@@ -559,7 +611,13 @@ def render_clip(
                 )
             _run(
                 runner,
-                finalize_argv(ffmpeg, raw_video, staged_video, None if silent else measured),
+                finalize_argv(
+                    ffmpeg,
+                    raw_video,
+                    staged_video,
+                    None if silent else measured,
+                    join_times(edl),
+                ),
                 step="loudnorm + faststart",
                 timeout_s=ffmpeg_timeout_s,
                 env=env,

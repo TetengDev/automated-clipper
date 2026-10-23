@@ -24,6 +24,7 @@ PAGE_SIZE = 24
 
 class ClipStatus(StrEnum):
     PENDING_REVIEW = "pending_review"
+    NEEDS_ATTENTION = "needs_attention"  # a quality gate failed (CLP-74); still reviewable
     APPROVED = "approved"
     EXPORTED = "exported"
     REJECTED = "rejected"
@@ -51,8 +52,21 @@ REJECT_REASONS: tuple[str, ...] = (
 # Allowed moves for the review actions handled here (edit/regenerate come later).
 TRANSITIONS: dict[ClipStatus, frozenset[ClipStatus]] = {
     ClipStatus.PENDING_REVIEW: frozenset({ClipStatus.APPROVED, ClipStatus.REJECTED}),
+    ClipStatus.NEEDS_ATTENTION: frozenset({ClipStatus.APPROVED, ClipStatus.REJECTED}),
     ClipStatus.APPROVED: frozenset({ClipStatus.EXPORTED}),
 }
+
+REVIEWABLE = (ClipStatus.PENDING_REVIEW, ClipStatus.NEEDS_ATTENTION)
+
+GATE_REASON_LABELS: dict[str, str] = {
+    "caption_mismatch": "A word in the clip never shows as a caption",
+    "word_crosses_join": "A word is cut at a jump-cut join",
+    "late_speech": "Speech starts more than 0.25 s in",
+    "loudness": "Loudness is off target (-14 LUFS ±1, true peak at most -1 dBTP)",
+    "join_asr": "Speech around a jump-cut join does not match the transcript",
+    "gate_error": "A quality check could not run (details in the server log)",
+}
+"""Review-page text for the quality gate reasons (`clipper.pipeline.quality`)."""
 
 Sort = Literal["newest", "score"]
 
@@ -92,6 +106,7 @@ class ClipCard:
     source_title: str | None
     has_thumb: bool
     created_at: str
+    sensitive: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,10 +124,15 @@ class ClipVersion:
     prompt_version: str | None
     note: str | None
     created_at: str
+    rendered_s: float | None = None
+    """The video's length; with jump cuts shorter than end_s - start_s (the source range)."""
+    sensitive: bool = False
+    gate_reasons: tuple[str, ...] = ()
+    """Quality gates this version failed (CLP-74)."""
 
     @property
     def duration_s(self) -> float:
-        return self.end_s - self.start_s
+        return self.end_s - self.start_s if self.rendered_s is None else self.rendered_s
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ClipVersion:
@@ -130,6 +150,9 @@ class ClipVersion:
             prompt_version=row["prompt_version"],
             note=row["note"],
             created_at=row["created_at"],
+            rendered_s=row["duration_s"],
+            sensitive=bool(row["sensitive"]),
+            gate_reasons=_reasons(row["gate_reasons"]),
         )
 
 
@@ -152,6 +175,14 @@ class ClipDetail:
             return source_url_at(self.platform, self.item_id, self.current.start_s)
         except InvalidSourceURL:
             return None
+
+
+def _reasons(raw: str | None) -> tuple[str, ...]:
+    try:
+        value = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        return ()
+    return tuple(str(r) for r in value) if isinstance(value, list) else ()
 
 
 def parse_hashtags(raw: str | None) -> tuple[str, ...]:
@@ -201,7 +232,7 @@ def source_url_at(platform: str, item_id: str, start_s: float) -> str:
 
 _CARD_SELECT = """
 SELECT c.id, c.status, c.current_version, c.created_at, j.creator, j.title AS source_title,
-       v.title, v.score, v.start_s, v.end_s, v.thumb_path
+       v.title, v.score, v.start_s, v.end_s, v.duration_s, v.thumb_path, v.sensitive
 FROM clips c
 JOIN jobs j ON j.id = c.job_id
 JOIN clip_versions v ON v.clip_id = c.id AND v.version = c.current_version
@@ -242,10 +273,11 @@ def list_queue(
             title=r["title"],
             creator=r["creator"],
             score=r["score"],
-            duration_s=r["end_s"] - r["start_s"],
+            duration_s=r["end_s"] - r["start_s"] if r["duration_s"] is None else r["duration_s"],
             source_title=r["source_title"],
             has_thumb=bool(r["thumb_path"]),
             created_at=r["created_at"],
+            sensitive=bool(r["sensitive"]),
         )
         for r in rows
     ]
@@ -311,36 +343,35 @@ def get_version(conn: sqlite3.Connection, clip_id: int, version: int) -> ClipVer
 
 
 def neighbour_pending(conn: sqlite3.Connection, clip_id: int, *, older: bool) -> int | None:
-    """The adjacent pending clip in queue order (newest first): `older` is next (j)."""
+    """The adjacent reviewable clip in queue order (newest first): `older` is next (j)."""
     row = conn.execute("SELECT created_at FROM clips WHERE id = ?", (clip_id,)).fetchone()
     if row is None:
         return None
     if older:
         sql = (
-            "SELECT id FROM clips WHERE status = ? AND (created_at < ? OR"
+            "SELECT id FROM clips WHERE status IN (?, ?) AND (created_at < ? OR"
             " (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT 1"
         )
     else:
         sql = (
-            "SELECT id FROM clips WHERE status = ? AND (created_at > ? OR"
+            "SELECT id FROM clips WHERE status IN (?, ?) AND (created_at > ? OR"
             " (created_at = ? AND id > ?)) ORDER BY created_at ASC, id ASC LIMIT 1"
         )
     created = row["created_at"]
-    found = conn.execute(
-        sql, (str(ClipStatus.PENDING_REVIEW), created, created, clip_id)
-    ).fetchone()
+    found = conn.execute(sql, (*map(str, REVIEWABLE), created, created, clip_id)).fetchone()
     return found["id"] if found else None
 
 
 def next_pending_after(conn: sqlite3.Connection, clip_id: int) -> int | None:
-    """Where to go after acting on `clip_id`: the next older pending clip, else the newest."""
+    """Where to go after acting on `clip_id`: the next older reviewable clip, else the
+    newest."""
     nxt = neighbour_pending(conn, clip_id, older=True)
     if nxt is not None:
         return nxt
     row = conn.execute(
-        "SELECT id FROM clips WHERE status = ? AND id != ? ORDER BY created_at DESC, id DESC"
-        " LIMIT 1",
-        (str(ClipStatus.PENDING_REVIEW), clip_id),
+        "SELECT id FROM clips WHERE status IN (?, ?) AND id != ?"
+        " ORDER BY created_at DESC, id DESC LIMIT 1",
+        (*map(str, REVIEWABLE), clip_id),
     ).fetchone()
     return row["id"] if row else None
 

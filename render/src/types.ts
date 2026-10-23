@@ -6,7 +6,7 @@ export const FPS = 30;
 export const WIDTH = 1080;
 export const HEIGHT = 1920;
 
-export type Layout = "blurred_fill";
+export type Layout = "blurred_fill" | "face_track";
 export type HookStyle = "stakes" | "question" | "quote";
 export type CaptionStyleId = "bold_pop";
 
@@ -17,6 +17,24 @@ export type SourceSegment = {
   in_s: number;
   /** Cut end, seconds in the source. */
   out_s: number;
+};
+
+/** A kept range (EDL v2), seconds in the source, on the frame grid. */
+export type Segment = {
+  in_s: number;
+  out_s: number;
+};
+
+export type CutKind = "silence" | "stutter" | "retake" | "false_start" | "filler";
+
+/** A range cut out (`applied`) or only proposed; a record, not used by the renderer. */
+export type Cut = {
+  in_s: number;
+  out_s: number;
+  kind: CutKind;
+  confidence: number;
+  reason: string;
+  applied: boolean;
 };
 
 export type Hook = {
@@ -34,8 +52,15 @@ export type Word = {
   end_s: number;
 };
 
+export type CropKey = {
+  /** Seconds from the clip start (output timeline). */
+  t_s: number;
+  /** Crop window centre, share of the source width (0..1). */
+  x_center: number;
+};
+
 export type Edl = {
-  schema_version: 1;
+  schema_version: 1 | 2;
   source: SourceSegment;
   layout: Layout;
   hook: Hook | null;
@@ -43,4 +68,9 @@ export type Edl = {
   captions_enabled: boolean;
   caption_style: CaptionStyleId;
   progress_bar: boolean;
+  /** face_track only: sorted keys; two keys at one time are a jump (scene cut). */
+  crop: CropKey[] | null;
+  /** v2 jump cuts: the kept ranges, spanning `source`; null means the one range `source`. */
+  segments: Segment[] | null;
+  cuts: Cut[];
 };

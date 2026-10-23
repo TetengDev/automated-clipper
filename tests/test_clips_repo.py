@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
@@ -50,6 +51,17 @@ def test_insert_pending_clip(conn: sqlite3.Connection, tmp_path: Path) -> None:
     assert (ver["title"], ver["score"], ver["created_at"]) == ("T", 0.9, "2026-10-21")
 
 
+def test_insert_pending_clip_with_explicit_source_range(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), start_s=125.5, end_s=155.5
+    )
+    ver = conn.execute("SELECT * FROM clip_versions WHERE clip_id = ?", (ref.clip_id,)).fetchone()
+    assert (ver["start_s"], ver["end_s"]) == (125.5, 155.5)
+
+
 def test_duplicate_rank_rolls_back(conn: sqlite3.Connection, tmp_path: Path) -> None:
     edl = parse_edl(EDL_DATA)
     insert_pending_clip(conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path))
@@ -97,3 +109,149 @@ def test_each_version_keeps_its_own_files(conn: sqlite3.Connection, tmp_path: Pa
         (1, "v1.mp4", "v1.jpg"),
         (2, "v2.mp4", "v2.jpg"),
     ]
+
+
+def test_rendered_duration_is_stored_apart_from_the_source_range(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """With jump cuts the video (38 s) is shorter than its source range (45 s)."""
+    from clipper import clips
+
+    result = dataclasses.replace(_result(tmp_path), duration_s=38.0)
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=parse_edl(EDL_DATA), result=result, start_s=100.0,
+        end_s=145.0,
+    )  # fmt: skip
+    detail = clips.get_clip(conn, ref.clip_id)
+    assert detail is not None
+    (version,) = detail.versions
+    assert (version.start_s, version.end_s, version.duration_s) == (100.0, 145.0, 38.0)
+    (card,) = clips.list_queue(conn, clips.QueueFilter())
+    assert card.duration_s == 38.0
+
+
+def test_playbook_version_recorded_on_every_version(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    edl = parse_edl(EDL_DATA)
+    meta = ClipMeta(prompt_version="select_v2", playbook_version="playbook_v1")
+    ref = insert_pending_clip(conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), meta=meta)
+    add_clip_version(conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"), meta=meta)
+    rows = conn.execute(
+        "SELECT prompt_version, playbook_version FROM clip_versions WHERE clip_id = ?",
+        (ref.clip_id,),
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("select_v2", "playbook_v1")] * 2
+
+
+def test_playbook_version_defaults_to_null(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=parse_edl(EDL_DATA), result=_result(tmp_path)
+    )
+    row = conn.execute(
+        "SELECT playbook_version FROM clip_versions WHERE clip_id = ?", (ref.clip_id,)
+    ).fetchone()
+    assert row[0] is None
+
+
+def test_sensitive_flag_round_trips(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    edl = parse_edl(EDL_DATA)
+    flagged = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), meta=ClipMeta(sensitive=True)
+    )
+    plain = insert_pending_clip(conn, job_id=1, rank=2, edl=edl, result=_result(tmp_path))
+    again = add_clip_version(
+        conn,
+        clip_id=flagged.clip_id,
+        edl=edl,
+        result=_result(tmp_path, "v2"),
+        meta=ClipMeta(sensitive=True),
+    )
+    rows = conn.execute("SELECT clip_id, version, sensitive FROM clip_versions ORDER BY id")
+    assert [tuple(r) for r in rows] == [
+        (flagged.clip_id, 1, 1),
+        (plain.clip_id, 1, 0),
+        (flagged.clip_id, again.version, 1),
+    ]
+
+
+def test_new_version_keeps_the_sensitive_flag(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), meta=ClipMeta(sensitive=True)
+    )
+    v2 = add_clip_version(conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"))
+    row = conn.execute(
+        "SELECT sensitive FROM clip_versions WHERE clip_id = ? AND version = ?",
+        (ref.clip_id, v2.version),
+    ).fetchone()
+    assert row[0] == 1
+
+
+# --- quality gates (CLP-74) -------------------------------------------------------------
+
+
+def _status_and_reasons(conn: sqlite3.Connection, clip_id: int) -> tuple[str, object]:
+    row = conn.execute(
+        "SELECT c.status, v.gate_reasons FROM clips c JOIN clip_versions v"
+        " ON v.clip_id = c.id AND v.version = c.current_version WHERE c.id = ?",
+        (clip_id,),
+    ).fetchone()
+    return row[0], None if row[1] is None else json.loads(row[1])
+
+
+@pytest.mark.parametrize(
+    ("reasons", "status"),
+    [
+        ((), "pending_review"),
+        (("gate_error",), "pending_review"),
+        (("loudness",), "needs_attention"),
+        (("word_crosses_join", "gate_error"), "needs_attention"),
+    ],
+)
+def test_gate_reasons_decide_the_first_status(
+    conn: sqlite3.Connection, tmp_path: Path, reasons: tuple[str, ...], status: str
+) -> None:
+    ref = insert_pending_clip(
+        conn,
+        job_id=1,
+        rank=1,
+        edl=parse_edl(EDL_DATA),
+        result=_result(tmp_path),
+        meta=ClipMeta(gate_reasons=reasons),
+    )
+    assert _status_and_reasons(conn, ref.clip_id) == (status, list(reasons))
+
+
+def test_ungated_version_stores_no_reasons(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    """A re-render is not gated yet: NULL, not an empty (passed) list."""
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path),
+        meta=ClipMeta(gate_reasons=("loudness",)),
+    )  # fmt: skip
+    add_clip_version(conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"))
+    assert _status_and_reasons(conn, ref.clip_id) == ("pending_review", None)
+
+
+def test_gate_reasons_reach_the_clip_detail(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    from clipper import clips
+
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=parse_edl(EDL_DATA), result=_result(tmp_path),
+        meta=ClipMeta(gate_reasons=("late_speech",)),
+    )  # fmt: skip
+    detail = clips.get_clip(conn, ref.clip_id)
+    assert detail is not None and detail.current.gate_reasons == ("late_speech",)
+
+
+def test_gated_re_render_that_fails_needs_attention(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path))
+    add_clip_version(
+        conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"),
+        meta=ClipMeta(gate_reasons=("loudness",)),
+    )  # fmt: skip
+    assert _status_and_reasons(conn, ref.clip_id) == ("needs_attention", ["loudness"])

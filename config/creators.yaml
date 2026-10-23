@@ -13,28 +13,38 @@ settings:
   max_clips_per_stream: 10
   max_source_hours_per_day: 24
   daily_llm_usd_cap: 10.0
+  max_llm_windows: 8             # long sources: only the most engaging windows go to Claude
   daily_transcribe_usd_cap: 5.0
+  transcriber: local              # local (faster-whisper, free) | groq (needs GROQ_API_KEY)
+  whisper_model: large-v3-turbo   # pinned: tiny base small medium large-v3 large-v3-turbo
+  whisper_compute_type: int8
+  whisper_cpu_threads: 4          # per local ASR child; keep <= the worker CPU quota
   disk_budget_gb: 150
   media_retention_hours: 48
   review_expiry_days: 7
+  reframe: auto                   # auto = face-tracked crop when faces are found; or blurred_fill
+  jump_cuts: silences             # cuts inside a clip: silences, full (+ stutters, fillers) or off
 
 creators:
   # --- Global ---
   - name: MrBeast
     region: global
     tags: [challenge, entertainment]
+    content_type: challenge_stunt
     youtube:
       handle: "@MrBeast"
 
   - name: IShowSpeed
     region: global
     tags: [streamer, irl, sports]
+    content_type: streamer_reaction
     youtube:
       handle: "@IShowSpeed"
 
   - name: Kai Cenat
     region: global
     tags: [streamer]
+    content_type: streamer_reaction
     twitch:
       login: kaicenat
     youtube:
@@ -45,6 +55,7 @@ creators:
     region: ph
     language: tl
     tags: [public-service, news]
+    content_type: public_service
     youtube:
       handle: "@RaffyTulfoInAction"
 
@@ -52,6 +63,7 @@ creators:
     region: ph
     language: tl
     tags: [vlog, lifestyle]
+    content_type: vlog_lifestyle
     youtube:
       handle: "@IvanaAlawi"
 
@@ -59,5 +71,6 @@ creators:
     region: ph
     language: tl
     tags: [vlog, comedy]
+    content_type: comedy
     youtube:
       handle: "@CongTV"

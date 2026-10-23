@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Render still snapshots of the Clip composition at the hook, mid-caption and the end.
 //
-//   node scripts/stills.mjs [--out out/stills] [--props props.json --public-dir media/]
+//   node scripts/stills.mjs [--out out/stills] [--face-track] [--props props.json --public-dir media/]
 //
 // Without --props, a 6 s fixture (ffmpeg testsrc2 + sine) and matching props are generated
 // in a temp dir. Snapshot comparison is manual/optional; the PNGs are review artifacts.
@@ -19,6 +19,7 @@ const { values } = parseArgs({
     out: { type: "string", default: join(root, "out", "stills") },
     props: { type: "string" },
     "public-dir": { type: "string" },
+    "face-track": { type: "boolean", default: false },
   },
 });
 
@@ -52,7 +53,13 @@ if (values.props) {
     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
     join(tempDir, "source.mp4"),
   ]);
-  props = FIXTURE_PROPS;
+  props = values["face-track"]
+    ? {
+        ...FIXTURE_PROPS,
+        layout: "face_track",
+        crop: [{ t_s: 0, x_center: 0.3 }, { t_s: 4.9, x_center: 0.7 }],
+      }
+    : FIXTURE_PROPS;
 }
 
 try {

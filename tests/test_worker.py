@@ -420,15 +420,15 @@ def test_stage_def_rejects_escaping_artifact() -> None:
             StageDef(lambda job, ctx: None, bad)
 
 
-def test_build_stages_registers_the_pipeline_up_to_rendering() -> None:
+def test_build_stages_registers_the_pipeline_through_rendering() -> None:
     stages = build_stages()
 
     assert stages[JobStatus.DETECTED].artifact is None
     assert {status: stage.artifact for status, stage in stages.items() if stage.artifact} == {
         status: name for status, name in ARTIFACTS.items() if status is not JobStatus.RENDERING
     }
-    # CLP-17 not merged yet: jobs park at `rendering`.
-    assert JobStatus.RENDERING not in stages
+    # Rendering's progress lives in the `clips` table, not in an artifact file.
+    assert stages[JobStatus.RENDERING].artifact is None
     assert JobStatus.WAITING_VOD not in stages
 
 

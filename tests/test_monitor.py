@@ -504,21 +504,59 @@ def test_format_errors_back_off_to_hourly_and_never_give_up(conn, cfg, source, c
     source.meta[V1] = "format: Requested format is not available"
     monitor = make(conn, cfg, source, clock)
     attempts_at: list[int] = []
+    error = {"creator": "MrBeast", "item": V1, "error": "format: Requested format is not available"}
 
     for minute in range(0, 24 * 60, 10):  # a day of 10-minute polls
         clock.now = T0 + timedelta(minutes=minute)
         before = calls_for(source, V1)
         report = monitor.run_cycle([cfg.creator("MrBeast")])
-        if calls_for(source, V1) > before:
+        attempted = calls_for(source, V1) > before
+        if attempted:
             attempts_at.append(minute)
+        assert report.errors == ([error] if attempted else [])  # backing off: no error
 
     assert attempts_at[:6] == [0, 10, 30, 70, 130, 190]  # 10 min doubling, capped at 1 h
     assert len(attempts_at) == 4 + (24 * 60 - 130) // 60 + 1
     assert V1 not in seen(conn) and monitor.failures == {}
-    assert report.errors in (
-        [],
-        [{"creator": "MrBeast", "item": V1, "error": "format: Requested format is not available"}],
-    )
+
+
+@pytest.mark.parametrize("interval_minutes", [60, 90])
+def test_a_video_stuck_on_format_errors_does_not_starve_the_ones_behind_it(
+    conn, cfg, source, clock, interval_minutes: int
+) -> None:
+    # X never gets a usable format; by the time the backoff (capped at 1 h) is over it is
+    # due again each poll, and it is listed first (newest). V2 and V3 still get probed.
+    x = "x" * 11
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(x, T0), Upload(V2, T0), Upload(V3, T0)]
+    source.meta.update({x: "format: Requested format is not available"})
+    source.meta.update({V2: video(V2), V3: video(V3)})
+    monitor = make(conn, cfg, source, clock)
+
+    for _ in range(3):
+        monitor.run_cycle([cfg.creator("MrBeast")])
+        clock.now += timedelta(minutes=interval_minutes)
+
+    assert seen(conn) == {"zzzzzzzzzzz": "baseline", V2: "enqueued", V3: "enqueued"}
+    assert x in monitor.format_retries
+
+
+def test_new_items_are_probed_before_retries(conn, cfg, source, clock) -> None:
+    x, y = "x" * 11, "y" * 11
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(x, T0), Upload(y, T0)]
+    source.meta.update({x: "format: Requested format is not available", y: "yt-dlp failed"})
+    monitor = make(conn, cfg, source, clock)
+    monitor.run_cycle([cfg.creator("MrBeast")])  # x: format error, the batch stops
+    clock.now += timedelta(hours=2)
+    monitor.run_cycle([cfg.creator("MrBeast")])  # y (new): generic error; x: format error
+    clock.now += timedelta(hours=2)
+    source.feeds[BEAST] = [Upload(x, T0), Upload(y, T0), Upload(V1, T0)]
+    source.meta[V1] = video(V1)
+
+    monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert source.metadata_calls[-1] == [V1, y, x]  # new, then failures, then format errors
 
 
 def test_format_error_stops_the_batch_with_one_error_per_poll(conn, cfg, source, clock) -> None:

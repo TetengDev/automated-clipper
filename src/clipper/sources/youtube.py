@@ -112,6 +112,8 @@ class VideoMeta:
     duration_s: int | None
     live_status: LiveStatus
     published: datetime | None
+    day_precision: bool = False
+    """`published` is only a calendar day (yt-dlp's upload_date at midnight UTC)."""
 
 
 @dataclass
@@ -320,20 +322,27 @@ class YtDlpProvider:
         if status not in LIVE_STATUSES:
             status = "is_live" if info.get("is_live") is True else "not_live"
         published = _parse_time(info.get("timestamp"))
+        day_precision = False
         if published is None and isinstance(info.get("upload_date"), str):
             try:
                 published = datetime.strptime(info["upload_date"], "%Y%m%d").replace(tzinfo=UTC)
+                day_precision = True
             except ValueError:
                 published = None
         return VideoMeta(
-            video_id, _title(info.get("title")), _seconds(info.get("duration")), status, published
+            video_id,
+            _title(info.get("title")),
+            _seconds(info.get("duration")),
+            status,
+            published,
+            day_precision,
         )
 
     def uploads(self, channel_id: str) -> list[Upload]:
         """The channel's videos tab (long-form uploads, newest first). Dates come from the
-        page's "N weeks ago" text (`approximate_date`): rounded down, so never earlier than
-        the real upload, which keeps the first-run lookback filter from dropping recent
-        uploads while it spares probes for old ones."""
+        page's "N weeks ago" text (`approximate_date`), rounded to the NEAREST unit, so up
+        to half a unit early or late. Good enough to spare probes for clearly old items
+        on a creator's first poll; never used to judge an item on later polls."""
         url = f"https://www.youtube.com/channel/{_channel(channel_id)}/videos"
         try:
             info = self.ytdlp.listing(

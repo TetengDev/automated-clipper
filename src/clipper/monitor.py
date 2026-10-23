@@ -14,7 +14,8 @@ Per creator:
   seen without any metadata call; `emit` handles items published within `lookback_days`
   like new ones and marks the older ones seen. On every poll, items published before the
   cutoff (the first poll's time, minus lookback_days for emit) are marked seen, so an
-  interrupted first poll never lets old items through later.
+  interrupted first poll never lets old items through later. Only the first poll trusts
+  the listing's (possibly rounded) dates; later ones use each item's metadata date.
 - Otherwise only unseen IDs get metadata. Then: live, upcoming, or a finished stream
   whose VOD is still processing -> `waiting_vod`, not enqueued (the S3 live-VOD work,
   CLP-26, rechecks these); shorter than min_duration_seconds (Shorts) -> `skipped_short`;
@@ -52,6 +53,7 @@ PLATFORM = "youtube"
 JITTER = 0.1
 """Each sleep is the poll interval +- 10 %, so creators are not polled in lockstep."""
 METADATA_RETRY_BASE = timedelta(minutes=10)
+DAY = timedelta(days=1)
 MAX_METADATA_ATTEMPTS = 6
 """A video whose metadata keeps failing is retried after 10, 20, 40, 80 and 160 minutes,
 then recorded as `metadata_failed` (about 5 h of failures). Platform blocks (bot check)
@@ -206,11 +208,15 @@ class YouTubeMonitor:
                     "%s: first poll, %d item(s) recorded as baseline", creator.name, poll.new
                 )
             return
-        # Listing dates spare a metadata call for items clearly before the cutoff.
-        old = {u.video_id for u in fresh if u.published is not None and u.published < cutoff}
-        for video_id in old:
-            self._record(creator.name, video_id, SeenStatus.BASELINE, now)
-        fresh = [u for u in fresh if u.video_id not in old]
+        if poll.first_run:
+            # Listing dates spare a metadata call for items clearly before the cutoff. Only
+            # on the first poll: the fallback listing's dates are rounded to the nearest
+            # unit, so a later upload could look older than the first poll. Later polls
+            # judge each item by its metadata's exact date.
+            old = {u.video_id for u in fresh if u.published is not None and u.published < cutoff}
+            for video_id in old:
+                self._record(creator.name, video_id, SeenStatus.BASELINE, now)
+            fresh = [u for u in fresh if u.video_id not in old]
         listed = {u.video_id for u in uploads}
         for video_id, failure in list(self.failures.items()):
             if failure.creator == creator.name and video_id not in listed:
@@ -269,7 +275,12 @@ class YouTubeMonitor:
     ) -> None:
         # Undated: on the first poll it could be old -> baseline; later polls only list
         # recent uploads, so it is treated as new.
-        old = poll.first_run if video.published is None else video.published < cutoff
+        if video.published is None:
+            old = poll.first_run
+        else:
+            # A bare calendar day may be the uploader's local date: allow a day either way.
+            slack = DAY if video.day_precision else timedelta(0)
+            old = video.published < cutoff - slack
         if old:
             status = SeenStatus.BASELINE
         elif video.live_status in NOT_FINISHED:

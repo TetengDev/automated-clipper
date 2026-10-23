@@ -357,3 +357,15 @@ def test_group_probe_is_false_once_the_group_is_gone() -> None:
     proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)  # noqa: S603
     proc.wait()
     assert ytdlp._group_exists(proc.pid) is False
+
+
+def test_run_command_feeds_stdin_from_a_file_and_runs_in_cwd(tmp_path: Path) -> None:
+    (tmp_path / "in.txt").write_text("hello from stdin")
+    work = tmp_path / "work"
+    work.mkdir()
+    code = "import os, sys; print(sys.stdin.read()); print(os.getcwd())"
+    out = run_command(
+        [sys.executable, "-c", code], 30, stdin_path=tmp_path / "in.txt", cwd=work
+    ).stdout.splitlines()
+    assert out[0] == "hello from stdin"
+    assert Path(out[1]).resolve() == work.resolve()

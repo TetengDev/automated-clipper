@@ -29,6 +29,11 @@ The title and transcript are untrusted (anyone can upload a video): they are str
 control characters, the transcript is fenced in <transcript> tags, the system prompt says
 to treat both as data, and every output field is length-limited and sanitized.
 
+With `selector: claude_cli` (CLP-81) the same request goes through the Claude Code CLI on a
+Claude subscription instead (`claude -p`, no API key, nothing billed per token): no tools,
+no user settings, plugins or MCP servers, the prompt on stdin, and only the subscription
+token in its environment. A usage limit defers the job until the limit resets.
+
 Prompt caching note: the system prompt is only cached if the cached prefix reaches the
 model's minimum cacheable length; select_v2 plus the playbook may still fall short. We log
 `cache_read_input_tokens` per call; verify against live traffic before relying on it.
@@ -39,12 +44,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
-from collections.abc import Mapping, Sequence
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
@@ -58,6 +65,8 @@ from clipper.jobs.models import Job
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext, StageDef
 from clipper.pipeline import common
 from clipper.pipeline.common import read_json, strip_control, write_json_atomic
+from clipper.pipeline.ytdlp import CommandTimeout, RunResult
+from clipper.redact import redact
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +76,16 @@ PLAYBOOK_VERSION = "playbook_v3"
 """Bump when select_v2.md or any file in prompts/playbook/ changes: it is part of the window
 cache key (a test pins the text hash per version)."""
 PROVIDER = "anthropic"
+CLI_PROVIDER = "claude_cli"
+CLI_COMMAND = "claude"
+CLI_TIMEOUT_S = 600.0
+_LOCAL_LOGIN_ENV = ("CLAUDE_CONFIG_DIR", "USER", "LOGNAME")
+_CLI_QUIET_ENV = {"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+CLI_MAX_TURNS = 3
+_CLI_GAVE_UP = ("error_max_turns", "error_max_structured_output_retries")
+"""Structured output takes 2 turns (the schema is answered through a tool call)."""
+USAGE_LIMIT_MAX_WAIT = timedelta(days=8)
+"""A reset time further out than this (the weekly limit plus slack) is not trusted."""
 ARTIFACT = "highlights.json"
 
 WINDOW_S = 30 * 60.0
@@ -92,6 +111,9 @@ PAYOFF_OUTSIDE = "payoff_outside"
 FIELD_LIMITS = {"hook": 120, "title": 100, "caption": 2200, "reason": 500, "open_question": 200}
 MAX_HASHTAGS = 10
 _HASHTAG = re.compile(r"^#\w{1,50}$")
+_RESET_EPOCH = re.compile(r"\|(\d{9,11})\b")
+_USAGE_LIMIT = re.compile(r"usage limit|hit your limit|limit reached|rate.?limit", re.IGNORECASE)
+_LOGIN = re.compile(r"/login|not logged in|invalid api key|authenticat|oauth token", re.IGNORECASE)
 _TRANSCRIPT_TAG = re.compile(r"</?\s*transcript\b[^>]*>", re.IGNORECASE)
 
 
@@ -595,12 +617,24 @@ class _Refused(Exception):
     """The model declined this window; the call is paid, retrying it would be too."""
 
 
-def _parse_reply(message: Any) -> list[Candidate]:
-    if message.stop_reason == "refusal":
+@dataclass(frozen=True)
+class Reply:
+    """One model answer, the same shape from either backend."""
+
+    text: str | None
+    stop_reason: str | None
+    usd: float
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int | None = None
+
+
+def _parse_reply(reply: Reply) -> list[Candidate]:
+    if reply.stop_reason == "refusal":
         raise _Refused
-    if message.stop_reason not in ("end_turn", "stop_sequence"):
-        raise ValueError(f"stop_reason={message.stop_reason}")  # e.g. max_tokens: retry
-    text = next((b.text for b in message.content if b.type == "text"), None)
+    if reply.stop_reason not in ("end_turn", "stop_sequence"):
+        raise ValueError(f"stop_reason={reply.stop_reason}")  # e.g. max_tokens: retry
+    text = reply.text
     if text is None:
         raise ValueError("no text block")
     candidates: list[Candidate] = []
@@ -625,19 +659,29 @@ class _CreditDeferred(Deferred):
     """Deferred because the Anthropic account is out of credit (keeps the marker)."""
 
 
-def _no_credit(ctx: StageContext) -> Exception:
+def _no_credit(ctx: StageContext, reason: str = "Anthropic credit balance too low") -> Exception:
     """Deferred an hour at a time, for at most CREDIT_MAX_WAIT since the first deferral."""
     now = ctx.clock()
     since = common.first_seen(ctx.media_dir / CREDIT_MARKER, now, max_age=CREDIT_MARKER_MAX_AGE)
     if now - since > CREDIT_MAX_WAIT:
         hours = CREDIT_MAX_WAIT.total_seconds() / 3600
-        return PermanentError(f"Anthropic credit balance too low for {hours:.0f} h; giving up")
+        return PermanentError(f"{reason} for {hours:.0f} h; giving up")
     logger.warning(
-        "Anthropic credit balance too low (since %s); deferring this job by %s",
-        since.isoformat(),
-        CREDIT_RETRY,
+        "%s (since %s); deferring this job by %s", reason, since.isoformat(), CREDIT_RETRY
     )
-    return _CreditDeferred(now + CREDIT_RETRY, "Anthropic credit balance too low")
+    return _CreditDeferred(now + CREDIT_RETRY, reason)
+
+
+def _usage_limited(ctx: StageContext, text: str) -> Exception:
+    """Subscription usage limit: wait for the reset time the CLI reports, else hourly."""
+    reason = "Claude usage limit reached"
+    now = ctx.clock()
+    if match := _RESET_EPOCH.search(text):
+        reset = datetime.fromtimestamp(int(match[1]), UTC)
+        if now < reset <= now + USAGE_LIMIT_MAX_WAIT:
+            logger.warning("%s; deferring this job until %s", reason, reset.isoformat())
+            return _CreditDeferred(reset, reason)
+    return _no_credit(ctx, reason)
 
 
 def _call(
@@ -661,45 +705,179 @@ def _call(
         raise RuntimeError(f"Anthropic API error ({exc.status_code})") from None
     except anthropic.APIConnectionError as exc:
         raise RuntimeError(f"Anthropic API unreachable ({type(exc).__name__})") from None
-    (ctx.media_dir / CREDIT_MARKER).unlink(missing_ok=True)
     return message
 
 
+class _ApiBackend:
+    """The paid Messages API; the client is built on the first call (cached windows need
+    no key)."""
+
+    provider = PROVIDER
+    billed = True
+
+    def __init__(self, client: anthropic.Anthropic | None) -> None:
+        self.client = client
+
+    def estimate(self, system: list[dict[str, Any]], prompt: str) -> float:
+        return estimate_call_usd(system, prompt)
+
+    def complete(self, system: list[dict[str, Any]], prompt: str, ctx: StageContext) -> Reply:
+        if self.client is None:
+            self.client = _make_client()
+        message = _call(self.client, system, prompt, ctx)
+        usage = message.usage
+        return Reply(
+            text=next((b.text for b in message.content if b.type == "text"), None),
+            stop_reason=message.stop_reason,
+            usd=PRICING[MODEL].cost(usage),
+            input_tokens=_input_tokens(usage),
+            output_tokens=int(usage.output_tokens or 0),
+            cache_read_tokens=getattr(usage, "cache_read_input_tokens", None),
+        )
+
+
+class _CliBackend:
+    """The Claude Code CLI on a Claude subscription (`claude -p`): nothing billed per token.
+
+    The transcript is untrusted, so the model gets no tools, and the CLI loads no user
+    settings, plugins, MCP servers or slash commands (they would also multiply the tokens
+    each call uses). The prompt goes on stdin, the child runs in an empty scratch dir, and
+    its env is the runner's allowlist plus the subscription token and two flags that turn
+    off autoupdate and non-essential traffic. A token login gets a throwaway config dir (the
+    image's root fs is read-only); without a token the CLI uses the machine's existing
+    `claude` login (keeping CLAUDE_CONFIG_DIR, USER and LOGNAME)."""
+
+    provider = CLI_PROVIDER
+    billed = False
+
+    def __init__(self, runner: Callable[..., RunResult] | None) -> None:
+        self.runner = runner
+
+    def estimate(self, system: list[dict[str, Any]], prompt: str) -> float:
+        return 0.0
+
+    def complete(self, system: list[dict[str, Any]], prompt: str, ctx: StageContext) -> Reply:
+        token = Secrets().claude_code_oauth_token
+        with tempfile.TemporaryDirectory(prefix="clipper-claude-") as tmp:
+            root = Path(tmp)
+            (root / "work").mkdir()
+            (root / "system.md").write_text("\n\n".join(b["text"] for b in system), "utf-8")
+            (root / "prompt.txt").write_text(prompt, "utf-8")
+            # Without a token the machine's login is used: it may live under a custom
+            # CLAUDE_CONFIG_DIR, and the macOS Keychain lookup needs USER (none are secrets).
+            env = {k: os.environ[k] for k in _LOCAL_LOGIN_ENV if os.environ.get(k)}
+            if token and token.get_secret_value():
+                (root / "config").mkdir()
+                env = {
+                    "CLAUDE_CODE_OAUTH_TOKEN": token.get_secret_value(),
+                    "CLAUDE_CONFIG_DIR": str(root / "config"),
+                }
+            env |= _CLI_QUIET_ENV
+            args = [
+                CLI_COMMAND, "-p", "--model", MODEL, "--max-turns", str(CLI_MAX_TURNS),
+                "--output-format", "json", "--json-schema", json.dumps(OUTPUT_SCHEMA),
+                "--system-prompt-file", str(root / "system.md"),
+                "--tools", "", "--strict-mcp-config", "--setting-sources", "",
+                "--disable-slash-commands", "--no-session-persistence",
+            ]  # fmt: skip
+            run = self.runner or common.default_runner()
+            try:
+                result = run(
+                    args, CLI_TIMEOUT_S, env=env, stdin_path=root / "prompt.txt", cwd=root / "work"
+                )
+            except FileNotFoundError:
+                raise PermanentError(
+                    "claude CLI not found; install @anthropic-ai/claude-code (docs/DEPLOYMENT.md)"
+                ) from None
+            except CommandTimeout as exc:
+                raise RuntimeError(f"claude CLI: {exc}") from None
+        return _cli_reply(result, ctx)
+
+
+def _cli_reply(result: RunResult, ctx: StageContext) -> Reply:
+    try:
+        out = json.loads(result.stdout)
+    except ValueError:
+        out = None
+    if not isinstance(out, dict):
+        detail = common.stderr_tail(result.stderr) or "no JSON output"
+        raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {detail}")
+    if out.get("subtype") in _CLI_GAVE_UP:  # no valid answer in time: invalid output, retried
+        return Reply(None, "end_turn", 0.0, 0, 0)
+    if out.get("is_error"):
+        text = str(out.get("result") or "")
+        status = out.get("api_error_status")
+        if status == 429 or _USAGE_LIMIT.search(text):
+            raise _usage_limited(ctx, text)
+        if status in (401, 403) or _LOGIN.search(text):
+            raise PermanentError(
+                "Claude subscription login rejected; run `claude setup-token` and set"
+                " CLAUDE_CODE_OAUTH_TOKEN"
+            )
+        detail = strip_control(redact(text))[:300]
+        raise RuntimeError(f"claude CLI error ({out.get('subtype')}): {detail}")
+    if result.returncode != 0:
+        detail = common.stderr_tail(result.stderr) or "no error output"
+        raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {detail}")
+    usage = out.get("usage") if isinstance(out.get("usage"), dict) else {}
+    structured = out.get("structured_output")
+
+    def tokens(name: str) -> int:
+        value = usage.get(name)
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    return Reply(
+        text=None if structured is None else json.dumps(structured),
+        stop_reason="refusal" if out.get("stop_reason") == "refusal" else "end_turn",
+        usd=0.0,
+        input_tokens=sum(
+            tokens(n)
+            for n in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+        ),
+        output_tokens=tokens("output_tokens"),
+        cache_read_tokens=tokens("cache_read_input_tokens"),
+    )
+
+
+Backend = _ApiBackend | _CliBackend
+
+
 def _paid_call(
-    client: anthropic.Anthropic,
+    backend: Backend,
     system: list[dict[str, Any]],
     prompt: str,
     job: Job,
     ctx: StageContext,
     cap: float,
-) -> Any:
-    """One API call with its estimate reserved first and its actual cost settled after."""
+) -> Reply:
+    """One call with its estimate reserved first and its actual cost settled after."""
     with common.reserve_spend(
         ctx.conn,
         kind="llm",
         label="LLM",
-        provider=PROVIDER,
+        provider=backend.provider,
         job_id=job.id,
-        estimate_usd=estimate_call_usd(system, prompt),
+        estimate_usd=backend.estimate(system, prompt),
         cap_usd=cap,
         now=ctx.clock(),
     ) as charge:
-        message = _call(client, system, prompt, ctx)
-        usage = message.usage
-        charge.usd = PRICING[MODEL].cost(usage)
-        charge.input_tokens = _input_tokens(usage)
-        charge.output_tokens = int(usage.output_tokens or 0)
+        reply = backend.complete(system, prompt, ctx)
+        charge.usd = reply.usd
+        charge.input_tokens = reply.input_tokens
+        charge.output_tokens = reply.output_tokens
+    (ctx.media_dir / CREDIT_MARKER).unlink(missing_ok=True)
     logger.info(
-        "job %s: LLM call $%.4f, cache_read_input_tokens=%s",
+        "job %s: LLM call via %s $%.4f, cache_read_input_tokens=%s",
         job.id,
+        backend.provider,
         charge.usd,
-        getattr(usage, "cache_read_input_tokens", None),
+        reply.cache_read_tokens,
     )
-    return message
+    return reply
 
 
 def _select_window(
-    client: anthropic.Anthropic,
+    backend: Backend,
     system: list[dict[str, Any]],
     prompt: str,
     job: Job,
@@ -708,9 +886,9 @@ def _select_window(
 ) -> list[Candidate]:
     problem = ""
     for _ in range(MAX_ATTEMPTS_PER_WINDOW):
-        message = _paid_call(client, system, prompt, job, ctx, cap)
+        reply = _paid_call(backend, system, prompt, job, ctx, cap)
         try:
-            return _parse_reply(message)
+            return _parse_reply(reply)
         except _Refused:
             logger.warning("job %s: model refused a window; treating it as empty", job.id)
             return []
@@ -762,11 +940,13 @@ def select_highlights(
     ctx: StageContext,
     client: anthropic.Anthropic | None = None,
     feedback_examples: Sequence[Mapping[str, Any]] = (),
+    runner: Callable[..., RunResult] | None = None,
 ) -> None:
     """The stage. Any outcome other than a credit deferral (success incl. all windows from
-    cache, any error, giving up) ends the credit episode and removes its marker."""
+    cache, any error, giving up) ends the credit episode and removes its marker. `client`
+    (API) and `runner` (CLI) are test seams."""
     try:
-        _select(job, ctx, client, feedback_examples)
+        _select(job, ctx, client, feedback_examples, runner)
     except _CreditDeferred:
         raise
     except BaseException:
@@ -780,6 +960,7 @@ def _select(
     ctx: StageContext,
     client: anthropic.Anthropic | None,
     feedback_examples: Sequence[Mapping[str, Any]],
+    runner: Callable[..., RunResult] | None,
 ) -> None:
     raw_transcript = read_json(ctx.media_dir / "transcript.json", required=True)
     try:
@@ -806,6 +987,9 @@ def _select(
     settings, creator = _settings_for(job, ctx)
     top_k = settings.max_clips_per_stream if job.is_stream else settings.max_clips_per_source
     cap = settings.daily_llm_usd_cap
+    backend: Backend = (
+        _CliBackend(runner) if settings.selector == "claude_cli" else _ApiBackend(client)
+    )
     detected = transcript.language if transcript.language != "unknown" else None
     system = build_system(
         job.creator,
@@ -828,10 +1012,9 @@ def _select(
             if index not in chosen:
                 skipped.append(f"#{index} {fmt_ts(window.start_s)}-{fmt_ts(window.end_s)}")
                 continue
-            _check_budget(ctx, cap)
-            if client is None:
-                client = _make_client()
-            found = _select_window(client, system, prompt, job, ctx, cap)
+            if backend.billed:
+                _check_budget(ctx, cap)
+            found = _select_window(backend, system, prompt, job, ctx, cap)
             write_json_atomic(cache, {"clips": [c.model_dump() for c in found]})
         candidates += found
     if skipped:

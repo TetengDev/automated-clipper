@@ -20,6 +20,11 @@ uv run pytest                     # tests
 docker compose build              # image with ffmpeg + yt-dlp
 ```
 
+Highlights are picked through the Claude Code CLI on your Claude subscription
+(`selector: claude_cli`; a logged-in `claude` locally, or `CLAUDE_CODE_OAUTH_TOKEN` from
+`claude setup-token` on a server), so no `ANTHROPIC_API_KEY` is needed. `selector: api` uses
+the paid Messages API instead. Details: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#highlight-selection).
+
 Transcription runs locally with faster-whisper by default (`transcriber: local`,
 `whisper_model: large-v3-turbo` in `config/creators.yaml`; transcriber, model and compute
 type can be set per creator). `GROQ_API_KEY` is needed only with `transcriber: groq`.

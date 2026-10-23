@@ -104,6 +104,7 @@ class _Strict(BaseModel):
 
 
 JumpCuts = Literal["off", "silences", "full"]
+Selector = Literal["api", "claude_cli"]
 
 
 def _yaml_off(value: Any) -> Any:
@@ -135,6 +136,9 @@ class Settings(_Strict):
     whisper_model: WhisperModelName = "large-v3-turbo"
     whisper_compute_type: ComputeType = "int8"
     whisper_cpu_threads: int = Field(4, ge=1, le=64)
+    selector: Selector = "api"
+    """How highlights are picked (CLP-81): the paid Messages API (ANTHROPIC_API_KEY), or
+    the Claude Code CLI on a Claude subscription (CLAUDE_CODE_OAUTH_TOKEN or a local login)."""
     jump_cuts: JumpCuts = "silences"
     """Cuts inside a clip (CLP-73): silences only, also stutters and fillers (full), or off.
     A stutter is cut only when its first word is clearly cut short, so with Whisper's
@@ -164,6 +168,7 @@ class CreatorOverrides(_Strict):
     whisper_model: WhisperModelName | None = None
     whisper_compute_type: ComputeType | None = None
     max_llm_windows: int | None = Field(None, ge=1)
+    selector: Selector | None = None
     jump_cuts: JumpCuts | None = None
 
     _jump_cuts_off = field_validator("jump_cuts", mode="before")(_yaml_off)
@@ -310,6 +315,7 @@ class Secrets(BaseSettings):
     twitch_client_id: SecretStr | None = None
     twitch_client_secret: SecretStr | None = None
     anthropic_api_key: SecretStr | None = None
+    claude_code_oauth_token: SecretStr | None = None
     groq_api_key: SecretStr | None = None
     discord_webhook_url: SecretStr | None = None
     discord_alerts_webhook_url: SecretStr | None = None

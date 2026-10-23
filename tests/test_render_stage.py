@@ -520,9 +520,8 @@ def test_transient_failure_with_all_others_invalid_stays_retryable(
     _setup(media, [_highlight(1, 10.0, 15.0, title=5), _highlight(2, 20.0, 25.0)])
     fake.fail_on[1] = RenderError("remotion render timed out after 900s")
 
-    with pytest.raises(RETRIED) as excinfo:
+    with pytest.raises(Deferred):  # the failure was counted: retried without an attempt
         rc.render_clips(job, _ctx(media, conn))
-    assert not isinstance(excinfo.value, PermanentError)
     assert _rows(conn) == []
 
 
@@ -551,7 +550,7 @@ def test_render_failure_is_retryable(
     _setup(media, [_highlight(1, 10.0, 15.0)])
     fake.fail_on[1] = RenderError("remotion render timed out after 900s")
 
-    with pytest.raises(RETRIED):
+    with pytest.raises(Deferred):  # the failure was counted: retried without an attempt
         rc.render_clips(job, _ctx(media, conn))
     assert _rows(conn) == []
 
@@ -1452,6 +1451,49 @@ def test_failure_marker_that_is_not_a_file_counts_as_no_failures(
     rc.render_clips(job, _ctx(media, conn))
 
     assert [r["rank"] for r in _rows(conn)] == [1]
+
+
+def test_failure_that_cannot_be_written_does_not_stop_later_clips(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
+    (media / "clips/1" / rc.FAILURES_MARKER).mkdir()  # the write cannot replace it
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+
+    with pytest.raises(Deferred, match="0 failure\\(s\\) counted"):  # clip 2 is progress
+        rc.render_clips(job, _ctx(media, conn))
+
+    assert [r["rank"] for r in _rows(conn)] == [2]
+    assert any("not counting the failure" in r.getMessage() for r in caplog.records)
+
+
+def test_all_left_out_still_fails_when_a_marker_cannot_be_removed(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+    for _ in range(rc.MAX_RENDER_FAILURES - 1):
+        with pytest.raises(Deferred):
+            rc.render_clips(job, _ctx(media, conn))
+    unlink = Path.unlink
+
+    def stuck(path: Path, missing_ok: bool = False) -> None:
+        if path.name == rc.FAILURES_MARKER:
+            raise PermissionError(f"cannot remove {path}")
+        unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", stuck)
+
+    with pytest.raises(PermanentError, match="no clip could be rendered"):
+        rc.render_clips(job, _ctx(media, conn))
 
 
 def test_symlinked_failure_marker_is_not_followed(

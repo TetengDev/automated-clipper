@@ -60,7 +60,14 @@ import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
-from clipper.config import ContentType, Creator, MissingSecretError, Secrets, Settings
+from clipper.config import (
+    ALWAYS_SENSITIVE,
+    ContentType,
+    Creator,
+    MissingSecretError,
+    Secrets,
+    Settings,
+)
 from clipper.jobs.models import Job
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext, StageDef
 from clipper.pipeline import common
@@ -567,8 +574,13 @@ def _payoff_kept(clip: Clip, max_s: float) -> bool:
 
 
 def finalize(
-    candidates: Sequence[Candidate], words: Sequence[_Word], settings: Settings, top_k: int
+    candidates: Sequence[Candidate],
+    words: Sequence[_Word],
+    settings: Settings,
+    top_k: int,
+    content_type: ContentType | None = None,
 ) -> list[dict[str, Any]]:
+    forced = content_type in ALWAYS_SENSITIVE
     snapped = [
         clip
         for c in candidates
@@ -592,7 +604,7 @@ def finalize(
             if (payoff := clip.candidate.payoff_s) is None
             else round(min(max(payoff, clip.start_s), clip.end_s), 3),
             "open_question": clip.candidate.open_question,
-            "sensitive": clip.candidate.sensitive,
+            "sensitive": forced or clip.candidate.sensitive,
         }
         for rank, clip in enumerate(kept, start=1)
     ]
@@ -1027,7 +1039,7 @@ def _select(
         )
 
     words = sorted(transcript.words, key=lambda w: w.start)
-    clips = finalize(candidates, words, settings, top_k)
+    clips = finalize(candidates, words, settings, top_k, creator.content_type if creator else None)
     write_json_atomic(
         ctx.media_dir / ARTIFACT,
         {

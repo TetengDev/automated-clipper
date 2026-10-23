@@ -188,6 +188,11 @@ class ContentType(StrEnum):
     COMEDY = "comedy"
 
 
+# Clips of these content types are always `sensitive`, whatever the model said (CLP-87): the
+# model sees only the transcript, so a victim's face or a name it missed is the reviewer's call.
+ALWAYS_SENSITIVE = frozenset({ContentType.PUBLIC_SERVICE})
+
+
 class YouTubeChannel(_Strict):
     # ASCII only: \w would also accept look-alike letters and digits from other scripts.
     handle: str = Field(pattern=r"^@[A-Za-z0-9_.-]{3,100}$")

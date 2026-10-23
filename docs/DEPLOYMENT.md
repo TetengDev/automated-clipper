@@ -100,6 +100,19 @@ The worker transcribes with faster-whisper on CPU (`transcriber: local`, the def
 - **Image**: faster-whisper and its native wheels (CTranslate2, onnxruntime, PyAV) add
   about 320 MB to the image.
 
+## Render failures
+
+A clip whose render fails 3 times (`MAX_RENDER_FAILURES`: a Remotion or ffmpeg timeout, a
+corrupt or missing section file) is left out. The job still reaches `clips_ready` with
+the other clips, and the worker log lists each left-out clip with its last error. If no
+clip renders, the job fails.
+
+- Each failure is counted in `data/media/<job>/clips/<rank>/render_failures.json`. Clip
+  failures use up these counts, not the job's attempts.
+- When no clip rendered, the counts are dropped, so `clipper retry <job>` tries every clip
+  again. A job that failed for another reason (e.g. its worker kept crashing) keeps them on
+  `clipper retry`. To give such a clip fresh tries, delete its `render_failures.json` first.
+
 ## CI/CD
 
 - **`ci.yml`** runs on every PR and on pushes to main: ruff, pytest (unit and integration against fixtures), Docker build, and Playwright tests for the review app.

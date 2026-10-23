@@ -19,7 +19,8 @@ Per creator:
 - Otherwise only unseen IDs get metadata. Then: live, upcoming, or a finished stream
   whose VOD is still processing -> `waiting_vod`, not enqueued (the S3 live-VOD work,
   CLP-26, rechecks these); shorter than min_duration_seconds (Shorts) -> `skipped_short`;
-  private/removed -> `unavailable`; anything else is enqueued.
+  private/removed, or members-only/Premium unless `allow_gated_content` -> `unavailable`;
+  anything else is enqueued.
 - An item's seen_items row and its job are written in one transaction, so it is enqueued
   exactly once, across crashes and restarts too. A failed metadata lookup leaves the item
   unseen; the next poll retries it.
@@ -43,7 +44,14 @@ from clipper.db import transaction
 from clipper.jobs.models import Clock, from_iso, to_iso, utcnow
 from clipper.jobs.queue import insert_job
 from clipper.redact import redact
-from clipper.sources.youtube import NOT_FINISHED, Metadata, SourceCancelled, Upload, VideoMeta
+from clipper.sources.youtube import (
+    GATED_AVAILABILITY,
+    NOT_FINISHED,
+    Metadata,
+    SourceCancelled,
+    Upload,
+    VideoMeta,
+)
 from clipper.urls import SourceRef
 
 logger = logging.getLogger(__name__)
@@ -323,6 +331,10 @@ class YouTubeMonitor:
             old = video.published < cutoff - slack
         if old:
             status = SeenStatus.BASELINE
+        elif video.availability in GATED_AVAILABILITY and not settings.allow_gated_content:
+            # Fetchable only through the cookies account's membership or Premium.
+            logger.info("%s: %s is %s; skipped", creator, video.video_id, video.availability)
+            status = SeenStatus.UNAVAILABLE
         elif video.live_status in NOT_FINISHED:
             status = SeenStatus.WAITING_VOD
         elif video.duration_s is not None and video.duration_s < settings.min_duration_seconds:

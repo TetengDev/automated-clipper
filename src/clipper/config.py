@@ -139,6 +139,9 @@ class Settings(_Strict):
     selector: Selector = "api"
     """How highlights are picked (CLP-81): the paid Messages API (ANTHROPIC_API_KEY), or
     the Claude Code CLI on a Claude subscription (CLAUDE_CODE_OAUTH_TOKEN or a local login)."""
+    allow_gated_content: bool = False
+    """Clip members-only and Premium videos that the yt-dlp cookies account can watch. Off:
+    they are skipped (ToS and licensing risk). 18+ videos are allowed either way."""
     jump_cuts: JumpCuts = "silences"
     """Cuts inside a clip (CLP-73): silences only, also stutters and fillers (full), or off.
     A stutter is cut only when its first word is clearly cut short, so with Whisper's

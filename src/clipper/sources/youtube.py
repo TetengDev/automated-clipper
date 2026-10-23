@@ -74,6 +74,9 @@ NOT_FINISHED: frozenset[str] = frozenset({"is_live", "is_upcoming", "post_live"}
 """Live now, scheduled, or a finished stream whose VOD is still processing."""
 GONE_REASONS: frozenset[str] = frozenset({"private", "members-only", "removed or unavailable"})
 """`Unavailable.reason`s that mean nobody can fetch it: recorded once, never retried."""
+GATED_AVAILABILITY: frozenset[str] = frozenset({"subscriber_only", "premium_only"})
+"""yt-dlp `availability` of members-only and Premium videos: fetchable with the right
+cookies, but skipped unless `allow_gated_content`."""
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _YT = "{http://www.youtube.com/xml/schemas/2015}"
@@ -120,6 +123,8 @@ class VideoMeta:
     published: datetime | None
     day_precision: bool = False
     """`published` is only a calendar day (yt-dlp's upload_date at midnight UTC)."""
+    availability: str | None = None
+    """yt-dlp's `availability` (public, unlisted, needs_auth, subscriber_only, ...)."""
 
 
 @dataclass
@@ -361,6 +366,7 @@ class YtDlpProvider:
             status,
             published,
             day_precision,
+            info["availability"] if isinstance(info.get("availability"), str) else None,
         )
 
     def uploads(self, channel_id: str) -> list[Upload]:

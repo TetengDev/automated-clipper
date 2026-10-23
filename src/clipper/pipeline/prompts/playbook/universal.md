@@ -30,12 +30,14 @@ hardship (debt, family conflict, a medical or legal problem).
 - Protected people are a victim in any abuse, sexual (including rape), family or child
   case, and any minor. "Family" includes spouses, partners and unpaid support
   (sustento). Never choose a moment in which anyone, at any point, says something that
-  identifies them or shows their face: the subtitles show every spoken word, so a role in
-  the hook does not hide it. That covers anything that, alone or together, tends to identify them: their
+  identifies them: the subtitles show every spoken word, so a role in the hook does not
+  hide it. That covers anything that, alone or together, tends to identify them: their
   name or nickname; the name of a parent, spouse, partner or relative; the name of the
   respondent in an abuse, sexual, family/support or child case; their school,
   workplace, employer, barangay, town, address, phone or plate number; or a relationship
-  combined with a place.
+  combined with a place. Also never choose a moment in which the transcript shows they
+  are on camera (they are called forward, introduced, or speak). Faces are checked by
+  the reviewer, who sees the video.
 - Never put the name, school, workplace, address or phone number of a private
   complainant in any other case in the hook, title, caption or hashtags, and never
   choose a start whose first spoken line names them. Refer to people by role (for

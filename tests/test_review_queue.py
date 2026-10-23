@@ -219,3 +219,12 @@ def test_sensitive_badge_only_on_sensitive_cards(client: TestClient, env: Env) -
     assert f'data-clip-id="{flagged}"' in cards[0] and 'class="badge sensitive"' in cards[0]
     assert 'class="badge sensitive"' not in cards[1]
     assert "check for names, faces or identifiers of victims and minors" in cards[0]
+
+
+def test_needs_attention_has_its_own_tab(client: TestClient, env: Env) -> None:
+    env.clip(status="needs_attention", title="Flagged", gate_reasons=["loudness"])
+    env.clip(title="Plain")
+    pending = client.get("/queue").text
+    assert "Flagged" not in pending and "Plain" in pending
+    flagged = client.get("/queue?status=needs_attention").text
+    assert "Flagged" in flagged and "Plain" not in flagged

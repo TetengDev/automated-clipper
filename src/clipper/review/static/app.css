@@ -119,6 +119,7 @@ select, input[type="number"] {
 .meta { display: flex; flex-direction: column; gap: 0.25rem; padding: 0.75rem; font-size: 0.9rem; }
 .badge { align-self: flex-start; font-size: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 999px; background: var(--bg); border: 1px solid var(--border); }
 .badge.sensitive { color: var(--error); border-color: var(--error); font-weight: 600; }
+.gate-reasons { color: var(--error); border-left: 3px solid var(--error); margin: 0 0 0.75rem; padding-left: 1.5rem; }
 .more { grid-column: 1 / -1; }
 .clip-nav { display: flex; justify-content: space-between; margin-bottom: 1rem; }
 .clip-nav span { display: flex; gap: 1rem; }

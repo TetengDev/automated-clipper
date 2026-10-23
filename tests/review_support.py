@@ -148,6 +148,7 @@ class Env:
         versions: int = 1,
         duration_s: float | None = None,
         sensitive: bool = False,
+        gate_reasons: list[str] | None = None,
     ) -> int:
         job = job_id if job_id is not None else self.job()
         rank = self.conn.execute(
@@ -184,6 +185,11 @@ class Env:
         if duration_s is not None:  # the rendered length (jump cuts make it < end - start)
             self.conn.execute(
                 "UPDATE clip_versions SET duration_s = ? WHERE clip_id = ?", (duration_s, clip_id)
+            )
+        if gate_reasons is not None:
+            self.conn.execute(
+                "UPDATE clip_versions SET gate_reasons = ? WHERE clip_id = ?",
+                (json.dumps(gate_reasons), clip_id),
             )
         return clip_id
 

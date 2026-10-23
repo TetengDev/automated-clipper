@@ -19,6 +19,11 @@
       {% if v.sensitive %}<span class="badge sensitive" title="Involves a victim, a minor or a tragedy: no effects, review with care; check for names, faces or identifiers of victims and minors">Sensitive</span>{% endif %}
       v{{ v.version }} · {{ clip.creator }} · {{ "%d" % v.duration_s }}s ·
       score {{ "%.1f" % v.score if v.score is not none else "–" }}</p>
+    {% if v.gate_reasons %}
+    <ul class="gate-reasons" id="gate-reasons" aria-label="Quality checks">
+      {% for reason in v.gate_reasons %}<li>{{ gate_labels.get(reason, reason) }}</li>{% endfor %}
+    </ul>
+    {% endif %}
     {% if v.caption %}<p class="caption">{{ v.caption }}</p>{% endif %}
     {% if v.hashtags %}<p class="muted">{{ v.hashtags | join(" ") }}</p>{% endif %}
     {% if v.reason %}<h2>Why Claude picked it</h2><p>{{ v.reason }}</p>{% endif %}

@@ -581,3 +581,43 @@ def test_detail_shows_the_rendered_duration(client: TestClient, env: Env) -> Non
     clip_id = env.clip(start_s=125.0, end_s=170.0, duration_s=38.0)
     html = client.get(f"/clip/{clip_id}").text
     assert "38s" in html and "45s" not in html
+
+
+# --- quality gates (CLP-74) -------------------------------------------------------------
+
+
+def test_needs_attention_clip_lists_its_reasons(client: TestClient, env: Env) -> None:
+    clip_id = env.clip(status="needs_attention", gate_reasons=["word_crosses_join", "loudness"])
+
+    html = client.get(f"/clip/{clip_id}").text
+
+    assert 'id="gate-reasons"' in html
+    assert "A word is cut at a jump-cut join" in html
+    assert "Loudness is off target" in html
+    assert 'id="approve-btn"' in html and 'id="reject-btn"' in html
+
+
+def test_gate_error_is_shown_on_a_pending_clip(client: TestClient, env: Env) -> None:
+    clip_id = env.clip(gate_reasons=["gate_error"])
+    html = client.get(f"/clip/{clip_id}").text
+    assert "A quality check could not run" in html
+
+
+def test_passing_clip_shows_no_gate_reasons(client: TestClient, env: Env) -> None:
+    clip_id = env.clip(gate_reasons=[])
+    assert 'id="gate-reasons"' not in client.get(f"/clip/{clip_id}").text
+
+
+def test_unknown_stored_reason_is_shown_as_is(client: TestClient, env: Env) -> None:
+    clip_id = env.clip(status="needs_attention", gate_reasons=["<b>new_check</b>"])
+    html = client.get(f"/clip/{clip_id}").text
+    assert "&lt;b&gt;new_check&lt;/b&gt;" in html and "<b>new_check</b>" not in html
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_needs_attention_clip_can_be_decided(
+    client: TestClient, env: Env, video_clip: int, action: str
+) -> None:
+    env.conn.execute("UPDATE clips SET status = 'needs_attention' WHERE id = ?", (video_clip,))
+    post(client, f"/clip/{video_clip}/{action}", version=1, reason_tag="bad_cut")
+    assert env.status(video_clip) == ("exported" if action == "approve" else "rejected")

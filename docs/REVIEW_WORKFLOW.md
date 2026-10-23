@@ -4,7 +4,7 @@ Every clip is reviewed by a person before anything is exported. Review happens i
 
 ## Flow
 
-1. The worker finishes rendering a source. Its clips get status `pending_review`.
+1. The worker finishes rendering a source. Each rendered clip first runs the quality gates (CLP-74): captions match the EDL words, no word crosses a jump-cut join, speech starts within 0.25 s, loudness is -14 LUFS ±1 with true peak at most -1 dBTP, and a `tiny` Whisper pass around each join hears the EDL's words. A clip that passes gets status `pending_review`. A clip that fails a gate gets `needs_attention`, and the clip page lists the reasons; it can still be approved or rejected. A gate that cannot run (for example, an ffmpeg timeout) is logged and shown as `gate_error`, but the clip still goes to `pending_review`.
 2. Discord receives one message per source batch, with deep links to each `/clip/{id}`.
 3. The reviewer opens the queue or a clip and takes one of these actions:
    - **Approve**: the clip becomes `approved`, it is exported to `output/ready/<date>/`, and its status becomes `exported`.
@@ -18,6 +18,8 @@ Every clip is reviewed by a person before anything is exported. Review happens i
 ## Clip state machine
 
 ```
+needs_attention ──approve / reject──▶ (as pending_review)
+
 pending_review ──approve──▶ approved ──export──▶ exported
       │
       ├──reject (reason)──▶ rejected

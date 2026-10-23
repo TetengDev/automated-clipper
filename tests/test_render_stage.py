@@ -176,6 +176,25 @@ def faces(monkeypatch: pytest.MonkeyPatch) -> FakeFaces:
     return fake
 
 
+class FakeGates:
+    """Stands in for the quality gates (CLP-74): every clip passes unless `reasons` says."""
+
+    def __init__(self) -> None:
+        self.reasons: list[str] = []
+        self.calls: list[dict[str, Any]] = []
+
+    def check(self, edl: EDL, video: Path, **kw: Any) -> list[str]:
+        self.calls.append({"edl": edl, "video": video, **kw})
+        return list(self.reasons)
+
+
+@pytest.fixture(autouse=True)
+def gates(monkeypatch: pytest.MonkeyPatch) -> FakeGates:
+    fake = FakeGates()
+    monkeypatch.setattr(rc, "check_clip", fake.check)
+    return fake
+
+
 @pytest.fixture
 def fake(monkeypatch: pytest.MonkeyPatch) -> FakeRender:
     render = FakeRender()
@@ -1146,3 +1165,75 @@ def test_non_boolean_sensitive_is_invalid_metadata(
     _setup(media, [_highlight(1, 10.0, 15.0, sensitive=bad), _highlight(2, 30.5, 40.5)])
     rc.render_clips(job, _ctx(media, conn))
     assert [r["rank"] for r in _rows(conn)] == [2]  # the bad clip is skipped, not stored
+
+
+# --- quality gates (CLP-74) -------------------------------------------------------------
+
+
+def test_rendered_clip_is_gated_on_its_video(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, gates: FakeGates
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    rc.render_clips(job, _ctx(media, conn))
+    (call,) = gates.calls
+    assert call["video"] == media / "clips/1/v1.mp4"
+    assert call["edl"] == fake.calls[0]["edl"]
+    row = _rows(conn)[0]
+    assert (row["status"], json.loads(row["gate_reasons"])) == ("pending_review", [])
+
+
+def test_failed_gate_sends_the_clip_to_needs_attention(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, gates: FakeGates
+) -> None:
+    gates.reasons = ["word_crosses_join"]
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    rc.render_clips(job, _ctx(media, conn))
+    row = _rows(conn)[0]
+    assert (row["status"], json.loads(row["gate_reasons"])) == (
+        "needs_attention",
+        ["word_crosses_join"],
+    )
+
+
+def test_gates_get_the_creators_language_and_threads(
+    conn: sqlite3.Connection, media: Path, fake: FakeRender, gates: FakeGates
+) -> None:
+    config = AppConfig(
+        settings=Settings(whisper_cpu_threads=2),
+        creators=(
+            Creator(
+                name="Raffy", region="ph", language="tl", youtube=YouTubeChannel(handle="@raffy")
+            ),
+        ),
+    )
+    job, _ = enqueue(conn, SourceRef("youtube", "dQw4w9WgXcQ"), T0, creator="Raffy")
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
+    assert gates.calls[0]["language"] == "tl"
+    assert gates.calls[0]["asr"].asr.cpu_threads == 2
+
+
+def test_worst_case_covers_the_gates() -> None:
+    from clipper.pipeline import quality
+
+    assert rc.CLIP_WORST_CASE_S >= quality.GATES_TIMEOUT_S + rc.DEFAULT_RENDER_TIMEOUT_S
+    assert rc.CLIP_WORST_CASE_S < rc.STAGE_BUDGET_S / 2
+
+
+def test_clip_starting_on_a_scene_cut_tells_the_gates(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    gates: FakeGates,
+    cuts: list[float],
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 40.0)])  # section time [2, 32]
+    rc.render_clips(job, _ctx(media, conn))
+    assert gates.calls[0]["starts_on_cut"] is False
+    gates.calls.clear()
+    conn.execute("DELETE FROM clip_versions")
+    conn.execute("DELETE FROM clips")
+    cuts.append(fake.calls[0]["edl"].source.in_s)
+    rc.render_clips(job, _ctx(media, conn))
+    assert gates.calls[0]["starts_on_cut"] is True

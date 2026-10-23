@@ -92,6 +92,24 @@ def test_enqueue_creates_one_job_per_url(tmp_path: Path) -> None:
     assert "already queued: job 1 (detected)" in again.output
 
 
+def test_enqueue_accepts_a_video_id_that_starts_with_a_dash(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+
+    result = runner.invoke(
+        app, ["--db", str(db_path), "enqueue", "https://www.youtube.com/watch?v=-4mo8fGTST0"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "queued job 1: youtube -4mo8fGTST0" in result.output
+    with closing(connect(db_path)) as conn:
+        row = conn.execute("SELECT item_id, source_url, status FROM jobs").fetchone()
+    assert tuple(row) == (
+        "-4mo8fGTST0",
+        "https://www.youtube.com/watch?v=-4mo8fGTST0",
+        "detected",
+    )
+
+
 def test_enqueue_rejects_invalid_url(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
 

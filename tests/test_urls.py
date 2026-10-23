@@ -52,7 +52,11 @@ def test_parses_twitch_vod(url: str) -> None:
         ("https://www.youtube.com/watch", "unsupported YouTube URL"),
         (f"https://www.youtube.com/watch?v={VID}&v={VID}", "unsupported YouTube URL"),
         ("https://www.youtube.com/watch?v=short", "valid youtube video id"),
-        ("https://www.youtube.com/watch?v=-Qw4w9WgXcQ", "valid youtube video id"),
+        ("https://www.youtube.com/watch?v=-4mo8fGTST", "valid youtube video id"),  # 10 chars
+        ("https://www.youtube.com/watch?v=-4mo8fGTST0x", "valid youtube video id"),  # 12
+        ("https://www.youtube.com/watch?v=-4mo8fGTST.", "valid youtube video id"),
+        ("https://www.youtube.com/watch?v=--../../etc", "valid youtube video id"),
+        ("https://youtu.be/-4mo8fGTS%2F", "valid youtube video id"),
         ("https://www.youtube.com/watch?v=dQw4w9WgXc%2F", "valid youtube video id"),
         (f"https://youtu.be/{VID}/extra", "youtu.be"),
         ("https://www.twitch.tv/kaicenat", "Twitch"),
@@ -96,3 +100,59 @@ def test_source_ref_validates_id_and_key() -> None:
         SourceRef("vimeo", "123")  # type: ignore[arg-type]
 
     assert SourceRef("twitch", "42").key == "twitch_42"
+
+
+# --- CLP-84: real YouTube ids can start with "-" ---------------------------------------
+
+DASH_IDS = ["-4mo8fGTST0", "-HgaXKz0rtg", "-----------", "_-_-_-_-_-_"]
+
+
+@pytest.mark.parametrize("vid", DASH_IDS)
+@pytest.mark.parametrize(
+    "template",
+    [
+        "https://www.youtube.com/watch?v={}",
+        "https://youtube.com/watch?v={}&t=42s",
+        "https://www.youtube.com/live/{}",
+        "https://youtu.be/{}?si=xyz",
+    ],
+)
+def test_parses_leading_dash_youtube_ids(template: str, vid: str) -> None:
+    ref = parse_source_url(template.format(vid))
+
+    assert ref == SourceRef("youtube", vid)
+    assert ref.key == f"youtube_{vid}"  # the media dir name never starts with "-"
+
+
+@pytest.mark.parametrize("vid", DASH_IDS)
+def test_canonical_url_of_a_leading_dash_id_round_trips(vid: str) -> None:
+    ref = SourceRef("youtube", vid)
+
+    assert canonical_url(ref) == f"https://www.youtube.com/watch?v={vid}"
+    assert parse_source_url(canonical_url(ref)) == ref
+
+
+@pytest.mark.parametrize(
+    "vid",
+    [
+        "-4mo8fGTST",  # 10 characters
+        "-4mo8fGTST00",  # 12 characters
+        "-4mo8fGTS/0",
+        "-4mo8fGTS.0",
+        "-4mo8fGT ST",
+        "../../etc/p",
+        "..-------..",
+        "-4mo8fGTST\n",
+        "-4mo8fGTST\u00e9",
+        "",
+    ],
+)
+def test_source_ref_still_rejects_bad_youtube_ids(vid: str) -> None:
+    with pytest.raises(InvalidSourceURL):
+        SourceRef("youtube", vid)
+
+
+@pytest.mark.parametrize("vid", ["-1", "-123", "0", "1-2", "12a"])
+def test_twitch_ids_stay_numeric(vid: str) -> None:
+    with pytest.raises(InvalidSourceURL):
+        SourceRef("twitch", vid)

@@ -4,6 +4,7 @@ The source is a fake (feeds and metadata per test) and the clock is fake; no net
 """
 
 import json
+import logging
 import os
 import signal
 import sqlite3
@@ -1108,3 +1109,53 @@ def test_stop_kills_an_in_flight_probe_and_the_monitor_exits_quickly(
     pid = int(pid_file.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+# --- CLP-84: video ids that start with "-" ----------------------------------------------
+
+DASH_IDS = ("-4mo8fGTST0", "-HgaXKz0rtg")  # real MrBeast uploads
+
+
+def test_upload_whose_id_starts_with_a_dash_is_enqueued(
+    conn, cfg, clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Through the real RSS parser and the keyless yt-dlp provider (both faked at the
+    transport), so the id validation of every layer is exercised."""
+    from clipper.pipeline.ytdlp import RunResult, YtDlp
+    from clipper.sources.youtube import FEED_URL
+
+    entries = "".join(
+        f"<entry><yt:videoId>{vid}</yt:videoId><published>{T0.isoformat()}</published></entry>"
+        for vid in DASH_IDS
+    )
+    feed = (
+        '<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015"'
+        f' xmlns="http://www.w3.org/2005/Atom">{entries}</feed>'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith(FEED_URL)
+        return httpx.Response(200, text=feed)
+
+    probes: list[list[str]] = []
+
+    def ytdlp(args, timeout_s):
+        probes.append(list(args))
+        vid = args[-1].rpartition("v=")[2]
+        body = {"id": vid, "title": f"Title {vid}", "duration": 1500, "timestamp": T0.timestamp()}
+        return RunResult(0, json.dumps(body), "")
+
+    not_first_poll(conn)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        source = YouTubeSource(http, YtDlpProvider(YtDlp(runner=ytdlp)))
+        with caplog.at_level(logging.WARNING):
+            report = make(conn, cfg, source, clock).run_cycle([cfg.creator("MrBeast")])
+
+    assert "ignoring invalid YouTube video id" not in caplog.text
+    assert report.items_new == 2
+    assert {vid: seen(conn)[vid] for vid in DASH_IDS} == dict.fromkeys(DASH_IDS, "enqueued")
+    rows = sorted((j["item_id"], j["source_url"]) for j in jobs(conn))
+    assert rows == sorted((v, f"https://www.youtube.com/watch?v={v}") for v in DASH_IDS)
+    for args in probes:  # the id reaches yt-dlp only inside the canonical URL, after "--"
+        assert args[-2] == "--"
+        assert args[-1].startswith("https://www.youtube.com/watch?v=-")

@@ -90,7 +90,8 @@ class CreatorPoll:
     first_run: bool = False
     new: int = 0
     """Items not seen before that this poll handled (enqueued or not); items whose
-    metadata lookup is still backing off are not counted."""
+    metadata lookup is still backing off, or that a stopped or blocked batch never got
+    to, are not counted."""
     enqueued: list[tuple[int, str, str | None]] = field(default_factory=list)
     """(job id, video id, title) per job created."""
     errors: list[dict[str, str]] = field(default_factory=list)
@@ -205,10 +206,10 @@ class YouTubeMonitor:
             start if mode is FirstRun.BASELINE else start - timedelta(days=settings.lookback_days)
         )
         fresh = [u for u in uploads if not self._is_seen(u.video_id)]
-        poll.new = len(fresh)
         if poll.first_run and mode is FirstRun.BASELINE:
             for upload in fresh:
                 self._record(creator.name, upload.video_id, SeenStatus.BASELINE, now)
+            poll.new = len(fresh)
             if fresh:
                 logger.info(
                     "%s: first poll, %d item(s) recorded as baseline", creator.name, poll.new
@@ -223,6 +224,7 @@ class YouTubeMonitor:
             for video_id in old:
                 self._record(creator.name, video_id, SeenStatus.BASELINE, now)
             fresh = [u for u in fresh if u.video_id not in old]
+            poll.new = len(old)
         listed = {u.video_id for u in uploads}
         for video_id, failure in list(self.failures.items()):
             if failure.creator == creator.name and video_id not in listed:
@@ -232,10 +234,11 @@ class YouTubeMonitor:
             for u in fresh
             if u.video_id not in self.failures or self.failures[u.video_id].retry_at <= now
         ]
-        poll.new -= len(fresh) - len(due)  # still backing off: not looked at this poll
         if not due:
             return
         meta = self.source.videos(due, self.stop.is_set)
+        # Only IDs looked at: the rest (stop requested, a block) are counted when they are.
+        poll.new += len(set(due) & (meta.videos.keys() | meta.unavailable | meta.errors.keys()))
         for video_id in due:
             if video_id in meta.unavailable:
                 self.failures.pop(video_id, None)

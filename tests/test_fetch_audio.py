@@ -686,6 +686,16 @@ def test_format_error_past_the_age_cap_fails_for_good(media_dir: Path) -> None:
         _fetch_at(media_dir, T0 + fa.NO_FORMAT_MAX_AGE + timedelta(hours=1), runner)
 
 
+def test_stale_format_marker_does_not_fail_a_new_breakage_at_once(media_dir: Path) -> None:
+    # A marker left by an earlier episode (e.g. the job was then skipped) is restarted.
+    (media_dir / fa.NO_FORMAT_MARKER).write_text((T0 - timedelta(days=10)).isoformat())
+    runner = FakeRunner()
+    runner.responses["probe"] = RunResult(1, "", FORMAT_ERROR)
+
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0, runner)
+
+
 def test_format_marker_cleared_once_the_download_works(media_dir: Path) -> None:
     runner = FakeRunner()
     runner.responses["download"] = RunResult(1, "", FORMAT_ERROR)

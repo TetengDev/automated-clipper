@@ -4,6 +4,7 @@ replays recorded-style responses from tests/fixtures/anthropic/."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -48,7 +49,20 @@ from clipper.urls import SourceRef
 FIXTURES = Path(__file__).parent / "fixtures" / "anthropic"
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 YT = SourceRef("youtube", "dQw4w9WgXcQ")
-CLIP_KEYS = {"rank", "start_s", "end_s", "hook", "title", "caption", "hashtags", "score", "reason"}
+CLIP_KEYS = {
+    "rank",
+    "start_s",
+    "end_s",
+    "hook",
+    "title",
+    "caption",
+    "hashtags",
+    "score",
+    "reason",
+    "payoff_s",
+    "open_question",
+    "sensitive",
+}
 
 
 def fixture(name: str) -> dict[str, Any]:
@@ -163,7 +177,8 @@ def test_valid_output_writes_highlights_contract(conn, media):
     out = run(make_job(conn), make_ctx(conn, media), fake)
 
     assert out["model"] == MODEL == "claude-sonnet-5-5"
-    assert out["prompt_version"] == PROMPT_VERSION == "select_v1"
+    assert out["prompt_version"] == PROMPT_VERSION == "select_v2"
+    assert out["playbook_version"] == select.PLAYBOOK_VERSION
     assert [c["rank"] for c in out["clips"]] == [1, 2, 3]
     assert [c["score"] for c in out["clips"]] == [92, 88, 75]  # ranked by score
     for clip in out["clips"]:
@@ -173,6 +188,8 @@ def test_valid_output_writes_highlights_contract(conn, media):
         assert all(isinstance(tag, str) for tag in clip["hashtags"])
     top = out["clips"][0]
     assert (top["start_s"], top["end_s"], top["hook"]) == (400.1, 445.6, "Hook 3")
+    assert (top["payoff_s"], top["open_question"]) == (410.1, "What happens after Hook 3?")
+    assert top["sensitive"] is False
     assert len(fake.requests) == 1
     assert not list(media.glob(".*.tmp"))  # atomic write leaves no temp file
 
@@ -190,7 +207,7 @@ def test_request_uses_cached_system_prompt_and_json_schema(conn, media):
     assert body["model"] == "claude-sonnet-5-5"
     system = body["system"]
     assert system[0]["cache_control"] == {"type": "ephemeral"}
-    assert system[0]["text"] == select.load_system_prompt()
+    assert system[0]["text"].startswith(select.load_system_prompt())  # + universal playbook
     assert "MrBeast" in system[1]["text"]
     fmt = body["output_config"]["format"]
     assert fmt["type"] == "json_schema"
@@ -1018,3 +1035,262 @@ def test_max_llm_windows_creator_override(conn, long_media):
         fake,
     )
     assert _sent_windows(fake) == [0, 3, 5]
+
+
+# --- CLP-51: select_v2 prompt, playbook and content types ---------------------------------------
+
+CONTENT_TYPES = [
+    "challenge_stunt",
+    "streamer_reaction",
+    "public_service",
+    "vlog_lifestyle",
+    "comedy",
+]
+
+
+def _creator_ctx(conn, media, content_type: str | None) -> StageContext:
+    creator: dict[str, Any] = {
+        "name": "MrBeast",
+        "region": "global",
+        "youtube": {"handle": "@MrBeast"},
+    }
+    if content_type is not None:
+        creator["content_type"] = content_type
+    config = AppConfig.model_validate({"creators": [creator]})
+    return StageContext(media, conn, config, clock=lambda: T0)
+
+
+def test_v2_prompt_carries_the_short_form_rules():
+    prompt = select.load_system_prompt().lower()
+    assert select.PROMPT_VERSION == "select_v2"
+    for rule in (
+        "3-second test",
+        "vague teas",
+        "names the person or thing",
+        "payoff_s",
+        "call to action",
+    ):
+        assert rule in prompt, rule
+    assert "open_question" in prompt and "sensitive" in prompt
+    assert "untrusted data" in prompt  # the v1 injection guard is kept
+
+
+def test_v1_prompt_still_loads():
+    assert "Output rules" in select.load_system_prompt("select_v1")
+
+
+@pytest.mark.parametrize("content_type", CONTENT_TYPES)
+def test_playbook_has_a_section_per_content_type(content_type):
+    text = select.load_playbook(content_type)
+    assert text.strip() and "Allowed" in text and "Avoid" in text
+
+
+def test_playbook_universal_rules_cover_sensitive_moments():
+    text = select.load_playbook("universal").lower()
+    assert "sensitive" in text and "minor" in text and "tragedy" in text
+
+
+def test_system_prompt_has_static_rules_first_and_content_type_second(conn, media):
+    fake = FakeAnthropic("valid.json")
+    run(make_job(conn), _creator_ctx(conn, media, "public_service"), fake)
+    system = fake.requests[0]["system"]
+    assert all(block["cache_control"] == {"type": "ephemeral"} for block in system)
+    assert system[0]["text"].startswith(select.load_system_prompt())
+    assert select.load_playbook("universal") in system[0]["text"]
+    assert "public_service" not in system[0]["text"]  # per-creator parts stay out of block 0
+    assert "Content type: public_service" in system[1]["text"]
+    assert select.load_playbook("public_service") in system[1]["text"]
+    assert select.load_playbook("comedy") not in system[1]["text"]
+
+
+def test_static_system_block_is_shared_across_content_types(conn, media):
+    first, second = FakeAnthropic("valid.json"), FakeAnthropic("valid.json")
+    run(make_job(conn), _creator_ctx(conn, media, "comedy"), first)
+    (media / ARTIFACT).unlink()
+    run(make_job(conn), _creator_ctx(conn, media, None), second)
+    assert first.requests[0]["system"][0] == second.requests[0]["system"][0]
+    assert "Content type" not in second.requests[0]["system"][1]["text"]
+
+
+def test_output_schema_has_payoff_open_question_and_sensitive():
+    props = select.OUTPUT_SCHEMA["properties"]["clips"]["items"]["properties"]
+    assert props["payoff_s"] == {"type": "number"}
+    assert props["open_question"] == {"type": "string"}
+    assert props["sensitive"] == {"type": "boolean"}
+    required = select.OUTPUT_SCHEMA["properties"]["clips"]["items"]["required"]
+    assert {"payoff_s", "open_question", "sensitive"} <= set(required)
+
+
+@pytest.mark.parametrize("payoff", [9.9, 30.1, -1.0])
+def test_candidate_model_rejects_payoff_outside_the_clip(payoff):
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    with pytest.raises(ValueError):
+        Candidate(start_s=10, end_s=30, payoff_s=payoff, **base)
+    for inside in (10, 20.5, 30):
+        assert Candidate(start_s=10, end_s=30, payoff_s=inside, **base).payoff_s == inside
+
+
+def test_open_question_is_limited_and_sanitized():
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    c = Candidate(start_s=1, end_s=30, open_question="q\x00" + "x" * 500, **base)
+    assert len(c.open_question) == select.FIELD_LIMITS["open_question"]
+    assert "\x00" not in c.open_question
+
+
+@pytest.mark.parametrize("payoff", [0.0, 70.0])
+def test_payoff_outside_its_clip_drops_only_that_candidate(conn, media, caplog, payoff):
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    reply = _message(
+        [
+            _cand(30.1, 60.6, hook="bad", payoff_s=payoff, open_question="", sensitive=False),
+            _cand(200.1, 235.6, hook="good", payoff_s=210.0, open_question="", sensitive=False),
+        ]
+    )
+    fake = FakeAnthropic((200, reply))  # a retry call would fail: nothing else is queued
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 1
+    assert [c["hook"] for c in out["clips"]] == ["good"]
+    assert "payoff_s" in caplog.text and "30.1" in caplog.text
+
+
+def test_malformed_reply_still_goes_through_the_retry_path(conn, media):
+    fake = FakeAnthropic("invalid.json", "valid.json")
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 2 and len(out["clips"]) == 3
+
+
+def test_payoff_cut_off_by_the_length_clamp_drops_the_candidate(caplog):
+    caplog.set_level(logging.INFO, logger="clipper.pipeline.select")
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(300)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    cut_off = Candidate(start_s=100.0, end_s=200.0, payoff_s=190.0, **base)
+    assert select.finalize([cut_off], words, Settings(), 3) == []
+    assert "payoff" in caplog.text
+
+
+def test_payoff_nudged_by_snapping_is_clamped_not_dropped():
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(300)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    edge = Candidate(start_s=100.0, end_s=130.0, payoff_s=100.0, **base)
+    (clip,) = select.finalize([edge], words, Settings(), 3)
+    assert clip["start_s"] == 100.1 and clip["payoff_s"] == 100.1
+
+
+@pytest.mark.parametrize("bad", ["../select_v1", "playbook/universal", "Comedy", ""])
+def test_load_playbook_rejects_unknown_sections(bad):
+    with pytest.raises(ValueError):
+        select.load_playbook(bad)
+
+
+PLAYBOOK_HASHES = {
+    "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
+    "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
+}
+
+
+def test_playbook_version_is_bumped_when_the_prompt_or_playbook_changes():
+    """If this fails after editing the playbook or select_v2.md, bump PLAYBOOK_VERSION and
+    add its new hash here (cached windows are keyed by the version, not the text)."""
+    root = Path(select.__file__).parent / "prompts"
+    digest = hashlib.sha256()
+    for path in sorted([*root.glob("playbook/*.md"), root / "select_v2.md"]):
+        rel = path.relative_to(root).as_posix().encode()
+        digest.update(rel + b"\0" + path.read_bytes() + b"\0")
+    assert PLAYBOOK_HASHES.get(select.PLAYBOOK_VERSION) == digest.hexdigest()
+
+
+def test_playbook_wording_review_fixes():
+    assert "or mark them" not in select.load_playbook("comedy")
+    public = select.load_playbook("public_service")
+    assert "Leave out moments that identify a minor or a victim" in public
+    assert "address or phone" in select.load_playbook("universal")
+
+
+def test_v1_recorded_reply_still_parses(conn, media):
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic("valid_v1.json"))
+    assert [c["score"] for c in out["clips"]] == [92, 88, 75]
+    for clip in out["clips"]:
+        assert clip["payoff_s"] is None
+        assert clip["open_question"] == ""
+        assert clip["sensitive"] is False
+
+
+def test_payoff_stays_inside_the_snapped_clip(conn, media):
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic("clamp.json"))
+    for clip in out["clips"]:
+        assert clip["start_s"] <= clip["payoff_s"] <= clip["end_s"]
+
+
+def test_sensitive_flag_is_passed_through_to_highlights(conn, media):
+    reply = (200, _message([_cand(30.1, 60.6, payoff_s=40.0, open_question="", sensitive=True)]))
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic(reply))
+    assert out["clips"][0]["sensitive"] is True
+
+
+def test_window_cache_key_includes_prompt_and_playbook_version(tmp_path, monkeypatch):
+    settings = Settings()
+    system = [{"type": "text", "text": "s"}]
+    base = select._window_cache(tmp_path, 0, system, "p", settings)
+    monkeypatch.setattr(select, "PLAYBOOK_VERSION", "playbook_v999")
+    other_playbook = select._window_cache(tmp_path, 0, system, "p", settings)
+    monkeypatch.setattr(select, "PROMPT_VERSION", "select_v999")
+    other_prompt = select._window_cache(tmp_path, 0, system, "p", settings)
+    assert len({base, other_playbook, other_prompt}) == 3
+
+
+def test_cached_v1_window_artifact_still_loads(tmp_path):
+    path = tmp_path / "000-abc.json"
+    v1 = json.loads(fixture("valid_v1.json")["content"][-1]["text"])
+    path.write_text(json.dumps(v1))
+    found = select._load_window(path)
+    assert found is not None and len(found) == 3
+    assert all(c.payoff_s is None and c.open_question == "" for c in found)
+
+
+def test_leftover_v1_cache_entry_is_a_miss_not_a_crash(conn, media):
+    (media / ".select").mkdir()
+    v1 = json.loads(fixture("valid_v1.json")["content"][-1]["text"])
+    (media / ".select" / "000-0123456789abcdef.json").write_text(json.dumps(v1))
+    fake = FakeAnthropic("valid.json")
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 1 and out["clips"][0]["payoff_s"] == 410.1
+    assert not (media / ".select").exists()
+
+
+def test_victims_minors_and_complainants_are_never_named():
+    universal = select.load_playbook("universal")
+    assert "Never put the name, school, workplace, address or phone number of a victim" in universal
+    assert 'This overrides "the hook names the\n  person"' in universal
+    prompt = select.load_system_prompt()
+    assert "never name a victim, a minor or a private\n  complainant" in prompt
+    public = select.load_playbook("public_service")
+    assert "does not identify them and is still worth" in public
+    assert "Any moment with a minor on screen or named is always `sensitive`." in public
+
+
+def test_payoff_after_a_clamped_end_drops_the_candidate():
+    # 100-200 clamped to 60 s ends near 160; a payoff at 162 is cut off, not "nudged".
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(300)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    cut_off = Candidate(start_s=100.0, end_s=200.0, payoff_s=162.0, **base)
+    assert select.finalize([cut_off], words, Settings(), 3) == []
+
+
+def test_negative_payoff_drops_only_that_candidate(conn, media):
+    reply = _message(
+        [
+            _cand(30.1, 60.6, hook="bad", payoff_s=-5.0, open_question="", sensitive=False),
+            _cand(200.1, 235.6, hook="good", payoff_s=210.0, open_question="", sensitive=False),
+        ]
+    )
+    fake = FakeAnthropic((200, reply))
+    out = run(make_job(conn), make_ctx(conn, media), fake)
+    assert len(fake.requests) == 1
+    assert [c["hook"] for c in out["clips"]] == ["good"]
+
+
+@pytest.mark.parametrize("payoff", [float("nan"), float("inf")])
+def test_non_finite_payoff_is_rejected(payoff):
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    with pytest.raises(ValueError):
+        Candidate(start_s=10, end_s=30, payoff_s=payoff, **base)

@@ -11,7 +11,7 @@
     },
     {
       "type": "text",
-      "text": "{\"clips\": [{\"start_s\": 30.1, \"end_s\": 60.6, \"hook\": \"Hook 1\", \"title\": \"Title 1\", \"caption\": \"Caption 1\", \"hashtags\": [\"#clip\", \"#n1\"], \"score\": 88, \"reason\": \"Reason 1\"}]}"
+      "text": "{\"clips\": [{\"start_s\": 30.1, \"end_s\": 60.6, \"hook\": \"Hook 1\", \"title\": \"Title 1\", \"caption\": \"Caption 1\", \"hashtags\": [\"#clip\", \"#n1\"], \"score\": 88, \"reason\": \"Reason 1\", \"payoff_s\": 40.1, \"open_question\": \"What happens after Hook 1?\", \"sensitive\": false}]}"
     }
   ],
   "stop_reason": "end_turn",

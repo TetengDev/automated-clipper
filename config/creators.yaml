@@ -30,18 +30,21 @@ creators:
   - name: MrBeast
     region: global
     tags: [challenge, entertainment]
+    content_type: challenge_stunt
     youtube:
       handle: "@MrBeast"
 
   - name: IShowSpeed
     region: global
     tags: [streamer, irl, sports]
+    content_type: streamer_reaction
     youtube:
       handle: "@IShowSpeed"
 
   - name: Kai Cenat
     region: global
     tags: [streamer]
+    content_type: streamer_reaction
     twitch:
       login: kaicenat
     youtube:
@@ -52,6 +55,7 @@ creators:
     region: ph
     language: tl
     tags: [public-service, news]
+    content_type: public_service
     youtube:
       handle: "@RaffyTulfoInAction"
 
@@ -59,6 +63,7 @@ creators:
     region: ph
     language: tl
     tags: [vlog, lifestyle]
+    content_type: vlog_lifestyle
     youtube:
       handle: "@IvanaAlawi"
 
@@ -66,5 +71,6 @@ creators:
     region: ph
     language: tl
     tags: [vlog, comedy]
+    content_type: comedy
     youtube:
       handle: "@CongTV"

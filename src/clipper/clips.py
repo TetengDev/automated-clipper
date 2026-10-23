@@ -92,6 +92,7 @@ class ClipCard:
     source_title: str | None
     has_thumb: bool
     created_at: str
+    sensitive: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,7 @@ class ClipVersion:
     created_at: str
     rendered_s: float | None = None
     """The video's length; with jump cuts shorter than end_s - start_s (the source range)."""
+    sensitive: bool = False
 
     @property
     def duration_s(self) -> float:
@@ -133,6 +135,7 @@ class ClipVersion:
             note=row["note"],
             created_at=row["created_at"],
             rendered_s=row["duration_s"],
+            sensitive=bool(row["sensitive"]),
         )
 
 
@@ -204,7 +207,7 @@ def source_url_at(platform: str, item_id: str, start_s: float) -> str:
 
 _CARD_SELECT = """
 SELECT c.id, c.status, c.current_version, c.created_at, j.creator, j.title AS source_title,
-       v.title, v.score, v.start_s, v.end_s, v.duration_s, v.thumb_path
+       v.title, v.score, v.start_s, v.end_s, v.duration_s, v.thumb_path, v.sensitive
 FROM clips c
 JOIN jobs j ON j.id = c.job_id
 JOIN clip_versions v ON v.clip_id = c.id AND v.version = c.current_version
@@ -249,6 +252,7 @@ def list_queue(
             source_title=r["source_title"],
             has_thumb=bool(r["thumb_path"]),
             created_at=r["created_at"],
+            sensitive=bool(r["sensitive"]),
         )
         for r in rows
     ]

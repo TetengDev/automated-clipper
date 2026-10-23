@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 
@@ -42,6 +42,8 @@ class ClipMeta:
     score: float | None = None
     reason: str | None = None
     prompt_version: str | None = None
+    playbook_version: str | None = None
+    sensitive: bool = False
     note: str | None = None
 
 
@@ -64,7 +66,8 @@ def _insert_version(
     conn.execute(
         "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption, hashtags,"
         " score, reason, captions_enabled, note, video_path, thumb_path, prompt_version,"
-        " created_at, duration_s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " playbook_version, sensitive, created_at, duration_s)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             clip_id,
             version,
@@ -80,6 +83,8 @@ def _insert_version(
             str(result.video_path),
             str(result.thumbnail_path),
             meta.prompt_version,
+            meta.playbook_version,
+            int(meta.sensitive),
             now,
             result.duration_s,
         ),
@@ -149,13 +154,18 @@ def add_clip_version(
         if exists is None:
             raise KeyError(f"clip {clip_id} not found")
         version = int(row[0]) + 1
+        # A re-render or edit never clears the sensitive flag an earlier version carried.
+        flagged = conn.execute(
+            "SELECT COALESCE(MAX(sensitive), 0) FROM clip_versions WHERE clip_id = ?", (clip_id,)
+        ).fetchone()[0]
+        meta = meta or ClipMeta()
         _insert_version(
             conn,
             clip_id=clip_id,
             version=version,
             edl=edl,
             result=result,
-            meta=meta or ClipMeta(),
+            meta=replace(meta, sensitive=meta.sensitive or bool(flagged)),
             now=stamp,
         )
         conn.execute(

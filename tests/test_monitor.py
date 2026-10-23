@@ -586,20 +586,49 @@ def test_upload_probed_during_a_player_breakage_is_still_enqueued(conn, cfg, sou
     assert all("--ignore-no-formats-error" not in call for call in calls)
 
 
-def test_age_restricted_upload_fetchable_with_cookies_is_enqueued(conn, cfg, source, clock) -> None:
+def poll_probed(conn, cfg, source, clock, availability: str):
+    """One poll of V1 through the real yt-dlp provider; the probe (with cookies) works."""
     from clipper.pipeline.ytdlp import RunResult, YtDlp
 
-    body = {"id": V1, "title": "18+ video", "duration": 1500, "timestamp": T0.timestamp()}
-    body |= {"availability": "needs_auth", "formats": [{"format_id": "140", "url": "https://x"}]}
+    body = {"id": V1, "title": "Gated", "duration": 1500, "timestamp": T0.timestamp()}
+    body |= {"availability": availability, "formats": [{"format_id": "140", "url": "https://x"}]}
     ytdlp = YtDlp(runner=lambda args, timeout_s: RunResult(0, json.dumps(body), ""))
     not_first_poll(conn)
     source.feeds[BEAST] = [Upload(V1, T0)]
     source.videos = YtDlpProvider(ytdlp).videos  # type: ignore[method-assign]
+    return make(conn, cfg, source, clock).run_cycle([cfg.creator("MrBeast")])
 
-    report = make(conn, cfg, source, clock).run_cycle([cfg.creator("MrBeast")])
+
+def test_age_restricted_upload_fetchable_with_cookies_is_enqueued(conn, cfg, source, clock) -> None:
+    report = poll_probed(conn, cfg, source, clock, "needs_auth")
 
     assert seen(conn)[V1] == "enqueued"
     assert report.items_new == 1 and report.errors == []
+
+
+@pytest.mark.parametrize("availability", ["subscriber_only", "premium_only"])
+def test_members_and_premium_uploads_are_skipped_by_default(
+    conn, cfg, source, clock, availability: str
+) -> None:
+    assert cfg.settings.allow_gated_content is False
+
+    report = poll_probed(conn, cfg, source, clock, availability)
+
+    assert seen(conn)[V1] == "unavailable"  # never retried
+    assert jobs(conn) == [] and report.errors == []
+
+
+@pytest.mark.parametrize("availability", ["subscriber_only", "premium_only", "needs_auth"])
+def test_gated_uploads_are_enqueued_when_allowed(
+    conn, source, clock, tmp_path: Path, availability: str
+) -> None:
+    path = tmp_path / "gated.yaml"
+    path.write_text(CONFIG.replace("settings:\n", "settings:\n  allow_gated_content: true\n", 1))
+    cfg = load_config(path)
+
+    poll_probed(conn, cfg, source, clock, availability)
+
+    assert seen(conn)[V1] == "enqueued"
 
 
 def test_interrupted_emit_first_poll_keeps_its_lookback_after_restart(

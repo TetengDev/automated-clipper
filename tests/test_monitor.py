@@ -22,7 +22,13 @@ from clipper.cli import app
 from clipper.config import AppConfig, Secrets, load_config
 from clipper.db import connect, migrate
 from clipper.jobs.queue import enqueue
-from clipper.monitor import COMPONENT, FirstRun, SeenStatus, YouTubeMonitor
+from clipper.monitor import (
+    COMPONENT,
+    MAX_METADATA_ATTEMPTS,
+    FirstRun,
+    SeenStatus,
+    YouTubeMonitor,
+)
 from clipper.sources.youtube import (
     Metadata,
     SourceError,
@@ -107,6 +113,10 @@ class FakeSource:
             answer = self.meta[vid]
             if answer == "unavailable":
                 result.unavailable.add(vid)
+            elif isinstance(answer, str) and answer.startswith("blocked"):
+                result.errors[vid] = answer
+                result.blocked.add(vid)
+                break
             elif isinstance(answer, str):
                 result.errors[vid] = answer
             else:
@@ -376,6 +386,73 @@ def test_metadata_error_leaves_item_unseen_and_is_retried(conn, cfg, source, clo
 
     assert retried.items_new == 1
     assert source.metadata_calls[-1] == [V1]
+
+
+def not_first_poll(conn: sqlite3.Connection, creator: str = "MrBeast") -> None:
+    conn.execute(
+        "INSERT INTO seen_items VALUES ('youtube', 'zzzzzzzzzzz', ?, 'baseline', ?, ?)",
+        (creator, "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z"),
+    )
+
+
+def calls_for(source: FakeSource, vid: str) -> int:
+    return sum(vid in call for call in source.metadata_calls)
+
+
+def test_failing_item_backs_off_then_is_given_up(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.meta[V1] = "yt-dlp failed: Connection reset"
+    monitor = make(conn, cfg, source, clock)
+    attempts_at: list[int] = []
+
+    for minute in range(0, 24 * 60, 10):  # a day of 10-minute polls
+        clock.now = T0 + timedelta(minutes=minute)
+        before = calls_for(source, V1)
+        monitor.run_cycle([cfg.creator("MrBeast")])
+        if calls_for(source, V1) > before:
+            attempts_at.append(minute)
+
+    assert attempts_at == [0, 10, 30, 70, 150, 310]  # 10 min doubling, then give up
+    assert len(attempts_at) == MAX_METADATA_ATTEMPTS
+    assert seen(conn)[V1] == "metadata_failed"
+    assert jobs(conn) == []
+
+
+def test_item_recovering_from_errors_is_enqueued_and_forgotten(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.meta[V1] = "yt-dlp failed: Connection reset"
+    monitor = make(conn, cfg, source, clock)
+    monitor.run_cycle([cfg.creator("MrBeast")])
+
+    clock.now += timedelta(minutes=5)  # still backing off: no call
+    monitor.run_cycle([cfg.creator("MrBeast")])
+    assert calls_for(source, V1) == 1
+
+    source.meta[V1] = video(V1)
+    clock.now += timedelta(minutes=5)
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert report.items_new == 1
+    assert monitor.failures == {}
+
+
+def test_bot_check_is_retried_every_poll_and_never_gives_up(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0), Upload(V2, T0)]
+    source.meta.update({V1: "blocked by platform (bot check)", V2: video(V2)})
+    monitor = make(conn, cfg, source, clock)
+
+    for _ in range(MAX_METADATA_ATTEMPTS * 3):
+        report = monitor.run_cycle([cfg.creator("MrBeast")])
+        clock.now += timedelta(minutes=10)
+
+    assert calls_for(source, V1) == MAX_METADATA_ATTEMPTS * 3
+    assert V1 not in seen(conn) and V2 not in seen(conn)  # V2 waits behind the block
+    assert report.errors == [
+        {"creator": "MrBeast", "item": V1, "error": "blocked by platform (bot check)"}
+    ]
 
 
 # --- isolation, runs rows, unresolved creators ---------------------------------------------

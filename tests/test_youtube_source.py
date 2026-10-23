@@ -673,6 +673,21 @@ def test_format_and_age_errors_are_retryable_not_unavailable(stderr: str) -> Non
     assert set(meta.errors) == {V1}
 
 
+def test_bot_check_stops_probing_the_rest_of_the_batch() -> None:
+    runner = FakeRunner(
+        {
+            watch(V1): RunResult(1, "", "ERROR: [youtube] x: Sign in to confirm you're not a bot"),
+            watch(V2): ok_json(info(V2)),
+        }
+    )
+
+    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1, V2])
+
+    assert runner.urls() == [watch(V1)]  # V2 waits for the next poll
+    assert set(meta.errors) == {V1} and meta.blocked == {V1}
+    assert meta.videos == {}
+
+
 def test_metadata_probes_and_listings_ignore_missing_formats() -> None:
     url = f"https://www.youtube.com/channel/{CHANNEL}/videos"
     runner = FakeRunner({watch(V1): ok_json(info(V1)), url: ok_json({"entries": []})})

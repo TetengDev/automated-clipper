@@ -240,7 +240,7 @@ class YouTubeMonitor:
                 logger.warning("%s: %s: metadata failed: %s", creator.name, video_id, error)
                 poll.errors.append({"creator": creator.name, "item": video_id, "error": error})
                 if video_id not in meta.blocked:
-                    self._metadata_failed(creator.name, video_id, now)
+                    self._metadata_failed(creator.name, video_id, now, poll)
             elif video_id in meta.videos:
                 self.failures.pop(video_id, None)
                 self._decide(creator.name, meta.videos[video_id], settings, cutoff, now, poll)
@@ -250,7 +250,9 @@ class YouTubeMonitor:
                 "%s: %d new item(s), %d enqueued", creator.name, poll.new, len(poll.enqueued)
             )
 
-    def _metadata_failed(self, creator: str, video_id: str, now: datetime) -> None:
+    def _metadata_failed(
+        self, creator: str, video_id: str, now: datetime, poll: CreatorPoll
+    ) -> None:
         failure = self.failures.get(video_id) or _Failure(creator, 0, now)
         failure.attempts += 1
         if failure.attempts >= MAX_METADATA_ATTEMPTS:
@@ -262,6 +264,13 @@ class YouTubeMonitor:
                 failure.attempts,
             )
             self._record(creator, video_id, SeenStatus.METADATA_FAILED, now)
+            poll.errors.append(
+                {
+                    "creator": creator,
+                    "item": video_id,
+                    "error": f"metadata failed {failure.attempts} times; given up",
+                }
+            )
             return
         failure.retry_at = now + METADATA_RETRY_BASE * 2 ** (failure.attempts - 1)
         self.failures[video_id] = failure

@@ -80,6 +80,9 @@ CLI_PROVIDER = "claude_cli"
 CLI_COMMAND = "claude"
 CLI_TIMEOUT_S = 600.0
 _LOCAL_LOGIN_ENV = ("CLAUDE_CONFIG_DIR", "USER", "LOGNAME")
+_CLI_QUIET_ENV = {"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+CLI_MAX_TURNS = 3
+"""Structured output takes 2 turns (the schema is answered through a tool call)."""
 USAGE_LIMIT_MAX_WAIT = timedelta(days=8)
 """A reset time further out than this (the weekly limit plus slack) is not trusted."""
 ARTIFACT = "highlights.json"
@@ -767,8 +770,9 @@ class _CliBackend:
                     "CLAUDE_CODE_OAUTH_TOKEN": token.get_secret_value(),
                     "CLAUDE_CONFIG_DIR": str(root / "config"),
                 }
+            env |= _CLI_QUIET_ENV
             args = [
-                CLI_COMMAND, "-p", "--model", MODEL,
+                CLI_COMMAND, "-p", "--model", MODEL, "--max-turns", str(CLI_MAX_TURNS),
                 "--output-format", "json", "--json-schema", json.dumps(OUTPUT_SCHEMA),
                 "--system-prompt-file", str(root / "system.md"),
                 "--tools", "", "--strict-mcp-config", "--setting-sources", "",
@@ -796,6 +800,8 @@ def _cli_reply(result: RunResult, ctx: StageContext) -> Reply:
     if not isinstance(out, dict):
         detail = common.stderr_tail(result.stderr) or "no JSON output"
         raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {detail}")
+    if out.get("subtype") == "error_max_turns":  # no answer in time: invalid output, retried
+        return Reply(None, "end_turn", 0.0, 0, 0)
     if out.get("is_error"):
         text = str(out.get("result") or "")
         status = out.get("api_error_status")

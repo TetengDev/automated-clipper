@@ -15,12 +15,13 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
     && npx --no-install remotion browser ensure \
     && npm cache clean --force
 
-# Claude Code CLI for `selector: claude_cli` (CLP-81), pinned. Its postinstall copies the
-# native binary for this platform over the wrapper stub; only that binary is copied below
-# (it needs no Node.js at runtime).
+# Claude Code CLI for `selector: claude_cli` (CLP-81), pinned. --ignore-scripts: its
+# postinstall only copies the native binary out of the platform package, which is done here
+# instead; only that binary goes into the image (it needs no Node.js at runtime).
 FROM node AS claude-cli
-RUN npm install -g --no-audit --no-fund @anthropic-ai/claude-code@2.1.295 \
-    && cp "$(npm root -g)/@anthropic-ai/claude-code/bin/claude.exe" /claude \
+RUN npm install --prefix /cli --ignore-scripts --no-audit --no-fund \
+        @anthropic-ai/claude-code@2.1.295 \
+    && cp "/cli/node_modules/@anthropic-ai/claude-code-linux-$(node -p process.arch)/claude" /claude \
     && /claude --version
 
 FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258

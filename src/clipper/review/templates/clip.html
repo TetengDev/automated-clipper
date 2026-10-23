@@ -16,6 +16,7 @@
   <div class="details">
     <h1>{{ v.title or "Untitled clip" }}</h1>
     <p><span class="badge status-{{ clip.status }}" id="clip-status">{{ clip.status | replace("_", " ") }}</span>
+      {% if v.sensitive %}<span class="badge sensitive" title="Involves a victim, a minor or a tragedy: no effects, review with care; check for names, faces or identifiers of victims and minors">Sensitive</span>{% endif %}
       v{{ v.version }} · {{ clip.creator }} · {{ "%d" % v.duration_s }}s ·
       score {{ "%.1f" % v.score if v.score is not none else "–" }}</p>
     {% if v.caption %}<p class="caption">{{ v.caption }}</p>{% endif %}

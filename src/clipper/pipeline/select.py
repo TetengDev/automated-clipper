@@ -3,9 +3,12 @@
 Reads `transcript.json` (required), `meta.json` and `signals.json` (optional hints) from
 the job's media dir and writes `highlights.json`:
 
-    {"model": str, "prompt_version": str,
+    {"model": str, "prompt_version": str, "playbook_version": str,
      "clips": [{"rank", "start_s", "end_s", "hook", "title", "caption",
-                "hashtags", "score", "reason"}]}
+                "hashtags", "score", "reason", "payoff_s", "open_question", "sensitive"}]}
+
+The system prompt is `select_v2` plus the universal editing playbook (static, shared by every
+creator), then the creator block with its content type's playbook section (CLP-51).
 
 The transcript is split into ~30 min windows with a small overlap; each window is one
 Messages API call with a cached system prompt and a JSON-schema structured output. When a
@@ -27,7 +30,7 @@ control characters, the transcript is fenced in <transcript> tags, the system pr
 to treat both as data, and every output field is length-limited and sanitized.
 
 Prompt caching note: the system prompt is only cached if the cached prefix reaches the
-model's minimum cacheable length; select_v1 alone may fall short. We log
+model's minimum cacheable length; select_v2 plus the playbook may still fall short. We log
 `cache_read_input_tokens` per call; verify against live traffic before relying on it.
 """
 
@@ -44,12 +47,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
-from clipper.config import MissingSecretError, Secrets, Settings
+from clipper.config import ContentType, Creator, MissingSecretError, Secrets, Settings
 from clipper.jobs.models import Job
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext, StageDef
 from clipper.pipeline import common
@@ -58,7 +62,10 @@ from clipper.pipeline.common import read_json, strip_control, write_json_atomic
 logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-5-5"
-PROMPT_VERSION = "select_v1"
+PROMPT_VERSION = "select_v2"
+PLAYBOOK_VERSION = "playbook_v3"
+"""Bump when select_v2.md or any file in prompts/playbook/ changes: it is part of the window
+cache key (a test pins the text hash per version)."""
 PROVIDER = "anthropic"
 ARTIFACT = "highlights.json"
 
@@ -81,7 +88,8 @@ CREDIT_MARKER = ".credit_deferred_since"
 CREDIT_MARKER_MAX_AGE = timedelta(days=7)
 """An older marker is from an earlier, unrelated outage and restarts the clock."""
 CACHE_DIR = ".select"
-FIELD_LIMITS = {"hook": 120, "title": 100, "caption": 2200, "reason": 500}
+PAYOFF_OUTSIDE = "payoff_outside"
+FIELD_LIMITS = {"hook": 120, "title": 100, "caption": 2200, "reason": 500, "open_question": 200}
 MAX_HASHTAGS = 10
 _HASHTAG = re.compile(r"^#\w{1,50}$")
 _TRANSCRIPT_TAG = re.compile(r"</?\s*transcript\b[^>]*>", re.IGNORECASE)
@@ -180,8 +188,13 @@ class Candidate(BaseModel):
     hashtags: list[str]
     score: int = Field(ge=0, le=100)
     reason: str
+    # v2 fields; defaults keep v1 replies and cached v1 windows loadable.
+    # No ge=0: a negative payoff fails the range check below and drops only its candidate.
+    payoff_s: float | None = Field(None, allow_inf_nan=False)
+    open_question: str = ""
+    sensitive: bool = False
 
-    @field_validator("hook", "title", "caption", "reason", mode="after")
+    @field_validator("hook", "title", "caption", "reason", "open_question", mode="after")
     @classmethod
     def _clean_text(cls, value: str, info: Any) -> str:
         """Control characters stripped, then cut to the field's limit (not rejected: the
@@ -203,11 +216,13 @@ class Candidate(BaseModel):
     def _ordered(self) -> Candidate:
         if self.end_s <= self.start_s:
             raise ValueError("end_s must be after start_s")
+        if self.payoff_s is not None and not self.start_s <= self.payoff_s <= self.end_s:
+            raise PydanticCustomError(PAYOFF_OUTSIDE, "payoff_s must fall inside [start_s, end_s]")
         return self
 
 
 class _Reply(BaseModel):
-    clips: list[Candidate]
+    clips: list[dict[str, Any]]
 
 
 _CANDIDATE_SCHEMA: dict[str, Any] = {
@@ -221,8 +236,23 @@ _CANDIDATE_SCHEMA: dict[str, Any] = {
         "hashtags": {"type": "array", "items": {"type": "string"}},
         "score": {"type": "integer"},
         "reason": {"type": "string"},
+        "payoff_s": {"type": "number"},
+        "open_question": {"type": "string"},
+        "sensitive": {"type": "boolean"},
     },
-    "required": ["start_s", "end_s", "hook", "title", "caption", "hashtags", "score", "reason"],
+    "required": [
+        "start_s",
+        "end_s",
+        "hook",
+        "title",
+        "caption",
+        "hashtags",
+        "score",
+        "reason",
+        "payoff_s",
+        "open_question",
+        "sensitive",
+    ],
     "additionalProperties": False,
 }
 OUTPUT_SCHEMA: dict[str, Any] = {
@@ -240,6 +270,13 @@ def load_system_prompt(version: str = PROMPT_VERSION) -> str:
     return (resources.files("clipper.pipeline") / "prompts" / f"{version}.md").read_text(
         encoding="utf-8"
     )
+
+
+def load_playbook(section: ContentType | Literal["universal"]) -> str:
+    """The universal rules or one content type's section; any other value is a ValueError."""
+    name = "universal" if section == "universal" else ContentType(section).value
+    path = resources.files("clipper.pipeline") / "prompts" / "playbook" / f"{name}.md"
+    return path.read_text(encoding="utf-8")
 
 
 def fmt_ts(seconds: float) -> str:
@@ -385,14 +422,23 @@ def build_user_prompt(
     return "\n\n".join(parts)
 
 
-def build_system(creator: str, language: str | None, tags: Sequence[str]) -> list[dict[str, Any]]:
-    """Static instructions first (cached), then the per-creator style block (cached too)."""
+def build_system(
+    creator: str,
+    language: str | None,
+    tags: Sequence[str],
+    content_type: ContentType | None = None,
+) -> list[dict[str, Any]]:
+    """Static instructions and the universal playbook first (cached, shared by every
+    creator), then the per-creator block with its content-type section (cached too)."""
     language = strip_control(language or "")[:MAX_LANGUAGE_CHARS] or "unknown"
     style = f"Creator: {creator}\nVideo language: {language}"
     if tags:
         style += f"\nCreator style tags: {', '.join(tags)}"
+    if content_type:
+        style += f"\nContent type: {content_type.value}\n\n{load_playbook(content_type)}"
+    static = f"{load_system_prompt()}\n\n{load_playbook('universal')}"
     return [
-        {"type": "text", "text": load_system_prompt(), "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": style, "cache_control": {"type": "ephemeral"}},
     ]
 
@@ -479,6 +525,25 @@ def dedupe(clips: Sequence[Clip], max_overlap: float = MAX_OVERLAP) -> list[Clip
     return kept
 
 
+def _payoff_kept(clip: Clip, max_s: float) -> bool:
+    """Snapping may nudge the payoff just outside the clip (clamped later); a payoff the
+    length clamp cut off is a clip without its payoff, so a clamped clip gets no slack."""
+    payoff = clip.candidate.payoff_s
+    clamped = clip.candidate.end_s - clip.candidate.start_s > max_s
+    slack = 0.0 if clamped else MAX_SNAP_S
+    if payoff is None or clip.start_s - slack <= payoff <= clip.end_s + slack:
+        return True
+    logger.info(
+        "dropping candidate %.1f-%.1f: payoff at %.1f falls outside the final clip %.1f-%.1f",
+        clip.candidate.start_s,
+        clip.candidate.end_s,
+        payoff,
+        clip.start_s,
+        clip.end_s,
+    )
+    return False
+
+
 def finalize(
     candidates: Sequence[Candidate], words: Sequence[_Word], settings: Settings, top_k: int
 ) -> list[dict[str, Any]]:
@@ -486,6 +551,7 @@ def finalize(
         clip
         for c in candidates
         if (clip := snap_to_words(c, words, settings.clip_min_seconds, settings.clip_max_seconds))
+        and _payoff_kept(clip, settings.clip_max_seconds)
     ]
     kept = dedupe(snapped)[:top_k]
     return [
@@ -499,6 +565,12 @@ def finalize(
             "hashtags": list(clip.candidate.hashtags),
             "score": clip.candidate.score,
             "reason": clip.candidate.reason,
+            # Snapping may nudge the boundaries (_payoff_kept); keep the payoff inside.
+            "payoff_s": None
+            if (payoff := clip.candidate.payoff_s) is None
+            else round(min(max(payoff, clip.start_s), clip.end_s), 3),
+            "open_question": clip.candidate.open_question,
+            "sensitive": clip.candidate.sensitive,
         }
         for rank, clip in enumerate(kept, start=1)
     ]
@@ -507,10 +579,8 @@ def finalize(
 # --- the stage ----------------------------------------------------------------------------------
 
 
-def _settings_for(job: Job, ctx: StageContext) -> tuple[Settings, str | None, tuple[str, ...]]:
-    creator = common.creator_for(job, ctx.config)
-    settings = common.settings_for(job, ctx.config)
-    return (settings, creator.language, creator.tags) if creator else (settings, None, ())
+def _settings_for(job: Job, ctx: StageContext) -> tuple[Settings, Creator | None]:
+    return common.settings_for(job, ctx.config), common.creator_for(job, ctx.config)
 
 
 def _make_client() -> anthropic.Anthropic:
@@ -533,7 +603,22 @@ def _parse_reply(message: Any) -> list[Candidate]:
     text = next((b.text for b in message.content if b.type == "text"), None)
     if text is None:
         raise ValueError("no text block")
-    return _Reply.model_validate_json(text).clips
+    candidates: list[Candidate] = []
+    for raw in _Reply.model_validate_json(text).clips:
+        try:
+            candidates.append(Candidate.model_validate(raw))
+        except ValidationError as exc:
+            # A payoff outside its own clip is a judgment miss on one candidate, not a
+            # malformed reply: drop it and keep the paid window. Anything else retries.
+            if not all(e["type"] == PAYOFF_OUTSIDE for e in exc.errors()):
+                raise
+            logger.info(
+                "dropping candidate %r-%r: payoff_s %r is outside the clip",
+                raw.get("start_s"),
+                raw.get("end_s"),
+                raw.get("payoff_s"),
+            )
+    return candidates
 
 
 class _CreditDeferred(Deferred):
@@ -656,7 +741,9 @@ def _window_cache(
         "clip_min_seconds": settings.clip_min_seconds,
         "clip_max_seconds": settings.clip_max_seconds,
     }
-    key = json.dumps([PROMPT_VERSION, MODEL, system, prompt, prompt_settings], sort_keys=True)
+    key = json.dumps(
+        [PROMPT_VERSION, PLAYBOOK_VERSION, MODEL, system, prompt, prompt_settings], sort_keys=True
+    )
     return cache_dir / f"{index:03d}-{hashlib.sha256(key.encode()).hexdigest()[:16]}.json"
 
 
@@ -716,11 +803,16 @@ def _select(
     if not transcript.words or not transcript.segments:
         raise SkipJob("transcript has no speech to clip")
 
-    settings, language, tags = _settings_for(job, ctx)
+    settings, creator = _settings_for(job, ctx)
     top_k = settings.max_clips_per_stream if job.is_stream else settings.max_clips_per_source
     cap = settings.daily_llm_usd_cap
     detected = transcript.language if transcript.language != "unknown" else None
-    system = build_system(job.creator, detected or language, tags)
+    system = build_system(
+        job.creator,
+        detected or (creator.language if creator else None),
+        creator.tags if creator else (),
+        creator.content_type if creator else None,
+    )
     duration = meta.get("duration_s") or transcript.duration_s
     windows = make_windows(transcript.segments, duration_s=float(duration) if duration else None)
     chosen = set(choose_windows(windows, signals, settings.max_llm_windows))
@@ -755,7 +847,12 @@ def _select(
     clips = finalize(candidates, words, settings, top_k)
     write_json_atomic(
         ctx.media_dir / ARTIFACT,
-        {"model": MODEL, "prompt_version": PROMPT_VERSION, "clips": clips},
+        {
+            "model": MODEL,
+            "prompt_version": PROMPT_VERSION,
+            "playbook_version": PLAYBOOK_VERSION,
+            "clips": clips,
+        },
     )
     shutil.rmtree(cache_dir, ignore_errors=True)
 

@@ -108,3 +108,61 @@ def test_each_version_keeps_its_own_files(conn: sqlite3.Connection, tmp_path: Pa
         (1, "v1.mp4", "v1.jpg"),
         (2, "v2.mp4", "v2.jpg"),
     ]
+
+
+def test_playbook_version_recorded_on_every_version(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    edl = parse_edl(EDL_DATA)
+    meta = ClipMeta(prompt_version="select_v2", playbook_version="playbook_v1")
+    ref = insert_pending_clip(conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), meta=meta)
+    add_clip_version(conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"), meta=meta)
+    rows = conn.execute(
+        "SELECT prompt_version, playbook_version FROM clip_versions WHERE clip_id = ?",
+        (ref.clip_id,),
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("select_v2", "playbook_v1")] * 2
+
+
+def test_playbook_version_defaults_to_null(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=parse_edl(EDL_DATA), result=_result(tmp_path)
+    )
+    row = conn.execute(
+        "SELECT playbook_version FROM clip_versions WHERE clip_id = ?", (ref.clip_id,)
+    ).fetchone()
+    assert row[0] is None
+
+
+def test_sensitive_flag_round_trips(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    edl = parse_edl(EDL_DATA)
+    flagged = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), meta=ClipMeta(sensitive=True)
+    )
+    plain = insert_pending_clip(conn, job_id=1, rank=2, edl=edl, result=_result(tmp_path))
+    again = add_clip_version(
+        conn,
+        clip_id=flagged.clip_id,
+        edl=edl,
+        result=_result(tmp_path, "v2"),
+        meta=ClipMeta(sensitive=True),
+    )
+    rows = conn.execute("SELECT clip_id, version, sensitive FROM clip_versions ORDER BY id")
+    assert [tuple(r) for r in rows] == [
+        (flagged.clip_id, 1, 1),
+        (plain.clip_id, 1, 0),
+        (flagged.clip_id, again.version, 1),
+    ]
+
+
+def test_new_version_keeps_the_sensitive_flag(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), meta=ClipMeta(sensitive=True)
+    )
+    v2 = add_clip_version(conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"))
+    row = conn.execute(
+        "SELECT sensitive FROM clip_versions WHERE clip_id = ? AND version = ?",
+        (ref.clip_id, v2.version),
+    ).fetchone()
+    assert row[0] == 1

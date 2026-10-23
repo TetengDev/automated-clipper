@@ -101,7 +101,14 @@ class DownloadBlocked(YtDlpError):
 
 
 class Unavailable(PermanentError):
-    """The video cannot be fetched by anyone without special access; do not retry."""
+    """The video cannot be fetched by anyone without special access; do not retry.
+
+    `reason` is the matched category ("private", "members-only", "removed or
+    unavailable", "age", "requested format not available")."""
+
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 _UNSAFE_ENV_PREFIXES = ("LD_", "DYLD_", "PYTHON")
@@ -296,7 +303,7 @@ def classify_error(stderr: str, *, secrets: Sequence[str] = ()) -> Exception:
         return DownloadBlocked(f"blocked by platform (rate limited): {tail}")
     for pattern, reason in _PERMANENT:
         if pattern.search(stderr):
-            return Unavailable(f"video not downloadable ({reason}): {tail}")
+            return Unavailable(f"video not downloadable ({reason}): {tail}", reason)
     if _BLOCKED.search(stderr):
         return DownloadBlocked(f"blocked by platform (bot check / rate limit): {tail}")
     return YtDlpError(f"yt-dlp failed: {tail or 'no error output'}")
@@ -360,10 +367,16 @@ class YtDlp:
             raise classify_error(result.stderr, secrets=secrets)
         return result
 
-    def probe(self, url: str) -> dict[str, Any]:
-        """Metadata only (`--dump-single-json --skip-download`); nothing is downloaded."""
-        result = self._run(["--dump-single-json", "--skip-download"], url, self.probe_timeout_s)
-        return _json_object(result.stdout)
+    def probe(self, url: str, *, ignore_no_formats: bool = False) -> dict[str, Any]:
+        """Metadata only (`--dump-single-json --skip-download`); nothing is downloaded.
+
+        `ignore_no_formats` is for callers that need no formats (detection): a YouTube
+        player breakage then still yields metadata instead of "requested format is not
+        available". The pipeline keeps the default, since it downloads from the result."""
+        extra = ["--dump-single-json", "--skip-download"]
+        if ignore_no_formats:
+            extra.append("--ignore-no-formats-error")
+        return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
     def listing(
         self, url: str, playlist_items: str, *, extractor_args: str | None = None
@@ -372,7 +385,10 @@ class YtDlp:
         none per video. `playlist_items` is yt-dlp's selector, e.g. "1:15", or "0" for the
         page's own metadata (channel_id) without any entries. `extractor_args` must be a
         fixed string chosen by the caller."""
-        extra = ["--flat-playlist", "--playlist-items", playlist_items, "--dump-single-json"]
+        extra = [
+            "--flat-playlist", "--playlist-items", playlist_items, "--dump-single-json",
+            "--ignore-no-formats-error",
+        ]  # fmt: skip
         if extractor_args:
             extra += ["--extractor-args", extractor_args]
         return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)

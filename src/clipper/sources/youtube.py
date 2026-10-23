@@ -59,6 +59,8 @@ LIVE_STATUSES: frozenset[str] = frozenset(
 )
 NOT_FINISHED: frozenset[str] = frozenset({"is_live", "is_upcoming", "post_live"})
 """Live now, scheduled, or a finished stream whose VOD is still processing."""
+GONE_REASONS: frozenset[str] = frozenset({"private", "members-only", "removed or unavailable"})
+"""`Unavailable.reason`s that mean nobody can fetch it: recorded once, never retried."""
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _YT = "{http://www.youtube.com/xml/schemas/2015}"
@@ -265,10 +267,15 @@ class YtDlpProvider:
         for video_id in ids:
             if should_stop():
                 break
+            url = canonical_url(SourceRef("youtube", video_id))
             try:
-                info = self.ytdlp.probe(canonical_url(SourceRef("youtube", video_id)))
-            except Unavailable:
-                result.unavailable.add(video_id)
+                info = self.ytdlp.probe(url, ignore_no_formats=True)
+            except Unavailable as exc:
+                if exc.reason in GONE_REASONS:
+                    logger.warning("%s: unavailable, not retried: %s", video_id, exc)
+                    result.unavailable.add(video_id)
+                else:  # age gate, format errors: may work later (cookies, a yt-dlp update)
+                    result.errors[video_id] = str(exc)
             except YtDlpError as exc:
                 if _UPCOMING.search(str(exc)):
                     result.videos[video_id] = VideoMeta(video_id, None, None, "is_upcoming", None)
@@ -382,7 +389,12 @@ class ApiProvider:
                 if video_id in batch:
                     result.videos[video_id] = self._meta(video_id, item)
             # Private and removed videos are simply left out of the response.
-            result.unavailable.update(v for v in batch if v not in result.videos)
+            missing = [v for v in batch if v not in result.videos]
+            for video_id in missing:
+                logger.warning(
+                    "%s: unavailable (not returned by videos.list), not retried", video_id
+                )
+            result.unavailable.update(missing)
         return result
 
     @staticmethod

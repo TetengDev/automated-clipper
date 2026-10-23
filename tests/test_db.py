@@ -259,3 +259,16 @@ def test_export_once_migration_dedupes_existing_rows(tmp_path: Path) -> None:
             " VALUES (1, 1, 'export', 't')"
         )
     conn.close()
+
+
+def test_a_skipped_lower_version_is_applied_later(tmp_path: Path) -> None:
+    """Parallel branches: a DB that got 4 before 3 still gets 3 (a set check, not max)."""
+    conn = connect(tmp_path / "state.db")
+    m = {v: Migration(v, f"m{v}", f"CREATE TABLE t{v}(x);") for v in (1, 2, 3, 4)}
+    assert migrate(conn, [m[1], m[2], m[4]]) == [1, 2, 4]
+
+    assert migrate(conn, list(m.values())) == [3]
+    assert "t3" in _tables(conn)
+    assert migrate(conn, list(m.values())) == []  # still idempotent
+    versions = [r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1")]
+    assert versions == [1, 2, 3, 4]

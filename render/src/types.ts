@@ -19,6 +19,24 @@ export type SourceSegment = {
   out_s: number;
 };
 
+/** A kept range (EDL v2), seconds in the source, on the frame grid. */
+export type Segment = {
+  in_s: number;
+  out_s: number;
+};
+
+export type CutKind = "silence" | "stutter" | "retake" | "false_start" | "filler";
+
+/** A range cut out (`applied`) or only proposed; a record, not used by the renderer. */
+export type Cut = {
+  in_s: number;
+  out_s: number;
+  kind: CutKind;
+  confidence: number;
+  reason: string;
+  applied: boolean;
+};
+
 export type Hook = {
   text: string;
   style: HookStyle;
@@ -35,14 +53,14 @@ export type Word = {
 };
 
 export type CropKey = {
-  /** Seconds from the clip start. */
+  /** Seconds from the clip start (output timeline). */
   t_s: number;
   /** Crop window centre, share of the source width (0..1). */
   x_center: number;
 };
 
 export type Edl = {
-  schema_version: 1;
+  schema_version: 1 | 2;
   source: SourceSegment;
   layout: Layout;
   hook: Hook | null;
@@ -52,4 +70,7 @@ export type Edl = {
   progress_bar: boolean;
   /** face_track only: sorted keys; two keys at one time are a jump (scene cut). */
   crop: CropKey[] | null;
+  /** v2 jump cuts: the kept ranges, spanning `source`; null means the one range `source`. */
+  segments: Segment[] | null;
+  cuts: Cut[];
 };

@@ -103,6 +103,14 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+JumpCuts = Literal["off", "silences", "full"]
+
+
+def _yaml_off(value: Any) -> Any:
+    """YAML 1.1 reads a bare `off` as false."""
+    return "off" if value is False else value
+
+
 class Settings(_Strict):
     poll_interval_youtube_minutes: int = Field(10, ge=1)
     poll_interval_twitch_minutes: int = Field(5, ge=1)
@@ -127,6 +135,12 @@ class Settings(_Strict):
     whisper_model: WhisperModelName = "large-v3-turbo"
     whisper_compute_type: ComputeType = "int8"
     whisper_cpu_threads: int = Field(4, ge=1, le=64)
+    jump_cuts: JumpCuts = "silences"
+    """Cuts inside a clip (CLP-73): silences only, also stutters and fillers (full), or off.
+    A stutter is cut only when its first word is clearly cut short, so with Whisper's
+    timestamps such cuts are rare: missing a stutter beats cutting deliberate repetition."""
+
+    _jump_cuts_off = field_validator("jump_cuts", mode="before")(_yaml_off)
 
     @model_validator(mode="after")
     def _clip_range(self) -> Settings:
@@ -150,6 +164,9 @@ class CreatorOverrides(_Strict):
     whisper_model: WhisperModelName | None = None
     whisper_compute_type: ComputeType | None = None
     max_llm_windows: int | None = Field(None, ge=1)
+    jump_cuts: JumpCuts | None = None
+
+    _jump_cuts_off = field_validator("jump_cuts", mode="before")(_yaml_off)
 
 
 class ContentType(StrEnum):

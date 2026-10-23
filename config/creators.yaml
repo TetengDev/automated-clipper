@@ -23,6 +23,7 @@ settings:
   media_retention_hours: 48
   review_expiry_days: 7
   reframe: auto                   # auto = face-tracked crop when faces are found; or blurred_fill
+  jump_cuts: silences             # cuts inside a clip: silences, full (+ stutters, fillers) or off
 
 creators:
   # --- Global ---

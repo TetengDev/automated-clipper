@@ -66,8 +66,8 @@ def _insert_version(
     conn.execute(
         "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption, hashtags,"
         " score, reason, captions_enabled, note, video_path, thumb_path, prompt_version,"
-        " playbook_version, sensitive, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " playbook_version, sensitive, created_at, duration_s)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             clip_id,
             version,
@@ -86,6 +86,7 @@ def _insert_version(
             meta.playbook_version,
             int(meta.sensitive),
             now,
+            result.duration_s,
         ),
     )
 

@@ -573,3 +573,11 @@ def test_clip_with_invalid_source_id_renders_without_link(client: TestClient, en
     assert response.status_code == 200
     assert 'id="source-link"' not in response.text
     assert "no valid source link" in response.text
+
+
+def test_detail_shows_the_rendered_duration(client: TestClient, env: Env) -> None:
+    """Jump cuts: a 45 s source range rendered to 38 s shows 38 s; the source link
+    still starts at the source position."""
+    clip_id = env.clip(start_s=125.0, end_s=170.0, duration_s=38.0)
+    html = client.get(f"/clip/{clip_id}").text
+    assert "38s" in html and "45s" not in html

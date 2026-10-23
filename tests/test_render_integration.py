@@ -205,3 +205,73 @@ def test_render_face_track(tmp_path: Path) -> None:
     red, blue = _mean_rgb(result.video_path, 0.5), _mean_rgb(result.video_path, 2.5)
     assert red[0] > 200 and red[2] < 40  # all red: no blue, no black bars
     assert blue[2] > 200 and blue[0] < 40
+
+
+def test_render_jump_cut(tmp_path: Path) -> None:
+    """AC (CLP-73): 1.2 s of silence inside the clip is found by a real silencedetect,
+    cut down to a breath, and the two-segment render is shorter by the gap minus that
+    breath (ffprobe), with no long silence left at the join."""
+    from clipper.edl import Word
+    from clipper.pipeline import jumpcuts as jc
+    from clipper.pipeline.common import Deadline
+
+    media_root = tmp_path / "media"
+    (media_root / "src").mkdir(parents=True)
+    section = media_root / "src" / "gap.mp4"
+    tone = "sine=frequency=440:sample_rate=48000:duration=2"
+    _run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=5.2",
+            "-f", "lavfi", "-i", tone,
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=1.2",
+            "-f", "lavfi", "-i", tone,
+            "-filter_complex", "[1][2][3]concat=n=3:v=0:a=1[a]",
+            "-map", "0:v", "-map", "[a]",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(section),
+        ]
+    )  # fmt: skip
+    texts = ["we", "did", "not", "see", "that", "coming", "at", "all"]
+    times = [(0.2, 0.5), (0.6, 0.9), (1.0, 1.4), (1.5, 2.0)]
+    times += [(3.2, 3.6), (3.7, 4.2), (4.3, 4.6), (4.7, 5.0)]
+    words = [Word(text=t, start_s=a, end_s=b) for t, (a, b) in zip(texts, times, strict=True)]
+
+    silences = jc.detect_silences(section, Deadline())
+    assert silences
+    cuts = jc.plan_cuts(words, silences, "silences")
+    segments = jc.apply_cuts((0.0, 5.2), cuts)
+    assert len(segments) == 2
+    edl = parse_edl(
+        {
+            "source": {"path": "src/gap.mp4", "in_s": segments[0][0], "out_s": segments[-1][1]},
+            "segments": [{"in_s": a, "out_s": b} for a, b in segments],
+            "cuts": [c.model_dump(mode="json") for c in cuts],
+            "words": [w.model_dump(mode="json") for w in words],
+            "hook": {"text": "Jump cut", "duration_s": 1.0},
+        }
+    )
+    result = render_clip(edl, media_root, tmp_path / "out", timeout_s=600)
+
+    probe = json.loads(
+        _run(
+            [
+                "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_frames", "-show_format",
+                "-of", "json", str(result.video_path),
+            ]
+        ).stdout
+    )  # fmt: skip
+    frames = int(probe["streams"][0]["nb_read_frames"])
+    assert frames == edl.duration_in_frames
+    assert frames / 30 == pytest.approx(5.2 - (1.2 - jc.BREATH_S), abs=1 / 30)
+    assert float(probe["format"]["duration"]) == pytest.approx(frames / 30, abs=0.1)
+    # The kept breath is all that is left of the silence.
+    out = subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "ffmpeg", "-hide_banner", "-nostats", "-i", str(result.video_path),
+            "-af", "silencedetect=noise=-40dB:d=0.3", "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=True, timeout=120,
+    ).stderr  # fmt: skip
+    assert "silence_start" not in out
+    print(f"jump cut render: {frames} frames, segments {segments}")  # noqa: T201

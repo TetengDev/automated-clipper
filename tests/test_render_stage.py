@@ -1365,11 +1365,21 @@ def test_rank_that_recovers_below_the_limit_renders_once(
     assert not (media / "clips/2" / rc.FAILURES_MARKER).exists()
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{not json",
+        json.dumps({"failures": True, "error": "x"}),
+        json.dumps({"failures": "9", "error": "x"}),
+        json.dumps({"failures": 9, "error": None}),
+        json.dumps([9]),
+    ],
+)
 def test_unreadable_failure_marker_counts_as_no_failures(
-    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, content: str
 ) -> None:
     _setup(media, [_highlight(1, 10.0, 15.0)])
-    (media / "clips/1" / rc.FAILURES_MARKER).write_text("{not json")
+    (media / "clips/1" / rc.FAILURES_MARKER).write_text(content)
 
     rc.render_clips(job, _ctx(media, conn))
 

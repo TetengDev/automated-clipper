@@ -363,13 +363,14 @@ class YtDlp:
     def probe(self, url: str) -> dict[str, Any]:
         """Metadata only (`--dump-single-json --skip-download`); nothing is downloaded."""
         result = self._run(["--dump-single-json", "--skip-download"], url, self.probe_timeout_s)
-        try:
-            info = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            raise YtDlpError("yt-dlp returned invalid JSON") from None
-        if not isinstance(info, dict):
-            raise YtDlpError("yt-dlp returned unexpected JSON")
-        return info
+        return _json_object(result.stdout)
+
+    def listing(self, url: str, playlist_items: str) -> dict[str, Any]:
+        """A channel or playlist page, flat (`--flat-playlist`): one request for the page,
+        none per video. `playlist_items` is yt-dlp's selector, e.g. "1:15", or "0" for the
+        page's own metadata (channel_id) without any entries."""
+        extra = ["--flat-playlist", "--playlist-items", playlist_items, "--dump-single-json"]
+        return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
     @classmethod
     def from_env(
@@ -436,6 +437,16 @@ class YtDlp:
         ]
         self._run(extra, url, self.download_timeout_s if timeout_s is None else timeout_s)
         return _downloaded(out_dir, stem)
+
+
+def _json_object(stdout: str) -> dict[str, Any]:
+    try:
+        info = json.loads(stdout)
+    except json.JSONDecodeError:
+        raise YtDlpError("yt-dlp returned invalid JSON") from None
+    if not isinstance(info, dict):
+        raise YtDlpError("yt-dlp returned unexpected JSON")
+    return info
 
 
 def _template(out_dir: Path, stem: str) -> str:

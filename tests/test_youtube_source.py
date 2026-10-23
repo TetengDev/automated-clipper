@@ -329,7 +329,7 @@ def test_ytdlp_provider_handle_lookup_network_error_is_not_not_found() -> None:
 def api() -> Iterator[respx.MockRouter]:
     with respx.mock(base_url=yt.API_BASE, assert_all_called=False) as mock:
         # search.list costs 100 units; it must never be called.
-        mock.route(path__startswith="/youtube/v3/search").mock(
+        mock.route(name="search", path__startswith="/search").mock(
             side_effect=AssertionError("search.list must never be called")
         )
         yield mock
@@ -438,9 +438,7 @@ def test_api_error_is_redacted_and_counted(api: respx.MockRouter, http: httpx.Cl
     assert provider.quota.units == 1
 
 
-def test_api_transport_error_never_shows_the_key(
-    api: respx.MockRouter, http: httpx.Client
-) -> None:
+def test_api_transport_error_never_shows_the_key(api: respx.MockRouter, http: httpx.Client) -> None:
     api.get("/videos").mock(side_effect=httpx.ConnectError(f"boom ?key={KEY}"))
 
     with pytest.raises(SourceError) as info_:
@@ -515,6 +513,7 @@ def test_api_provider_never_calls_search(api: respx.MockRouter, http: httpx.Clie
     provider.uploads(CHANNEL)
     provider.videos([V1])
 
+    assert not api.routes["search"].called
     assert all("/search" not in str(call.request.url) for call in api.calls)
 
 

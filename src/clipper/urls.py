@@ -34,6 +34,8 @@ class InvalidSourceURL(ValueError):
 class SourceRef:
     platform: Platform
     item_id: str
+    """May start with "-": never use it as a bare file name or argv value; use `key` (paths)
+    or `canonical_url(ref)` (after "--") instead."""
 
     def __post_init__(self) -> None:
         pattern = _ITEM_ID.get(self.platform)

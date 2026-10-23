@@ -111,6 +111,11 @@ class DownloadBlocked(YtDlpError):
     """The platform is refusing us (bot check / rate limit). Retryable; alert on it."""
 
 
+NO_FORMAT = "requested format not available"
+"""`Unavailable.reason` when no format could be selected: usually a YouTube player change
+(SABR, n-sig) that a yt-dlp update fixes, not the video itself."""
+
+
 class Unavailable(PermanentError):
     """The video cannot be fetched by anyone without special access; do not retry.
 
@@ -309,7 +314,7 @@ _PERMANENT: tuple[tuple[re.Pattern[str], str], ...] = tuple(
             r"account .*has been terminated|no longer available|video .*does not exist",
             "removed or unavailable",
         ),
-        (r"requested format is not available", "requested format not available"),
+        (r"requested format is not available", NO_FORMAT),
     )
 )
 # YouTube's rate-limit page says "Video unavailable ... try again later": not permanent.
@@ -405,16 +410,15 @@ class YtDlp:
             raise classify_error(result.stderr, secrets=secrets)
         return result
 
-    def probe(self, url: str, *, ignore_no_formats: bool = False) -> dict[str, Any]:
+    def probe(self, url: str) -> dict[str, Any]:
         """Metadata only (`--dump-single-json --skip-download`); nothing is downloaded.
 
-        Normally without `--ignore-no-formats-error`: yt-dlp would then downgrade private,
+        Never with `--ignore-no-formats-error`: yt-dlp would then downgrade private,
         members-only, age-gate and bot-check failures to a warning and exit 0, so they
-        could not be classified. `ignore_no_formats` is for the monitor's re-probe after
-        a format error only, and its result is trusted only when it lists formats."""
+        could not be classified. The YouTube extractor also appends storyboard images to
+        the formats after its playability check, so even a non-empty format list would
+        not prove the video playable."""
         extra = ["--dump-single-json", "--skip-download"]
-        if ignore_no_formats:
-            extra.append("--ignore-no-formats-error")
         return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
     def listing(

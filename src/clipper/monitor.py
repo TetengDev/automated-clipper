@@ -58,7 +58,10 @@ MAX_METADATA_ATTEMPTS = 6
 """A video whose metadata keeps failing is retried after 10, 20, 40, 80 and 160 minutes,
 then recorded as `metadata_failed` (about 5 h of failures). Platform blocks (bot check)
 and format errors (a YouTube player breakage) are not counted: they say nothing about the
-video, and they are retried every poll."""
+video. Blocks are retried every poll, format errors after FORMAT_RETRY_MAX at most."""
+FORMAT_RETRY_MAX = timedelta(hours=1)
+"""A video hit by a format error is retried after 10, 20, 40, then every 60 minutes until a
+yt-dlp update fixes the player; never given up."""
 
 
 class FirstRun(StrEnum):
@@ -130,6 +133,9 @@ class YouTubeMonitor:
     failures: dict[str, _Failure] = field(default_factory=dict)
     """Videos whose metadata lookup failed, by id. Kept in memory: a restart only resets
     the backoff, it cannot enqueue anything twice."""
+    format_retries: dict[str, _Failure] = field(default_factory=dict)
+    """Videos whose last lookup was a format error, by id (`attempts`: the streak). Kept
+    apart from `failures` because these never count toward giving up."""
 
     def run_forever(self, creators: Sequence[Creator]) -> None:
         """Poll every interval (with jitter) until `stop` is set. A failing cycle (e.g. the
@@ -227,20 +233,21 @@ class YouTubeMonitor:
             fresh = [u for u in fresh if u.video_id not in old]
             poll.new = len(old)
         listed = {u.video_id for u in uploads}
-        for video_id, failure in list(self.failures.items()):
-            if failure.creator == creator.name and video_id not in listed:
-                del self.failures[video_id]  # dropped off the listing: forget it
-        due = [
-            u.video_id
-            for u in fresh
-            if u.video_id not in self.failures or self.failures[u.video_id].retry_at <= now
-        ]
+        for retries in (self.failures, self.format_retries):
+            for video_id, failure in list(retries.items()):
+                if failure.creator == creator.name and video_id not in listed:
+                    del retries[video_id]  # dropped off the listing: forget it
+        due = [u.video_id for u in fresh if not self._backing_off(u.video_id, now)]
         if not due:
             return
         meta = self.source.videos(due, self.stop.is_set)
         # Only IDs looked at: the rest (stop requested, a block) are counted when they are.
         poll.new += len(set(due) & (meta.videos.keys() | meta.unavailable | meta.errors.keys()))
         for video_id in due:
+            if video_id in meta.format_errors:
+                self._format_failed(creator.name, video_id, now)
+            elif video_id in meta.unavailable | meta.errors.keys() | meta.videos.keys():
+                self.format_retries.pop(video_id, None)
             if video_id in meta.unavailable:
                 self.failures.pop(video_id, None)
                 self._record(creator.name, video_id, SeenStatus.UNAVAILABLE, now)
@@ -258,6 +265,19 @@ class YouTubeMonitor:
             logger.info(
                 "%s: %d new item(s), %d enqueued", creator.name, poll.new, len(poll.enqueued)
             )
+
+    def _backing_off(self, video_id: str, now: datetime) -> bool:
+        return any(
+            video_id in retries and retries[video_id].retry_at > now
+            for retries in (self.failures, self.format_retries)
+        )
+
+    def _format_failed(self, creator: str, video_id: str, now: datetime) -> None:
+        failure = self.format_retries.get(video_id) or _Failure(creator, 0, now)
+        failure.attempts += 1
+        delay = METADATA_RETRY_BASE * 2 ** min(failure.attempts - 1, 6)
+        failure.retry_at = now + min(delay, FORMAT_RETRY_MAX)
+        self.format_retries[video_id] = failure
 
     def _metadata_failed(
         self, creator: str, video_id: str, now: datetime, poll: CreatorPoll

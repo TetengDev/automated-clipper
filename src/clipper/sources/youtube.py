@@ -36,6 +36,7 @@ from defusedxml.ElementTree import fromstring
 from clipper.config import Secrets
 from clipper.jobs.stages import PermanentError
 from clipper.pipeline.ytdlp import (
+    NO_FORMAT,
     CommandCancelled,
     DownloadBlocked,
     Unavailable,
@@ -73,8 +74,6 @@ NOT_FINISHED: frozenset[str] = frozenset({"is_live", "is_upcoming", "post_live"}
 """Live now, scheduled, or a finished stream whose VOD is still processing."""
 GONE_REASONS: frozenset[str] = frozenset({"private", "members-only", "removed or unavailable"})
 """`Unavailable.reason`s that mean nobody can fetch it: recorded once, never retried."""
-NO_FORMAT = "requested format not available"
-"""The `Unavailable.reason` of a format selection failure (e.g. a YouTube player change)."""
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _YT = "{http://www.youtube.com/xml/schemas/2015}"
@@ -137,8 +136,8 @@ class Metadata:
     """The subset of `errors` where the platform refused us (bot check, rate limit): says
     nothing about the video itself. The batch stops there."""
     format_errors: set[str] = field(default_factory=set)
-    """The subset of `errors` where extraction worked but no format could be selected (a
-    YouTube player breakage): says nothing about the video either."""
+    """The subset of `errors` where no format could be selected, typically a YouTube player
+    breakage: says nothing about the video either. The batch stops there too."""
 
 
 @dataclass
@@ -294,10 +293,6 @@ def _title(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-class _NoFormat(Exception):
-    """A format error the re-probe did not resolve. Message: the original error."""
-
-
 @dataclass
 class YtDlpProvider:
     """Keyless metadata: one yt-dlp probe per new video (~1-2 s each, no quota)."""
@@ -312,13 +307,17 @@ class YtDlpProvider:
                 break
             url = canonical_url(SourceRef("youtube", video_id))
             try:
-                info = self._probe(url)
+                info = self.ytdlp.probe(url)
             except CommandCancelled:
                 break  # shutting down; this one and the rest wait for the next start
-            except _NoFormat as exc:
-                result.errors[video_id] = str(exc)
-                result.format_errors.add(video_id)
             except Unavailable as exc:
+                if exc.reason == NO_FORMAT:
+                    # A YouTube player change (SABR, n-sig) hits every video alike, so
+                    # the rest of the batch would only fail the same way: next poll.
+                    logger.warning("%s: no usable format; stopping this batch: %s", video_id, exc)
+                    result.errors[video_id] = str(exc)
+                    result.format_errors.add(video_id)
+                    break
                 if exc.reason in GONE_REASONS:
                     logger.warning("%s: unavailable, not retried: %s", video_id, exc)
                     result.unavailable.add(video_id)
@@ -336,39 +335,11 @@ class YtDlpProvider:
                 else:
                     result.errors[video_id] = str(exc)
             else:
-                # `availability` is not checked: a probe that returns always lists formats
-                # (yt-dlp fails without the flag; `_probe` rejects a re-probe without), so
-                # this account can fetch it, e.g. an 18+ or members' video with cookies.
-                # Without formats, availability could mean something, but a playability
-                # failure would then be hidden too; the next poll's plain probe says which.
+                # A probe that returns found a format to fetch (without
+                # --ignore-no-formats-error yt-dlp fails otherwise), so this account can
+                # fetch the video, e.g. an 18+ or members' video with cookies.
                 result.videos[video_id] = self._meta(video_id, info)
         return result
-
-    def _probe(self, url: str) -> dict[str, Any]:
-        """`ytdlp.probe`, re-probed once with `--ignore-no-formats-error` on a format error.
-
-        yt-dlp raises "Requested format is not available" in format selection, after the
-        extractor returned (YoutubeDL.process_video_result), so this video passed the
-        playability checks: its metadata is good even with no usable format. The re-probe
-        is trusted only when it lists formats: with the flag, a playability failure that
-        appears meanwhile (private, bot check) is only a warning, and yt-dlp's YouTube
-        extractor raises those only when it found no formats at all. Raises `_NoFormat`
-        when the re-probe does not resolve it; a bot check or cancel propagates as is."""
-        try:
-            return self.ytdlp.probe(url)
-        except Unavailable as exc:
-            if exc.reason != NO_FORMAT:
-                raise
-            error = str(exc)
-        try:
-            info = self.ytdlp.probe(url, ignore_no_formats=True)
-        except DownloadBlocked:
-            raise
-        except (YtDlpError, PermanentError):
-            raise _NoFormat(error) from None
-        if not info.get("formats"):
-            raise _NoFormat(error)
-        return info
 
     @staticmethod
     def _meta(video_id: str, info: dict[str, Any]) -> VideoMeta:

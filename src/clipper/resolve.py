@@ -13,6 +13,7 @@ import copy
 import io
 import os
 import shutil
+import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,7 +137,12 @@ def write_ids(path: Path, results: Sequence[Resolved]) -> int:
             _insert_after(node, handle_key, id_key, value)
     out = io.StringIO()
     yaml.dump(doc, out)
-    tmp = path.with_name(f".{path.name}.resolve.tmp")  # same directory: atomic replace
+    # Same directory (atomic replace); a fresh random name created with O_EXCL, so a file
+    # or symlink planted at a predictable name is never written through.
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+    ) as handle:
+        tmp = Path(handle.name)
     try:
         tmp.write_text(out.getvalue(), encoding="utf-8")
         shutil.copymode(path, tmp)

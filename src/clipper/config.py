@@ -121,6 +121,8 @@ class Settings(_Strict):
     disk_budget_gb: int = Field(150, ge=1)
     media_retention_hours: int = Field(48, ge=1)
     review_expiry_days: int = Field(7, ge=1)
+    reframe: Literal["auto", "blurred_fill"] = "auto"
+    """auto: a face-tracked 9:16 crop when faces are found, else blurred fill (CLP-58)."""
     transcriber: Literal["local", "groq"] = "local"
     whisper_model: WhisperModelName = "large-v3-turbo"
     whisper_compute_type: ComputeType = "int8"
@@ -143,6 +145,7 @@ class CreatorOverrides(_Strict):
     max_clips_per_source: int | None = Field(None, ge=1)
     max_clips_per_stream: int | None = Field(None, ge=1)
     max_source_hours_per_day: float | None = Field(None, gt=0)
+    reframe: Literal["auto", "blurred_fill"] | None = None
     transcriber: Literal["local", "groq"] | None = None
     whisper_model: WhisperModelName | None = None
     whisper_compute_type: ComputeType | None = None

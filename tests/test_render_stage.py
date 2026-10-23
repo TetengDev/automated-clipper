@@ -23,6 +23,7 @@ from clipper.jobs.models import Job, JobStatus
 from clipper.jobs.stages import PermanentError, StageContext
 from clipper.pipeline import boundaries as bd
 from clipper.pipeline import build_stages
+from clipper.pipeline import reframe as rf
 from clipper.pipeline import render_clips as rc
 from clipper.pipeline.common import Deadline, StageTimeout
 from clipper.render import InvalidClipError, RenderError, RenderResult
@@ -132,6 +133,27 @@ def cuts(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     found: list[float] = []
     monkeypatch.setattr(rc, "detect_cuts", lambda path, deadline: found)
     return found
+
+
+class FakeFaces:
+    """Stands in for the face model fetch and the detection child (no faces by default)."""
+
+    def __init__(self) -> None:
+        self.model: Path | None = Path("model.tflite")
+        self.result: rf.Faces | None = None
+        self.calls: list[tuple[Path, Path]] = []
+
+    def detect(self, path: Path, model: Path, deadline: Deadline) -> rf.Faces | None:
+        self.calls.append((path, model))
+        return self.result
+
+
+@pytest.fixture(autouse=True)
+def faces(monkeypatch: pytest.MonkeyPatch) -> FakeFaces:
+    fake = FakeFaces()
+    monkeypatch.setattr(rc, "ensure_model", lambda **kw: fake.model)
+    monkeypatch.setattr(rc, "detect_faces", fake.detect)
+    return fake
 
 
 @pytest.fixture
@@ -680,6 +702,147 @@ def test_sections_without_clips_list_is_permanent(
     (media / "sections.json").write_text("[]")
     with pytest.raises(PermanentError, match="sections.json has no clips list"):
         rc.render_clips(job, _ctx(media, conn))
+
+
+def _faces(share: float, x: float = 0.3, n: int = 300) -> rf.Faces:
+    """Samples every 0.2 s over the section, with a face at x in `share` of them."""
+    return rf.Faces(
+        1280, 720, [(i / 5, [(x, 0.02)] if i % 10 < share * 10 else []) for i in range(n)]
+    )
+
+
+def test_faces_found_give_a_face_tracked_clip(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    faces: FakeFaces,
+    cuts: list[float],
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 40.0)])  # section time [2, 32]
+    faces.result = _faces(1.0)
+    cuts.append(12.0)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    assert faces.calls == [((media / "clips/1/source.mp4").resolve(), Path("model.tflite"))]
+    edl = fake.calls[0]["edl"]
+    assert edl.layout == "face_track"
+    assert edl.crop is not None and edl.crop[0].t_s == 0.0
+    assert edl.crop[0].x_center == pytest.approx(rf.crop_path([(0.0, 0.3)], [], 1.0, 0.16)[0][1])
+    # The cut is reset in clip time (section 12.0 - in_s).
+    assert [k.t_s for k in edl.crop].count(pytest.approx(12.0 - edl.source.in_s)) == 2
+    assert len(_rows(conn)) == 1
+
+
+@pytest.mark.parametrize("share", [0.0, 0.5])
+def test_few_faces_keep_blurred_fill(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    faces: FakeFaces,
+    share: float,
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    faces.result = _faces(share)
+    rc.render_clips(job, _ctx(media, conn))
+    edl = fake.calls[0]["edl"]
+    assert (edl.layout, edl.crop) == ("blurred_fill", None)
+
+
+@pytest.mark.parametrize("failure", ["model", "detection"])
+def test_face_tracking_failure_never_fails_the_clip(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    faces: FakeFaces,
+    failure: str,
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    if failure == "model":
+        faces.model = None  # download failed or checksum mismatch
+    faces.result = None if failure == "detection" else _faces(1.0)
+    rc.render_clips(job, _ctx(media, conn))
+    assert fake.calls[0]["edl"].layout == "blurred_fill"
+    assert len(faces.calls) == (failure == "detection")
+    assert len(_rows(conn)) == 1
+
+
+def test_crop_the_edl_rejects_keeps_blurred_fill(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    faces: FakeFaces,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    faces.result = _faces(1.0)
+    monkeypatch.setattr(rc, "plan_reframe", lambda *a: (rf.Layout.FACE_TRACK, [(0.0, 1.5)]))
+    rc.render_clips(job, _ctx(media, conn))
+    assert fake.calls[0]["edl"].layout == "blurred_fill"
+    assert "face track rejected" in caplog.text
+
+
+def test_creator_can_opt_out_of_face_tracking(
+    conn: sqlite3.Connection, media: Path, fake: FakeRender, faces: FakeFaces
+) -> None:
+    config = AppConfig(
+        creators=(
+            Creator(
+                name="Static",
+                region="global",
+                youtube=YouTubeChannel(handle="@static"),
+                overrides=CreatorOverrides(reframe="blurred_fill"),
+            ),
+        ),
+    )
+    job, _ = enqueue(conn, SourceRef("youtube", "dQw4w9WgXcQ"), T0, creator="Static")
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    faces.result = _faces(1.0)
+    rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
+    assert faces.calls == []
+    assert fake.calls[0]["edl"].layout == "blurred_fill"
+
+
+def test_oversized_section_skips_face_detection(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, faces: FakeFaces
+) -> None:
+    section = {**_section(1, 10.0, 40.0), "width": 7680, "height": 4320}
+    _setup(media, [_highlight(1, 10.0, 40.0)], sections=[section])
+    faces.result = _faces(1.0)
+    rc.render_clips(job, _ctx(media, conn))
+    assert faces.calls == []
+
+
+def test_scene_cuts_are_detected_once_per_clip(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    faces: FakeFaces,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 40.0)])
+    faces.result = _faces(1.0)
+    seen: list[Path] = []
+    monkeypatch.setattr(rc, "detect_cuts", lambda path, deadline: seen.append(path) or [])
+    rc.render_clips(job, _ctx(media, conn))
+    assert len(seen) == 1  # the polish and the reframe share one cut list
+
+
+def test_worst_case_covers_face_tracking() -> None:
+    assert rc.CLIP_WORST_CASE_S >= (
+        bd.DETECT_TIMEOUT_S
+        + rf.MODEL_TIMEOUT_S
+        + rf.FACE_TIMEOUT_S
+        + rc.DEFAULT_RENDER_TIMEOUT_S
+        + 4 * rc.DEFAULT_FFMPEG_TIMEOUT_S
+    )
+    assert rc.CLIP_WORST_CASE_S < rc.STAGE_BUDGET_S / 2
 
 
 def test_records_prompt_and_playbook_version(

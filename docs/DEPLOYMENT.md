@@ -22,6 +22,7 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 - Install Docker Engine and the compose plugin. Set the timezone to UTC.
 - Create the directory layout under `/srv/clipper`: `data/`, `output/`, `config/`, `.env` (with `chmod 600`).
 - Run `chown -R 10001:10001 data output`. The containers run as uid 10001 and need write access.
+- `data/models/` (or `CLIPPER_MODELS_DIR`) holds the face-detection model. The worker fetches it once from Google's storage and checks its pinned SHA-256; without it, clips keep the blurred-fill layout.
 
 ## Secrets
 

@@ -13,6 +13,7 @@ dependencies = [
     "httpx>=0.27",
     "itsdangerous>=2.2.0",
     "jinja2>=3.1.6",
+    "mediapipe==1.1.1",
     "opencv-python-headless==5.0.0.93",
     "pydantic>=2.8",
     "pydantic-settings>=2.4",
@@ -44,10 +45,14 @@ build-backend = "hatchling.build"
 packages = ["src/clipper"]
 
 [tool.uv]
-# scenedetect requires GUI `opencv-python` (Qt, libGL); the headless build above provides
-# the same `cv2` module, so the GUI one is never installed. Only uv honours this override:
-# install with `uv sync` (pip would pull in opencv-python next to the headless build).
-override-dependencies = ["opencv-python; sys_platform == 'never'"]
+# scenedetect requires GUI `opencv-python` (Qt, libGL) and mediapipe GUI
+# `opencv-contrib-python`; the headless build above provides the same `cv2` module, so the
+# GUI ones are never installed. Only uv honours this override: install with `uv sync` (pip
+# would pull in a GUI OpenCV next to the headless build).
+override-dependencies = [
+    "opencv-python; sys_platform == 'never'",
+    "opencv-contrib-python; sys_platform == 'never'",
+]
 
 [tool.ruff]
 line-length = 100

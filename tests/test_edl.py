@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from clipper.edl import EDL, dump_json_schema, export_json_schema, parse_edl
+from clipper.edl import EDL, MAX_CROP_KEYS, dump_json_schema, export_json_schema, parse_edl
 
 REPO = Path(__file__).resolve().parents[1]
 SCHEMA_FILE = REPO / "render" / "schema" / "edl.schema.json"
@@ -45,7 +45,7 @@ def test_schema_shape() -> None:
     assert schema["$schema"].endswith("2020-12/schema")
     assert schema["additionalProperties"] is False
     assert schema["required"] == ["source"]
-    assert schema["$defs"]["Layout"]["enum"] == ["blurred_fill"]
+    assert schema["$defs"]["Layout"]["enum"] == ["blurred_fill", "face_track"]
     assert schema["$defs"]["HookStyle"]["enum"] == ["stakes", "question", "quote"]
     assert schema["$defs"]["CaptionStyle"]["enum"] == ["bold_pop"]
 
@@ -61,6 +61,7 @@ def test_defaults_and_props() -> None:
         "captions_enabled": True,
         "caption_style": "bold_pop",
         "progress_bar": True,
+        "crop": None,
     }
     json.dumps(edl.to_props())  # JSON-serializable
 
@@ -117,3 +118,38 @@ def test_non_finite_numbers_rejected(bad: float, field: str) -> None:
         parse_edl(data)  # JSON path ("Infinity"/"NaN" tokens)
     with pytest.raises(ValidationError):
         EDL.model_validate(data)  # Python path
+
+
+def _face_track(crop: list[dict]) -> dict:
+    return {
+        "source": {"path": "a.mp4", "in_s": 0, "out_s": 5},
+        "layout": "face_track",
+        "crop": crop,
+    }
+
+
+def test_face_track_crop_keys() -> None:
+    edl = parse_edl(_face_track([{"t_s": 0, "x_center": 0.4}, {"t_s": 0, "x_center": 0.6}]))
+    assert edl.layout == "face_track"
+    assert edl.to_props()["crop"] == [{"t_s": 0.0, "x_center": 0.4}, {"t_s": 0.0, "x_center": 0.6}]
+
+
+@pytest.mark.parametrize(
+    ("layout", "crop", "message"),
+    [
+        ("face_track", None, "crop is required"),
+        ("blurred_fill", [{"t_s": 0, "x_center": 0.5}], "crop is only allowed"),
+        ("face_track", [{"t_s": 1, "x_center": 0.5}, {"t_s": 0.5, "x_center": 0.5}], "sorted"),
+        ("face_track", [{"t_s": 0, "x_center": -0.01}], "greater than or equal"),
+        ("face_track", [{"t_s": 0, "x_center": 0.5}] * (MAX_CROP_KEYS + 1), "at most"),
+    ],
+)
+def test_crop_validation(layout: str, crop: list[dict] | None, message: str) -> None:
+    data = {**_face_track(crop or []), "layout": layout, "crop": crop}
+    with pytest.raises(ValidationError, match=message):
+        parse_edl(data)
+
+
+def test_crop_key_limit() -> None:
+    assert MAX_CROP_KEYS == 2000
+    parse_edl(_face_track([{"t_s": i / 100, "x_center": 0.5} for i in range(MAX_CROP_KEYS)]))

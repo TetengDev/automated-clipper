@@ -7,6 +7,31 @@
       "title": "CaptionStyle",
       "type": "string"
     },
+    "CropKey": {
+      "additionalProperties": false,
+      "description": "Where the 9:16 crop window is centred at `t_s` (seconds from the clip start), as a\nshare of the source width. Keys are linear in between; two keys at one time are a jump\n(a scene cut).",
+      "properties": {
+        "t_s": {
+          "description": "Seconds from the clip start.",
+          "minimum": 0,
+          "title": "T S",
+          "type": "number"
+        },
+        "x_center": {
+          "description": "Crop centre, share of the source width.",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "X Center",
+          "type": "number"
+        }
+      },
+      "required": [
+        "t_s",
+        "x_center"
+      ],
+      "title": "CropKey",
+      "type": "object"
+    },
     "Hook": {
       "additionalProperties": false,
       "properties": {
@@ -46,9 +71,10 @@
       "type": "string"
     },
     "Layout": {
-      "description": "Frame layout. Only blurred_fill ships in S1; face_track/split_screen come in S4b.",
+      "description": "Frame layout: the source fit over a blurred copy, or a 9:16 crop following faces.",
       "enum": [
-        "blurred_fill"
+        "blurred_fill",
+        "face_track"
       ],
       "title": "Layout",
       "type": "string"
@@ -128,6 +154,23 @@
       "default": true,
       "title": "Captions Enabled",
       "type": "boolean"
+    },
+    "crop": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/CropKey"
+          },
+          "maxItems": 2000,
+          "minItems": 1,
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Crop"
     },
     "hook": {
       "anyOf": [

@@ -22,7 +22,7 @@ import json
 import math
 import sys
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -33,15 +33,17 @@ HEIGHT = 1920
 MIN_CLIP_SECONDS = 1.0
 MAX_CLIP_SECONDS = 180.0
 MAX_WORDS = 5000
+MAX_CROP_KEYS = 2000
 # Relative POSIX path under the media root: no leading '/', '.', or '-'; no backslashes.
 # '..' segments are rejected by the validator below (the Rust regex engine has no lookahead).
 SOURCE_PATH_PATTERN = r"^[A-Za-z0-9_][A-Za-z0-9_.\-/ ]{0,511}$"
 
 
 class Layout(StrEnum):
-    """Frame layout. Only blurred_fill ships in S1; face_track/split_screen come in S4b."""
+    """Frame layout: the source fit over a blurred copy, or a 9:16 crop following faces."""
 
     BLURRED_FILL = "blurred_fill"
+    FACE_TRACK = "face_track"
 
 
 class HookStyle(StrEnum):
@@ -102,6 +104,15 @@ class Word(_Strict):
         return self
 
 
+class CropKey(_Strict):
+    """Where the 9:16 crop window is centred at `t_s` (seconds from the clip start), as a
+    share of the source width. Keys are linear in between; two keys at one time are a jump
+    (a scene cut)."""
+
+    t_s: float = Field(ge=0, description="Seconds from the clip start.")
+    x_center: float = Field(ge=0, le=1, description="Crop centre, share of the source width.")
+
+
 class EDL(_Strict):
     """Composition props for the Remotion `Clip` composition (1080x1920 @ 30 fps)."""
 
@@ -115,14 +126,25 @@ class EDL(_Strict):
     captions_enabled: bool = True
     caption_style: CaptionStyle = CaptionStyle.BOLD_POP
     progress_bar: bool = True
+    crop: Annotated[tuple[CropKey, ...], Field(min_length=1, max_length=MAX_CROP_KEYS)] | None = (
+        None
+    )
 
     @model_validator(mode="after")
     def _check(self) -> EDL:
-        previous = -1.0
-        for index, word in enumerate(self.words):
-            if word.start_s < previous:
-                raise ValueError(f"words must be sorted by start_s (index {index})")
-            previous = word.start_s
+        for name, key, times in (
+            ("words", "start_s", [w.start_s for w in self.words]),
+            ("crop", "t_s", [k.t_s for k in self.crop or ()]),
+        ):
+            bad = next((i for i in range(1, len(times)) if times[i] < times[i - 1]), None)
+            if bad is not None:
+                raise ValueError(f"{name} must be sorted by {key} (index {bad})")
+        if (self.layout is Layout.FACE_TRACK) != (self.crop is not None):
+            raise ValueError(
+                "crop is required when layout is face_track"
+                if self.crop is None
+                else "crop is only allowed when layout is face_track"
+            )
         if self.hook is not None and self.hook.duration_s > self.source.duration_s:
             raise ValueError("hook.duration_s must not exceed the clip duration")
         return self

@@ -9,7 +9,10 @@ and the transcript words that overlap the clip, shifted into the section's timel
 score, reason, and the prompt and playbook versions it was selected with. Before the EDL
 is final, dead air is trimmed and the clip edges are snapped to scene cuts (CLP-68,
 `clipper.pipeline.boundaries`); a failed or skipped scene detection (sections over
-MAX_DETECT_PIXELS) leaves only the trim.
+MAX_DETECT_PIXELS) leaves only the trim. Then, unless the creator's `reframe` is
+blurred_fill, faces are detected on the section and a clip with faces in most frames gets a
+face-tracked 9:16 crop that jumps at the same scene cuts (CLP-58, `clipper.pipeline.reframe`);
+any failure keeps the blurred fill.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
 rerun after a crash renders only the clips without a row. The row's start_s/end_s are the
@@ -48,6 +51,13 @@ from clipper.pipeline.common import (
     settings_for,
     strip_control,
 )
+from clipper.pipeline.reframe import (
+    FACE_TIMEOUT_S,
+    MODEL_TIMEOUT_S,
+    detect_faces,
+    ensure_model,
+    plan_reframe,
+)
 from clipper.redact import redact
 from clipper.render import (
     DEFAULT_FFMPEG_TIMEOUT_S,
@@ -62,8 +72,15 @@ logger = logging.getLogger(__name__)
 
 MAX_WORD_CHARS = 64
 """EDL limit for one caption word."""
-CLIP_WORST_CASE_S = DETECT_TIMEOUT_S + DEFAULT_RENDER_TIMEOUT_S + 4 * DEFAULT_FFMPEG_TIMEOUT_S
-"""Scene detection, Remotion and the four ffmpeg steps of `render_clip`, each at its timeout."""
+CLIP_WORST_CASE_S = (
+    DETECT_TIMEOUT_S
+    + MODEL_TIMEOUT_S
+    + FACE_TIMEOUT_S
+    + DEFAULT_RENDER_TIMEOUT_S
+    + 4 * DEFAULT_FFMPEG_TIMEOUT_S
+)
+"""Scene detection, the face model fetch, face detection, Remotion and the four ffmpeg steps
+of `render_clip`, each at its timeout."""
 assert CLIP_WORST_CASE_S < STAGE_BUDGET_S / 2, "a stage run must fit at least two clips"
 MAX_REASON_CHARS = 300
 _VERSION = re.compile(r"^[\w.-]{1,64}$")
@@ -166,14 +183,26 @@ def _plan(
     return rank, edl, start, end, meta
 
 
+def _detectable(section: dict[str, Any]) -> bool:
+    width, height = section.get("width"), section.get("height")
+    return _number(width) and _number(height) and 0 < width * height <= MAX_DETECT_PIXELS
+
+
+def _cuts(edl: EDL, section: dict[str, Any], media_dir: Path, deadline: Deadline) -> list[float]:
+    if _detectable(section):
+        return detect_cuts(resolve_source(edl, media_dir), deadline)
+    width, height = section.get("width"), section.get("height")
+    logger.info("clip source %s: %sx%s, detection skipped", edl.source.path, width, height)
+    return []
+
+
 def _polish(
     edl: EDL,
     start: float,
     section: dict[str, Any],
     transcript: Any,
     limits: tuple[float, float],
-    media_dir: Path,
-    deadline: Deadline,
+    cuts: list[float],
 ) -> tuple[float, float]:
     """Clip edges in the section file after the dead-air trim and the scene-cut snap."""
     src = edl.source
@@ -184,15 +213,29 @@ def _polish(
     words = [
         (w["start_s"], w["end_s"]) for w in _words(transcript, offset, offset, offset + span[1])
     ]
-    width, height = section.get("width"), section.get("height")
-    if _number(width) and _number(height) and 0 < width * height <= MAX_DETECT_PIXELS:
-        cuts = detect_cuts(resolve_source(edl, media_dir), deadline)
-    else:
-        logger.info("clip source %s: %sx%s, scene detection skipped", src.path, width, height)
-        cuts = []
     a, b = polish(src.in_s, src.out_s, cuts, words, *limits, section=span)
     # Floor, so an end just before a cut never rounds up onto the next shot's first frame.
     return round(a, 3), math.floor(round(b * 1000, 6)) / 1000
+
+
+def _reframe(edl: EDL, cuts: list[float], media_dir: Path, deadline: Deadline) -> EDL:
+    """The EDL with a face-tracked crop when faces are found; else (or on any failure) as is."""
+    model = ensure_model(timeout_s=deadline.timeout(MODEL_TIMEOUT_S))
+    faces = detect_faces(resolve_source(edl, media_dir), model, deadline) if model else None
+    if not faces:
+        return edl
+    layout, crop = plan_reframe(faces, cuts, edl.source.in_s, edl.source.out_s)
+    if crop is None:
+        return edl
+    keys = [{"t_s": t, "x_center": x} for t, x in crop]
+    try:
+        return parse_edl({**edl.to_props(), "layout": layout.value, "crop": keys})
+    except ValueError as exc:  # pydantic's ValidationError
+        reason = redact(strip_control(str(exc).splitlines()[0]))[:MAX_REASON_CHARS]
+        logger.warning(
+            "clip source %s: face track rejected, blurred fill: %s", edl.source.path, reason
+        )
+        return edl
 
 
 def _done(conn: sqlite3.Connection, job_id: int) -> set[int]:
@@ -219,7 +262,8 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 continue
             if deadline.remaining() < CLIP_WORST_CASE_S:
                 raise StageTimeout(f"stage budget left too small for clip {rank}; resuming later")
-            bounds = _polish(edl, start, section, transcript, limits, ctx.media_dir, deadline)
+            cuts = _cuts(edl, section, ctx.media_dir, deadline)
+            bounds = _polish(edl, start, section, transcript, limits, cuts)
             try:
                 rank, edl, start, end, meta = _plan(
                     section, highlights, transcript, selection, bounds
@@ -227,6 +271,8 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             except PermanentError as exc:  # e.g. rounding nudged it past an EDL limit
                 reason = redact(strip_control(str(exc)))[:MAX_REASON_CHARS]
                 logger.warning("%s; rendering the requested range", reason)
+            if settings.reframe == "auto" and _detectable(section):
+                edl = _reframe(edl, cuts, ctx.media_dir, deadline)
             result = render_clip(
                 edl,
                 ctx.media_dir,

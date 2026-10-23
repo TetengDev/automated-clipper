@@ -384,3 +384,9 @@ def test_extra_child_env_cannot_override_the_allowlist() -> None:
         ytdlp.run_command(["true"], 5.0, env={"LD_PRELOAD": "/x.so"})
     with pytest.raises(TypeError):
         bd.CHILD_ENV["X"] = "1"  # type: ignore[index]
+
+
+def test_cut_list_is_sorted_unique_and_capped() -> None:
+    assert bd._cut_list([3.0, 1.0, 3.0, 2]) == [1.0, 2.0, 3.0]
+    many = bd._cut_list([float(i) for i in range(bd.MAX_CUTS + 100, 0, -1)])
+    assert len(many) == bd.MAX_CUTS and many[0] == 1.0

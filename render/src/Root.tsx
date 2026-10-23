@@ -22,6 +22,7 @@ const defaultProps: Edl = {
   captions_enabled: true,
   caption_style: "bold_pop",
   progress_bar: true,
+  crop: null,
 };
 
 // Runs before any frame is rendered: invalid props abort the render here.

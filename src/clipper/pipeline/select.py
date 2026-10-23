@@ -61,12 +61,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from pydantic_core import PydanticCustomError
 
 from clipper.config import (
-    ALWAYS_SENSITIVE,
     ContentType,
     Creator,
     MissingSecretError,
     Secrets,
     Settings,
+    always_sensitive,
 )
 from clipper.jobs.models import Job
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext, StageDef
@@ -578,9 +578,8 @@ def finalize(
     words: Sequence[_Word],
     settings: Settings,
     top_k: int,
-    content_type: ContentType | None = None,
+    force_sensitive: bool = False,
 ) -> list[dict[str, Any]]:
-    forced = content_type in ALWAYS_SENSITIVE
     snapped = [
         clip
         for c in candidates
@@ -604,7 +603,7 @@ def finalize(
             if (payoff := clip.candidate.payoff_s) is None
             else round(min(max(payoff, clip.start_s), clip.end_s), 3),
             "open_question": clip.candidate.open_question,
-            "sensitive": forced or clip.candidate.sensitive,
+            "sensitive": force_sensitive or clip.candidate.sensitive,
         }
         for rank, clip in enumerate(kept, start=1)
     ]
@@ -1039,7 +1038,7 @@ def _select(
         )
 
     words = sorted(transcript.words, key=lambda w: w.start)
-    clips = finalize(candidates, words, settings, top_k, creator.content_type if creator else None)
+    clips = finalize(candidates, words, settings, top_k, always_sensitive(creator))
     write_json_atomic(
         ctx.media_dir / ARTIFACT,
         {

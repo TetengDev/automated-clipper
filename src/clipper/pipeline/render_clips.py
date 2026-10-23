@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any
 
 from clipper.clips_repo import ClipMeta, insert_pending_clip
-from clipper.config import ALWAYS_SENSITIVE, JumpCuts
+from clipper.config import JumpCuts, always_sensitive
 from clipper.edl import EDL, FPS, MAX_CLIP_SECONDS, frames, parse_edl
 from clipper.jobs.models import Job
 from clipper.jobs.queue import MAX_ATTEMPTS, backoff
@@ -180,11 +180,11 @@ def _plan(
     selection: dict[str, Any],
     bounds: tuple[float, float] | None = None,
     *,
-    always_sensitive: bool = False,
+    force_sensitive: bool = False,
 ) -> tuple[int, EDL, float, float, ClipMeta]:
     """(rank, EDL, source start, source end, meta) for one section; PermanentError if invalid.
     `bounds` overrides the cut inside the section file (seconds, from `_polish`).
-    `always_sensitive` (the creator's content type, CLP-87) stores the clip as sensitive."""
+    `force_sensitive` (the creator's `always_sensitive`, CLP-87) stores the clip as sensitive."""
     rank = section.get("rank") if isinstance(section, dict) else None
     if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
         raise PermanentError(f"invalid clip rank: {rank!r}")
@@ -233,7 +233,7 @@ def _plan(
         reason=reason,
         prompt_version=_version(selection.get("prompt_version")),
         playbook_version=_version(selection.get("playbook_version")),
-        sensitive=always_sensitive or sensitive,
+        sensitive=force_sensitive or sensitive,
     )
     return rank, edl, start, end, meta
 
@@ -401,8 +401,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
     settings = settings_for(job, ctx.config)
     limits = (settings.clip_min_seconds, min(settings.clip_max_seconds, MAX_CLIP_SECONDS))
     language = creator_language(job, ctx)
-    creator = creator_for(job, ctx.config)
-    always_sensitive = bool(creator and creator.content_type in ALWAYS_SENSITIVE)
+    force_sensitive = always_sensitive(creator_for(job, ctx.config))
     asr = default_asr(cpu_threads=settings.whisper_cpu_threads)
     invalid: list[str] = []
     left_out: list[Path] = []  # failure markers of the clips left out after repeated failures
@@ -414,7 +413,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
     for section in order:
         try:
             rank, edl, start, end, meta = _plan(
-                section, highlights, transcript, selection, always_sensitive=always_sensitive
+                section, highlights, transcript, selection, force_sensitive=force_sensitive
             )
             if rank in done:
                 continue
@@ -435,7 +434,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                     transcript,
                     selection,
                     bounds,
-                    always_sensitive=always_sensitive,
+                    force_sensitive=force_sensitive,
                 )
             except PermanentError as exc:  # e.g. rounding nudged it past an EDL limit
                 reason = redact(strip_control(str(exc)))[:MAX_REASON_CHARS]

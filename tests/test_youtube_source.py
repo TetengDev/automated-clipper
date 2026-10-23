@@ -768,28 +768,17 @@ def test_metadata_probes_never_ignore_missing_formats() -> None:
     assert "--ignore-no-formats-error" in listing  # harmless with --flat-playlist
 
 
-@pytest.mark.parametrize("availability", ["private", "subscriber_only"])
-def test_probe_exiting_zero_without_formats_for_restricted_video_is_unavailable(
-    availability: str,
-) -> None:
-    body = info(V1, formats=[], availability=availability, duration=None)
-    runner = FakeRunner({watch(V1): RunResult(0, json.dumps(body), "")})
+@pytest.mark.parametrize("availability", ["needs_auth", "subscriber_only", "premium_only"])
+def test_probe_listing_formats_is_fetchable_whatever_its_availability(availability: str) -> None:
+    # With CLIPPER_YTDLP_COOKIES, an 18+ or members' video the account can watch exits 0
+    # with formats: it is fetchable, so it is returned, not retried or dropped.
+    body = info(V1, formats=[STORYBOARD], availability=availability)
+    runner = FakeRunner({watch(V1): ok_json(body)})
 
     meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
 
-    assert meta.unavailable == {V1}
-    assert meta.videos == {} and meta.errors == {}
-
-
-@pytest.mark.parametrize("availability", ["needs_auth", "premium_only"])
-def test_probe_exiting_zero_for_gated_video_is_a_retryable_error(availability: str) -> None:
-    body = info(V1, formats=[], availability=availability)
-    runner = FakeRunner({watch(V1): RunResult(0, json.dumps(body), "")})
-
-    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
-
-    assert set(meta.errors) == {V1} and availability in meta.errors[V1]
-    assert meta.videos == {} and meta.unavailable == set()
+    assert set(meta.videos) == {V1}
+    assert meta.errors == {} and meta.unavailable == set()
 
 
 def test_pipeline_probe_still_fails_on_missing_formats() -> None:

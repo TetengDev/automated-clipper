@@ -545,6 +545,22 @@ def test_upload_probed_during_a_player_breakage_is_still_enqueued(conn, cfg, sou
     assert report.items_new == 1
 
 
+def test_age_restricted_upload_fetchable_with_cookies_is_enqueued(conn, cfg, source, clock) -> None:
+    from clipper.pipeline.ytdlp import RunResult, YtDlp
+
+    body = {"id": V1, "title": "18+ video", "duration": 1500, "timestamp": T0.timestamp()}
+    body |= {"availability": "needs_auth", "formats": [{"format_id": "140", "url": "https://x"}]}
+    ytdlp = YtDlp(runner=lambda args, timeout_s: RunResult(0, json.dumps(body), ""))
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.videos = YtDlpProvider(ytdlp).videos  # type: ignore[method-assign]
+
+    report = make(conn, cfg, source, clock).run_cycle([cfg.creator("MrBeast")])
+
+    assert seen(conn)[V1] == "enqueued"
+    assert report.items_new == 1 and report.errors == []
+
+
 def test_interrupted_emit_first_poll_keeps_its_lookback_after_restart(
     conn, cfg, source, clock
 ) -> None:

@@ -51,7 +51,7 @@ API_MAX_BYTES = 4 * 1024 * 1024
 HTTP_TIMEOUT = httpx.Timeout(20.0)
 _HTTPX_ERRORS = (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, httpx.CookieConflict)
 """Everything httpx raises for a request; InvalidURL and StreamError are not HTTPErrors."""
-CHANNEL_ID = re.compile(r"UC[\w-]{22}")
+CHANNEL_ID = re.compile(r"UC[A-Za-z0-9_-]{22}")
 
 LiveStatus = Literal["not_live", "is_live", "is_upcoming", "post_live", "was_live"]
 LIVE_STATUSES: frozenset[str] = frozenset(

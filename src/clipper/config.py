@@ -185,8 +185,9 @@ class ContentType(StrEnum):
 
 
 class YouTubeChannel(_Strict):
-    handle: str = Field(pattern=r"^@[\w.\-]{3,100}$")
-    channel_id: str | None = Field(None, pattern=r"^UC[\w-]{22}$")
+    # ASCII only: \w would also accept look-alike letters and digits from other scripts.
+    handle: str = Field(pattern=r"^@[A-Za-z0-9_.-]{3,100}$")
+    channel_id: str | None = Field(None, pattern=r"^UC[A-Za-z0-9_-]{22}$")
 
 
 class TwitchChannel(_Strict):

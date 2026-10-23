@@ -44,6 +44,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -738,7 +739,7 @@ class _CliBackend:
     each call uses). The prompt goes on stdin, the child runs in an empty scratch dir, and
     its env is the runner's allowlist plus only the subscription token. A token login gets
     a throwaway config dir (the image's root fs is read-only); without a token the CLI uses
-    the machine's existing `claude` login."""
+    the machine's existing `claude` login (and its CLAUDE_CONFIG_DIR, if set)."""
 
     provider = CLI_PROVIDER
     billed = False
@@ -756,7 +757,9 @@ class _CliBackend:
             (root / "work").mkdir()
             (root / "system.md").write_text("\n\n".join(b["text"] for b in system), "utf-8")
             (root / "prompt.txt").write_text(prompt, "utf-8")
-            env = {}
+            # Without a token, a login made under a custom CLAUDE_CONFIG_DIR lives there.
+            config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+            env = {"CLAUDE_CONFIG_DIR": config_dir} if config_dir else {}
             if token and token.get_secret_value():
                 (root / "config").mkdir()
                 env = {

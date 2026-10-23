@@ -358,6 +358,85 @@ def test_stale_version_rejected(client: TestClient, env: Env) -> None:
     assert env.status(clip_id) == "pending_review"
 
 
+# --- CLP-87: sensitive clips need a face check before approval ----------------------------
+
+FACE_NOTE = "Check faces of minors and victims; the model cannot see the video."
+CONFIRM_BOX = 'type="checkbox" name="confirm_sensitive" value="1"'
+
+
+def test_face_check_note_and_confirm_box_only_on_sensitive_clips(
+    client: TestClient, env: Env
+) -> None:
+    flagged = client.get(f"/clip/{env.clip(sensitive=True)}").text
+    plain = client.get(f"/clip/{env.clip()}").text
+
+    assert FACE_NOTE in flagged and CONFIRM_BOX in flagged
+    assert FACE_NOTE not in plain and CONFIRM_BOX not in plain
+
+
+@pytest.mark.parametrize("htmx", [True, False])
+@pytest.mark.parametrize("confirm", [None, "", "0", "on"])
+def test_approving_a_sensitive_clip_without_confirmation_is_refused(
+    client: TestClient, env: Env, htmx: bool, confirm: str | None
+) -> None:
+    clip_id = env.clip(sensitive=True)
+    data = {} if confirm is None else {"confirm_sensitive": confirm}
+
+    response = post(client, f"/clip/{clip_id}/approve", htmx=htmx, version=1, **data)
+
+    assert response.status_code == 422
+    assert 'class="error" role="alert"' in response.text
+    assert "Confirm you checked faces of minors and victims" in response.text
+    assert env.status(clip_id) == "pending_review"
+    assert env.reviews(clip_id) == []
+
+
+@pytest.mark.parametrize("status", ["pending_review", "needs_attention"])
+def test_approving_a_sensitive_clip_with_confirmation_works(
+    client: TestClient, env: Env, status: str
+) -> None:
+    clip_id = env.clip(sensitive=True, status=status, video_path="missing.mp4")
+
+    response = post(client, f"/clip/{clip_id}/approve", version=1, confirm_sensitive="1")
+
+    assert response.status_code == 200
+    assert response.headers["HX-Redirect"] == "/queue"
+    assert env.status(clip_id) == "approved"
+    assert [r["action"] for r in env.reviews(clip_id)][0] == "approve"
+
+
+def test_retrying_the_export_of_an_approved_sensitive_clip_needs_no_new_confirmation(
+    client: TestClient, env: Env
+) -> None:
+    clip_id = env.clip(sensitive=True, video_path="missing.mp4")
+    post(client, f"/clip/{clip_id}/approve", confirm_sensitive="1")
+
+    page = client.get(f"/clip/{clip_id}").text
+    response = post(client, f"/clip/{clip_id}/approve")
+
+    assert "Retry export" in page and CONFIRM_BOX not in page
+    assert response.status_code == 200
+    assert [r["action"] for r in env.reviews(clip_id)].count("export_failed") == 2
+
+
+def test_plain_clip_approves_without_confirmation(client: TestClient, env: Env) -> None:
+    clip_id = env.clip(video_path="missing.mp4")
+
+    assert post(client, f"/clip/{clip_id}/approve", version=1).status_code == 200
+    assert env.status(clip_id) == "approved"
+
+
+def test_sensitive_confirmation_still_needs_csrf(client: TestClient, env: Env) -> None:
+    clip_id = env.clip(sensitive=True)
+
+    response = client.post(
+        f"/clip/{clip_id}/approve", data={"confirm_sensitive": "1", "csrf_token": "nope"}
+    )
+
+    assert response.status_code == 403
+    assert env.status(clip_id) == "pending_review"
+
+
 def test_actions_on_missing_clip_404(client: TestClient) -> None:
     assert post(client, "/clip/999/approve").status_code == 404
     assert post(client, "/clip/999/reject", reason_tag="boring").status_code == 404

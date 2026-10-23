@@ -99,3 +99,20 @@ def test_typing_in_inputs_and_disabled_buttons_are_ignored() -> None:
     elements = [["approve-btn", "BUTTON", {"disabled": True}], ["note", "INPUT"]]
 
     assert run(elements, [["a", None], ["j", "note"]]) == []
+
+
+def _sensitive_page(checked: bool) -> list[list[object]]:
+    return [*CLIP_PAGE, ["confirm-sensitive", "INPUT", {"type": "checkbox", "checked": checked}]]
+
+
+def test_a_on_unconfirmed_sensitive_clip_focuses_the_confirm_box() -> None:
+    """CLP-87: like `r` and the reason picker; `a` in the unticked box does nothing."""
+    log = run(_sensitive_page(False), [["a", None], ["a", "confirm-sensitive"]])
+
+    assert log == ["focus:confirm-sensitive", "prevent:a"]
+
+
+def test_a_approves_once_the_sensitive_clip_is_confirmed() -> None:
+    log = run(_sensitive_page(True), [["a", None], ["a", "confirm-sensitive"]])
+
+    assert log == ["click:approve-btn", "prevent:a", "click:approve-btn", "prevent:a"]

@@ -221,6 +221,19 @@ def test_sensitive_badge_only_on_sensitive_cards(client: TestClient, env: Env) -
     assert "check for names, faces or identifiers of victims and minors" in cards[0]
 
 
+def test_sensitive_cards_carry_the_face_check_note(client: TestClient, env: Env) -> None:
+    """CLP-87: visible text, not only the badge's hover title (no hover on a phone)."""
+    note = "Check faces of minors and victims; the model cannot see the video."
+    job = env.job("Raffy Tulfo in Action", title="Case")
+    env.clip(job, title="Flagged one", sensitive=True, created_at="2027-01-02T00:00:00Z")
+    env.clip(job, title="Plain one", created_at="2027-01-01T00:00:00Z")
+
+    cards = client.get("/queue").text.split('class="clip-card"')[1:]
+
+    assert f'<span class="sensitive-note">{note}</span>' in cards[0]
+    assert note not in cards[1]
+
+
 def test_needs_attention_has_its_own_tab(client: TestClient, env: Env) -> None:
     env.clip(status="needs_attention", title="Flagged", gate_reasons=["loudness"])
     env.clip(title="Plain")

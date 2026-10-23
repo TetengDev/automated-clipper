@@ -5,6 +5,8 @@
 - PRD: [docs/PRD.md](docs/PRD.md)
 - Review workflow: [docs/REVIEW_WORKFLOW.md](docs/REVIEW_WORKFLOW.md)
 - Deployment: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+- Release notes: [RELEASE.md](RELEASE.md)
+- Known issues: [ISSUES.md](ISSUES.md)
 - Tracking: Linear project "Automated Clipper" (team CLP)
 
 ## Quickstart (local)

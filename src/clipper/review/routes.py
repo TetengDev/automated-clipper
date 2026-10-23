@@ -48,6 +48,10 @@ _THUMB_TYPES = {
     ".webp": "image/webp",
 }
 MEDIA_CACHE_CONTROL = "private, max-age=300"
+SENSITIVE_UNCONFIRMED = (
+    "Confirm you checked faces of minors and victims (tick the box) before approving this"
+    " sensitive clip."
+)
 
 
 def _now(request: Request) -> datetime:
@@ -192,11 +196,21 @@ def approve_clip(
     conn: Conn,
     background: BackgroundTasks,
     version: FormVersion = None,
+    confirm_sensitive: Annotated[str, Form(max_length=8)] = "",
 ) -> Response:
     """Commit the approval (+ audit row) and return; the export runs after the response.
-    Approving an already-approved clip (the "Retry export" button) re-schedules the export."""
+    Approving an already-approved clip (the "Retry export" button) re-schedules the export.
+    A sensitive clip is approved only with `confirm_sensitive=1` (CLP-87): the model cannot
+    see the video, so the reviewer confirms the faces check."""
+    clip = clips.get_clip(conn, clip_id)
+    if clip is None:
+        raise HTTPException(status_code=404, detail="clip not found")
+    if clip.status in REVIEWABLE and clip.current.sensitive and confirm_sensitive != "1":
+        return _action_error(request, SENSITIVE_UNCONFIRMED, 422)
+    # Pin the version checked above, so a newer one cannot slip in unconfirmed.
+    expected = version if version is not None else clip.current_version
     try:
-        result = clips.approve(conn, clip_id, _now(request), expected_version=version)
+        result = clips.approve(conn, clip_id, _now(request), expected_version=expected)
     except LookupError:
         raise HTTPException(status_code=404, detail="clip not found") from None
     except InvalidTransition as exc:

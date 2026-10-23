@@ -246,6 +246,10 @@ class YouTubeMonitor:
                 if failure.creator == creator.name and video_id not in listed:
                     del retries[video_id]  # dropped off the listing: forget it
         due = [u.video_id for u in fresh if not self._backing_off(u.video_id, now)]
+        # New items first, then retries, format errors last (stable: newest first within
+        # each). A format error or block stops the batch, so a video stuck on one must
+        # not keep the uploads behind it from ever being probed.
+        due.sort(key=lambda v: (v in self.format_retries, v in self.failures))
         if not due:
             return
         meta = self.source.videos(due, self.stop.is_set)

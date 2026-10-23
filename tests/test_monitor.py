@@ -592,6 +592,56 @@ def test_format_backoff_is_forgotten_when_the_item_leaves_the_listing(
     assert monitor.format_retries == {}
 
 
+@pytest.mark.parametrize("interval_minutes", [60, 90])
+def test_format_retry_that_recovers_is_not_starved_by_a_stuck_one(
+    conn, cfg, source, clock, interval_minutes: int
+) -> None:
+    # x (listed first) never gets a usable format; y had a format error too, then recovers.
+    # With hourly polls x is due every time: if it were always probed first, its error
+    # would stop the batch before y on every poll. The least recently tried goes first.
+    x, y = "x" * 11, "y" * 11
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(x, T0), Upload(y, T0)]
+    source.meta.update({x: "format: Requested format is not available"})
+    source.meta.update({y: "format: Requested format is not available"})
+    monitor = make(conn, cfg, source, clock)
+    for _ in range(3):  # x fails, then y (new, so first), then whichever was tried earlier
+        monitor.run_cycle([cfg.creator("MrBeast")])
+        clock.now += timedelta(minutes=interval_minutes)
+    assert x in monitor.format_retries and y in monitor.format_retries
+
+    source.meta[y] = video(y)
+    for _ in range(2):
+        monitor.run_cycle([cfg.creator("MrBeast")])
+        clock.now += timedelta(minutes=interval_minutes)
+
+    assert seen(conn).get(y) == "enqueued"
+    assert [row["item_id"] for row in jobs(conn)] == [y]
+    assert x in monitor.format_retries and y not in monitor.format_retries
+
+
+def test_retried_items_are_counted_as_new_only_on_their_first_look(
+    conn, cfg, source, clock
+) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V2, T0), Upload(V1, T0)]
+    source.meta.update({V1: "format: Requested format is not available"})
+    source.meta.update({V2: "yt-dlp failed: Connection reset"})
+    monitor = make(conn, cfg, source, clock)
+    first = monitor.run_cycle([cfg.creator("MrBeast")])  # both looked at, both fail
+    clock.now += timedelta(hours=1)
+    retry = monitor.run_cycle([cfg.creator("MrBeast")])  # both looked at again
+    clock.now += timedelta(hours=1)
+    source.meta.update({V1: video(V1), V2: video(V2)})
+    recovered = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert source.metadata_calls == [[V2, V1], [V2, V1], [V2, V1]]
+    assert first.polls[0].new == 2
+    assert retry.polls[0].new == 0 and recovered.polls[0].new == 0
+    assert recovered.items_new == 2  # runs.items_new still counts every job created
+    assert runs(conn)[-1]["items_new"] == 2
+
+
 def test_upload_probed_during_a_player_breakage_is_still_enqueued(conn, cfg, source, clock) -> None:
     from clipper.pipeline.ytdlp import RunResult, YtDlp
 

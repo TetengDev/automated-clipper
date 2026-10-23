@@ -69,7 +69,9 @@ and format errors (a YouTube player breakage) are not counted: they say nothing 
 video. Blocks are retried every poll, format errors after FORMAT_RETRY_MAX at most."""
 FORMAT_RETRY_MAX = timedelta(hours=1)
 """A video hit by a format error is retried after 10, 20, 40, then every 60 minutes until a
-yt-dlp update fixes the player; never given up."""
+yt-dlp update fixes the player; never given up. So a video that has no usable format at all
+(e.g. no audio, or no video) stays in the retries for as long as it is listed; probing the
+least recently tried first keeps it from starving the other retries."""
 
 
 class FirstRun(StrEnum):
@@ -102,7 +104,7 @@ class CreatorPoll:
     new: int = 0
     """Items not seen before that this poll handled (enqueued or not); items whose
     metadata lookup is still backing off, or that a stopped or blocked batch never got
-    to, are not counted."""
+    to, are not counted, and a retried item only counts on its first look."""
     enqueued: list[tuple[int, str, str | None]] = field(default_factory=list)
     """(job id, video id, title) per job created."""
     errors: list[dict[str, str]] = field(default_factory=list)
@@ -248,13 +250,18 @@ class YouTubeMonitor:
         due = [u.video_id for u in fresh if not self._backing_off(u.video_id, now)]
         # New items first, then retries, format errors last (stable: newest first within
         # each). A format error or block stops the batch, so a video stuck on one must
-        # not keep the uploads behind it from ever being probed.
-        due.sort(key=lambda v: (v in self.format_retries, v in self.failures))
+        # not keep the uploads behind it from ever being probed. Format errors go least
+        # recently tried first (earliest retry_at), so one that stays broken does not stop
+        # the batch before another that recovered on every poll.
+        due.sort(key=lambda v: self._probe_order(v, now))
         if not due:
             return
+        retried = {v for v in due if v in self.failures or v in self.format_retries}
         meta = self.source.videos(due, self.stop.is_set)
         # Only IDs looked at: the rest (stop requested, a block) are counted when they are.
-        poll.new += len(set(due) & (meta.videos.keys() | meta.unavailable | meta.errors.keys()))
+        # A retried item was counted on its first look.
+        looked = meta.videos.keys() | meta.unavailable | meta.errors.keys()
+        poll.new += len((set(due) - retried) & looked)
         for video_id in due:
             if video_id in meta.format_errors:
                 self._format_failed(creator.name, video_id, now)
@@ -277,6 +284,11 @@ class YouTubeMonitor:
             logger.info(
                 "%s: %d new item(s), %d enqueued", creator.name, poll.new, len(poll.enqueued)
             )
+
+    def _probe_order(self, video_id: str, now: datetime) -> tuple[bool, bool, datetime]:
+        format_retry = self.format_retries.get(video_id)
+        retry_at = format_retry.retry_at if format_retry else now
+        return format_retry is not None, video_id in self.failures, retry_at
 
     def _backing_off(self, video_id: str, now: datetime) -> bool:
         return any(

@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from yt_dlp import YoutubeDL
 
 from clipper.jobs.stages import PermanentError
 from clipper.pipeline import ytdlp
@@ -68,9 +69,10 @@ def test_download_requests_audio_only_and_returns_file(tmp_path: Path) -> None:
     path = YtDlp(runner=runner).download_audio(URL, tmp_path, ".src", info_json=info)
     assert path == tmp_path / ".src.webm"
     args, _ = runner.calls[0]
-    # Audio-only when there is one, else the best muxed format (ffmpeg drops the video):
-    # the probe's default selector accepts a muxed-only video, so the download must too.
-    assert args[args.index("-f") + 1] == "bestaudio/best"
+    # Audio-only when there is one, else a small muxed format with audio (ffmpeg drops the
+    # video): --max-filesize only bounds each HLS fragment, not a whole muxed download.
+    selector = "bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none]"
+    assert args[args.index("-f") + 1] == selector == ytdlp.AUDIO_FORMAT
     assert args[args.index("--load-info-json") + 1] == str(info)
     assert args[-2:] == ["--", URL]
     assert args.index("--") > args.index("-o")
@@ -423,4 +425,119 @@ def test_format_errors_share_one_reason(stderr: str) -> None:
     # Both mean yt-dlp found nothing it could fetch: usually a player change, not the video.
     error = classify_error(stderr)
 
+    assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT
+
+
+def test_probe_selects_like_the_clip_download(tmp_path: Path) -> None:
+    # The monitor and the worker probe with the clip download's selector, which implies the
+    # audio download's (see test_probe_selector_implies_the_audio_selector): a video the
+    # probe accepts is one both downloads can fetch, and one they cannot is a format error
+    # up front, before any transcription or LLM spend.
+    probe = Recorder(ok(json.dumps({"id": "x"})))
+    YtDlp(runner=probe).probe(URL)
+    download = Recorder(ok())
+    with pytest.raises(YtDlpError, match="found 0"):
+        YtDlp(runner=download).download_audio(URL, tmp_path, "src")
+
+    probe_args, download_args = probe.calls[0][0], download.calls[0][0]
+    assert probe_args[probe_args.index("-f") + 1] == ytdlp.CLIP_FORMAT
+    assert download_args[download_args.index("-f") + 1] == ytdlp.AUDIO_FORMAT
+    assert ytdlp.CLIP_FORMAT == "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]"
+
+
+def _hls(height: int, tbr: float) -> dict[str, object]:
+    return {
+        "format_id": f"hls-{height}", "url": f"https://media.invalid/{height}.m3u8",
+        "protocol": "m3u8_native", "ext": "mp4", "width": height * 16 // 9,
+        "height": height, "tbr": tbr, "vcodec": "avc1.4d401f", "acodec": "mp4a.40.2",
+    }  # fmt: skip
+
+
+def _video_only(height: int) -> dict[str, object]:
+    return {
+        "format_id": f"v-{height}", "url": f"https://media.invalid/v{height}", "ext": "mp4",
+        "height": height, "tbr": height * 4.0, "vcodec": "avc1.640028", "acodec": "none",
+    }  # fmt: skip
+
+
+AUDIO_ONLY = {
+    "format_id": "140", "url": "https://media.invalid/a", "ext": "m4a", "tbr": 129.0,
+    "vcodec": "none", "acodec": "mp4a.40.2",
+}  # fmt: skip
+MUXED_HLS = [_hls(h, t) for h, t in [(1080, 5e3), (144, 100), (720, 3e3), (480, 1200), (360, 700)]]
+
+
+def _select(formats: list[dict[str, object]], selector: str = ytdlp.AUDIO_FORMAT) -> str:
+    """Real yt-dlp format selection over an offline info dict: nothing is fetched."""
+    info = {
+        "id": "x", "title": "t", "extractor": "generic", "extractor_key": "Generic",
+        "webpage_url": "https://media.invalid/watch", "formats": formats,
+    }  # fmt: skip
+    params = {"format": selector, "simulate": True, "quiet": True, "no_warnings": True}
+    with YoutubeDL(params) as ydl:
+        return str(ydl.process_ie_result(info, download=False)["format_id"])
+
+
+FIXTURES = {
+    "dash and muxed": [*MUXED_HLS, AUDIO_ONLY, _video_only(1080)],
+    "dash only": [AUDIO_ONLY, _video_only(1080), _video_only(720)],
+    "muxed hls only": MUXED_HLS,
+    "muxed above 480p and video-only": [_hls(1080, 5000), _hls(720, 3000), _video_only(360)],
+    "muxed above 1080p only": [_hls(1440, 9000), _hls(2160, 16000)],
+    "audio only": [AUDIO_ONLY],
+    "video only": [_video_only(1080), _video_only(720)],
+    "nothing": [],
+}
+
+
+@pytest.mark.parametrize("name", FIXTURES)
+def test_probe_selector_implies_the_audio_selector(name: str) -> None:
+    # A video the probe accepts must be one the audio download accepts too: either `ba`
+    # exists, or a muxed format with audio does, which the audio fallbacks take.
+    formats = FIXTURES[name]
+    try:
+        _select(formats, ytdlp.CLIP_FORMAT)
+    except Exception as exc:  # noqa: BLE001 - only a format error may come out
+        error = classify_error(f"ERROR: {exc}")
+        assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT
+        return
+    assert _select(formats)  # raises if the audio selector found nothing
+
+
+@pytest.mark.parametrize("name", ["audio only", "video only", "muxed above 1080p only"])
+def test_probe_selector_rejects_what_the_clip_download_cannot_use(name: str) -> None:
+    # Audio but no video (a partial breakage): the job would otherwise pay for ASR and the
+    # LLM and only then fail in fetch_clips. Video but no audio: the clips would be silent.
+    with pytest.raises(Exception, match="Requested format is not available") as info:
+        _select(FIXTURES[name], ytdlp.CLIP_FORMAT)
+
+    error = classify_error(f"ERROR: {info.value}")
+    assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT
+
+
+def test_probe_selector_merges_without_downloading() -> None:
+    # Selection with `+` is resolved in the info dict; nothing is merged under simulate.
+    assert _select(FIXTURES["dash only"], ytdlp.CLIP_FORMAT) == "v-1080+140"
+
+
+@pytest.mark.parametrize(
+    ("formats", "chosen"),
+    [
+        ([*MUXED_HLS, AUDIO_ONLY, _video_only(1080)], "140"),  # audio-only always wins
+        (MUXED_HLS, "hls-480"),  # muxed-only HLS: 480p at most, never the 1080p
+        ([_hls(1080, 5000), _hls(720, 3000), _video_only(360)], "hls-720"),  # smallest w/ audio
+    ],
+)
+def test_audio_selector_caps_a_muxed_only_fallback(
+    formats: list[dict[str, object]], chosen: str
+) -> None:
+    assert _select(formats) == chosen
+
+
+def test_audio_selector_never_picks_a_format_without_audio() -> None:
+    # Plain `best` falls back to a video-only format here, and ffmpeg -vn then fails.
+    with pytest.raises(Exception, match="Requested format is not available") as info:
+        _select([_video_only(1080), _video_only(720)])
+
+    error = classify_error(f"ERROR: {info.value}")
     assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT

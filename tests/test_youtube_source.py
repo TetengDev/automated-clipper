@@ -13,6 +13,7 @@ import pytest
 import respx
 
 from clipper.config import Secrets
+from clipper.pipeline import ytdlp
 from clipper.pipeline.ytdlp import RunResult, YtDlp
 from clipper.sources import youtube as yt
 from clipper.sources.youtube import (
@@ -781,6 +782,17 @@ def test_metadata_probes_never_ignore_missing_formats() -> None:
     probe, listing = runner.calls
     assert "--ignore-no-formats-error" not in probe
     assert "--ignore-no-formats-error" in listing  # harmless with --flat-playlist
+
+
+def test_metadata_probe_selects_like_the_worker_downloads() -> None:
+    # A video the monitor accepts must be one the worker's clip download can fetch, which
+    # implies its audio download can too.
+    runner = FakeRunner({watch(V1): ok_json(info(V1))})
+
+    YtDlpProvider(YtDlp(runner=runner)).videos([V1])
+
+    (probe,) = runner.calls
+    assert probe[probe.index("-f") + 1] == ytdlp.CLIP_FORMAT
 
 
 @pytest.mark.parametrize("availability", ["needs_auth", "subscriber_only", "premium_only"])

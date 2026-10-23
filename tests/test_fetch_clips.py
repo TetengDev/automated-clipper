@@ -20,6 +20,7 @@ import pytest
 from clipper.jobs.models import Job, JobStatus
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext
 from clipper.pipeline import fetch_clips as fc
+from clipper.pipeline import ytdlp
 from clipper.pipeline.common import (
     NO_FORMAT_MAX_AGE,
     NO_FORMAT_RETRY,
@@ -167,7 +168,8 @@ def test_argv_has_padded_sections_and_dash_dash_before_canonical_url(tmp_path: P
     assert argv[:3] == [sys.executable, "-m", "yt_dlp"]
     assert _section(argv) == (10.0 - fc.PAD_S, 13.0 + fc.PAD_S)
     assert "--force-keyframes-at-cuts" in argv
-    assert argv[argv.index("-f") + 1] == "bv*[height<=1080]+ba/b[height<=1080]"
+    # Never a muxed fallback without audio (CLP-85): the clips would be silent.
+    assert argv[argv.index("-f") + 1] == "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]"
     assert argv[argv.index("--merge-output-format") + 1] == "mp4"
     # URL comes last, after "--", and is the canonical one (never the raw input).
     assert argv[-2:] == ["--", CANONICAL]
@@ -389,6 +391,8 @@ def test_existing_clip_for_a_different_section_is_redownloaded(tmp_path: Path) -
     fc.fetch_clips(_job(), _ctx(tmp_path), runner=FakeYtdlp())
     sidecar = json.loads((tmp_path / "clips/1/.section.json").read_text())
     assert sidecar == {"start": 3.0, "end": 10.0, "url": CANONICAL, "format": fc.FORMAT}
+    # The probe (monitor and worker) selects with this same string (CLP-85).
+    assert fc.FORMAT == ytdlp.CLIP_FORMAT
 
     cuts = tmp_path / "clips/1/source.mp4.cuts.json"  # scene cuts of the old file
     cuts.write_text("[]")

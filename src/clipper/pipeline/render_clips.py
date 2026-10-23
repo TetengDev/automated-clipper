@@ -348,7 +348,14 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             logger.warning("job %s: clip %s failed, will retry: %s", job.id, rank, reason)
             retry = retry or exc
             continue
-        reasons = check_clip(edl, result.video_path, language=language, asr=asr, deadline=deadline)
+        reasons = check_clip(
+            edl,
+            result.video_path,
+            language=language,
+            asr=asr,
+            deadline=deadline,
+            starts_on_cut=any(abs(c - edl.source.in_s) <= 1 / FPS for c in cuts),
+        )
         if reasons:
             logger.info("job %s: clip %s quality gates: %s", job.id, rank, ", ".join(reasons))
         insert_pending_clip(

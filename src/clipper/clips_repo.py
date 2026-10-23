@@ -55,6 +55,12 @@ class ClipMeta:
     """Failed quality gates; () passed every gate, None was not gated."""
 
 
+def _status(meta: ClipMeta) -> ClipStatus:
+    """`needs_attention` when a quality gate failed (`gate_error` alone does not count)."""
+    failed = any(r != GATE_ERROR for r in meta.gate_reasons or ())
+    return ClipStatus.NEEDS_ATTENTION if failed else ClipStatus.PENDING_REVIEW
+
+
 def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -120,8 +126,7 @@ def insert_pending_clip(
     in the original video, for when the EDL cuts a pre-fetched section of it."""
     stamp = now or _now()
     meta = meta or ClipMeta()
-    failed = any(r != GATE_ERROR for r in meta.gate_reasons or ())
-    status = ClipStatus.NEEDS_ATTENTION if failed else ClipStatus.PENDING_REVIEW
+    status = _status(meta)
     with transaction(conn):
         cursor = conn.execute(
             "INSERT INTO clips (job_id, rank, status, current_version, created_at, updated_at)"
@@ -153,7 +158,8 @@ def add_clip_version(
     meta: ClipMeta | None = None,
     now: str | None = None,
 ) -> ClipVersionRef:
-    """Record a re-render as version n+1 and return the clip to `pending_review`.
+    """Record a re-render as version n+1 and return the clip to `pending_review` (or
+    `needs_attention` when `meta.gate_reasons` has a failed gate).
 
     `result` must come from a render with a version-specific basename (see module doc);
     earlier version rows keep their own video/thumbnail paths.
@@ -183,6 +189,6 @@ def add_clip_version(
         )
         conn.execute(
             "UPDATE clips SET current_version = ?, status = ?, updated_at = ? WHERE id = ?",
-            (version, ClipStatus.PENDING_REVIEW.value, stamp, clip_id),
+            (version, _status(meta).value, stamp, clip_id),
         )
     return ClipVersionRef(clip_id=clip_id, version=version)

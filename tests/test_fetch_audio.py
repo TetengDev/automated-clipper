@@ -683,7 +683,7 @@ def test_format_error_past_the_age_cap_fails_for_good(media_dir: Path) -> None:
         _fetch_at(media_dir, T0 + fa.NO_FORMAT_MAX_AGE - timedelta(hours=1), runner)
 
     with pytest.raises(PermanentError, match="requested format not available.*giving up"):
-        _fetch_at(media_dir, T0 + fa.NO_FORMAT_MAX_AGE + timedelta(hours=1), runner)
+        _fetch_at(media_dir, T0 + fa.NO_FORMAT_MAX_AGE + timedelta(minutes=10), runner)
 
 
 def test_stale_format_marker_does_not_fail_a_new_breakage_at_once(media_dir: Path) -> None:

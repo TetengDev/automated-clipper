@@ -16,6 +16,8 @@ cookies/proxy env and redaction as `fetching_audio`). Each kept clip has a sidec
 `clips/<rank>/.section.json` ({"start", "end", "url", "format"}): an existing source.mp4 is only
 reused if its sidecar matches the section wanted now (highlights can change between runs).
 All calls share one 100 min `Deadline`; running out is a retryable `StageTimeout`.
+"Requested format is not available" (a YouTube player change) defers the stage like in
+`fetching_audio` (`NoUsableFormat`, +30 min), failing for good only after 48 h of it.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from clipper.pipeline.common import (
     PROTOCOL_WHITELIST,
     Deadline,
     default_runner,
+    deferring_no_format,
     read_json,
     write_json_atomic,
 )
@@ -49,6 +52,8 @@ TIMEOUT_PER_SECOND = 20.0
 TOLERANCE_S = 0.5
 TMP_STEM = "source.tmp"
 SIDECAR = ".section.json"
+NO_FORMAT_MARKER = ".clips_no_format_since"
+"""When this stage first hit a format error (a player breakage): see `deferring_no_format`."""
 
 
 @dataclass(frozen=True)
@@ -219,7 +224,8 @@ def fetch_clips(
         probe = _reusable(dest, _sidecar(url, section), runner, deadline)
         if probe is None:
             dest.unlink(missing_ok=True)
-            probe = _download(ytdlp, runner, deadline, job, clip, section, dest)
+            with deferring_no_format(ctx.media_dir / NO_FORMAT_MARKER, ctx.clock):
+                probe = _download(ytdlp, runner, deadline, job, clip, section, dest)
         entries.append(
             {
                 "rank": clip.rank,
@@ -232,6 +238,7 @@ def fetch_clips(
                 "height": probe.height,
             }
         )
+    (ctx.media_dir / NO_FORMAT_MARKER).unlink(missing_ok=True)
     write_json_atomic(ctx.media_dir / "sections.json", {"clips": entries})
 
 

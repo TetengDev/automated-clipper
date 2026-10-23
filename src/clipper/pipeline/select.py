@@ -79,6 +79,7 @@ PROVIDER = "anthropic"
 CLI_PROVIDER = "claude_cli"
 CLI_COMMAND = "claude"
 CLI_TIMEOUT_S = 600.0
+_LOCAL_LOGIN_ENV = ("CLAUDE_CONFIG_DIR", "USER", "LOGNAME")
 USAGE_LIMIT_MAX_WAIT = timedelta(days=8)
 """A reset time further out than this (the weekly limit plus slack) is not trusted."""
 ARTIFACT = "highlights.json"
@@ -739,7 +740,7 @@ class _CliBackend:
     each call uses). The prompt goes on stdin, the child runs in an empty scratch dir, and
     its env is the runner's allowlist plus only the subscription token. A token login gets
     a throwaway config dir (the image's root fs is read-only); without a token the CLI uses
-    the machine's existing `claude` login (and its CLAUDE_CONFIG_DIR, if set)."""
+    the machine's existing `claude` login (keeping CLAUDE_CONFIG_DIR and USER)."""
 
     provider = CLI_PROVIDER
     billed = False
@@ -757,9 +758,9 @@ class _CliBackend:
             (root / "work").mkdir()
             (root / "system.md").write_text("\n\n".join(b["text"] for b in system), "utf-8")
             (root / "prompt.txt").write_text(prompt, "utf-8")
-            # Without a token, a login made under a custom CLAUDE_CONFIG_DIR lives there.
-            config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-            env = {"CLAUDE_CONFIG_DIR": config_dir} if config_dir else {}
+            # Without a token the machine's login is used: it may live under a custom
+            # CLAUDE_CONFIG_DIR, and the macOS Keychain lookup needs USER (none are secrets).
+            env = {k: os.environ[k] for k in _LOCAL_LOGIN_ENV if os.environ.get(k)}
             if token and token.get_secret_value():
                 (root / "config").mkdir()
                 env = {

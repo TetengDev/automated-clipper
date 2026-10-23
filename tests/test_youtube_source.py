@@ -688,7 +688,9 @@ def test_bot_check_stops_probing_the_rest_of_the_batch() -> None:
     assert meta.videos == {}
 
 
-def test_metadata_probes_and_listings_ignore_missing_formats() -> None:
+def test_metadata_probes_never_ignore_missing_formats() -> None:
+    # With --ignore-no-formats-error, yt-dlp turns private, members-only, age-gate and bot
+    # check failures into a warning and exits 0, so none of them would ever be classified.
     url = f"https://www.youtube.com/channel/{CHANNEL}/videos"
     runner = FakeRunner({watch(V1): ok_json(info(V1)), url: ok_json({"entries": []})})
     provider = YtDlpProvider(YtDlp(runner=runner))
@@ -696,7 +698,33 @@ def test_metadata_probes_and_listings_ignore_missing_formats() -> None:
     provider.videos([V1])
     provider.uploads(CHANNEL)
 
-    assert all("--ignore-no-formats-error" in call for call in runner.calls)
+    probe, listing = runner.calls
+    assert "--ignore-no-formats-error" not in probe
+    assert "--ignore-no-formats-error" in listing  # harmless with --flat-playlist
+
+
+@pytest.mark.parametrize("availability", ["private", "subscriber_only"])
+def test_probe_exiting_zero_without_formats_for_restricted_video_is_unavailable(
+    availability: str,
+) -> None:
+    body = info(V1, formats=[], availability=availability, duration=None)
+    runner = FakeRunner({watch(V1): RunResult(0, json.dumps(body), "")})
+
+    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
+
+    assert meta.unavailable == {V1}
+    assert meta.videos == {} and meta.errors == {}
+
+
+@pytest.mark.parametrize("availability", ["needs_auth", "premium_only"])
+def test_probe_exiting_zero_for_gated_video_is_a_retryable_error(availability: str) -> None:
+    body = info(V1, formats=[], availability=availability)
+    runner = FakeRunner({watch(V1): RunResult(0, json.dumps(body), "")})
+
+    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
+
+    assert set(meta.errors) == {V1} and availability in meta.errors[V1]
+    assert meta.videos == {} and meta.unavailable == set()
 
 
 def test_pipeline_probe_still_fails_on_missing_formats() -> None:

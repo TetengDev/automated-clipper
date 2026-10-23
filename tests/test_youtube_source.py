@@ -593,6 +593,25 @@ def test_source_raises_when_feed_and_fallback_fail(http: httpx.Client) -> None:
         YouTubeSource(http, provider).recent_uploads(CHANNEL)
 
 
+def test_cancelled_listing_raises_source_cancelled() -> None:
+    from clipper.pipeline.ytdlp import CommandCancelled
+
+    def cancelled(args, timeout_s):
+        raise CommandCancelled("python cancelled")
+
+    with pytest.raises(yt.SourceCancelled):
+        YtDlpProvider(YtDlp(runner=cancelled)).uploads(CHANNEL)
+
+
+@respx.mock
+def test_source_does_not_rewrap_a_cancelled_fallback(http: httpx.Client) -> None:
+    respx.get(yt.FEED_URL).mock(return_value=httpx.Response(500))
+    provider = StubProvider(yt.SourceCancelled("yt-dlp listing cancelled"))
+
+    with pytest.raises(yt.SourceCancelled):
+        YouTubeSource(http, provider).recent_uploads(CHANNEL)
+
+
 def test_build_source_is_keyless_without_api_key(http: httpx.Client) -> None:
     source = yt.build_source(Secrets(), http, YtDlp(runner=FakeRunner({})))
 

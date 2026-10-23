@@ -33,6 +33,7 @@ from clipper.monitor import (
 )
 from clipper.sources.youtube import (
     Metadata,
+    SourceCancelled,
     SourceError,
     Upload,
     VideoMeta,
@@ -670,13 +671,28 @@ def test_day_precision_date_gets_a_day_of_slack(conn, cfg, source, clock) -> Non
 def test_listing_killed_by_stop_is_not_recorded_as_an_error(conn, cfg, source, clock) -> None:
     monitor = make(conn, cfg, source, clock)
     source.on_feed = lambda channel_id: monitor.stop.set()  # SIGTERM mid-listing
-    source.feeds[BEAST] = SourceError("feed: HTTP 404; fallback: yt-dlp listing failed: cancelled")
+    source.feeds[BEAST] = SourceCancelled("yt-dlp listing cancelled")
 
     report = monitor.run_cycle([cfg.creator("MrBeast"), cfg.creator("IShowSpeed")])
 
     assert report.errors == []
     assert runs(conn)[-1]["errors"] is None
     assert source.feed_calls == [BEAST]  # the cycle ends there
+
+
+@pytest.mark.parametrize(
+    "error",
+    [SourceError("feed: HTTP 500; fallback: HTTP 500"), sqlite3.OperationalError("disk I/O error")],
+)
+def test_real_error_during_shutdown_is_still_recorded(conn, cfg, source, clock, error) -> None:
+    monitor = make(conn, cfg, source, clock)
+    source.on_feed = lambda channel_id: monitor.stop.set()  # SIGTERM mid-listing
+    source.feeds[BEAST] = error
+
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert [e["creator"] for e in report.errors] == ["MrBeast"]
+    assert str(error) in json.loads(runs(conn)[-1]["errors"])[0]["error"]
 
 
 def test_one_creator_raising_does_not_stop_the_others(conn, cfg, source, clock) -> None:

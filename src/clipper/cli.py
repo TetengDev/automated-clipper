@@ -11,7 +11,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, NoReturn
 
 import typer
 from pydantic import ValidationError
@@ -29,6 +29,12 @@ from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version
 from clipper.export import DEFAULT_OUTPUT_DIR
 from clipper.pipeline import build_stages
 from clipper.urls import InvalidSourceURL, parse_source_url
+
+if TYPE_CHECKING:
+    import httpx
+
+    from clipper.resolve import Resolved
+    from clipper.sources.youtube import MetadataProvider
 
 EXIT_NOT_IMPLEMENTED = 70  # EX_SOFTWARE; distinct from Click's usage-error code 2
 MANUAL_CREATOR = "manual"
@@ -439,10 +445,89 @@ def bench_transcribe(
         _fail(f"bench-transcribe: {exc}")
 
 
+def _http_client() -> httpx.Client:
+    import httpx
+
+    from clipper.sources.youtube import HTTP_TIMEOUT
+
+    return httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False)
+
+
+def _youtube_provider(secrets: Secrets, http: httpx.Client) -> MetadataProvider:
+    """Data API with YOUTUBE_API_KEY, else keyless yt-dlp (honours the yt-dlp cookie and
+    proxy env). A seam for tests."""
+    from clipper.pipeline.ytdlp import YtDlp, run_command
+    from clipper.sources.youtube import metadata_provider
+
+    return metadata_provider(secrets, http, YtDlp.from_env(run_command))
+
+
+def _describe(result: Resolved) -> str:
+    head = f"{result.creator}: {result.platform} {result.handle}"
+    if result.error is not None:
+        return f"{head}: error: {result.error}"
+    if not result.changed:
+        return f"{head} -> {result.new} (unchanged)"
+    return f"{head} -> {result.new} ({f'was {result.old}' if result.old else 'new'})"
+
+
 @app.command("resolve")
-def resolve() -> None:
-    """Resolve creator handles to stable channel / user IDs."""
-    _not_implemented("CLP-22")
+def resolve(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show what would change; write nothing.")
+    ] = False,
+) -> None:
+    """Resolve creator handles to stable channel / user IDs (written into creators.yaml).
+
+    Twitch logins are resolved only when TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET are set.
+    Exits non-zero if any handle failed; the others are still written."""
+    from clipper.pipeline.ytdlp import YtDlpError
+    from clipper.resolve import resolve_twitch, resolve_youtube, write_ids
+
+    path = _app(ctx).config_path
+    try:
+        cfg = load_config(path)
+        secrets = Secrets()
+    except ConfigError as exc:
+        _fail(str(exc))
+    except ValidationError as exc:
+        _fail(f"resolve: {exc}")
+    twitch_creators = [c for c in cfg.creators if c.twitch is not None]
+    twitch_id, twitch_secret = (
+        s.get_secret_value() if s else ""
+        for s in (secrets.twitch_client_id, secrets.twitch_client_secret)
+    )
+    with _http_client() as http:
+        try:
+            provider = _youtube_provider(secrets, http)
+        except YtDlpError as exc:
+            _fail(f"resolve: {exc}")
+        results = resolve_youtube(cfg.creators, provider)
+        if twitch_creators and twitch_id and twitch_secret:
+            results += resolve_twitch(twitch_creators, http, twitch_id, twitch_secret)
+    for result in results:
+        typer.echo(_describe(result), err=result.error is not None)
+    if twitch_creators and not (twitch_id and twitch_secret):
+        typer.echo(
+            f"twitch: skipped {len(twitch_creators)} creator(s)"
+            " (set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET to resolve user IDs)"
+        )
+    if provider.quota.units:
+        typer.echo(f"YouTube API quota units used: {provider.quota.units}")
+    changed = sum(r.changed for r in results)
+    if dry_run:
+        typer.echo(f"dry run: {changed} id(s) would change; nothing written")
+    elif changed:
+        try:
+            written = write_ids(path, results)
+        except (ValueError, OSError) as exc:
+            _fail(f"resolve: {exc}")
+        typer.echo(f"wrote {written} id(s) to {path}")
+    else:
+        typer.echo("nothing to write")
+    if any(r.error is not None for r in results):
+        raise typer.Exit(code=1)
 
 
 @app.command("status")

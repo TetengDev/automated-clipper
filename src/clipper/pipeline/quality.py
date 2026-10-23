@@ -6,8 +6,8 @@ validate-plan and quality gates, in our own code.
     caption_mismatch   an EDL word inside the clip never shows as a caption (frame rounding)
     word_crosses_join  a word runs over a jump-cut join, so half of it is cut
     late_speech        the first word starts more than 0.25 s (plus one frame of rounding)
-                       into the clip; not checked when the clip starts on a scene cut,
-                       where the boundary snap may add up to 1 s of lead-in on purpose
+                       into the clip; when the clip starts on a scene cut, plus the snap
+                       tolerance (1 s), which the boundary snap may add on purpose
     loudness           integrated loudness off -14 LUFS by more than 1 LU, or true peak
                        above -1 dBTP (ffmpeg ebur128 on the final video)
     join_asr           a tiny Whisper pass on +-1 s around a join hears other words than the
@@ -33,6 +33,7 @@ from typing import Protocol
 
 from clipper.clips_repo import GATE_ERROR
 from clipper.edl import EDL, FPS, frames
+from clipper.pipeline.boundaries import SNAP_TOLERANCE_S
 from clipper.pipeline.common import Deadline, MediaError, run_media, strip_control
 from clipper.pipeline.transcribe import ChunkTranscript, FasterWhisperTranscriber
 from clipper.redact import redact
@@ -133,8 +134,9 @@ def edl_reasons(edl: EDL, *, starts_on_cut: bool = False) -> list[str]:
         for w in edl.words
     ):
         reasons.append("word_crosses_join")
-    # One frame of slack: a jump-cut segment start is rounded down onto the frame grid.
-    if not starts_on_cut and shown and shown[0][1] > SPEECH_START_MAX_S + 1 / FPS + 1e-9:
+    # One frame of slack: a jump-cut segment start is rounded onto the frame grid.
+    limit = SPEECH_START_MAX_S + 1 / FPS + (SNAP_TOLERANCE_S if starts_on_cut else 0.0)
+    if shown and shown[0][1] > limit + 1e-9:
         reasons.append("late_speech")
     return reasons
 

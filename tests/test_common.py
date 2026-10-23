@@ -240,6 +240,32 @@ def test_format_error_marker_from_before_the_upgrade_still_counts(tmp_path: Path
     assert type(_format_error_at(marker, T0 + timedelta(hours=49))) is PermanentError
 
 
+def test_format_error_marker_read_is_bounded(tmp_path: Path) -> None:
+    # Only the start of the marker is read: whatever follows it is never looked at.
+    marker = tmp_path / ".no_format_since"
+    stamps = f"{T0.isoformat()}\n{(T0 + timedelta(hours=1)).isoformat()}\n"
+    marker.write_text(stamps + " " * 300 + "not-a-time" * 100_000)
+
+    _format_error_at(marker, T0 + timedelta(hours=2))
+
+    assert marker.read_text().split() == [
+        T0.isoformat(),
+        (T0 + timedelta(hours=2)).isoformat(),
+    ]
+
+
+def test_format_error_marker_write_does_not_follow_a_planted_symlink(tmp_path: Path) -> None:
+    marker = tmp_path / ".no_format_since"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    marker.with_name(f"{marker.name}.tmp").symlink_to(victim)
+
+    assert isinstance(_format_error_at(marker, T0), common.NoUsableFormat)
+
+    assert victim.read_text() == "keep me"
+    assert not marker.is_symlink() and marker.read_text().split()[0] == T0.isoformat()
+
+
 def test_other_unavailable_errors_pass_through_untouched(tmp_path: Path) -> None:
     marker = tmp_path / ".no_format_since"
     error = ytdlp.Unavailable("Private video", "private")

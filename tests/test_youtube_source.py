@@ -784,14 +784,15 @@ def test_metadata_probes_never_ignore_missing_formats() -> None:
     assert "--ignore-no-formats-error" in listing  # harmless with --flat-playlist
 
 
-def test_metadata_probe_selects_like_the_worker_download() -> None:
-    # A video the monitor accepts must be one the worker's audio download can fetch.
+def test_metadata_probe_selects_like_the_worker_downloads() -> None:
+    # A video the monitor accepts must be one the worker's clip download can fetch, which
+    # implies its audio download can too.
     runner = FakeRunner({watch(V1): ok_json(info(V1))})
 
     YtDlpProvider(YtDlp(runner=runner)).videos([V1])
 
     (probe,) = runner.calls
-    assert probe[probe.index("-f") + 1] == ytdlp.AUDIO_FORMAT
+    assert probe[probe.index("-f") + 1] == ytdlp.CLIP_FORMAT
 
 
 @pytest.mark.parametrize("availability", ["needs_auth", "subscriber_only", "premium_only"])

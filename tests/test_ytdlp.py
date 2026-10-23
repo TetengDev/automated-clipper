@@ -428,9 +428,11 @@ def test_format_errors_share_one_reason(stderr: str) -> None:
     assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT
 
 
-def test_probe_selects_like_the_audio_download(tmp_path: Path) -> None:
-    # The monitor and the worker probe with the download's selector: a video the probe
-    # accepts is one the download can fetch, and one it cannot is a format error up front.
+def test_probe_selects_like_the_clip_download(tmp_path: Path) -> None:
+    # The monitor and the worker probe with the clip download's selector, which implies the
+    # audio download's (see test_probe_selector_implies_the_audio_selector): a video the
+    # probe accepts is one both downloads can fetch, and one they cannot is a format error
+    # up front, before any transcription or LLM spend.
     probe = Recorder(ok(json.dumps({"id": "x"})))
     YtDlp(runner=probe).probe(URL)
     download = Recorder(ok())
@@ -438,8 +440,9 @@ def test_probe_selects_like_the_audio_download(tmp_path: Path) -> None:
         YtDlp(runner=download).download_audio(URL, tmp_path, "src")
 
     probe_args, download_args = probe.calls[0][0], download.calls[0][0]
-    assert probe_args[probe_args.index("-f") + 1] == ytdlp.AUDIO_FORMAT
+    assert probe_args[probe_args.index("-f") + 1] == ytdlp.CLIP_FORMAT
     assert download_args[download_args.index("-f") + 1] == ytdlp.AUDIO_FORMAT
+    assert ytdlp.CLIP_FORMAT == "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]"
 
 
 def _hls(height: int, tbr: float) -> dict[str, object]:
@@ -464,15 +467,57 @@ AUDIO_ONLY = {
 MUXED_HLS = [_hls(h, t) for h, t in [(1080, 5e3), (144, 100), (720, 3e3), (480, 1200), (360, 700)]]
 
 
-def _select(formats: list[dict[str, object]]) -> str:
+def _select(formats: list[dict[str, object]], selector: str = ytdlp.AUDIO_FORMAT) -> str:
     """Real yt-dlp format selection over an offline info dict: nothing is fetched."""
     info = {
         "id": "x", "title": "t", "extractor": "generic", "extractor_key": "Generic",
         "webpage_url": "https://media.invalid/watch", "formats": formats,
     }  # fmt: skip
-    params = {"format": ytdlp.AUDIO_FORMAT, "simulate": True, "quiet": True, "no_warnings": True}
+    params = {"format": selector, "simulate": True, "quiet": True, "no_warnings": True}
     with YoutubeDL(params) as ydl:
         return str(ydl.process_ie_result(info, download=False)["format_id"])
+
+
+FIXTURES = {
+    "dash and muxed": [*MUXED_HLS, AUDIO_ONLY, _video_only(1080)],
+    "dash only": [AUDIO_ONLY, _video_only(1080), _video_only(720)],
+    "muxed hls only": MUXED_HLS,
+    "muxed above 480p and video-only": [_hls(1080, 5000), _hls(720, 3000), _video_only(360)],
+    "muxed above 1080p only": [_hls(1440, 9000), _hls(2160, 16000)],
+    "audio only": [AUDIO_ONLY],
+    "video only": [_video_only(1080), _video_only(720)],
+    "nothing": [],
+}
+
+
+@pytest.mark.parametrize("name", FIXTURES)
+def test_probe_selector_implies_the_audio_selector(name: str) -> None:
+    # A video the probe accepts must be one the audio download accepts too: either `ba`
+    # exists, or a muxed format with audio does, which the audio fallbacks take.
+    formats = FIXTURES[name]
+    try:
+        _select(formats, ytdlp.CLIP_FORMAT)
+    except Exception as exc:  # noqa: BLE001 - only a format error may come out
+        error = classify_error(f"ERROR: {exc}")
+        assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT
+        return
+    assert _select(formats)  # raises if the audio selector found nothing
+
+
+@pytest.mark.parametrize("name", ["audio only", "video only", "muxed above 1080p only"])
+def test_probe_selector_rejects_what_the_clip_download_cannot_use(name: str) -> None:
+    # Audio but no video (a partial breakage): the job would otherwise pay for ASR and the
+    # LLM and only then fail in fetch_clips. Video but no audio: the clips would be silent.
+    with pytest.raises(Exception, match="Requested format is not available") as info:
+        _select(FIXTURES[name], ytdlp.CLIP_FORMAT)
+
+    error = classify_error(f"ERROR: {info.value}")
+    assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT
+
+
+def test_probe_selector_merges_without_downloading() -> None:
+    # Selection with `+` is resolved in the info dict; nothing is merged under simulate.
+    assert _select(FIXTURES["dash only"], ytdlp.CLIP_FORMAT) == "v-1080+140"
 
 
 @pytest.mark.parametrize(

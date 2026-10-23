@@ -20,6 +20,7 @@ import pytest
 from clipper.jobs.models import Job, JobStatus
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext
 from clipper.pipeline import fetch_clips as fc
+from clipper.pipeline import ytdlp
 from clipper.pipeline.common import (
     NO_FORMAT_MAX_AGE,
     NO_FORMAT_RETRY,
@@ -389,6 +390,8 @@ def test_existing_clip_for_a_different_section_is_redownloaded(tmp_path: Path) -
     fc.fetch_clips(_job(), _ctx(tmp_path), runner=FakeYtdlp())
     sidecar = json.loads((tmp_path / "clips/1/.section.json").read_text())
     assert sidecar == {"start": 3.0, "end": 10.0, "url": CANONICAL, "format": fc.FORMAT}
+    # The probe (monitor and worker) selects with this same string (CLP-85).
+    assert fc.FORMAT == ytdlp.CLIP_FORMAT
 
     cuts = tmp_path / "clips/1/source.mp4.cuts.json"  # scene cuts of the old file
     cuts.write_text("[]")

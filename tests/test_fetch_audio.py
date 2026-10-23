@@ -221,8 +221,9 @@ def test_audio_only_download_and_16k_mono_conversion(ctx: StageContext) -> None:
     run(make_job(), ctx, runner)
     (download,) = runner.of("download")
     (probe,) = runner.of("probe")
-    assert download[download.index("-f") + 1] == ytdlp.AUDIO_FORMAT  # probe and download agree
-    assert probe[probe.index("-f") + 1] == ytdlp.AUDIO_FORMAT
+    assert download[download.index("-f") + 1] == ytdlp.AUDIO_FORMAT
+    # The probe selects like the clip download, which implies the audio download.
+    assert probe[probe.index("-f") + 1] == ytdlp.CLIP_FORMAT
     (convert,) = runner.of("convert")
     for flag, value in (("-ac", "1"), ("-ar", "16000"), ("-c:a", "flac")):
         assert convert[convert.index(flag) + 1] == value

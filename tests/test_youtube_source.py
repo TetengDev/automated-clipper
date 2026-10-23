@@ -636,6 +636,18 @@ def test_cli_logging_keeps_httpx_request_lines_out(monkeypatch: pytest.MonkeyPat
     assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING
 
 
+def test_lookalike_channel_id_from_ytdlp_is_rejected() -> None:
+    lookalike = "UCХ6OQ3DkcsbYNE6H8uQQuVA"  # Cyrillic Ha instead of X
+    runner = FakeRunner(
+        {"https://www.youtube.com/@MrBeast": ok_json({"id": "@MrBeast", "channel_id": lookalike})}
+    )
+
+    with pytest.raises(HandleNotFound):
+        YtDlpProvider(YtDlp(runner=runner)).channel_id("@MrBeast")
+    with pytest.raises(ValueError, match="invalid channel id"):
+        YtDlpProvider(YtDlp(runner=runner)).uploads(lookalike)
+
+
 class Endless:
     """A streamed body of 1 MiB chunks; counts how many were pulled."""
 

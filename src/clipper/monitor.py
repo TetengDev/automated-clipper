@@ -88,7 +88,8 @@ class CreatorPoll:
     creator: str
     first_run: bool = False
     new: int = 0
-    """Items not seen before (enqueued or not)."""
+    """Items not seen before that this poll handled (enqueued or not); items whose
+    metadata lookup is still backing off are not counted."""
     enqueued: list[tuple[int, str, str | None]] = field(default_factory=list)
     """(job id, video id, title) per job created."""
     errors: list[dict[str, str]] = field(default_factory=list)
@@ -226,6 +227,7 @@ class YouTubeMonitor:
             for u in fresh
             if u.video_id not in self.failures or self.failures[u.video_id].retry_at <= now
         ]
+        poll.new -= len(fresh) - len(due)  # still backing off: not looked at this poll
         if not due:
             return
         meta = self.source.videos(due, self.stop.is_set)

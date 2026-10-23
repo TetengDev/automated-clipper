@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "source": {
+    "path": "a.mp4",
+    "in_s": 0.25,
+    "out_s": 5.0
+  },
+  "cuts": [
+    {
+      "in_s": 0.5,
+      "out_s": 1.5,
+      "kind": "retake",
+      "confidence": 0.5,
+      "reason": "phrase 1 ~ 2 (jaccard 0.50)",
+      "applied": false
+    }
+  ]
+}

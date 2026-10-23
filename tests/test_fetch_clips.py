@@ -383,6 +383,9 @@ def test_existing_clip_for_a_different_section_is_redownloaded(tmp_path: Path) -
     sidecar = json.loads((tmp_path / "clips/1/.section.json").read_text())
     assert sidecar == {"start": 3.0, "end": 10.0, "url": CANONICAL, "format": fc.FORMAT}
 
+    cuts = tmp_path / "clips/1/source.mp4.cuts.json"  # scene cuts of the old file
+    cuts.write_text("[]")
+
     # Highlights changed (e.g. selection re-run): clip 1 now means another moment.
     (tmp_path / "sections.json").unlink()
     _setup(tmp_path, [_clip(1, 30.0, 34.0)])
@@ -391,6 +394,7 @@ def test_existing_clip_for_a_different_section_is_redownloaded(tmp_path: Path) -
     assert len(again.calls) == 1
     assert _section(again.calls[0]) == (28.0, 36.0)
     assert _sections(tmp_path)["clips"][0]["duration_s"] == pytest.approx(8.0, abs=0.5)
+    assert not cuts.exists()
 
 
 def test_playable_clip_without_sidecar_is_redownloaded(tmp_path: Path) -> None:

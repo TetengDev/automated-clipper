@@ -20,13 +20,14 @@ FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3
 COPY --from=ghcr.io/astral-sh/uv:0.11.31@sha256:ecd4de2f060c64bea0ff8ecb182ddf46ba3fcccdc8a60cfdbaf20d1a047d7437 /uv /usr/local/bin/uv
 
 # ffmpeg/tini for the pipeline; the lib* packages are the shared libraries Chrome
-# headless shell needs on Debian (https://www.remotion.dev/docs/miscellaneous/linux-dependencies).
+# headless shell needs on Debian (https://www.remotion.dev/docs/miscellaneous/linux-dependencies);
+# libegl1/libgles2 (GL loader stubs) are linked by mediapipe even on its CPU path.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates tini fonts-dejavu-core fonts-noto-color-emoji \
         libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libgbm1 libasound2 \
         libxrandr2 libxkbcommon0 libxfixes3 libxcomposite1 libxdamage1 \
-        libpango-1.0-0 libcairo2 libcups2 \
+        libpango-1.0-0 libcairo2 libcups2 libegl1 libgles2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
@@ -53,7 +54,8 @@ COPY render/schema ./render/schema
 COPY render/src ./render/src
 
 COPY src ./src
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --no-dev \
+    && python -I -c "import cv2, scenedetect, mediapipe.tasks.python.vision"
 
 RUN useradd --create-home --uid 10001 clipper \
     && mkdir -p /app/data /app/output /app/config \

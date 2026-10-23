@@ -7,7 +7,7 @@ import { durationInFrames, parseEdl } from "./validate";
 // Preview props for `remotion studio` (expects public/sample.mp4); real renders always pass
 // --props from Python.
 const defaultProps: Edl = {
-  schema_version: 1,
+  schema_version: 2,
   source: { path: "sample.mp4", in_s: 0, out_s: 5 },
   layout: "blurred_fill",
   hook: { text: "Nobody expected this", style: "stakes", duration_s: 2 },
@@ -22,6 +22,9 @@ const defaultProps: Edl = {
   captions_enabled: true,
   caption_style: "bold_pop",
   progress_bar: true,
+  crop: null,
+  segments: null,
+  cuts: [],
 };
 
 // Runs before any frame is rendered: invalid props abort the render here.

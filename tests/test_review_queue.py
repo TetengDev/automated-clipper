@@ -198,3 +198,33 @@ def test_empty_state_reflects_filters(
 
     assert text in html
     assert card_ids(html) == []
+
+
+def test_card_shows_the_rendered_duration(client: TestClient, env: Env) -> None:
+    """Jump cuts: a 45 s source range rendered to 38 s shows 38 s."""
+    env.clip(start_s=125.0, end_s=170.0, duration_s=38.0)
+    html = client.get("/queue").text
+    assert "· 38s ·" in html and "45s" not in html
+
+
+def test_sensitive_badge_only_on_sensitive_cards(client: TestClient, env: Env) -> None:
+    job = env.job("Raffy Tulfo in Action", title="Case")
+    flagged = env.clip(job, title="Flagged one", sensitive=True, created_at="2027-01-02T00:00:00Z")
+    env.clip(job, title="Plain one", created_at="2027-01-01T00:00:00Z")
+
+    html = client.get("/queue").text
+
+    cards = html.split('class="clip-card"')[1:]
+    assert len(cards) == 2
+    assert f'data-clip-id="{flagged}"' in cards[0] and 'class="badge sensitive"' in cards[0]
+    assert 'class="badge sensitive"' not in cards[1]
+    assert "check for names, faces or identifiers of victims and minors" in cards[0]
+
+
+def test_needs_attention_has_its_own_tab(client: TestClient, env: Env) -> None:
+    env.clip(status="needs_attention", title="Flagged", gate_reasons=["loudness"])
+    env.clip(title="Plain")
+    pending = client.get("/queue").text
+    assert "Flagged" not in pending and "Plain" in pending
+    flagged = client.get("/queue?status=needs_attention").text
+    assert "Flagged" in flagged and "Plain" not in flagged

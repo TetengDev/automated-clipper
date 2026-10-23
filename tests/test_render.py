@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -10,7 +11,7 @@ import pytest
 
 from clipper import render
 from clipper.edl import parse_edl
-from clipper.render import RenderError, render_clip
+from clipper.render import InvalidClipError, RenderError, render_clip
 
 LOUDNORM_STDERR = """\
 [Parsed_loudnorm_0 @ 0x1] 
@@ -44,12 +45,14 @@ class FakeRunner:
         fail_step: str | None = None,
         loudnorm_stderr: str = LOUDNORM_STDERR,
         raise_exc: BaseException | None = None,
+        fail_stderr: str = "boom: something broke\nlast line",
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.props: dict[str, Any] | None = None
         self.fail_step = fail_step
         self.loudnorm_stderr = loudnorm_stderr
         self.raise_exc = raise_exc
+        self.fail_stderr = fail_stderr
         self.public_listing: list[str] = []
 
     @staticmethod
@@ -72,7 +75,7 @@ class FakeRunner:
         if self.raise_exc is not None and step == self.fail_step:
             raise self.raise_exc
         if step == self.fail_step:
-            return subprocess.CompletedProcess(argv, 1, "", "boom: something broke\nlast line")
+            return subprocess.CompletedProcess(argv, 1, "", self.fail_stderr)
         stderr = ""
         if step == "remotion":
             props_arg = next(a for a in argv if a.startswith("--props="))
@@ -234,6 +237,33 @@ def test_remotion_failure_raises_with_stderr_tail(
     assert not (tmp_path / "out" / ".clip.work").exists()
     assert not (tmp_path / "out" / "clip.mp4").exists()
     assert not (tmp_path / "out" / "clip.json").exists()
+    assert not isinstance(excinfo.value, InvalidClipError)  # may be transient: retry
+
+
+def test_remotion_rejecting_props_is_invalid_clip(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    stderr = (
+        "Error rendering composition\n"
+        "EdlValidationError  EdlValidationError: invalid clip props: /hook/text: must match"
+        " pattern; /words: bad\n"
+        "    at parseEdl (validate.ts:64)"
+    )
+    runner = FakeRunner(fail_step="remotion", fail_stderr=stderr)
+    with pytest.raises(InvalidClipError) as excinfo:
+        _render(media_root, render_dir, tmp_path, runner)
+    assert str(excinfo.value).splitlines()[0] == (
+        "Remotion rejected the clip props: /hook/text: must match pattern; /words: bad"
+    )
+
+
+def test_props_text_without_the_error_class_is_not_a_rejection(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    runner = FakeRunner(fail_step="remotion", fail_stderr="echo: invalid clip props: x")
+    with pytest.raises(RenderError) as excinfo:
+        _render(media_root, render_dir, tmp_path, runner)
+    assert not isinstance(excinfo.value, InvalidClipError)
 
 
 def test_timeout(media_root: Path, render_dir: Path, tmp_path: Path) -> None:
@@ -283,7 +313,7 @@ def test_invalid_edl_rejected_before_any_subprocess(
 ) -> None:
     runner = FakeRunner()
     bad = {**EDL_DATA, "layout": "split_screen"}
-    with pytest.raises(RenderError, match="invalid EDL"):
+    with pytest.raises(InvalidClipError, match="invalid EDL"):
         render_clip(bad, media_root, tmp_path / "out", runner=runner, render_dir=render_dir)
     assert runner.calls == []
 
@@ -291,9 +321,10 @@ def test_invalid_edl_rejected_before_any_subprocess(
 def test_missing_source(media_root: Path, render_dir: Path, tmp_path: Path) -> None:
     (media_root / "media" / "source.mp4").unlink()
     runner = FakeRunner()
-    with pytest.raises(RenderError, match="source media not found"):
+    with pytest.raises(RenderError, match="source media not found") as excinfo:
         _render(media_root, render_dir, tmp_path, runner)
     assert runner.calls == []
+    assert not isinstance(excinfo.value, InvalidClipError)  # volume may be back on retry
 
 
 def test_symlink_escape_rejected(media_root: Path, render_dir: Path, tmp_path: Path) -> None:
@@ -302,7 +333,7 @@ def test_symlink_escape_rejected(media_root: Path, render_dir: Path, tmp_path: P
     (media_root / "media" / "source.mp4").unlink()
     (media_root / "media" / "source.mp4").symlink_to(outside)
     runner = FakeRunner()
-    with pytest.raises(RenderError, match="escapes media root"):
+    with pytest.raises(InvalidClipError, match="escapes media root"):
         _render(media_root, render_dir, tmp_path, runner)
 
 
@@ -385,6 +416,128 @@ def test_segment_props_shift_and_clip_words() -> None:
     ]
     assert props["hook"] == edl.to_props()["hook"]
     assert props["progress_bar"] is False
+
+
+def test_segment_props_shift_segments_and_drop_cut_records() -> None:
+    """EDL v2: one pre-cut of the whole span (no pre-cut per segment: lip-sync drift),
+    segments shifted with it; the cut records stay in the sidecar, not in the props."""
+    edl = parse_edl(
+        {
+            "source": {"path": "a.mp4", "in_s": 10.0, "out_s": 16.0},
+            "segments": [{"in_s": 10.0, "out_s": 12.0}, {"in_s": 13.2, "out_s": 16.0}],
+            "cuts": [
+                {"in_s": 12.0, "out_s": 13.2, "kind": "silence", "confidence": 1.0,
+                 "reason": "pause", "applied": True},
+                {"in_s": 9.0, "out_s": 11.0, "kind": "retake", "confidence": 0.4,
+                 "reason": "phrase", "applied": False},
+            ],
+            "words": [{"text": "in", "start_s": 13.5, "end_s": 13.9}],
+        }
+    )  # fmt: skip
+    props = render.segment_props(edl)
+    assert props["source"] == {"path": "segment.mp4", "in_s": 0.0, "out_s": 6.0}
+    assert props["segments"] == [
+        {"in_s": 0.0, "out_s": pytest.approx(2.0)},
+        {"in_s": pytest.approx(3.2), "out_s": pytest.approx(6.0)},
+    ]
+    assert props["cuts"] == []
+    assert [(w["text"], round(w["start_s"], 3)) for w in props["words"]] == [("in", 3.5)]
+
+
+def test_precut_covers_the_whole_span_of_segments(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    data = {
+        **EDL_DATA,
+        "source": {"path": "media/source.mp4", "in_s": 1.0, "out_s": 6.0},
+        "segments": [{"in_s": 1.0, "out_s": 3.0}, {"in_s": 4.0, "out_s": 6.0}],
+        "hook": None,
+    }
+    runner = FakeRunner()
+    result = render_clip(data, media_root, tmp_path / "out", runner=runner, render_dir=render_dir)
+    precut = runner.calls[0]["argv"]
+    assert precut[precut.index("-t") + 1] == "5.000"  # the span, not the 4 s output
+    assert result.duration_s == pytest.approx(4.0)
+    sidecar = json.loads(result.sidecar_path.read_text())
+    assert sidecar["duration_in_frames"] == 120
+    assert sidecar["edl"]["segments"] == data["segments"]
+
+
+def test_finalize_fades_the_audio_at_each_join() -> None:
+    argv = render.finalize_argv("ffmpeg", Path("in.mp4"), Path("out.mp4"), None, joins=(2.0, 4.5))
+    chain = argv[argv.index("-af") + 1]
+    assert chain.startswith("asetnsamples=n=48:p=0,volume=")
+    assert "eval=frame" in chain
+    assert "2.000000" in chain and "4.500000" in chain
+    # No joins, no fade: the v1 command is unchanged.
+    assert "-af" not in render.finalize_argv("ffmpeg", Path("i"), Path("o"), None)
+
+
+def test_render_passes_the_output_join_times_to_finalize(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    data = {
+        **EDL_DATA,
+        "source": {"path": "media/source.mp4", "in_s": 1.0, "out_s": 6.0},
+        "segments": [{"in_s": 1.0, "out_s": 3.0}, {"in_s": 4.0, "out_s": 6.0}],
+        "hook": None,
+    }
+    runner = FakeRunner()
+    render_clip(data, media_root, tmp_path / "out", runner=runner, render_dir=render_dir)
+    finalize = next(c["argv"] for c in runner.calls if FakeRunner.step(c["argv"]) == "finalize")
+    chain = finalize[finalize.index("-af") + 1]
+    assert "2.000000" in chain and "loudnorm=" in chain
+    assert chain.index("volume=") < chain.index("loudnorm=")
+
+
+def _assert_fade_dips(tmp_path: Path, joins: tuple[float, ...]) -> None:
+    """Real finalize argv (PCM out): near-silent at the join at 0.5 s, untouched 60 ms away."""
+    src, dst = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+            "-c:v", "libx264", "-c:a", "pcm_s16le", "-f", "mov", str(src),
+        ],
+        check=True, capture_output=True, timeout=60,
+    )  # fmt: skip
+    argv = render.finalize_argv("ffmpeg", src, dst, None, joins=joins)
+    # PCM instead of AAC, so the samples at the join are exact.
+    del argv[argv.index("-b:a") : argv.index("-b:a") + 2]
+    argv[argv.index("aac")] = "pcm_s16le"
+    argv[argv.index("-f") + 1] = "mov"
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, check=False)  # noqa: S603
+    assert proc.returncode == 0, proc.stderr[-500:]
+    pcm = subprocess.run(  # noqa: S603
+        ["ffmpeg", "-v", "error", "-i", str(dst), "-f", "s16le", "-ac", "1", "-"],  # noqa: S607
+        check=True, capture_output=True, timeout=60,
+    ).stdout  # fmt: skip
+    samples = memoryview(pcm).cast("h")
+
+    def peak(t: float) -> int:
+        i = int(t * 48000)
+        return max(abs(x) for x in samples[i - 24 : i + 24])
+
+    assert peak(0.5) < 0.1 * peak(0.3)
+    assert peak(0.56) > 0.9 * peak(0.3)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_join_fade_dips_the_audio_to_silence(tmp_path: Path) -> None:
+    """A real sample-level fade: near-silent at the join, untouched 60 ms away."""
+    _assert_fade_dips(tmp_path, (0.5,))
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_join_fade_survives_600_joins(tmp_path: Path) -> None:
+    """ffmpeg's evaluator fails on one product of ~98 terms: the fade is chunked."""
+    joins = (0.5, *(10.0 + 0.3 * i for i in range(599)))
+    argv = render.finalize_argv("ffmpeg", Path("in"), Path("out"), None, joins=joins)
+    chain = argv[argv.index("-af") + 1]
+    assert chain.count("asetnsamples") == 1
+    assert chain.count("volume=") == 15  # 600 joins, at most 40 a filter
+    _assert_fade_dips(tmp_path, joins)
 
 
 def test_thumbnail_failure_publishes_nothing(

@@ -134,6 +134,17 @@ def test_deadline_shrinks_and_then_expires() -> None:
 def test_next_utc_midnight_and_strip_control() -> None:
     assert next_utc_midnight(T0) == datetime(2026, 10, 22, tzinfo=UTC)
     assert strip_control("a\nb\x00\tc\x7f  d") == "a b c d"
+    # Format characters (bidi, zero-width, BOM, tags) and blank fillers go.
+    spoof = "\u202eab\u200b\u200e\u200f\u2060\u2066c\u2069\ufeff\U000e0041"
+    assert strip_control(spoof) == "abc"
+    assert strip_control("a\u061cb\u180ec\ufff9d") == "abcd"
+    assert strip_control("\u3164\u115f\u1160\u034f\uffa0") == ""
+    # ZWJ (compound emoji) and ZWNJ (Persian/Indic spelling) stay.
+    family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+    assert strip_control(family) == family
+    assert strip_control("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645") == (
+        "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645"
+    )
 
 
 def test_leaked_reservation_of_this_job_is_dropped(conn: sqlite3.Connection) -> None:

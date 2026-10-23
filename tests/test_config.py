@@ -7,8 +7,10 @@ from pydantic import ValidationError
 
 from clipper.config import (
     ConfigError,
+    CreatorOverrides,
     MissingSecretError,
     Secrets,
+    Settings,
     load_config,
 )
 
@@ -187,3 +189,172 @@ def test_rclone_remote_validated(monkeypatch: pytest.MonkeyPatch, remote: str) -
 def test_rclone_remote_valid(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RCLONE_REMOTE", "gdrive:clips/ready")
     assert Secrets().rclone_remote == "gdrive:clips/ready"
+
+
+def test_reframe_setting_defaults_to_auto_with_creator_opt_out() -> None:
+    from clipper.config import AppConfig, Creator, CreatorOverrides, Settings, YouTubeChannel
+
+    creator = Creator(
+        name="Static",
+        region="global",
+        youtube=YouTubeChannel(handle="@static"),
+        overrides=CreatorOverrides(reframe="blurred_fill"),
+    )
+    cfg = AppConfig(creators=(creator,))
+    assert cfg.settings.reframe == "auto"
+    assert cfg.effective_settings("Static").reframe == "blurred_fill"
+    with pytest.raises(ValidationError):
+        Settings(reframe="split_screen")  # type: ignore[arg-type]
+
+
+def test_jump_cuts_defaults_to_silences_with_creator_override() -> None:
+    from clipper.config import AppConfig, Creator, CreatorOverrides, Settings, YouTubeChannel
+
+    creator = Creator(
+        name="Raw",
+        region="ph",
+        youtube=YouTubeChannel(handle="@raw"),
+        overrides=CreatorOverrides(jump_cuts="full"),
+    )
+    cfg = AppConfig(creators=(creator,))
+    assert cfg.settings.jump_cuts == "silences"
+    assert cfg.effective_settings("Raw").jump_cuts == "full"
+    with pytest.raises(ValidationError):
+        Settings(jump_cuts="everything")  # type: ignore[arg-type]
+
+
+def test_jump_cuts_off_survives_yaml(tmp_path: Path) -> None:
+    """YAML 1.1 reads a bare `off` as false; it still means "off"."""
+    from clipper.config import Settings
+
+    path = tmp_path / "creators.yaml"
+    path.write_text(
+        "settings:\n  jump_cuts: off\ncreators:\n"
+        "  - name: Raw\n    region: ph\n    youtube: {handle: '@raw'}\n"
+        "    overrides: {jump_cuts: off}\n"
+    )
+    cfg = load_config(path)
+    assert cfg.settings.jump_cuts == "off"
+    assert cfg.effective_settings("Raw").jump_cuts == "off"
+    with pytest.raises(ValidationError):
+        Settings(jump_cuts=True)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- transcriber (CLP-35)
+
+
+def test_transcriber_defaults_to_local_whisper() -> None:
+    from clipper.config import Settings
+
+    s = Settings()
+    assert (s.transcriber, s.whisper_model, s.whisper_compute_type) == (
+        "local",
+        "large-v3-turbo",
+        "int8",
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "../models/x",
+        "/etc/passwd",
+        "Systran/faster-whisper-tiny",
+        "https://evil.example/m",
+        "a b",
+        ".",
+        "",
+        "small.en",  # a real faster-whisper name, but not pinned
+        "large",  # alias: only pinned names
+    ],
+)
+def test_whisper_model_must_be_a_pinned_name(model: str) -> None:
+    from clipper.config import CreatorOverrides, Settings
+
+    with pytest.raises(ValidationError, match="whisper_model must be one of"):
+        Settings(whisper_model=model)
+    with pytest.raises(ValidationError, match="whisper_model must be one of"):
+        CreatorOverrides(whisper_model=model)
+
+
+@pytest.mark.parametrize("threads", [0, 65, -1])
+def test_whisper_cpu_threads_bounded(threads: int) -> None:
+    from clipper.config import Settings
+
+    assert Settings().whisper_cpu_threads == 4
+    with pytest.raises(ValidationError):
+        Settings(whisper_cpu_threads=threads)
+
+
+@pytest.mark.parametrize("field", ["transcriber", "whisper_compute_type"])
+def test_transcriber_choices_are_closed(field: str) -> None:
+    from clipper.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(**{field: "bogus"})
+
+
+def test_transcriber_per_creator_override(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "settings: {whisper_model: large-v3}\n"
+        "creators:\n"
+        "  - {name: A, region: global, youtube: {handle: '@aaa'},"
+        " overrides: {transcriber: groq, whisper_model: tiny, whisper_compute_type: float32}}\n"
+        "  - {name: B, region: global, youtube: {handle: '@bbb'}}\n"
+    )
+    cfg = load_config(path)
+    a, b = cfg.effective_settings("A"), cfg.effective_settings("B")
+    assert (a.transcriber, a.whisper_model, a.whisper_compute_type) == ("groq", "tiny", "float32")
+    assert (b.transcriber, b.whisper_model, b.whisper_compute_type) == ("local", "large-v3", "int8")
+
+
+def test_max_llm_windows_must_be_positive() -> None:
+    assert Settings().max_llm_windows == 8
+    with pytest.raises(ValidationError):
+        Settings(max_llm_windows=0)
+    with pytest.raises(ValidationError):
+        CreatorOverrides(max_llm_windows=0)
+
+
+# --- CLP-51: content_type per creator ------------------------------------------------------------
+
+
+def test_shipped_creators_have_their_content_type() -> None:
+    cfg = load_config(SHIPPED_CONFIG)
+    assert {c.name: c.content_type for c in cfg.creators} == {
+        "MrBeast": "challenge_stunt",
+        "IShowSpeed": "streamer_reaction",
+        "Kai Cenat": "streamer_reaction",
+        "Raffy Tulfo in Action": "public_service",
+        "Ivana Alawi": "vlog_lifestyle",
+        "Cong TV": "comedy",
+    }
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["challenge_stunt", "streamer_reaction", "public_service", "vlog_lifestyle", "comedy"],
+)
+def test_valid_content_types_accepted(tmp_path: Path, content_type: str) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "creators:\n  - {name: X, region: global, youtube: {handle: '@xxx'},"
+        f" content_type: {content_type}}}\n"
+    )
+    assert load_config(path).creator("X").content_type == content_type
+
+
+def test_content_type_is_optional(config_file: Path) -> None:
+    assert load_config(config_file).creator("MrBeast").content_type is None
+
+
+@pytest.mark.parametrize("bad", ["horror", "Comedy", "''", "[comedy]"])
+def test_invalid_content_type_rejected(tmp_path: Path, bad: str) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "creators:\n  - {name: X, region: global, youtube: {handle: '@xxx'},"
+        f" content_type: {bad}}}\n"
+    )
+    with pytest.raises(ConfigError, match="content_type"):
+        load_config(path)

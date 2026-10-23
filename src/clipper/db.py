@@ -136,6 +136,12 @@ def _has_version_table(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def _applied_versions(conn: sqlite3.Connection) -> set[int]:
+    if not _has_version_table(conn):
+        return set()
+    return {int(r[0]) for r in conn.execute("SELECT version FROM schema_version")}
+
+
 def current_version(conn: sqlite3.Connection) -> int:
     if not _has_version_table(conn):
         return 0
@@ -154,7 +160,8 @@ def migrate(conn: sqlite3.Connection, migrations: list[Migration] | None = None)
     """Apply pending migrations in order, each atomically. Returns applied versions.
 
     Safe to call concurrently from several processes: each migration takes the write lock
-    and re-checks the version before applying.
+    and re-checks the version before applying. Every version not yet recorded is applied,
+    also one below the highest applied (migrations from branches merged out of order).
     """
     ordered = _validate(bundled_migrations() if migrations is None else migrations)
     plans = [(m, split_statements(m)) for m in ordered]
@@ -167,9 +174,10 @@ def migrate(conn: sqlite3.Connection, migrations: list[Migration] | None = None)
             "upgrade the application"
         )
 
+    done = _applied_versions(conn)
     applied: list[int] = []
     for migration, statements in plans:
-        if migration.version <= db_version:
+        if migration.version in done:
             continue
         with transaction(conn):
             conn.execute(
@@ -178,7 +186,7 @@ def migrate(conn: sqlite3.Connection, migrations: list[Migration] | None = None)
                 " name TEXT NOT NULL,"
                 " applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')))"
             )
-            if current_version(conn) >= migration.version:
+            if migration.version in _applied_versions(conn):
                 continue  # another process applied it while we waited for the lock
             for stmt in statements:
                 conn.execute(stmt)

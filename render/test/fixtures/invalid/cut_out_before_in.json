@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "source": {
+    "path": "media/source.mp4",
+    "in_s": 1.0,
+    "out_s": 6.0
+  },
+  "segments": [
+    {
+      "in_s": 1.0,
+      "out_s": 3.0
+    },
+    {
+      "in_s": 4.2,
+      "out_s": 6.0
+    }
+  ],
+  "words": [
+    {
+      "text": "we",
+      "start_s": 1.2,
+      "end_s": 1.5
+    },
+    {
+      "text": "won",
+      "start_s": 4.4,
+      "end_s": 4.8
+    }
+  ],
+  "cuts": [
+    {
+      "in_s": 4.0,
+      "out_s": 3.0,
+      "kind": "silence",
+      "confidence": 1.0,
+      "reason": "pause 1.34s -> 0.14s",
+      "applied": true
+    }
+  ]
+}

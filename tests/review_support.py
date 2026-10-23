@@ -146,6 +146,9 @@ class Env:
         caption: str | None = "Watch this",
         hashtags: list[str] | None = None,
         versions: int = 1,
+        duration_s: float | None = None,
+        sensitive: bool = False,
+        gate_reasons: list[str] | None = None,
     ) -> int:
         job = job_id if job_id is not None else self.job()
         rank = self.conn.execute(
@@ -160,8 +163,8 @@ class Env:
         for n in range(1, versions + 1):
             self.conn.execute(
                 "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption,"
-                " hashtags, score, reason, video_path, thumb_path, prompt_version, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " hashtags, score, reason, video_path, thumb_path, prompt_version, sensitive,"
+                " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     clip_id,
                     n,
@@ -175,8 +178,18 @@ class Env:
                     video_path,
                     thumb_path,
                     "select-v3",
+                    int(sensitive),
                     created_at,
                 ),
+            )
+        if duration_s is not None:  # the rendered length (jump cuts make it < end - start)
+            self.conn.execute(
+                "UPDATE clip_versions SET duration_s = ? WHERE clip_id = ?", (duration_s, clip_id)
+            )
+        if gate_reasons is not None:
+            self.conn.execute(
+                "UPDATE clip_versions SET gate_reasons = ? WHERE clip_id = ?",
+                (json.dumps(gate_reasons), clip_id),
             )
         return clip_id
 

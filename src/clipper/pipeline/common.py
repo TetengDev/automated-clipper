@@ -21,7 +21,8 @@ import re
 import sqlite3
 import tempfile
 import time as _time
-from collections.abc import Callable, Iterator, Sequence
+import unicodedata
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
@@ -48,6 +49,11 @@ STAGE_BUDGET_S = 100 * 60.0
 PROTOCOL_WHITELIST = ["-protocol_whitelist", "file,pipe"]
 """ffmpeg/ffprobe input option: local files only, never network or nested protocols."""
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Format (Cf) characters can spoof text (bidi overrides, zero-width, BOM, tags) and are
+# dropped, except ZWNJ (Persian/Indic spelling) and ZWJ (compound emoji).
+_KEEP_FORMAT = frozenset("\u200c\u200d")
+# Invisible fillers that are not Cf but render blank; plus the whole tag block.
+_FILLERS = re.compile("[\u034f\u115f\u1160\u3164\uffa0\U000e0000-\U000e007f]")
 
 
 class MediaError(RuntimeError):
@@ -84,7 +90,11 @@ class Deadline:
 
 
 def strip_control(text: str) -> str:
-    """Drop control characters (incl. newlines) and collapse whitespace."""
+    """Drop control and invisible spoofing characters (incl. newlines, bidi overrides) and
+    collapse whitespace."""
+    text = "".join(
+        c for c in _FILLERS.sub("", text) if c in _KEEP_FORMAT or unicodedata.category(c) != "Cf"
+    )
     return " ".join(_CONTROL.sub(" ", text).split())
 
 
@@ -134,14 +144,18 @@ def run_media(
     *,
     runner: Runner | None = None,
     on_stderr_line: Callable[[str], None] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> RunResult:
-    """Run an ffmpeg/ffprobe argv; non-zero exit or timeout -> `MediaError`."""
+    """Run an ffmpeg/ffprobe argv; non-zero exit or timeout -> `MediaError`. `env` is added
+    to the runner's allowlisted environment."""
     run = runner if runner is not None else default_runner()
+    extra: dict[str, Any] = {}
+    if on_stderr_line is not None:
+        extra["on_stderr_line"] = on_stderr_line
+    if env:
+        extra["env"] = env
     try:
-        if on_stderr_line is None:
-            result = run(args, timeout_s)
-        else:
-            result = run(args, timeout_s, on_stderr_line=on_stderr_line)
+        result = run(args, timeout_s, **extra)
     except CommandTimeout as exc:
         raise MediaError(f"{what}: {exc}") from None
     if result.returncode != 0:
@@ -252,7 +266,7 @@ def reserve_spend(
     cap can never fit -> `SkipJob`. A DB error while settling after a failure is logged,
     never raised over the original exception.
     """
-    if estimate_usd > cap_usd:
+    if estimate_usd > cap_usd:  # never for a free (local) run: 0 > cap is impossible
         raise SkipJob(f"{label} cost ${estimate_usd:.2f} exceeds the daily cap ${cap_usd:.2f}")
     start, end = _utc_day(now)
     with transaction(conn):
@@ -272,7 +286,7 @@ def reserve_spend(
                 (kind, start, end),
             ).fetchone()[0]
         )
-        if spent + estimate_usd > cap_usd:
+        if estimate_usd > 0 and spent + estimate_usd > cap_usd:  # free runs always proceed
             raise Deferred(
                 next_utc_midnight(now),
                 f"daily {label} budget reached (${spent:.2f} of ${cap_usd:.2f} spent,"

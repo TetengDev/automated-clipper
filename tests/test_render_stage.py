@@ -7,6 +7,7 @@ Remotion render is covered by tests/test_render_integration.py and the e2e test.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -519,7 +520,7 @@ def test_transient_failure_with_all_others_invalid_stays_retryable(
     _setup(media, [_highlight(1, 10.0, 15.0, title=5), _highlight(2, 20.0, 25.0)])
     fake.fail_on[1] = RenderError("remotion render timed out after 900s")
 
-    with pytest.raises(RenderError) as excinfo:
+    with pytest.raises(RETRIED) as excinfo:
         rc.render_clips(job, _ctx(media, conn))
     assert not isinstance(excinfo.value, PermanentError)
     assert _rows(conn) == []
@@ -550,7 +551,7 @@ def test_render_failure_is_retryable(
     _setup(media, [_highlight(1, 10.0, 15.0)])
     fake.fail_on[1] = RenderError("remotion render timed out after 900s")
 
-    with pytest.raises(RenderError):
+    with pytest.raises(RETRIED):
         rc.render_clips(job, _ctx(media, conn))
     assert _rows(conn) == []
 
@@ -687,8 +688,11 @@ def test_transient_render_error_is_retried_by_the_worker(
 
     after = get_job(conn, job.id)
     assert after is not None and after.status is JobStatus.RENDERING
-    assert after.attempts == 1
+    # Paid for by the clip's failure count (CLP-65), not by the job's attempts.
+    assert after.attempts == 0
     assert after.last_error is not None and "remotion render failed" in after.last_error
+    due = conn.execute("SELECT next_attempt_at FROM jobs WHERE id = ?", (job.id,)).fetchone()[0]
+    assert due == to_iso(T0 + backoff(1))
     assert _rows(conn) == []
 
 
@@ -1434,6 +1438,22 @@ def test_marker_nested_too_deep_counts_as_no_failures(
     assert [r["rank"] for r in _rows(conn)] == [1]
 
 
+@pytest.mark.parametrize("make", [Path.mkdir, os.mkfifo], ids=["dir", "fifo"])
+def test_failure_marker_that_is_not_a_file_counts_as_no_failures(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    make: Callable[[Path], None],
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    make(media / "clips/1" / rc.FAILURES_MARKER)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    assert [r["rank"] for r in _rows(conn)] == [1]
+
+
 def test_symlinked_failure_marker_is_not_followed(
     conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
 ) -> None:
@@ -1578,7 +1598,7 @@ def test_all_ranks_left_out_fails_the_job_visibly(
     fake.fail_rank[1] = RenderError("remotion render timed out after 900s")
     fake.fail_rank[2] = RenderError("ffmpeg failed with exit code 1")
     for _ in range(rc.MAX_RENDER_FAILURES - 1):
-        with pytest.raises(RenderError):
+        with pytest.raises(RETRIED):
             rc.render_clips(job, _ctx(media, conn))
 
     with pytest.raises(PermanentError, match="no clip could be rendered: clip 1: render failed"):
@@ -1706,7 +1726,7 @@ def test_worker_timeout_without_progress_still_uses_an_attempt(
     assert fake.calls == []
 
 
-def test_timeout_after_only_a_failed_rank_is_not_progress(
+def test_timeout_after_a_counted_failure_defers(
     conn: sqlite3.Connection,
     job: Job,
     media: Path,
@@ -1726,12 +1746,30 @@ def test_timeout_after_only_a_failed_rank_is_not_progress(
 
     monkeypatch.setattr(rc, "render_clip", slow)
 
-    with pytest.raises(StageTimeout):  # charged: nothing new was rendered
+    # The failure was counted (bounded per clip), so no attempt is used.
+    with pytest.raises(Deferred, match="1 failure\\(s\\) counted"):
         rc.render_clips(job, _ctx(media, conn))
     assert _rows(conn) == []
 
 
-@pytest.mark.parametrize("bad", [MAX_ATTEMPTS + 1, 2 * MAX_ATTEMPTS])
+def test_failure_that_cannot_be_counted_uses_an_attempt(
+    conn: sqlite3.Connection, job: Job, tmp_path: Path, fake: FakeRender
+) -> None:
+    media = _worker_media(conn, job, tmp_path)
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    elsewhere = media / "elsewhere"
+    (media / "clips/1").rename(elsewhere)
+    (media / "clips/1").symlink_to(elsewhere, target_is_directory=True)
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+    clock = [T0]
+
+    done = _drain(_render_worker(conn, tmp_path, clock), conn, job, clock)
+
+    assert done.status is JobStatus.FAILED  # bounded by the job's attempts instead
+    assert len(fake.calls) == MAX_ATTEMPTS
+
+
+@pytest.mark.parametrize("bad", [MAX_ATTEMPTS + 1, 3 * MAX_ATTEMPTS])
 def test_worker_failing_ranks_in_front_of_good_ones_still_reach_clips_ready(
     conn: sqlite3.Connection,
     job: Job,

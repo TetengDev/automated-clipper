@@ -117,6 +117,20 @@ clip renders, the job fails.
   before it fails. With a single worker, every job queued behind it waits that long too.
   Watch the worker log for repeated `clip N failed` lines across jobs.
 
+## Sensitive clips and the review app
+
+Every clip of a `public_service` creator, of a creator without a `content_type`, or of a
+creator not in `config/creators.yaml` (e.g. a manual `clipper enqueue`) is sensitive. The
+reviewer must tick "I checked faces of minors and victims" before approving it, because the
+model sees only the transcript.
+
+- The `review` service reads `config/creators.yaml` once, at startup, and does not start
+  without it. The `worker` also reads it once, at startup. After editing a creator's
+  `content_type`, restart both (`docker compose restart worker review`).
+- Until `review` is restarted, a creator newly set to `public_service` gates only clips
+  stored as sensitive (by a restarted worker). Its older clips need the confirmation only
+  once `review` has been restarted.
+
 ## CI/CD
 
 - **`ci.yml`** runs on every PR and on pushes to main: ruff, pytest (unit and integration against fixtures), Docker build, and Playwright tests for the review app.

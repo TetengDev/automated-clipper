@@ -139,6 +139,12 @@ def _video_id(value: object) -> str | None:
 
 
 def _parse_time(value: object) -> datetime | None:
+    """An ISO-8601 stamp (feed, Data API) or a Unix timestamp (yt-dlp) -> aware UTC."""
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value, UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -240,11 +246,8 @@ class YtDlpProvider:
         status = info.get("live_status")
         if status not in LIVE_STATUSES:
             status = "is_live" if info.get("is_live") is True else "not_live"
-        published = None
-        timestamp = info.get("timestamp")
-        if isinstance(timestamp, int | float) and not isinstance(timestamp, bool):
-            published = datetime.fromtimestamp(timestamp, UTC)
-        elif isinstance(info.get("upload_date"), str):
+        published = _parse_time(info.get("timestamp"))
+        if published is None and isinstance(info.get("upload_date"), str):
             try:
                 published = datetime.strptime(info["upload_date"], "%Y%m%d").replace(tzinfo=UTC)
             except ValueError:
@@ -254,15 +257,20 @@ class YtDlpProvider:
         )
 
     def uploads(self, channel_id: str) -> list[Upload]:
-        """The channel's videos tab (long-form uploads, newest first)."""
+        """The channel's videos tab (long-form uploads, newest first). Dates come from the
+        page's "N weeks ago" text (`approximate_date`): rounded down, so never earlier than
+        the real upload, which keeps the first-run lookback filter from dropping recent
+        uploads while it spares probes for old ones."""
         url = f"https://www.youtube.com/channel/{_channel(channel_id)}/videos"
         try:
-            info = self.ytdlp.listing(url, f"1:{FALLBACK_ITEMS}")
+            info = self.ytdlp.listing(
+                url, f"1:{FALLBACK_ITEMS}", extractor_args="youtubetab:approximate_date"
+            )
         except (YtDlpError, PermanentError) as exc:
             raise SourceError(f"yt-dlp listing failed: {exc}") from None
         entries = info.get("entries")
         rows = entries if isinstance(entries, list) else []
-        return _uploads((e.get("id"), None) for e in rows if isinstance(e, dict))
+        return _uploads((e.get("id"), e.get("timestamp")) for e in rows if isinstance(e, dict))
 
     def channel_id(self, handle: str) -> str:
         url = f"https://www.youtube.com/{quote(handle, safe='@')}"

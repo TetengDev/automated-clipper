@@ -365,11 +365,16 @@ class YtDlp:
         result = self._run(["--dump-single-json", "--skip-download"], url, self.probe_timeout_s)
         return _json_object(result.stdout)
 
-    def listing(self, url: str, playlist_items: str) -> dict[str, Any]:
+    def listing(
+        self, url: str, playlist_items: str, *, extractor_args: str | None = None
+    ) -> dict[str, Any]:
         """A channel or playlist page, flat (`--flat-playlist`): one request for the page,
         none per video. `playlist_items` is yt-dlp's selector, e.g. "1:15", or "0" for the
-        page's own metadata (channel_id) without any entries."""
+        page's own metadata (channel_id) without any entries. `extractor_args` must be a
+        fixed string chosen by the caller."""
         extra = ["--flat-playlist", "--playlist-items", playlist_items, "--dump-single-json"]
+        if extractor_args:
+            extra += ["--extractor-args", extractor_args]
         return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
     @classmethod

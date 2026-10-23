@@ -282,7 +282,7 @@ def test_ytdlp_provider_lists_channel_videos_tab_as_fallback() -> None:
 
     uploads = YtDlpProvider(YtDlp(runner=runner)).uploads(CHANNEL)
 
-    assert uploads == [Upload(V1, datetime(2026, 10, 17, tzinfo=UTC)), Upload(V2)]
+    assert uploads == [Upload(V1, datetime(2026, 10, 18, tzinfo=UTC)), Upload(V2)]
     args = runner.calls[0]
     assert "--flat-playlist" in args
     assert args[args.index("--playlist-items") + 1] == f"1:{yt.FALLBACK_ITEMS}"

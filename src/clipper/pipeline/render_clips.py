@@ -27,16 +27,23 @@ re-render from `clips/<rank>/source.mp4` must convert back by subtracting
 `requested_start_s - pad_start_s` (sections.json).
 
 A transient render failure or timeout (`RenderError`) does not stop the other clips; the
-first one is re-raised at the end so the job retries just the failed ranks. A clip with
+first one is re-raised at the end so the job retries just the failed ranks. Each failure
+is counted in `clips/<rank>/render_failures.json` (CLP-65); at MAX_RENDER_FAILURES the
+clip is left out like an invalid one, so one clip that always fails (a Remotion timeout,
+a corrupt or missing section file) cannot use up the job's attempts. A clip with
 bad input (invalid EDL or metadata, `InvalidClipError` from the renderer) is left out and
 the others still render; the skipped ranks are logged once. If no clip of the job ends up
-rendered, the job fails. A clip is only started if the stage budget still covers its worst
-case (CLIP_WORST_CASE_S), so a run never outlives the claim lease; else `StageTimeout`
-(retryable) and the next claim resumes.
+rendered, the job fails (and the failure counts are dropped, so a requeue tries again).
+A clip is only started if the stage budget still covers its worst case
+(CLIP_WORST_CASE_S), so a run never outlives the claim lease; else `StageTimeout` and the
+next claim resumes. The timeout is retryable and uses up an attempt only when the run
+rendered no new clip: after progress the stage is `Deferred` to now (no attempt used),
+which cannot loop, as every such run renders at least one of the finitely many clips.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -49,7 +56,8 @@ from clipper.clips_repo import ClipMeta, insert_pending_clip
 from clipper.config import JumpCuts
 from clipper.edl import EDL, FPS, MAX_CLIP_SECONDS, frames, parse_edl
 from clipper.jobs.models import Job
-from clipper.jobs.stages import PermanentError, StageContext, StageDef
+from clipper.jobs.queue import MAX_ATTEMPTS
+from clipper.jobs.stages import Deferred, PermanentError, StageContext, StageDef
 from clipper.pipeline.boundaries import DETECT_TIMEOUT_S, detect_cuts, polish
 from clipper.pipeline.common import (
     STAGE_BUDGET_S,
@@ -58,6 +66,7 @@ from clipper.pipeline.common import (
     read_json,
     settings_for,
     strip_control,
+    write_json_atomic,
 )
 from clipper.pipeline.jumpcuts import (
     SILENCE_TIMEOUT_S,
@@ -102,6 +111,12 @@ CLIP_WORST_CASE_S = (
 four ffmpeg steps of `render_clip` and the quality gates, each at its timeout."""
 assert CLIP_WORST_CASE_S < STAGE_BUDGET_S / 2, "a stage run must fit at least two clips"
 MAX_REASON_CHARS = 300
+MAX_RENDER_FAILURES = 3
+"""Render failures of one clip before it is left out: two retries for a transient error,
+and fewer than the job's attempts, so the job never runs out of them on one clip."""
+assert 1 < MAX_RENDER_FAILURES < MAX_ATTEMPTS
+FAILURES_MARKER = "render_failures.json"
+"""In `clips/<rank>/`: {"failures": count, "error": last reason}; removed once rendered."""
 _VERSION = re.compile(r"^[\w.-]{1,64}$")
 
 
@@ -289,6 +304,22 @@ def _done(conn: sqlite3.Connection, job_id: int) -> set[int]:
     return {row[0] for row in conn.execute("SELECT rank FROM clips WHERE job_id = ?", (job_id,))}
 
 
+def _failures(marker: Path) -> tuple[int, str]:
+    """(count, last reason) of the clip's earlier render failures; none if unreadable."""
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+        count, error = data["failures"], data["error"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return 0, ""
+    if isinstance(count, bool) or not isinstance(count, int) or not isinstance(error, str):
+        return 0, ""
+    return count, redact(strip_control(error))  # cleaned again: the file may be hand-edited
+
+
+def _left_out(rank: int, failures: int, error: str) -> str:
+    return f"clip {rank}: render failed {failures} times: {error}"[:MAX_REASON_CHARS]
+
+
 def render_clips(job: Job, ctx: StageContext) -> None:
     deadline = Deadline()
     sections = _clips(read_json(ctx.media_dir / "sections.json"), "sections.json")
@@ -303,11 +334,19 @@ def render_clips(job: Job, ctx: StageContext) -> None:
     language = creator_language(job, ctx)
     asr = default_asr(cpu_threads=settings.whisper_cpu_threads)
     invalid: list[str] = []
+    left_out: list[Path] = []  # failure markers of the clips left out after repeated failures
     retry: RenderError | None = None
+    rendered = 0  # new clips this run
     for section in sections:
         try:
             rank, edl, start, end, meta = _plan(section, highlights, transcript, selection)
             if rank in done:
+                continue
+            marker = ctx.media_dir / "clips" / str(rank) / FAILURES_MARKER
+            failures, error = _failures(marker)
+            if failures >= MAX_RENDER_FAILURES:
+                invalid.append(_left_out(rank, failures, error))
+                left_out.append(marker)
                 continue
             if deadline.remaining() < CLIP_WORST_CASE_S:
                 raise StageTimeout(f"stage budget left too small for clip {rank}; resuming later")
@@ -343,11 +382,28 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             invalid.append(f"clip {rank}: {reason}"[:MAX_REASON_CHARS])
             continue
         except RenderError as exc:
-            # Possibly transient: render the remaining clips, then retry the job for this one.
-            reason = redact(str(exc).splitlines()[0])
+            # Possibly transient: render the remaining clips, then retry the job for this
+            # one; unless it failed too often, then it is left out like an invalid clip.
+            reason = redact(strip_control(str(exc).splitlines()[0]))[:MAX_REASON_CHARS]
+            failures += 1
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(marker, {"failures": failures, "error": reason})
+            if failures >= MAX_RENDER_FAILURES:
+                logger.warning(
+                    "job %s: clip %s failed %d times, leaving it out: %s",
+                    job.id, rank, failures, reason,
+                )  # fmt: skip
+                invalid.append(_left_out(rank, failures, reason))
+                left_out.append(marker)
+                continue
             logger.warning("job %s: clip %s failed, will retry: %s", job.id, rank, reason)
             retry = retry or exc
             continue
+        except StageTimeout as exc:
+            if not rendered:
+                raise  # no progress: this run uses up an attempt
+            # Progress made: resume right away without using up an attempt.
+            raise Deferred(ctx.clock(), f"{exc} ({rendered} clip(s) rendered)") from None
         reasons = check_clip(
             edl,
             result.video_path,
@@ -369,9 +425,13 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             end_s=end,
         )
         done.add(rank)
+        rendered += 1
+        marker.unlink(missing_ok=True)
     if retry is not None:
         raise retry
     if not done:
+        for path in left_out:  # a requeued job tries these clips afresh
+            path.unlink(missing_ok=True)
         raise PermanentError("no clip could be rendered: " + "; ".join(invalid))
     if invalid:
         summary = "; ".join(invalid)  # each reason redacted before it was cut

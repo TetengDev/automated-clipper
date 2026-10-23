@@ -98,6 +98,8 @@ def _no_ambient_secrets(monkeypatch, tmp_path):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
 
 
 def cli_ctx(conn: sqlite3.Connection, media: Path, **settings: Any) -> StageContext:
@@ -180,12 +182,19 @@ def test_cli_without_a_token_uses_the_existing_login(conn, media):
     assert fake.calls[0]["env"] == {}
 
 
-def test_cli_without_a_token_keeps_a_custom_config_dir(conn, media, monkeypatch, tmp_path):
-    # A login made with CLAUDE_CONFIG_DIR set lives there; dropping it means "Not logged in".
+def test_cli_without_a_token_keeps_what_the_local_login_needs(conn, media, monkeypatch, tmp_path):
+    # A login made with CLAUDE_CONFIG_DIR set lives there, and the macOS Keychain lookup
+    # needs USER; without them the CLI answers "Not logged in" (seen in the live check).
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-personal"))
+    monkeypatch.setenv("USER", "someone")
+    monkeypatch.setenv("LOGNAME", "someone")
     fake = FakeCli(cli_json())
     run(make_job(conn), cli_ctx(conn, media), fake)
-    assert fake.calls[0]["env"] == {"CLAUDE_CONFIG_DIR": str(tmp_path / "claude-personal")}
+    assert fake.calls[0]["env"] == {
+        "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-personal"),
+        "USER": "someone",
+        "LOGNAME": "someone",
+    }
 
 
 # --- AC3: limits, login, process failures ----------------------------------------------------

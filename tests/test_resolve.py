@@ -336,3 +336,60 @@ def test_cli_invalid_config_fails_cleanly(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "config file not found" in result.stderr
+
+
+def test_cli_missing_cookies_file_fails_cleanly(
+    shipped: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLIPPER_YTDLP_COOKIES", str(tmp_path / "missing.txt"))
+
+    result = runner.invoke(app, ["--config", str(shipped), "resolve"])
+
+    assert result.exit_code == 1
+    assert "CLIPPER_YTDLP_COOKIES points to a missing file" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("token", "users", "message"),
+    [
+        (httpx.ConnectError("down"), None, "token request failed (ConnectError)"),
+        (httpx.Response(200, text="not json"), None, "unexpected response"),
+        (httpx.Response(200, json={"token_type": "bearer"}), None, "no access_token"),
+        (None, httpx.ReadTimeout("slow"), "users request failed (ReadTimeout)"),
+        (None, httpx.Response(401, json={}), "users request failed: HTTP 401"),
+    ],
+)
+def test_twitch_failures_are_reported_per_creator(
+    small: Path, token: object, users: object, message: str
+) -> None:
+    cfg = load_config(small)
+    with respx.mock:
+        token_route = respx.post(twitch.TOKEN_URL)
+        if isinstance(token, Exception):
+            token_route.mock(side_effect=token)
+        else:
+            token_route.mock(return_value=token or httpx.Response(200, json={"access_token": "t"}))
+        users_route = respx.get(twitch.USERS_URL)
+        if isinstance(users, Exception):
+            users_route.mock(side_effect=users)
+        else:
+            users_route.mock(return_value=users or httpx.Response(200, json={"data": []}))
+        with httpx.Client() as http:
+            results = resolve_twitch(cfg.creators, http, "cid", "csecret")
+
+    assert message in results[0].error
+
+
+def test_twitch_ignores_malformed_user_rows(small: Path, helix: respx.MockRouter) -> None:
+    helix.get(twitch.USERS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": ["x", {"login": "kaicenat", "id": "１２"}, {"login": "kaicenat"}]},
+        )
+    )
+    cfg = load_config(small)
+
+    with httpx.Client() as http:
+        results = resolve_twitch(cfg.creators, http, "cid", "csecret")
+
+    assert results[0].error == "no Twitch user has the login kaicenat"

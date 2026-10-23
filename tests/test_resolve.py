@@ -20,10 +20,10 @@ SHIPPED_CONFIG = Path(__file__).resolve().parents[1] / "config" / "creators.yaml
 IDS = {
     "@MrBeast": "UCX6OQ3DkcsbYNE6H8uQQuVA",
     "@IShowSpeed": "UCWsDFcIhY2DBi3GB5uykGXA",
-    "@KaiCenat": "UCvbUo8pClsgSoiV4XS4fu1g",
+    "@KaiCenat": "UCoEmptob-eEGKk18c2VplJg",
     "@RaffyTulfoInAction": "UCxhygwqQ1ZMoBGQM2yEcNug",
-    "@IvanaAlawi": "UCdl9Z9H4FHWp1YJKcrsxxtQ",
-    "@CongTV": "UCvP1t1zMbQ4AOEe3zj1GNjA",
+    "@IvanaAlawi": "UCypeLkg3Ne5-LIyiB41b1GQ",
+    "@CongTheVlogger": "UC73zqrs0Th_a9dFUivEmv2A",
 }
 OTHER = "UC0000000000000000000000"
 
@@ -156,7 +156,7 @@ creators:
       user_id: "641972806"
     youtube:
       handle: "@KaiCenat"   # trailing comment
-      channel_id: UCvbUo8pClsgSoiV4XS4fu1g
+      channel_id: UCoEmptob-eEGKk18c2VplJg
 """
     )
     cfg = load_config(small)
@@ -301,12 +301,13 @@ def test_cli_rerun_after_handle_change_updates_the_id(
 def test_cli_unknown_handle_fails_at_the_end_but_others_are_written(
     shipped: Path, provider: FakeProvider
 ) -> None:
-    del provider.ids["@CongTV"]
+    del provider.ids["@CongTheVlogger"]
 
     result = runner.invoke(app, ["--config", str(shipped), "resolve"])
 
     assert result.exit_code == 1
-    assert "Cong TV: youtube @CongTV: error: no YouTube channel has the handle @CongTV" in (
+    handle = "@CongTheVlogger"
+    assert f"Cong TV: youtube {handle}: error: no YouTube channel has the handle {handle}" in (
         result.output
     )
     assert "wrote 5 id(s)" in result.output

@@ -82,6 +82,10 @@ def _not_implemented(issue: str) -> NoReturn:
 
 def _setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # httpx logs every request URL at INFO; URLs may carry credentials (signed media URLs,
+    # query-string keys), so only its warnings are kept.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 @app.command("check-config")

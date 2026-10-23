@@ -297,7 +297,8 @@ def _channel(channel_id: str) -> str:
 @dataclass
 class ApiProvider:
     """YouTube Data API v3. Every request costs 1 quota unit (videos, playlistItems and
-    channels.list all do); the key is a query parameter and never appears in messages."""
+    channels.list all do). The key is sent as the X-Goog-Api-Key header, never in the URL,
+    so it cannot reach httpx's request log or an error message."""
 
     http: httpx.Client
     api_key: str
@@ -307,10 +308,10 @@ class ApiProvider:
         self.quota.units += 1
         try:
             response = self.http.get(
-                f"{API_BASE}/{endpoint}", params={**params, "key": self.api_key}
+                f"{API_BASE}/{endpoint}", params=params, headers={"X-Goog-Api-Key": self.api_key}
             )
         except httpx.HTTPError as exc:
-            # `from None`: the httpx error's message and chain carry the URL with the key.
+            # `from None`: keep the request (and its headers) out of the exception chain.
             raise SourceError(
                 f"YouTube API {endpoint} request failed ({type(exc).__name__})"
             ) from None

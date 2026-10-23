@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +19,9 @@ from clipper.config import AppConfig, Creator, CreatorOverrides, Settings, YouTu
 from clipper.db import connect, migrate
 from clipper.edl import EDL, parse_edl
 from clipper.jobs import Worker, enqueue, get_job
-from clipper.jobs.models import Job, JobStatus
-from clipper.jobs.stages import PermanentError, StageContext
+from clipper.jobs.models import Job, JobStatus, to_iso
+from clipper.jobs.queue import MAX_ATTEMPTS
+from clipper.jobs.stages import Deferred, PermanentError, StageContext
 from clipper.pipeline import boundaries as bd
 from clipper.pipeline import build_stages
 from clipper.pipeline import reframe as rf
@@ -40,6 +41,8 @@ class FakeRender:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.fail_on: dict[int, BaseException] = {}
+        self.fail_rank: dict[int, BaseException] = {}  # raised on every call for that rank
+        self.after: list[Callable[[], None]] = []  # run after each successful render
 
     def __call__(
         self, edl: EDL, media_root: Path, out_dir: Path, *, basename: str, **kw: Any
@@ -47,11 +50,15 @@ class FakeRender:
         self.calls.append({"edl": edl, "media_root": media_root, "out_dir": out_dir, **kw})
         if len(self.calls) in self.fail_on:
             raise self.fail_on[len(self.calls)]
+        if int(out_dir.name) in self.fail_rank:
+            raise self.fail_rank[int(out_dir.name)]
         assert (media_root / edl.source.path).is_file()
         out_dir.mkdir(parents=True, exist_ok=True)
         paths = [out_dir / f"{basename}.{ext}" for ext in ("mp4", "jpg", "json")]
         for path in paths:
             path.write_bytes(b"x")
+        for hook in self.after:
+            hook()
         return RenderResult(*paths, duration_s=edl.duration_s, render_seconds=1.0)
 
 
@@ -1237,3 +1244,304 @@ def test_clip_starting_on_a_scene_cut_tells_the_gates(
     cuts.append(fake.calls[0]["edl"].source.in_s)
     rc.render_clips(job, _ctx(media, conn))
     assert gates.calls[0]["starts_on_cut"] is True
+
+
+# CLP-65: a clip that keeps failing is left out instead of failing the whole job.
+
+
+def _render_worker(conn: sqlite3.Connection, tmp_path: Path, clock: list[datetime]) -> Worker:
+    """A real worker over `tmp_path/media`; `clock[0]` is its current time."""
+    return Worker(
+        conn=conn,
+        config=AppConfig(),
+        worker_id="w",
+        stages=build_stages(),
+        media_root=tmp_path / "media",
+        clock=lambda: clock[0],
+    )
+
+
+def _worker_media(conn: sqlite3.Connection, job: Job, tmp_path: Path) -> Path:
+    conn.execute("UPDATE jobs SET status = 'rendering' WHERE id = ?", (job.id,))
+    media = tmp_path / "media" / job.ref.key
+    media.mkdir(parents=True)
+    return media
+
+
+def _drain(worker: Worker, conn: sqlite3.Connection, job: Job, clock: list[datetime]) -> Job:
+    """Run the worker until the job is terminal, jumping the clock past every backoff."""
+    for _ in range(50):
+        current = get_job(conn, job.id)
+        assert current is not None
+        if current.status in (JobStatus.CLIPS_READY, JobStatus.FAILED):
+            return current
+        clock[0] += timedelta(hours=2)
+        worker.run_once()
+    raise AssertionError("job never finished")
+
+
+def test_quarantine_limit_is_below_the_attempt_limit() -> None:
+    # A rank must be left out before the job runs out of attempts on it.
+    assert 1 < rc.MAX_RENDER_FAILURES < MAX_ATTEMPTS
+
+
+def test_rank_failing_every_time_is_left_out_after_the_limit(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2, 3)])
+    fake.fail_rank[2] = RenderError("remotion render timed out after 900s")
+
+    for _ in range(rc.MAX_RENDER_FAILURES - 1):
+        with pytest.raises(RenderError):  # still retryable below the limit
+            rc.render_clips(job, _ctx(media, conn))
+    caplog.clear()
+    rc.render_clips(job, _ctx(media, conn))  # the last failure leaves clip 2 out
+
+    assert [r["rank"] for r in _rows(conn)] == [1, 3]
+    renders = [c["out_dir"].name for c in fake.calls]
+    assert renders.count("2") == rc.MAX_RENDER_FAILURES
+    assert renders.count("1") == renders.count("3") == 1  # never rendered twice
+    summary = [r.getMessage() for r in caplog.records if "left out" in r.getMessage()]
+    assert len(summary) == 1
+    assert "1 clip(s) left out" in summary[0]
+    assert f"clip 2: render failed {rc.MAX_RENDER_FAILURES} times" in summary[0]
+    assert "timed out after 900s" in summary[0]
+
+
+def test_left_out_rank_is_not_rendered_again_on_a_rerun(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
+    fake.fail_rank[2] = RenderError("ffmpeg failed with exit code 1")
+    for _ in range(rc.MAX_RENDER_FAILURES - 1):
+        with pytest.raises(RenderError):
+            rc.render_clips(job, _ctx(media, conn))
+    rc.render_clips(job, _ctx(media, conn))
+    calls = len(fake.calls)
+    caplog.clear()
+
+    rc.render_clips(job, _ctx(media, conn))  # e.g. a re-run after a restart
+
+    assert len(fake.calls) == calls and [r["rank"] for r in _rows(conn)] == [1]
+    assert any("clip 2: render failed" in r.getMessage() for r in caplog.records)
+
+
+def test_missing_section_file_counts_as_a_render_failure(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
+    (media / "clips/2/source.mp4").unlink()  # gone for good
+
+    for _ in range(rc.MAX_RENDER_FAILURES - 1):
+        with pytest.raises(RenderError, match="source media not found"):
+            rc.render_clips(job, _ctx(media, conn))
+    rc.render_clips(job, _ctx(media, conn))
+
+    assert [r["rank"] for r in _rows(conn)] == [1]
+
+
+def test_rank_that_recovers_below_the_limit_renders_once(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
+    fake.fail_rank[2] = RenderError("remotion render failed with exit code 1")
+    with pytest.raises(RenderError):
+        rc.render_clips(job, _ctx(media, conn))
+    del fake.fail_rank[2]  # transient: fine on the retry
+
+    rc.render_clips(job, _ctx(media, conn))
+    rc.render_clips(job, _ctx(media, conn))  # done: a no-op
+
+    assert [r["rank"] for r in _rows(conn)] == [1, 2]
+    assert [c["out_dir"].name for c in fake.calls] == ["1", "2", "2"]
+    assert not (media / "clips/2" / rc.FAILURES_MARKER).exists()
+
+
+def test_unreadable_failure_marker_counts_as_no_failures(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    (media / "clips/1" / rc.FAILURES_MARKER).write_text("{not json")
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    assert [r["rank"] for r in _rows(conn)] == [1]
+
+
+def test_crash_mid_render_does_not_count_as_a_failure(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    # A killed worker is charged by its claim (attempts), not by the rank's count.
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    fake.fail_on[1] = Crash()
+    with pytest.raises(Crash):
+        rc.render_clips(job, _ctx(media, conn))
+    assert not (media / "clips/1" / rc.FAILURES_MARKER).exists()
+
+
+def test_all_ranks_left_out_fails_the_job_visibly(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
+    fake.fail_rank[1] = RenderError("remotion render timed out after 900s")
+    fake.fail_rank[2] = RenderError("ffmpeg failed with exit code 1")
+    for _ in range(rc.MAX_RENDER_FAILURES - 1):
+        with pytest.raises(RenderError):
+            rc.render_clips(job, _ctx(media, conn))
+
+    with pytest.raises(PermanentError, match="no clip could be rendered: clip 1: render failed"):
+        rc.render_clips(job, _ctx(media, conn))
+
+    assert _rows(conn) == []
+    # A requeued job gets fresh tries at these ranks.
+    assert not list(media.glob(f"clips/*/{rc.FAILURES_MARKER}"))
+
+
+def test_worker_takes_a_job_with_a_failing_rank_to_clips_ready(
+    conn: sqlite3.Connection, job: Job, tmp_path: Path, fake: FakeRender
+) -> None:
+    media = _worker_media(conn, job, tmp_path)
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2, 3)])
+    fake.fail_rank[2] = RenderError("remotion render timed out after 900s")
+    clock = [T0]
+
+    done = _drain(_render_worker(conn, tmp_path, clock), conn, job, clock)
+
+    assert done.status is JobStatus.CLIPS_READY
+    assert [(r["rank"], r["status"]) for r in _rows(conn)] == [
+        (1, "pending_review"),
+        (3, "pending_review"),
+    ]
+
+
+def test_worker_fails_a_job_whose_every_rank_is_left_out(
+    conn: sqlite3.Connection, job: Job, tmp_path: Path, fake: FakeRender
+) -> None:
+    media = _worker_media(conn, job, tmp_path)
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    fake.fail_rank[1] = RenderError("remotion render timed out after 900s")
+    clock = [T0]
+
+    done = _drain(_render_worker(conn, tmp_path, clock), conn, job, clock)
+
+    assert done.status is JobStatus.FAILED
+    assert done.last_error is not None and "no clip could be rendered" in done.last_error
+    assert _rows(conn) == []
+
+
+def _budget_for_one_clip(monkeypatch: pytest.MonkeyPatch, fake: FakeRender) -> None:
+    """Each run's budget fits one clip: every render uses up 20 s of a fresh deadline."""
+    runs: list[list[float]] = []
+
+    def deadline() -> Deadline:
+        now = [0.0]
+        runs.append(now)
+        return Deadline(budget_s=rc.CLIP_WORST_CASE_S + 10, clock=lambda: now[0])
+
+    def spend() -> None:
+        runs[-1][0] += 20
+
+    monkeypatch.setattr(rc, "Deadline", deadline)
+    fake.after.append(spend)
+
+
+def test_timeout_after_progress_defers_instead_of_failing(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
+    _budget_for_one_clip(monkeypatch, fake)
+    ctx = StageContext(media_dir=media, conn=conn, config=AppConfig(), clock=lambda: T0)
+
+    with pytest.raises(Deferred) as excinfo:
+        rc.render_clips(job, ctx)
+
+    assert excinfo.value.until == T0  # due again right away
+    assert "1 clip(s) rendered" in excinfo.value.reason
+    assert [r["rank"] for r in _rows(conn)] == [1]
+
+
+def test_worker_timeout_after_progress_does_not_use_an_attempt(
+    conn: sqlite3.Connection,
+    job: Job,
+    tmp_path: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = _worker_media(conn, job, tmp_path)
+    ranks = range(1, MAX_ATTEMPTS + 3)  # more runs than the job has attempts
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in ranks])
+    _budget_for_one_clip(monkeypatch, fake)
+    clock = [T0]
+    worker = _render_worker(conn, tmp_path, clock)
+
+    assert worker.run_once()
+    after = get_job(conn, job.id)
+    assert after is not None and after.status is JobStatus.RENDERING
+    assert after.attempts == 0
+    due = conn.execute("SELECT next_attempt_at FROM jobs WHERE id = ?", (job.id,)).fetchone()[0]
+    assert due == to_iso(T0)  # due again right away
+
+    done = _drain(worker, conn, job, clock)
+    assert done.status is JobStatus.CLIPS_READY
+    assert [r["rank"] for r in _rows(conn)] == list(ranks)
+
+
+def test_worker_timeout_without_progress_still_uses_an_attempt(
+    conn: sqlite3.Connection,
+    job: Job,
+    tmp_path: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media = _worker_media(conn, job, tmp_path)
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    monkeypatch.setattr(rc, "Deadline", lambda: Deadline(budget_s=rc.CLIP_WORST_CASE_S - 1))
+    clock = [T0]
+    worker = _render_worker(conn, tmp_path, clock)
+
+    assert worker.run_once()
+    after = get_job(conn, job.id)
+    assert after is not None and after.status is JobStatus.RENDERING
+    assert after.attempts == 1
+    assert after.last_error is not None and "StageTimeout" in after.last_error
+
+    done = _drain(worker, conn, job, clock)  # never any progress: it cannot loop forever
+    assert done.status is JobStatus.FAILED
+    assert fake.calls == []
+
+
+def test_timeout_after_only_a_failed_rank_is_not_progress(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+    now = [0.0]
+    monkeypatch.setattr(
+        rc, "Deadline", lambda: Deadline(budget_s=rc.CLIP_WORST_CASE_S + 10, clock=lambda: now[0])
+    )
+
+    def slow(*args: Any, **kw: Any) -> RenderResult:
+        now[0] += 20
+        return fake(*args, **kw)
+
+    monkeypatch.setattr(rc, "render_clip", slow)
+
+    with pytest.raises(StageTimeout):  # charged: nothing new was rendered
+        rc.render_clips(job, _ctx(media, conn))
+    assert _rows(conn) == []

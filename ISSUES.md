@@ -46,6 +46,14 @@ each release. To report a problem, open a Linear issue, or a GitHub issue that l
 - j/k navigation ignores the active queue filters and sort (CLP-62).
 - There are no Playwright end-to-end tests for login, queue, approve and reject (CLP-61).
 
+### Highlight selection through the subscription (CLP-81)
+
+- `selector: claude_cli` relies on the JSON output of the Claude Code CLI (pinned at 2.1.295
+  in the image). A CLI upgrade can change that output; the parser then fails closed and the
+  job is retried. Re-test on each CLI version bump.
+- Unattended use of a consumer Claude plan on a server may fall outside the plan's terms.
+  Check them before the VPS rollout; local use is fine.
+
 ### CI and release
 
 - There is no nightly job for the slow tests: the real tiny Whisper model, real scene

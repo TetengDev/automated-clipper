@@ -109,9 +109,8 @@ def run(job: Job, ctx: StageContext, fake: FakeCli) -> dict[str, Any]:
 
 
 def spend_rows(conn: sqlite3.Connection) -> list[tuple]:
-    return conn.execute(
-        "SELECT provider, usd, input_tokens, output_tokens FROM spend ORDER BY id"
-    ).fetchall()
+    rows = conn.execute("SELECT provider, usd, input_tokens, output_tokens FROM spend ORDER BY id")
+    return [tuple(row) for row in rows]
 
 
 # --- AC1: highlights through the CLI, no API key ---------------------------------------------

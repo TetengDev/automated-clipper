@@ -15,6 +15,14 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
     && npx --no-install remotion browser ensure \
     && npm cache clean --force
 
+# Claude Code CLI for `selector: claude_cli` (CLP-81), pinned. Its postinstall copies the
+# native binary for this platform over the wrapper stub; only that binary is copied below
+# (it needs no Node.js at runtime).
+FROM node AS claude-cli
+RUN npm install -g --no-audit --no-fund @anthropic-ai/claude-code@2.1.295 \
+    && cp "$(npm root -g)/@anthropic-ai/claude-code/bin/claude.exe" /claude \
+    && /claude --version
+
 FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.31@sha256:ecd4de2f060c64bea0ff8ecb182ddf46ba3fcccdc8a60cfdbaf20d1a047d7437 /uv /usr/local/bin/uv
@@ -34,6 +42,7 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+COPY --from=claude-cli /claude /usr/local/bin/claude
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \

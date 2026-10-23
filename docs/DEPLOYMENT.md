@@ -29,13 +29,34 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 `/srv/clipper/.env` exists only on the server and is never committed. It holds:
 
 - `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`
-- `ANTHROPIC_API_KEY`, `PEXELS_API_KEY`, `PIXABAY_API_KEY`
+- `CLAUDE_CODE_OAUTH_TOKEN`, with `selector: claude_cli` (see [Highlight selection](#highlight-selection))
+- `ANTHROPIC_API_KEY`, only with `selector: api`; `PEXELS_API_KEY`, `PIXABAY_API_KEY`
 - `GROQ_API_KEY`, only with `transcriber: groq` (transcription runs locally by default; see [Local transcription](#local-transcription))
 - `DISCORD_WEBHOOK_URL`, `DISCORD_ALERTS_WEBHOOK_URL`, `HEALTHCHECK_URL_*`
 - `REVIEW_PASSWORD_HASH`, `SESSION_SECRET`, `RCLONE_REMOTE`
 - the restic credentials
 
 GitHub Actions secrets contain only the SSH key, host, and user.
+
+## Highlight selection
+
+The select stage asks Claude for highlights in one of two ways (`selector` in
+`config/creators.yaml`; it can be set per creator):
+
+- **`claude_cli`**: runs the Claude Code CLI (`claude -p`, pinned in the image) on a Claude
+  subscription. Calls are not billed per token. They count against the plan's usage limits.
+  - On the server, run `claude setup-token` once on any machine where you are logged in.
+    Put the token in `.env` as `CLAUDE_CODE_OAUTH_TOKEN`. Locally, an existing `claude`
+    login is used when the token is empty.
+  - Each call gets no tools and loads no settings, plugins, MCP servers or CLAUDE.md. It
+    runs in an empty temp dir, gets the prompt on stdin, and its env holds only the token
+    (no other secrets).
+  - When the plan's usage limit is hit, the job waits until the reset time the CLI reports
+    (or retries hourly, for up to 48 h). The `spend` table records these calls with
+    `usd = 0` and their tokens.
+  - A rejected login fails the job. Run `claude setup-token` again, then `clipper retry <job>`.
+  - Check your plan's terms before running this unattended on a server.
+- **`api`**: the paid Messages API with `ANTHROPIC_API_KEY`, capped by `daily_llm_usd_cap`.
 
 ## Local transcription
 

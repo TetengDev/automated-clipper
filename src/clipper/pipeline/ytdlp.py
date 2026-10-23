@@ -214,21 +214,26 @@ def run_command(
     *,
     on_stderr_line: Callable[[str], None] | None = None,
     env: Mapping[str, str] | None = None,
+    stdin_path: Path | None = None,
+    cwd: Path | None = None,
 ) -> RunResult:
-    """Default `Runner`: argument list (no shell), no stdin, allowlisted env (plus `env`),
-    own process group (killed as a whole on timeout), bounded stdout/stderr."""
+    """Default `Runner`: argument list (no shell), stdin from `stdin_path` (else none),
+    allowlisted env (plus `env`), own process group (killed as a whole on timeout), bounded
+    stdout/stderr."""
     extra = dict(env or {})
     unsafe = [k for k in extra if k in CHILD_ENV_ALLOWLIST or k.startswith(_UNSAFE_ENV_PREFIXES)]
     if unsafe:
         raise ValueError(f"extra env may not set {sorted(unsafe)}")
-    proc = subprocess.Popen(  # noqa: S603 - argument list, never a shell
-        list(args),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={**child_env(), **extra},
-        start_new_session=True,
-    )
+    with open(stdin_path, "rb") if stdin_path else contextlib.nullcontext() as stdin:
+        proc = subprocess.Popen(  # noqa: S603 - argument list, never a shell
+            list(args),
+            stdin=stdin if stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**child_env(), **extra},
+            cwd=cwd,
+            start_new_session=True,
+        )
     out, err = _Tail(STDOUT_LIMIT_BYTES), _Tail(STDERR_LIMIT_BYTES)
     assert proc.stdout is not None and proc.stderr is not None
     pumps = [

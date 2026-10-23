@@ -439,6 +439,21 @@ def test_item_recovering_from_errors_is_enqueued_and_forgotten(conn, cfg, source
     assert monitor.failures == {}
 
 
+def test_items_still_backing_off_are_not_counted_as_new(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.meta[V1] = "yt-dlp failed: Connection reset"
+    monitor = make(conn, cfg, source, clock)
+    first = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    clock.now += timedelta(minutes=5)  # still backing off: not looked up
+    deferred = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert first.polls[0].new == 1
+    assert deferred.polls[0].new == 0 and deferred.items_new == 0
+    assert calls_for(source, V1) == 1
+
+
 def test_bot_check_is_retried_every_poll_and_never_gives_up(conn, cfg, source, clock) -> None:
     not_first_poll(conn)
     source.feeds[BEAST] = [Upload(V1, T0), Upload(V2, T0)]

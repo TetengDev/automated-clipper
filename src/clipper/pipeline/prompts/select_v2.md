@@ -35,7 +35,9 @@ spelling.
   what this is about: a name, an object, a number, a place. Not "you won't believe this"
   or "this is crazy". Never choose a moment in which anyone, at any point, says
   something that identifies a protected person: the subtitles show every spoken word, so
-  a role in the hook does not hide it.
+  a role in the hook does not hide it. Nor one in which the transcript shows a protected
+  person is on camera (called forward, introduced, or speaking); the reviewer checks
+  faces.
 - **No vague teasing, no promises the footage can't keep.** Reject hooks and titles that
   hide what happens to create curiosity, and anything that promises a result, a fight, a
   reveal or a reaction the clip does not actually contain.

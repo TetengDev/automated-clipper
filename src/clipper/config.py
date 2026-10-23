@@ -188,6 +188,11 @@ class ContentType(StrEnum):
     COMEDY = "comedy"
 
 
+# Content types whose clips are always `sensitive` (CLP-87; see `always_sensitive`): the
+# model sees only the transcript, so a victim's face or a name it missed is the reviewer's call.
+ALWAYS_SENSITIVE = frozenset({ContentType.PUBLIC_SERVICE})
+
+
 class YouTubeChannel(_Strict):
     # ASCII only: \w would also accept look-alike letters and digits from other scripts.
     handle: str = Field(pattern=r"^@[A-Za-z0-9_.-]{3,100}$")
@@ -214,6 +219,13 @@ class Creator(_Strict):
         if self.youtube is None and self.twitch is None:
             raise ValueError("creator must have at least one platform (youtube or twitch)")
         return self
+
+
+def always_sensitive(creator: Creator | None) -> bool:
+    """Whether every clip of this creator is `sensitive`, whatever the model said (CLP-87).
+    Fails closed: no config entry (a manual enqueue, a renamed or look-alike name) or no
+    content type means the rule is unknown, so the clip is treated as sensitive."""
+    return creator is None or creator.content_type in (None, *ALWAYS_SENSITIVE)
 
 
 def _first_duplicate(values: Iterable[str]) -> str | None:

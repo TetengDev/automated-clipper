@@ -19,7 +19,7 @@ import anthropic
 import httpx2
 import pytest
 
-from clipper.config import AppConfig, Settings
+from clipper.config import AppConfig, ContentType, Settings
 from clipper.db import connect, migrate
 from clipper.jobs import (
     Deferred,
@@ -152,7 +152,14 @@ def make_job(conn: sqlite3.Connection, *, is_stream: bool = False) -> Job:
 
 
 def make_ctx(conn: sqlite3.Connection, media: Path, **settings: Any) -> StageContext:
-    config = AppConfig(settings=Settings(**settings))
+    """MrBeast is configured (challenge_stunt): an unknown creator is always sensitive."""
+    mrbeast = {
+        "name": "MrBeast",
+        "region": "global",
+        "content_type": "challenge_stunt",
+        "youtube": {"handle": "@MrBeast"},
+    }
+    config = AppConfig.model_validate({"settings": settings, "creators": [mrbeast]})
     return StageContext(media, conn, config, clock=lambda: T0)
 
 
@@ -819,7 +826,8 @@ def test_unknown_transcript_language_falls_back_to_creator_language(conn, media)
 
     (media / ARTIFACT).unlink()
     plain = FakeAnthropic("valid.json")
-    run(make_job(conn), make_ctx(conn, media), plain)  # unknown creator: stays "unknown"
+    unknown = StageContext(media, conn, AppConfig(), clock=lambda: T0)
+    run(make_job(conn), unknown, plain)  # unknown creator: stays "unknown"
     assert "Video language: unknown" in plain.requests[0]["system"][1]["text"]
 
 
@@ -1186,6 +1194,7 @@ PLAYBOOK_HASHES = {
     "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
     "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
     "playbook_v4": "97b8707018c24c6772d5f76d3d637f7ed6ed8b8f620942ffb790437a6cd16689",
+    "playbook_v5": "56a43482bd6783e8100c0de00d8469017758d6a684a130b20cfbf09b162f41a9",
 }
 
 
@@ -1203,8 +1212,20 @@ def test_playbook_version_is_bumped_when_the_prompt_or_playbook_changes():
 def test_playbook_wording_review_fixes():
     assert "or mark them" not in select.load_playbook("comedy")
     public = " ".join(select.load_playbook("public_service").split())
-    assert "Leave out moments that show the face of a minor or a protected victim" in public
+    assert (
+        "Leave out moments in which the transcript shows a minor or a protected victim is on"
+        " camera (see the universal rules), or that include anything that" in public
+    )  # CLP-87 review LOW-2: what the transcript shows, not faces the model cannot see
     assert "address or phone" in select.load_playbook("universal")
+
+
+def test_no_prompt_asks_the_model_to_judge_faces():
+    """CLP-87 review LOW-2: the model sees only the transcript; faces are the reviewer's."""
+    root = Path(select.__file__).parent / "prompts"
+    for path in [*root.glob("playbook/*.md"), root / "select_v2.md"]:
+        text = _flat(path.read_text())
+        for phrase in ("show the face", "shows the face", "shows their face"):
+            assert phrase not in text, (path.name, phrase)
 
 
 def _flat(text: str) -> str:
@@ -1221,7 +1242,6 @@ IDENTIFIERS = (
 
 def test_playbook_v4_protected_people_are_never_identified_at_any_point():
     """CLP-77: the subtitles are every spoken word, so a role in the hook hides nothing."""
-    assert select.PLAYBOOK_VERSION == "playbook_v4"
     universal = _flat(select.load_playbook("universal"))
     assert "a victim in any abuse, sexual" in universal
     assert "Never choose a moment in which anyone, at any point, says something" in universal
@@ -1388,3 +1408,134 @@ def test_non_finite_payoff_is_rejected(payoff):
     base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
     with pytest.raises(ValueError):
         Candidate(start_s=10, end_s=30, payoff_s=payoff, **base)
+
+
+# --- CLP-87: public_service clips are always sensitive ------------------------------------------
+
+RAFFY = "Raffy Tulfo in Action"
+
+
+def _raffy_ctx(conn, media, content_type: str | None = "public_service") -> StageContext:
+    creator: dict[str, Any] = {
+        "name": RAFFY,
+        "region": "ph",
+        "language": "tl",
+        "youtube": {"handle": "@RaffyTulfoInAction"},
+    }
+    if content_type is not None:
+        creator["content_type"] = content_type
+    config = AppConfig.model_validate({"creators": [creator]})
+    return StageContext(media, conn, config, clock=lambda: T0)
+
+
+def _raffy_job(conn: sqlite3.Connection) -> Job:
+    job, _ = enqueue(conn, YT, T0, creator=RAFFY)
+    return job
+
+
+def _name_a_victim_mid_clip(media: Path) -> None:
+    """A VAWC complaint whose segment at 50 s names the child (the model misses it)."""
+    path = media / "transcript.json"
+    transcript = json.loads(path.read_text())
+    lines = {
+        30: "Idol, hindi po nagbibigay ng sustento ang asawa ko",
+        40: "tatlong taon na po, may dalawa kaming anak",
+        50: "yung panganay ko po si Maria Santos, twelve years old, sa Barangay Malinis",
+        60: "sige tawagan natin ang asawa mo ngayon din",
+        70: "opo Idol, magbibigay na po ako buwan buwan",
+    }
+    for segment in transcript["segments"]:
+        if text := lines.get(int(segment["start"])):
+            segment["text"] = text
+    path.write_text(json.dumps(transcript))
+
+
+def test_public_service_clip_naming_a_victim_mid_clip_is_forced_sensitive(conn, media):
+    """CLP-87: the recorded reply leaves `sensitive` false although the child is named at
+    50 s, inside the first clip; every public_service clip ends up sensitive anyway."""
+    _name_a_victim_mid_clip(media)
+    fake = FakeAnthropic("public_service_unflagged.json")
+    out = run(_raffy_job(conn), _raffy_ctx(conn, media), fake)
+
+    assert "Maria Santos" in fake.requests[0]["messages"][0]["content"]
+    replied = json.loads(fixture("public_service_unflagged.json")["content"][-1]["text"])
+    assert [c["sensitive"] for c in replied["clips"]] == [False, False]
+    assert [(c["start_s"], c["sensitive"]) for c in out["clips"]] == [(30.1, True), (200.1, True)]
+
+
+@pytest.mark.parametrize("content_type", [t for t in CONTENT_TYPES if t != "public_service"])
+@pytest.mark.parametrize("flag", [False, True])
+def test_other_content_types_keep_the_models_sensitive_value(conn, media, content_type, flag):
+    reply = (200, _message([_cand(30.1, 60.6, payoff_s=40.0, open_question="", sensitive=flag)]))
+    out = run(_raffy_job(conn), _raffy_ctx(conn, media, content_type), FakeAnthropic(reply))
+    assert out["clips"][0]["sensitive"] is flag
+
+
+def test_creator_without_content_type_is_forced_sensitive(conn, media):
+    """CLP-87 review M1: no content type means the rule is unknown; fail closed."""
+    out = run(_raffy_job(conn), _raffy_ctx(conn, media, None), FakeAnthropic("valid.json"))
+    assert [c["sensitive"] for c in out["clips"]] == [True, True, True]
+
+
+@pytest.mark.parametrize("creator", ["manual", "Raffy Tulfo In Action!", "MrBeast2"])
+def test_unconfigured_creator_is_forced_sensitive(conn, media, creator):
+    """CLP-87 review M1: `clipper enqueue` (creator "manual"), a renamed creator or a
+    look-alike name has no config entry; its clips are always sensitive."""
+    job, _ = enqueue(conn, YT, T0, creator=creator)
+    out = run(job, make_ctx(conn, media), FakeAnthropic("valid.json"))
+    assert [c["sensitive"] for c in out["clips"]] == [True, True, True]
+
+
+def test_finalize_forces_sensitive_only_when_asked():
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(100)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    cand = Candidate(start_s=10.1, end_s=40.6, sensitive=False, **base)
+
+    (forced,) = select.finalize([cand], words, Settings(), 3, force_sensitive=True)
+    (kept,) = select.finalize([cand], words, Settings(), 3, force_sensitive=False)
+    (default,) = select.finalize([cand], words, Settings(), 3)
+
+    assert (forced["sensitive"], kept["sensitive"], default["sensitive"]) == (True, False, False)
+
+
+def test_assembled_static_prompt_carries_the_protected_people_rules():
+    """CLP-87: select_v2.md says "(see the playbook)"; the playbook it points to must be in
+    the same cached block the model reads first, for every creator."""
+    for content_type in (ContentType.PUBLIC_SERVICE, None):
+        static = _flat(select.build_system(RAFFY, "tl", (), content_type)[0]["text"])
+        assert "(see the playbook)" in static
+        assert "Protected people are a victim in any abuse, sexual" in static
+        assert "private complainant in any other case" in static
+
+
+def test_playbook_v5_on_camera_rule_is_in_terms_the_transcript_shows():
+    """CLP-87 review: the model cannot see faces, so the rule names what a transcript shows
+    (called forward, introduced, speaking) and leaves faces to the reviewer."""
+    assert select.PLAYBOOK_VERSION == "playbook_v5"
+    universal = _flat(select.load_playbook("universal"))
+    assert (
+        "Never choose a moment in which anyone, at any point, says something that identifies"
+        " them: the subtitles show every spoken word" in universal
+    )
+    assert (
+        "or a relationship combined with a place. Also never choose a moment in which the"
+        " transcript shows they are on camera (they are called forward, introduced, or"
+        " speak). Faces are checked by the reviewer, who sees the video." in universal
+    )
+    hook_rule = _flat(select.load_system_prompt())
+    assert (
+        "a role in the hook does not hide it. Nor one in which the transcript shows a"
+        " protected person is on camera (called forward, introduced, or speaking); the"
+        " reviewer checks faces." in hook_rule
+    )
+    for text in (universal, hook_rule):
+        assert "shows their face" not in text
+
+
+@pytest.mark.parametrize(
+    "name", ["playbook/universal.md", "playbook/public_service.md", "select_v2.md"]
+)
+def test_prompt_lines_are_wrapped(name):
+    """CLP-87 review: the reflowed rule left a 104-character line."""
+    path = Path(select.__file__).parent / "prompts" / name
+    assert max(len(line) for line in path.read_text().splitlines()) < 100  # existing: <= 91

@@ -35,7 +35,9 @@ hardship (debt, family conflict, a medical or legal problem).
   name or nickname; the name of a parent, spouse, partner or relative; the name of the
   respondent in an abuse, sexual, family/support or child case; their school,
   workplace, employer, barangay, town, address, phone or plate number; or a relationship
-  combined with a place.
+  combined with a place. Also never choose a moment in which the transcript shows they
+  are on camera (they are called forward, introduced, or speak). Faces are checked by
+  the reviewer, who sees the video.
 - Never put the name, school, workplace, address or phone number of a private
   complainant in any other case in the hook, title, caption or hashtags, and never
   choose a start whose first spoken line names them. Refer to people by role (for

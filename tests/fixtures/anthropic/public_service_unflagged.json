@@ -1,0 +1,26 @@
+{
+  "id": "msg_01FixturePublicService",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-5-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "sig"
+    },
+    {
+      "type": "text",
+      "text": "{\"clips\": [{\"start_s\": 30.1, \"end_s\": 75.6, \"hook\": \"Hindi raw nagbibigay ng sustento ang asawa\", \"title\": \"Misis humingi ng tulong kay Idol Raffy\", \"caption\": \"Sustento para sa mga anak, ipinaglaban sa RTIA.\", \"hashtags\": [\"#RaffyTulfo\", \"#sustento\"], \"score\": 87, \"reason\": \"Strong complaint and a clear resolution when the husband agrees to pay.\", \"payoff_s\": 70.1, \"open_question\": \"Magbabayad ba ang asawa?\", \"sensitive\": false}, {\"start_s\": 200.1, \"end_s\": 235.6, \"hook\": \"Employer refuses to pay three months of wages\", \"title\": \"Unpaid wages settled on air\", \"caption\": \"Tatlong buwang sahod, nabayaran.\", \"hashtags\": [\"#RaffyTulfo\", \"#sahod\"], \"score\": 74, \"reason\": \"Clear dispute and payoff.\", \"payoff_s\": 230.1, \"open_question\": \"Will the employer pay?\", \"sensitive\": false}]}"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 800,
+    "cache_creation_input_tokens": 1500,
+    "cache_read_input_tokens": 0
+  }
+}

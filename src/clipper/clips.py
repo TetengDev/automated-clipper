@@ -424,6 +424,7 @@ def _transition(
     expected_version: int | None,
     reason_tag: str | None = None,
     repeat_ok: frozenset[ClipStatus] = frozenset(),
+    payload: dict[str, Any] | None = None,
 ) -> TransitionResult:
     with transaction(conn):
         row = conn.execute(
@@ -442,13 +443,19 @@ def _transition(
             "UPDATE clips SET status = ?, updated_at = ? WHERE id = ?",
             (str(target), to_iso(now), clip_id),
         )
-        record_review(conn, clip_id, version, action, now, reason_tag=reason_tag)
+        record_review(conn, clip_id, version, action, now, reason_tag=reason_tag, payload=payload)
     return TransitionResult(changed=True, status=str(target), version=version)
 
 
 def approve(
-    conn: sqlite3.Connection, clip_id: int, now: datetime, *, expected_version: int | None = None
+    conn: sqlite3.Connection,
+    clip_id: int,
+    now: datetime,
+    *,
+    expected_version: int | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> TransitionResult:
+    """`payload` goes on the audit row, e.g. `{"confirmed_sensitive": True}` (CLP-87)."""
     return _transition(
         conn,
         clip_id,
@@ -457,6 +464,7 @@ def approve(
         now,
         expected_version=expected_version,
         repeat_ok=frozenset({ClipStatus.APPROVED, ClipStatus.EXPORTED}),
+        payload=payload,
     )
 
 

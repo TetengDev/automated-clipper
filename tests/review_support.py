@@ -16,6 +16,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from clipper.config import AppConfig
 from clipper.db import connect, migrate
 from clipper.review.app import create_app
 
@@ -26,6 +27,32 @@ WALL_START = 1_800_000_000.0  # 2027-01-15T08:00:00Z
 PASSWORD_HASH = bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt(rounds=4)).decode()
 
 _YT_IDS = iter(f"vid{n:08d}" for n in range(10**6))
+# The creators the review tests use (CLP-87): an unknown creator's clips always need the
+# faces check, so the usual ones are configured with their content type.
+REVIEW_CONFIG = AppConfig.model_validate(
+    {
+        "creators": [
+            {
+                "name": "MrBeast",
+                "region": "global",
+                "content_type": "challenge_stunt",
+                "youtube": {"handle": "@MrBeast"},
+            },
+            {
+                "name": "Kai Cenat",
+                "region": "global",
+                "content_type": "streamer_reaction",
+                "twitch": {"login": "kaicenat"},
+            },
+            {
+                "name": "Raffy Tulfo in Action",
+                "region": "ph",
+                "content_type": "public_service",
+                "youtube": {"handle": "@RaffyTulfoInAction"},
+            },
+        ]
+    }
+)
 
 
 def csrf_from(html: str) -> str:
@@ -103,6 +130,7 @@ class Env:
             "output_dir": self.output_dir,
             "export_runner": self.runner,
             "wall_clock": lambda: self.wall[0],
+            "config": REVIEW_CONFIG,
         }
         params.update(kwargs)
         return create_app(**params)

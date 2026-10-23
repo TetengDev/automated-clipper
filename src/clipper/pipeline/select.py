@@ -60,7 +60,14 @@ import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
-from clipper.config import ContentType, Creator, MissingSecretError, Secrets, Settings
+from clipper.config import (
+    ContentType,
+    Creator,
+    MissingSecretError,
+    Secrets,
+    Settings,
+    always_sensitive,
+)
 from clipper.jobs.models import Job
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext, StageDef
 from clipper.pipeline import common
@@ -72,7 +79,7 @@ logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-5-5"
 PROMPT_VERSION = "select_v2"
-PLAYBOOK_VERSION = "playbook_v4"
+PLAYBOOK_VERSION = "playbook_v5"
 """Bump when select_v2.md or any file in prompts/playbook/ changes: it is part of the window
 cache key (a test pins the text hash per version)."""
 PROVIDER = "anthropic"
@@ -567,7 +574,11 @@ def _payoff_kept(clip: Clip, max_s: float) -> bool:
 
 
 def finalize(
-    candidates: Sequence[Candidate], words: Sequence[_Word], settings: Settings, top_k: int
+    candidates: Sequence[Candidate],
+    words: Sequence[_Word],
+    settings: Settings,
+    top_k: int,
+    force_sensitive: bool = False,
 ) -> list[dict[str, Any]]:
     snapped = [
         clip
@@ -592,7 +603,7 @@ def finalize(
             if (payoff := clip.candidate.payoff_s) is None
             else round(min(max(payoff, clip.start_s), clip.end_s), 3),
             "open_question": clip.candidate.open_question,
-            "sensitive": clip.candidate.sensitive,
+            "sensitive": force_sensitive or clip.candidate.sensitive,
         }
         for rank, clip in enumerate(kept, start=1)
     ]
@@ -1027,7 +1038,7 @@ def _select(
         )
 
     words = sorted(transcript.words, key=lambda w: w.start)
-    clips = finalize(candidates, words, settings, top_k)
+    clips = finalize(candidates, words, settings, top_k, always_sensitive(creator))
     write_json_atomic(
         ctx.media_dir / ARTIFACT,
         {

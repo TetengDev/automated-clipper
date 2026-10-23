@@ -16,9 +16,10 @@
   <div class="details">
     <h1>{{ v.title or "Untitled clip" }}</h1>
     <p><span class="badge status-{{ clip.status }}" id="clip-status">{{ clip.status | replace("_", " ") }}</span>
-      {% if v.sensitive %}<span class="badge sensitive" title="Involves a victim, a minor or a tragedy: no effects, review with care; check for names, faces or identifiers of victims and minors">Sensitive</span>{% endif %}
+      {% if sensitive %}<span class="badge sensitive" title="Involves a victim, a minor or a tragedy: no effects, review with care; check for names, faces or identifiers of victims and minors">Sensitive</span>{% endif %}
       v{{ v.version }} · {{ clip.creator }} · {{ "%d" % v.duration_s }}s ·
       score {{ "%.1f" % v.score if v.score is not none else "–" }}</p>
+    {% if sensitive %}<p class="sensitive-note" id="sensitive-note">Check faces of minors and victims; the model cannot see the video.</p>{% endif %}
     {% if v.gate_reasons %}
     <ul class="gate-reasons" id="gate-reasons" aria-label="Quality checks">
       {% for reason in v.gate_reasons %}<li>{{ gate_labels.get(reason, reason) }}</li>{% endfor %}
@@ -42,6 +43,10 @@
             hx-target="#action-error" hx-disabled-elt="find button">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="version" value="{{ v.version }}">
+        {% if sensitive %}
+        <label class="confirm-sensitive"><input type="checkbox" name="confirm_sensitive" value="1" id="confirm-sensitive">
+          I checked faces of minors and victims</label>
+        {% endif %}
         <button type="submit" id="approve-btn">Approve (a)</button>
       </form>
       <form method="post" action="/clip/{{ clip.id }}/reject" hx-post="/clip/{{ clip.id }}/reject"

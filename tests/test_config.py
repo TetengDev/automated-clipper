@@ -7,11 +7,13 @@ from pydantic import ValidationError
 
 from clipper.config import (
     ConfigError,
+    Creator,
     CreatorOverrides,
     MissingSecretError,
     Secrets,
     Settings,
     YouTubeChannel,
+    always_sensitive,
     load_config,
 )
 
@@ -400,3 +402,30 @@ def test_youtube_ids_are_ascii_only(handle: str, channel_id: str | None) -> None
 def test_ascii_youtube_ids_are_accepted() -> None:
     channel = YouTubeChannel(handle="@Cong.TV_ph-1", channel_id="UCX6OQ3DkcsbYNE6H8uQ-_VA")
     assert channel.channel_id == "UCX6OQ3DkcsbYNE6H8uQ-_VA"
+
+
+def test_every_shipped_creator_has_a_content_type() -> None:
+    """CLP-87 review M1: a creator without one has all its clips forced sensitive."""
+    cfg = load_config(SHIPPED_CONFIG)
+
+    assert [c.name for c in cfg.creators if c.content_type is None] == []
+    assert [c.name for c in cfg.creators if always_sensitive(c)] == ["Raffy Tulfo in Action"]
+
+
+@pytest.mark.parametrize(
+    ("content_type", "expected"),
+    [
+        ("public_service", True),
+        (None, True),
+        ("challenge_stunt", False),
+        ("streamer_reaction", False),
+        ("vlog_lifestyle", False),
+        ("comedy", False),
+    ],
+)
+def test_always_sensitive_fails_closed(content_type: str | None, expected: bool) -> None:
+    creator = Creator(
+        name="X", region="ph", content_type=content_type, youtube=YouTubeChannel(handle="@xyz")
+    )
+    assert always_sensitive(creator) is expected
+    assert always_sensitive(None) is True  # no config entry for the job's creator

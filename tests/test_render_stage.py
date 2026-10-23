@@ -1161,12 +1161,50 @@ def test_malformed_versions_are_not_stored(
     assert row["prompt_version"] is None and row["playbook_version"] is None
 
 
+def _creator_job(
+    conn: sqlite3.Connection, name: str, content_type: str | None
+) -> tuple[Job, AppConfig]:
+    creator = Creator(
+        name="Raffy",
+        region="ph",
+        content_type=content_type,
+        youtube=YouTubeChannel(handle="@raffy"),
+    )
+    job, _ = enqueue(conn, SourceRef("youtube", "dQw4w9WgXcQ"), T0, creator=name)
+    return job, AppConfig(creators=(creator,))
+
+
 def test_sensitive_flag_is_passed_through(
-    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+    conn: sqlite3.Connection, media: Path, fake: FakeRender
 ) -> None:
+    job, config = _creator_job(conn, "Raffy", "comedy")
     _setup(media, [_highlight(1, 10.0, 15.0, sensitive=True), _highlight(2, 30.5, 40.5)])
-    rc.render_clips(job, _ctx(media, conn))
+    rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
     assert [r["sensitive"] for r in _rows(conn)] == [1, 0]
+
+
+@pytest.mark.parametrize(
+    ("name", "content_type"),
+    [
+        ("Raffy", "public_service"),
+        ("Raffy", None),  # review M1: no content type fails closed
+        ("manual", "comedy"),  # review M1: `clipper enqueue`, no config entry
+        ("Raffy2", "comedy"),  # review M1: a renamed or look-alike creator
+    ],
+)
+def test_always_sensitive_creator_stores_every_clip_as_sensitive(
+    conn: sqlite3.Connection,
+    media: Path,
+    fake: FakeRender,
+    name: str,
+    content_type: str | None,
+) -> None:
+    """CLP-87: a stale or hand-edited highlights.json cannot store such a clip as not
+    sensitive."""
+    job, config = _creator_job(conn, name, content_type)
+    _setup(media, [_highlight(1, 10.0, 15.0, sensitive=False), _highlight(2, 30.5, 40.5)])
+    rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
+    assert [r["sensitive"] for r in _rows(conn)] == [1, 1]
 
 
 @pytest.mark.parametrize("bad", ["yes", 1, None, ["x"]])

@@ -755,6 +755,32 @@ def test_stop_during_metadata_leaves_the_rest_for_next_time(conn, cfg, source, c
     assert seen(conn) == {V1: "enqueued"}  # V2 stays unseen: fetched next poll
 
 
+def test_items_not_looked_at_are_not_counted_as_new(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0), Upload(V2, T0), Upload(V3, T0)]
+    source.meta.update({V1: video(V1), V2: video(V2), V3: video(V3)})
+    monitor = make(conn, cfg, source, clock)
+    original = source.videos
+
+    def stop_after_first(ids, should_stop):
+        return original(ids, lambda: monitor.stop.is_set() or bool(monitor.stop.set()))
+
+    source.videos = stop_after_first  # type: ignore[method-assign]
+    stopped = monitor.run_cycle([cfg.creator("MrBeast")])
+    source.videos = original  # type: ignore[method-assign]
+    monitor.stop.clear()
+    clock.now += timedelta(minutes=10)
+    source.meta[V2] = "blocked by platform (bot check)"  # V3 waits behind the block
+    blocked = monitor.run_cycle([cfg.creator("MrBeast")])
+    clock.now += timedelta(minutes=10)
+    source.meta[V2] = video(V2)
+    rest = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert [r.polls[0].new for r in (stopped, blocked, rest)] == [1, 1, 2]
+    assert [r["items_new"] for r in runs(conn)] == [1, 0, 2]
+    assert seen(conn) == {"zzzzzzzzzzz": "baseline", V1: "enqueued", V2: "enqueued", V3: "enqueued"}
+
+
 # --- run_forever -------------------------------------------------------------------------------
 
 

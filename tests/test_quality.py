@@ -155,9 +155,10 @@ def test_join_check_compares_heard_words_around_each_join() -> None:
         TWO_SEGMENTS,
     )  # fmt: skip
     assert q.join_times(edl) == [pytest.approx(4.0)]
-    heard_ok = [("We", 3.0), ("are", 3.1), ("so", 3.5), ("back!", 4.2), ("now", 4.6)]
+    heard_ok = [("We", 2.6, 2.9), ("are", 3.0, 3.3), ("so", 3.4, 3.7), ("back!", 4.1, 4.4),
+                ("now", 4.5, 4.8)]  # fmt: skip
     assert q.join_mismatches(edl, heard_ok) == []
-    heard_bad = [("we", 3.0), ("arso", 3.4), ("bah", 4.2)]
+    heard_bad = [("we", 2.6, 2.9), ("arso", 3.0, 3.6), ("bah", 4.1, 4.4)]
     assert q.join_mismatches(edl, heard_bad) == [pytest.approx(4.0)]
 
 
@@ -201,8 +202,9 @@ def fake_media(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return state
 
 
-JOIN_WORDS = [("hi", 10.1, 10.4), ("so", 13.4, 13.7), ("we", 13.75, 13.9), ("back", 15.1, 15.4)]
-HEARD = [("so", 3.4, 3.7), ("we", 3.75, 3.9), ("back", 4.1, 4.4)]
+JOIN_WORDS = [("hi", 10.1, 10.4), ("and", 13.1, 13.35), ("so", 13.4, 13.7), ("we", 13.75, 13.9),
+              ("back", 15.1, 15.4)]  # fmt: skip
+HEARD = [("and", 3.1, 3.35), ("so", 3.4, 3.7), ("we", 3.75, 3.9), ("back", 4.1, 4.4)]
 
 
 def _check(edl: EDL, video: Path, asr: FakeAsr) -> list[str]:
@@ -274,7 +276,7 @@ def test_gates_get_a_bounded_share_of_the_stage(
 
 
 def test_default_asr_is_the_pinned_tiny_model() -> None:
-    asr = q.default_asr(cpu_threads=2)
+    asr = q.default_asr(cpu_threads=2).asr
     assert (asr.model, asr.compute_type, asr.cpu_threads) == ("tiny", "int8", 2)
 
 
@@ -311,3 +313,100 @@ def test_loudness_gate_on_real_audio(tmp_path: Path, target: float, reasons: lis
     edl = _edl([("hi", 10.1, 10.4)])
     got = q.check_clip(edl, video, language=None, asr=FakeAsr(), deadline=Deadline())
     assert got == reasons
+
+
+# --- pass 1 review fixes ----------------------------------------------------------------
+
+
+def test_lead_in_rounded_onto_the_frame_grid_is_not_late() -> None:
+    """The dead-air trim leaves 0.25 s; a jump-cut segment start rounded down to a whole
+    frame adds up to one more frame (review pass 1)."""
+    edl = _edl([("hello", 10.266, 10.6), ("ok", 12.6, 12.9)], [(10.0, 11.0), (12.5, 20.0)])
+    assert q.edl_reasons(edl) == []
+    assert q.edl_reasons(_edl([("hello", 10.3, 10.6)])) == ["late_speech"]
+
+
+def test_clip_starting_on_a_scene_cut_may_start_later() -> None:
+    """The snap to a scene cut may add up to 1 s of lead-in on purpose."""
+    edl = _edl([("hi", 10.9, 11.2)])
+    assert q.edl_reasons(edl) == ["late_speech"]
+    assert q.edl_reasons(edl, starts_on_cut=True) == []
+
+
+def test_join_window_counts_a_word_reaching_in_from_outside_on_both_sides() -> None:
+    """An EDL word that starts before the window but runs into it is matched the same way
+    on the heard side, so a perfect transcription passes (review pass 1)."""
+    edl = _edl(
+        [("alpha", 10.0, 10.9), ("bravo", 10.95, 11.0), ("charlie", 12.5, 12.6),
+         ("delta", 12.65, 13.6)] + [(f"x{i}", 14 + i * 0.5, 14.4 + i * 0.5) for i in range(10)],
+        [(10.0, 11.1), (12.4, 20.0)],
+    )  # fmt: skip
+    assert q.join_mismatches(edl, q.output_words(edl)) == []
+
+
+def test_join_needs_four_words_to_be_judged() -> None:
+    edl = _edl([("a", 13.2, 13.5), ("b", 13.6, 13.9), ("c", 15.1, 15.4)], TWO_SEGMENTS)
+    assert q.join_mismatches(edl, []) == []
+
+
+def test_failed_model_fetch_is_not_retried_for_every_clip(
+    tmp_path: Path, fake_media: dict[str, Any]
+) -> None:
+    inner = FakeAsr(HEARD)
+    inner.fail = MediaError("stalled download")
+    asr = q.OnceAsr(inner)
+    edl = _edl(JOIN_WORDS, TWO_SEGMENTS)
+    for _ in range(3):
+        assert _check(edl, tmp_path / "v1.mp4", asr) == ["gate_error"]  # type: ignore[arg-type]
+    assert [c[0] for c in inner.calls] == ["ensure"]
+
+
+def test_model_is_checked_once_when_it_works(tmp_path: Path, fake_media: dict[str, Any]) -> None:
+    inner = FakeAsr(HEARD)
+    asr = q.OnceAsr(inner)
+    for _ in range(2):
+        assert _check(_edl(JOIN_WORDS, TWO_SEGMENTS), tmp_path / "v1.mp4", asr) == []  # type: ignore[arg-type]
+    assert [c[0] for c in inner.calls] == ["ensure", "transcribe", "transcribe"]
+
+
+def test_ffmpeg_calls_use_the_render_input_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clipper.render import FFMPEG_INPUT_GUARD
+
+    seen: list[list[str]] = []
+
+    def fake_run(args: list[str], timeout_s: float, what: str, **kw: Any) -> Any:
+        seen.append(list(args))
+        if "ebur128=peak=true" in args:
+            return subprocess.CompletedProcess(args, 0, "", EBUR128_TAIL)
+        Path(args[-1]).write_bytes(b"flac")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(q, "run_media", fake_run)
+    _check(_edl(JOIN_WORDS, TWO_SEGMENTS), tmp_path / "v1.mp4", FakeAsr(HEARD))
+    assert len(seen) == 2
+    for args in seen:
+        i = args.index("-i")
+        assert tuple(args[i - len(FFMPEG_INPUT_GUARD) : i]) == FFMPEG_INPUT_GUARD
+        assert "pipe" not in " ".join(args)
+
+
+def test_stale_gate_dirs_are_swept(tmp_path: Path, fake_media: dict[str, Any]) -> None:
+    """A worker killed mid-gate leaves `.gates-*`; the next gate run removes it."""
+    stale = tmp_path / ".gates-old"
+    stale.mkdir()
+    (stale / "audio.flac").write_bytes(b"x")
+    _check(_edl(JOIN_WORDS, TWO_SEGMENTS), tmp_path / "v1.mp4", FakeAsr(HEARD))
+    assert not stale.exists()
+
+
+def test_gate_error_log_strips_control_characters(
+    tmp_path: Path,
+    fake_media: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(q, "measure_loudness", _raise(MediaError("bad \x1b[31mred\u202e")))
+    _check(_edl([("hi", 10.1, 10.4)]), tmp_path / "v1.mp4", FakeAsr())
+    assert "\x1b" not in caplog.text and "\u202e" not in caplog.text and "red" in caplog.text

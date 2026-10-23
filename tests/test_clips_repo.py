@@ -243,3 +243,15 @@ def test_gate_reasons_reach_the_clip_detail(conn: sqlite3.Connection, tmp_path: 
     )  # fmt: skip
     detail = clips.get_clip(conn, ref.clip_id)
     assert detail is not None and detail.current.gate_reasons == ("late_speech",)
+
+
+def test_gated_re_render_that_fails_needs_attention(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path))
+    add_clip_version(
+        conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"),
+        meta=ClipMeta(gate_reasons=("loudness",)),
+    )  # fmt: skip
+    assert _status_and_reasons(conn, ref.clip_id) == ("needs_attention", ["loudness"])

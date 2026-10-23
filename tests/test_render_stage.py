@@ -1210,7 +1210,7 @@ def test_gates_get_the_creators_language_and_threads(
     _setup(media, [_highlight(1, 10.0, 40.0)])
     rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
     assert gates.calls[0]["language"] == "tl"
-    assert gates.calls[0]["asr"].cpu_threads == 2
+    assert gates.calls[0]["asr"].asr.cpu_threads == 2
 
 
 def test_worst_case_covers_the_gates() -> None:
@@ -1218,3 +1218,22 @@ def test_worst_case_covers_the_gates() -> None:
 
     assert rc.CLIP_WORST_CASE_S >= quality.GATES_TIMEOUT_S + rc.DEFAULT_RENDER_TIMEOUT_S
     assert rc.CLIP_WORST_CASE_S < rc.STAGE_BUDGET_S / 2
+
+
+def test_clip_starting_on_a_scene_cut_tells_the_gates(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    gates: FakeGates,
+    cuts: list[float],
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 40.0)])  # section time [2, 32]
+    rc.render_clips(job, _ctx(media, conn))
+    assert gates.calls[0]["starts_on_cut"] is False
+    gates.calls.clear()
+    conn.execute("DELETE FROM clip_versions")
+    conn.execute("DELETE FROM clips")
+    cuts.append(fake.calls[0]["edl"].source.in_s)
+    rc.render_clips(job, _ctx(media, conn))
+    assert gates.calls[0]["starts_on_cut"] is True

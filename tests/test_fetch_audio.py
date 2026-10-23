@@ -710,3 +710,35 @@ def test_format_error_defers_the_job_without_failing_it(db: Path, tmp_path: Path
     row = _row(db, job.id)
     assert row["status"] == JobStatus.FETCHING_AUDIO.value
     assert row["next_attempt_at"] is not None
+
+
+# --- gated content: members-only and Premium (CLP-83) ----------------------------------------
+
+
+def _fetch_with(media_dir: Path, info: dict[str, Any], allow: bool) -> FakeRunner:
+    runner = FakeRunner(info)
+    config = AppConfig(settings=Settings(allow_gated_content=allow))
+    with closing(sqlite3.connect(":memory:")) as conn:
+        run(make_job(), StageContext(media_dir, conn, config), runner)
+    return runner
+
+
+@pytest.mark.parametrize("availability", ["subscriber_only", "premium_only"])
+def test_gated_video_is_skipped_when_not_allowed(media_dir: Path, availability: str) -> None:
+    # The monitor's check relies on yt-dlp's badges and the Data API has none: the worker
+    # checks again on its own probe.
+    with pytest.raises(SkipJob, match=f"{availability}.*allow_gated_content"):
+        _fetch_with(media_dir, base_info(availability=availability), allow=False)
+
+
+@pytest.mark.parametrize("availability", ["subscriber_only", "premium_only"])
+def test_gated_video_is_fetched_when_allowed(media_dir: Path, availability: str) -> None:
+    runner = _fetch_with(media_dir, base_info(availability=availability), allow=True)
+
+    assert runner.of("download") and (media_dir / AUDIO_NAME).is_file()
+
+
+def test_age_restricted_video_is_fetched_with_gating_off(media_dir: Path) -> None:
+    _fetch_with(media_dir, base_info(availability="needs_auth"), allow=False)
+
+    assert (media_dir / AUDIO_NAME).is_file()

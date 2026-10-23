@@ -68,6 +68,10 @@ NOT_FINISHED: frozenset[str] = frozenset({"is_live", "is_upcoming", "post_live"}
 """Live now, scheduled, or a finished stream whose VOD is still processing."""
 GONE_REASONS: frozenset[str] = frozenset({"private", "members-only", "removed or unavailable"})
 """`Unavailable.reason`s that mean nobody can fetch it: recorded once, never retried."""
+GONE_AVAILABILITY: frozenset[str] = frozenset({"private", "subscriber_only"})
+"""yt-dlp `availability` values meaning the same, should a probe ever exit 0 for one."""
+GATED_AVAILABILITY: frozenset[str] = frozenset({"needs_auth", "premium_only"})
+"""Fetchable only with an account (cookies): retried like other metadata errors."""
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _YT = "{http://www.youtube.com/xml/schemas/2015}"
@@ -279,7 +283,7 @@ class YtDlpProvider:
                 break
             url = canonical_url(SourceRef("youtube", video_id))
             try:
-                info = self.ytdlp.probe(url, ignore_no_formats=True)
+                info = self.ytdlp.probe(url)
             except CommandCancelled:
                 break  # shutting down; this one and the rest wait for the next start
             except Unavailable as exc:
@@ -300,7 +304,14 @@ class YtDlpProvider:
                 else:
                     result.errors[video_id] = str(exc)
             else:
-                result.videos[video_id] = self._meta(video_id, info)
+                availability = info.get("availability")
+                if availability in GONE_AVAILABILITY:
+                    logger.warning("%s: unavailable (%s), not retried", video_id, availability)
+                    result.unavailable.add(video_id)
+                elif availability in GATED_AVAILABILITY:
+                    result.errors[video_id] = f"video is {availability}"
+                else:
+                    result.videos[video_id] = self._meta(video_id, info)
         return result
 
     @staticmethod

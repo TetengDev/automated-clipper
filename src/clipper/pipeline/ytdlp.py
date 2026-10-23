@@ -405,15 +405,13 @@ class YtDlp:
             raise classify_error(result.stderr, secrets=secrets)
         return result
 
-    def probe(self, url: str, *, ignore_no_formats: bool = False) -> dict[str, Any]:
+    def probe(self, url: str) -> dict[str, Any]:
         """Metadata only (`--dump-single-json --skip-download`); nothing is downloaded.
 
-        `ignore_no_formats` is for callers that need no formats (detection): a YouTube
-        player breakage then still yields metadata instead of "requested format is not
-        available". The pipeline keeps the default, since it downloads from the result."""
+        Never with `--ignore-no-formats-error`: yt-dlp would then downgrade private,
+        members-only, age-gate and bot-check failures to a warning and exit 0, so they
+        could not be classified."""
         extra = ["--dump-single-json", "--skip-download"]
-        if ignore_no_formats:
-            extra.append("--ignore-no-formats-error")
         return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
     def listing(

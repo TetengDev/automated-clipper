@@ -43,6 +43,12 @@ class FakeClock:
         return self.now
 
 
+@pytest.fixture(autouse=True)
+def _creator_config(monkeypatch: pytest.MonkeyPatch, config_file: Path) -> None:
+    """run-review loads creators.yaml for the faces check (CLP-87)."""
+    monkeypatch.setenv("CLIPPER_CONFIG", str(config_file))
+
+
 @pytest.fixture(scope="module")
 def password_hash() -> str:
     return bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt(rounds=4)).decode()

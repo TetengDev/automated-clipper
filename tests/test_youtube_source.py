@@ -634,3 +634,58 @@ def test_cli_logging_keeps_httpx_request_lines_out(monkeypatch: pytest.MonkeyPat
 
     assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
     assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING
+
+
+class Endless:
+    """A streamed body of 1 MiB chunks; counts how many were pulled."""
+
+    def __init__(self, chunks: int = 100) -> None:
+        self.chunks = chunks
+        self.pulled = 0
+
+    def __iter__(self) -> Iterator[bytes]:
+        for _ in range(self.chunks):
+            self.pulled += 1
+            yield b" " * (1 << 20)
+
+
+@respx.mock
+def test_oversized_streamed_feed_is_cut_off_early(http: httpx.Client) -> None:
+    body = Endless()
+    respx.get(yt.FEED_URL).mock(return_value=httpx.Response(200, content=body))
+
+    with pytest.raises(FeedError, match="too large"):
+        yt.feed_uploads(http, CHANNEL)
+    assert body.pulled <= yt.FEED_MAX_BYTES // (1 << 20) + 1
+
+
+def test_oversized_api_response_is_cut_off_early(api: respx.MockRouter, http: httpx.Client) -> None:
+    body = Endless()
+    api.get("/videos").mock(return_value=httpx.Response(200, content=body))
+
+    with pytest.raises(SourceError, match="too large"):
+        ApiProvider(http, KEY).videos([V1])
+    assert body.pulled <= yt.API_MAX_BYTES // (1 << 20) + 1
+
+
+@pytest.mark.parametrize("error", [httpx.InvalidURL("bad"), httpx.StreamConsumed()])
+@respx.mock
+def test_any_httpx_failure_of_the_feed_is_a_feed_error(
+    http: httpx.Client, error: Exception
+) -> None:
+    respx.get(yt.FEED_URL).mock(side_effect=error)
+
+    with pytest.raises(FeedError, match=type(error).__name__) as info_:
+        yt.feed_uploads(http, CHANNEL)
+    assert info_.value.__cause__ is None and info_.value.__suppress_context__
+
+
+@pytest.mark.parametrize("error", [httpx.InvalidURL("bad"), httpx.StreamConsumed()])
+def test_any_httpx_failure_of_the_api_is_a_source_error(
+    api: respx.MockRouter, http: httpx.Client, error: Exception
+) -> None:
+    api.get("/videos").mock(side_effect=error)
+
+    with pytest.raises(SourceError, match=type(error).__name__) as info_:
+        ApiProvider(http, KEY).videos([V1])
+    assert info_.value.__suppress_context__

@@ -1186,6 +1186,7 @@ PLAYBOOK_HASHES = {
     "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
     "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
     "playbook_v4": "97b8707018c24c6772d5f76d3d637f7ed6ed8b8f620942ffb790437a6cd16689",
+    "playbook_v5": "78421c7efeb9bb77d09e18e3cda16d4133a944366fe88010ee694ab417d4f044",
 }
 
 
@@ -1221,7 +1222,6 @@ IDENTIFIERS = (
 
 def test_playbook_v4_protected_people_are_never_identified_at_any_point():
     """CLP-77: the subtitles are every spoken word, so a role in the hook hides nothing."""
-    assert select.PLAYBOOK_VERSION == "playbook_v4"
     universal = _flat(select.load_playbook("universal"))
     assert "a victim in any abuse, sexual" in universal
     assert "Never choose a moment in which anyone, at any point, says something" in universal
@@ -1470,3 +1470,25 @@ def test_finalize_forces_sensitive_only_for_public_service():
     (default,) = select.finalize([cand], words, Settings(), 3)
 
     assert (forced["sensitive"], kept["sensitive"], default["sensitive"]) == (True, False, False)
+
+
+def test_assembled_static_prompt_carries_the_protected_people_rules():
+    """CLP-87: select_v2.md says "(see the playbook)"; the playbook it points to must be in
+    the same cached block the model reads first, for every creator."""
+    for content_type in (ContentType.PUBLIC_SERVICE, None):
+        static = _flat(select.build_system(RAFFY, "tl", (), content_type)[0]["text"])
+        assert "(see the playbook)" in static
+        assert "Protected people are a victim in any abuse, sexual" in static
+        assert "private complainant in any other case" in static
+
+
+def test_playbook_v5_never_choose_a_moment_that_shows_a_protected_persons_face():
+    """CLP-87: the at-any-point rule covers faces too. The model cannot see the video, so
+    this only catches what the transcript gives away ("ipakita mo ang mukha"); the reviewer
+    checks the rest."""
+    assert select.PLAYBOOK_VERSION == "playbook_v5"
+    universal = _flat(select.load_playbook("universal"))
+    assert (
+        "Never choose a moment in which anyone, at any point, says something that identifies"
+        " them or shows their face: the subtitles show every spoken word" in universal
+    )

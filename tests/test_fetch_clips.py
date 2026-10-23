@@ -168,7 +168,8 @@ def test_argv_has_padded_sections_and_dash_dash_before_canonical_url(tmp_path: P
     assert argv[:3] == [sys.executable, "-m", "yt_dlp"]
     assert _section(argv) == (10.0 - fc.PAD_S, 13.0 + fc.PAD_S)
     assert "--force-keyframes-at-cuts" in argv
-    assert argv[argv.index("-f") + 1] == "bv*[height<=1080]+ba/b[height<=1080]"
+    # Never a muxed fallback without audio (CLP-85): the clips would be silent.
+    assert argv[argv.index("-f") + 1] == "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]"
     assert argv[argv.index("--merge-output-format") + 1] == "mp4"
     # URL comes last, after "--", and is the canonical one (never the raw input).
     assert argv[-2:] == ["--", CANONICAL]

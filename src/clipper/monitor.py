@@ -69,7 +69,9 @@ and format errors (a YouTube player breakage) are not counted: they say nothing 
 video. Blocks are retried every poll, format errors after FORMAT_RETRY_MAX at most."""
 FORMAT_RETRY_MAX = timedelta(hours=1)
 """A video hit by a format error is retried after 10, 20, 40, then every 60 minutes until a
-yt-dlp update fixes the player; never given up."""
+yt-dlp update fixes the player; never given up. So a video that has no usable format at all
+(e.g. no audio, or no video) stays in the retries for as long as it is listed; probing the
+least recently tried first keeps it from starving the other retries."""
 
 
 class FirstRun(StrEnum):

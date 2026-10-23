@@ -226,6 +226,10 @@ class NoUsableFormat(Deferred):
     """yt-dlp found no format to download (a player breakage); try again later."""
 
 
+_MARKER_READ_BYTES = 256
+"""A format-error marker is two ISO times (about 70 bytes); nothing past this is read."""
+
+
 def _format_errors_since(marker: Path, now: datetime) -> datetime:
     """When the current format-error episode began. `marker` holds that start and the last
     format error (one ISO time per line; a marker from before CLP-85 holds only the start).
@@ -233,8 +237,9 @@ def _format_errors_since(marker: Path, now: datetime) -> datetime:
     (a busy or stopped worker) still counts from its start, not from now."""
     start = None
     try:
-        stamps = [datetime.fromisoformat(s) for s in marker.read_text(encoding="utf-8").split()]
-        first, last = stamps[0], stamps[-1]
+        with marker.open("rb") as f:
+            words = f.read(_MARKER_READ_BYTES).decode("utf-8").split()
+        first, last = datetime.fromisoformat(words[0]), datetime.fromisoformat(words[-1])
         aware = first.tzinfo is not None and last.tzinfo is not None
         if aware and first <= now and now - last <= NO_FORMAT_MAX_AGE:
             start = first
@@ -244,7 +249,11 @@ def _format_errors_since(marker: Path, now: datetime) -> datetime:
     marker.parent.mkdir(parents=True, exist_ok=True)
     tmp = marker.with_name(f"{marker.name}.tmp")
     stamp = "\n".join(t.astimezone(UTC).isoformat() for t in (start, now))
-    tmp.write_text(stamp, encoding="utf-8")
+    # A fresh file, never through a planted symlink (or a leftover) at the tmp name.
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(stamp)
     os.replace(tmp, marker)
     return start
 

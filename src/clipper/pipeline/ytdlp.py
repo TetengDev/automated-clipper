@@ -53,8 +53,14 @@ AUDIO_FORMAT = "bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none]"
 """Audio-only when there is one; else a muxed format of 480p at most, else the smallest
 muxed one. `--max-filesize` is checked per HTTP request, so for HLS per fragment: it does
 not bound a whole muxed download, the height cap does. `[acodec!=none]`: never a
-video-only format (plain `best` falls back to one, and ffmpeg -vn then fails). The probe
-selects with this too, so a video the probe accepts is one the download can fetch."""
+video-only format (plain `best` falls back to one, and ffmpeg -vn then fails). Without
+`?` it also excludes a format whose acodec is unknown: deliberately, the safe direction,
+so a video-only stream can never be picked."""
+CLIP_FORMAT = "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]"
+"""The clip download's selector (fetch_clips), and the probe's. Whatever it accepts, the
+audio selector accepts too: either `ba` exists, or a muxed format with audio does, which
+the audio fallbacks take. `[acodec!=none]`: plain `b` falls back to a video-only format
+when there is no audio at all, which would make silent clips."""
 SECTION_MAX_FILESIZE = "2G"
 STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
 """yt-dlp's probe JSON is often several MB; anything bigger is cut (and fails to parse)."""
@@ -431,9 +437,11 @@ class YtDlp:
         the formats after its playability check, so even a non-empty format list would
         not prove the video playable.
 
-        `-f AUDIO_FORMAT`: the probe fails with a format error unless the audio download
-        would find a format, so the monitor and the worker judge a video as it is fetched."""
-        extra = ["--dump-single-json", "--skip-download", "-f", AUDIO_FORMAT]
+        `-f CLIP_FORMAT`: the probe selects like the clip download, which implies the audio
+        download, so it fails with a format error unless both would find a format: the
+        monitor and the worker judge a video as it is fetched, before any ASR or LLM spend.
+        A `+` selection is only resolved here, never merged (no ffmpeg needed)."""
+        extra = ["--dump-single-json", "--skip-download", "-f", CLIP_FORMAT]
         return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
     def listing(

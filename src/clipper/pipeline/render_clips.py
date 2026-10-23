@@ -48,6 +48,9 @@ the stage is `Deferred`, so clip failures are paid for by their counts, not by t
 attempts: to now after a timeout, after the queue's backoff for the highest failure count
 after a render failure. That cannot loop: each clip is rendered once and counts at most
 MAX_RENDER_FAILURES failures. Crashes still use up attempts (each claim is one).
+The cost of that: in an outage where every render fails (Remotion broken, disk full), a
+job runs up to about MAX_RENDER_FAILURES x clips x CLIP_WORST_CASE_S of failing renders
+before it fails, and with a single worker it holds up every job queued behind it.
 """
 
 from __future__ import annotations
@@ -364,13 +367,17 @@ def _try_order(failures: int) -> tuple[bool, int]:
 
 def _record_failure(marker: Path, failures: int, reason: str) -> bool:
     """Write the clip's failure count; False (not counted) if its directory or `clips/` is
-    a symlink: a planted link must not redirect the write."""
+    a symlink (a planted link must not redirect the write) or the write fails."""
     clip_dir = marker.parent
     if clip_dir.is_symlink() or clip_dir.parent.is_symlink():
         logger.warning("%s is a symlink; not counting the failure", clip_dir)
         return False
-    clip_dir.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(marker, {"failures": failures, "error": reason})
+    try:
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(marker, {"failures": failures, "error": reason})
+    except OSError as exc:  # e.g. a full disk, or a directory in the marker's place
+        logger.warning("cannot write %s, not counting the failure: %s", marker, exc.strerror)
+        return False
     return True
 
 
@@ -501,7 +508,8 @@ def render_clips(job: Job, ctx: StageContext) -> None:
         raise Deferred(ctx.clock() + backoff(max(worst, 1)), f"{reason} ({note})")
     if not done:
         for path in left_out:  # a requeued job tries these clips afresh
-            path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):  # never hides the PermanentError below
+                path.unlink(missing_ok=True)
         raise PermanentError("no clip could be rendered: " + "; ".join(invalid))
     if invalid:
         summary = "; ".join(invalid)  # each reason redacted before it was cut

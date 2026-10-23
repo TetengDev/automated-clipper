@@ -112,6 +112,10 @@ clip renders, the job fails.
 - When no clip rendered, the counts are dropped, so `clipper retry <job>` tries every clip
   again. A job that failed for another reason (e.g. its worker kept crashing) keeps them on
   `clipper retry`. To give such a clip fresh tries, delete its `render_failures.json` first.
+- Outage worst case: when every render fails (Remotion broken, disk full), a job keeps
+  trying for up to about 3 x clips x `CLIP_WORST_CASE_S` (the worst case of one clip)
+  before it fails. With a single worker, every job queued behind it waits that long too.
+  Watch the worker log for repeated `clip N failed` lines across jobs.
 
 ## CI/CD
 

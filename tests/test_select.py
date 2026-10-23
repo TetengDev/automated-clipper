@@ -1185,7 +1185,7 @@ def test_load_playbook_rejects_unknown_sections(bad):
 PLAYBOOK_HASHES = {
     "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
     "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
-    "playbook_v4": "dbc3274be8354df8137b2e4652125ae5b76f4051f6da25dcd3c28c1dca6b579b",
+    "playbook_v4": "72cf672b0846c32332df24acd0b7afd7c29857ef849146122d73e066f8222d1f",
 }
 
 
@@ -1202,43 +1202,78 @@ def test_playbook_version_is_bumped_when_the_prompt_or_playbook_changes():
 
 def test_playbook_wording_review_fixes():
     assert "or mark them" not in select.load_playbook("comedy")
-    public = select.load_playbook("public_service")
-    assert "Leave out moments that identify a minor or a victim" in public
+    public = " ".join(select.load_playbook("public_service").split())
+    assert "Leave out moments that show the face of a minor or a protected victim" in public
     assert "address or phone" in select.load_playbook("universal")
 
 
-def test_playbook_v4_never_starts_on_a_protected_name():
-    """CLP-77: a role in the hook is not enough if the first spoken line says the name."""
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+IDENTIFIERS = (
+    "anything that, alone or together, tends to identify them: their name or nickname; the"
+    " name of a parent, spouse, partner or relative; the name of the respondent in an abuse,"
+    " sexual, family/support or child case; their school, workplace, employer, barangay, town,"
+    " address, phone or plate number; or a relationship combined with a place."
+)
+
+
+def test_playbook_v4_protected_people_are_never_identified_at_any_point():
+    """CLP-77: the subtitles are every spoken word, so a role in the hook hides nothing."""
     assert select.PLAYBOOK_VERSION == "playbook_v4"
-    hook_rule = " ".join(select.load_system_prompt().split())
-    assert "Never choose a start whose first spoken line names one of them" in hook_rule
-    assert "still heard and shown in the captions" in hook_rule
+    for text in (select.load_system_prompt(), select.load_playbook("universal")):
+        flat = _flat(text)
+        assert "a victim in any abuse, sexual" in flat
+        assert "Never choose a moment in which anyone, at any point, says something" in flat
+        assert "the subtitles show every spoken word" in flat
+    hook_rule = _flat(select.load_system_prompt())
+    assert "Unless the person is protected (see the playbook), the first line" in hook_rule
 
 
-def test_playbook_v4_protects_indirect_identifiers():
-    """CLP-77: RA 9262 / RA 7610 cover anything that tends to identify the victim."""
-    universal = " ".join(select.load_playbook("universal").split())
-    assert "or anyone whose name would identify them" in universal
-    assert "a parent, spouse or the respondent in an abuse or child case" in universal
+def test_playbook_v4_covers_vawc_and_rape_victims():
+    """CLP-77: RA 9262 (incl. economic abuse via unpaid support) and RA 8505."""
+    universal = _flat(select.load_playbook("universal"))
+    assert "sexual (including rape)" in universal
+    assert '"Family" includes spouses, partners and unpaid support (sustento).' in universal
 
 
-def test_playbook_v4_minor_rule_is_a_fallback():
-    public = " ".join(select.load_playbook("public_service").split())
+@pytest.mark.parametrize("name", ["select_v2", "universal", "public_service"])
+def test_playbook_v4_one_identifier_list_in_every_file(name):
+    """CLP-77: RA 9262 / RA 7610 cover any information that tends to identify the victim."""
+    text = select.load_system_prompt() if name == "select_v2" else select.load_playbook(name)
+    assert IDENTIFIERS in _flat(text)
+
+
+def test_playbook_v4_private_complainant_keeps_the_narrow_rule():
+    for text in (select.load_system_prompt(), select.load_playbook("universal")):
+        flat = _flat(text)
+        assert "private complainant in any other case in the hook, title, caption" in flat
+        assert "never choose a start whose first spoken line names them" in flat
+
+
+def test_playbook_v4_minor_rule_never_permits_keeping_an_identified_minor():
+    public = _flat(select.load_playbook("public_service"))
     assert (
-        "If you keep a moment with a minor on screen or named despite the above, it is always"
-        " `sensitive`." in public
+        "Any moment that involves a minor in any way is always `sensitive`. This never permits"
+        " keeping a moment that names a minor or shows their face; leave those out." in public
     )
-    assert "- Any moment with a minor" not in public
+    for text in (
+        select.load_system_prompt(),
+        select.load_playbook("universal"),
+        select.load_playbook("public_service"),
+    ):
+        assert "despite the above" not in _flat(text)
 
 
-def test_playbook_v4_still_allows_naming_a_private_respondent():
+def test_playbook_v4_allows_naming_other_respondents():
     """CLP-77: naming e.g. an employer who refuses to pay wages stays a reviewer decision."""
-    text = " ".join(
-        f"{select.load_system_prompt()} {select.load_playbook('universal')}"
-        f" {select.load_playbook('public_service')}".split()
+    public = _flat(select.load_playbook("public_service"))
+    assert (
+        "Naming the respondent in a case that is not an abuse, sexual, family/support or child"
+        " case (for example an employer in an unpaid-wages case) is allowed; the reviewer"
+        " decides." in public
     )
-    assert "never name a respondent" not in text.lower()
-    assert "respondent in an abuse or child case" in text
 
 
 def test_v1_recorded_reply_still_parses(conn, media):
@@ -1293,14 +1328,16 @@ def test_leftover_v1_cache_entry_is_a_miss_not_a_crash(conn, media):
 
 
 def test_victims_minors_and_complainants_are_never_named():
-    universal = select.load_playbook("universal")
-    assert "Never put the name, school, workplace, address or phone number of a victim" in universal
-    assert 'This overrides "the hook names the\n  person"' in universal
-    prompt = select.load_system_prompt()
-    assert "never name a victim, a minor or a private\n  complainant" in prompt
-    public = select.load_playbook("public_service")
+    universal = _flat(select.load_playbook("universal"))
+    assert (
+        "Never put the name, school, workplace, address or phone number of a private" in universal
+    )
+    assert 'This overrides "the hook names the person"' in universal
+    prompt = _flat(select.load_system_prompt())
+    assert "Never name a private complainant in any other case" in prompt
+    public = _flat(select.load_playbook("public_service"))
     assert "does not identify them and is still worth" in public
-    assert "it is always\n  `sensitive`." in public  # v4 fallback wording (CLP-77)
+    assert "Any moment that involves a minor in any way is always `sensitive`." in public
 
 
 def test_payoff_after_a_clamped_end_drops_the_candidate():

@@ -219,7 +219,7 @@ def test_audio_only_download_and_16k_mono_conversion(ctx: StageContext) -> None:
     runner = FakeRunner()
     run(make_job(), ctx, runner)
     (download,) = runner.of("download")
-    assert download[download.index("-f") + 1] == "bestaudio"
+    assert download[download.index("-f") + 1] == "bestaudio/best"
     (convert,) = runner.of("convert")
     for flag, value in (("-ac", "1"), ("-ar", "16000"), ("-c:a", "flac")):
         assert convert[convert.index(flag) + 1] == value
@@ -752,3 +752,11 @@ def test_age_restricted_video_is_fetched_with_gating_off(media_dir: Path) -> Non
     _fetch_with(media_dir, base_info(availability="needs_auth"), allow=False)
 
     assert (media_dir / AUDIO_NAME).is_file()
+
+
+def test_no_video_formats_found_defers_too(media_dir: Path) -> None:
+    runner = FakeRunner()
+    runner.responses["probe"] = RunResult(1, "", "ERROR: [youtube] x: No video formats found!")
+
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0, runner)

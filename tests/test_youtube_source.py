@@ -856,3 +856,12 @@ def test_trickling_response_is_cut_off_at_the_deadline(http: httpx.Client) -> No
     with pytest.raises(SourceError, match="took longer than"):
         yt.get_capped(http, yt.FEED_URL, params={}, limit=1 << 40, what="feed", clock=Ticking(2.0))
     assert body.pulled <= yt.HTTP_DEADLINE_S // 2 + 1
+
+
+def test_no_video_formats_found_is_a_format_error() -> None:
+    stderr = "ERROR: [youtube] x: No video formats found!"
+    runner = FakeRunner({watch(V1): RunResult(1, "", stderr), watch(V2): ok_json(info(V2))})
+
+    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1, V2])
+
+    assert meta.format_errors == {V1} and runner.urls() == [watch(V1)]

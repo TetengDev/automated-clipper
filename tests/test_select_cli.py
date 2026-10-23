@@ -301,8 +301,9 @@ def test_invalid_output_twice_raises_invalid_model_output(conn, media):
     assert len(fake.calls) == 2
 
 
-def test_hitting_the_turn_limit_counts_as_invalid_output(conn, media):
-    over = cli_json(None, is_error=True, subtype="error_max_turns", result="")
+@pytest.mark.parametrize("subtype", ["error_max_turns", "error_max_structured_output_retries"])
+def test_running_out_of_turns_counts_as_invalid_output(conn, media, subtype):
+    over = cli_json(None, is_error=True, subtype=subtype, result="")
     with pytest.raises(InvalidModelOutput):
         run(make_job(conn), cli_ctx(conn, media), FakeCli(over, over))
 

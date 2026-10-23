@@ -82,6 +82,7 @@ CLI_TIMEOUT_S = 600.0
 _LOCAL_LOGIN_ENV = ("CLAUDE_CONFIG_DIR", "USER", "LOGNAME")
 _CLI_QUIET_ENV = {"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
 CLI_MAX_TURNS = 3
+_CLI_GAVE_UP = ("error_max_turns", "error_max_structured_output_retries")
 """Structured output takes 2 turns (the schema is answered through a tool call)."""
 USAGE_LIMIT_MAX_WAIT = timedelta(days=8)
 """A reset time further out than this (the weekly limit plus slack) is not trusted."""
@@ -741,9 +742,10 @@ class _CliBackend:
     The transcript is untrusted, so the model gets no tools, and the CLI loads no user
     settings, plugins, MCP servers or slash commands (they would also multiply the tokens
     each call uses). The prompt goes on stdin, the child runs in an empty scratch dir, and
-    its env is the runner's allowlist plus only the subscription token. A token login gets
-    a throwaway config dir (the image's root fs is read-only); without a token the CLI uses
-    the machine's existing `claude` login (keeping CLAUDE_CONFIG_DIR and USER)."""
+    its env is the runner's allowlist plus the subscription token and two flags that turn
+    off autoupdate and non-essential traffic. A token login gets a throwaway config dir (the
+    image's root fs is read-only); without a token the CLI uses the machine's existing
+    `claude` login (keeping CLAUDE_CONFIG_DIR, USER and LOGNAME)."""
 
     provider = CLI_PROVIDER
     billed = False
@@ -800,7 +802,7 @@ def _cli_reply(result: RunResult, ctx: StageContext) -> Reply:
     if not isinstance(out, dict):
         detail = common.stderr_tail(result.stderr) or "no JSON output"
         raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {detail}")
-    if out.get("subtype") == "error_max_turns":  # no answer in time: invalid output, retried
+    if out.get("subtype") in _CLI_GAVE_UP:  # no valid answer in time: invalid output, retried
         return Reply(None, "end_turn", 0.0, 0, 0)
     if out.get("is_error"):
         text = str(out.get("result") or "")

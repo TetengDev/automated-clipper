@@ -16,7 +16,9 @@ clip are cut and the EDL gets v2 segments plus the cut records (CLP-73,
 the creator's `reframe` is blurred_fill, faces are detected on the section and a clip with
 faces in most frames gets a face-tracked 9:16 crop that jumps at the same scene cuts
 (CLP-58, `clipper.pipeline.reframe`), on the output timeline (a jump at each join too);
-any failure keeps the blurred fill.
+any failure keeps the blurred fill. The rendered video then runs the quality gates
+(CLP-74, `clipper.pipeline.quality`): a failed gate stores the clip as `needs_attention`
+with its reasons; a gate that cannot run is noted but never holds the clip back.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
 rerun after a crash renders only the clips without a row. The row's start_s/end_s are the
@@ -39,6 +41,7 @@ import logging
 import math
 import re
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +66,7 @@ from clipper.pipeline.jumpcuts import (
     detect_silences,
     plan_cuts,
 )
+from clipper.pipeline.quality import GATES_TIMEOUT_S, check_clip, default_asr
 from clipper.pipeline.reframe import (
     FACE_TIMEOUT_S,
     MODEL_TIMEOUT_S,
@@ -70,6 +74,7 @@ from clipper.pipeline.reframe import (
     ensure_model,
     plan_reframe,
 )
+from clipper.pipeline.transcribe import creator_language
 from clipper.redact import redact
 from clipper.render import (
     DEFAULT_FFMPEG_TIMEOUT_S,
@@ -91,9 +96,10 @@ CLIP_WORST_CASE_S = (
     + FACE_TIMEOUT_S
     + DEFAULT_RENDER_TIMEOUT_S
     + 4 * DEFAULT_FFMPEG_TIMEOUT_S
+    + GATES_TIMEOUT_S
 )
-"""Scene detection, silencedetect, the face model fetch, face detection, Remotion and the
-four ffmpeg steps of `render_clip`, each at its timeout."""
+"""Scene detection, silencedetect, the face model fetch, face detection, Remotion, the
+four ffmpeg steps of `render_clip` and the quality gates, each at its timeout."""
 assert CLIP_WORST_CASE_S < STAGE_BUDGET_S / 2, "a stage run must fit at least two clips"
 MAX_REASON_CHARS = 300
 _VERSION = re.compile(r"^[\w.-]{1,64}$")
@@ -294,6 +300,8 @@ def render_clips(job: Job, ctx: StageContext) -> None:
     done = _done(ctx.conn, job.id)
     settings = settings_for(job, ctx.config)
     limits = (settings.clip_min_seconds, min(settings.clip_max_seconds, MAX_CLIP_SECONDS))
+    language = creator_language(job, ctx)
+    asr = default_asr(cpu_threads=settings.whisper_cpu_threads)
     invalid: list[str] = []
     retry: RenderError | None = None
     for section in sections:
@@ -340,13 +348,16 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             logger.warning("job %s: clip %s failed, will retry: %s", job.id, rank, reason)
             retry = retry or exc
             continue
+        reasons = check_clip(edl, result.video_path, language=language, asr=asr, deadline=deadline)
+        if reasons:
+            logger.info("job %s: clip %s quality gates: %s", job.id, rank, ", ".join(reasons))
         insert_pending_clip(
             ctx.conn,
             job_id=job.id,
             rank=rank,
             edl=edl,
             result=result,
-            meta=meta,
+            meta=replace(meta, gate_reasons=tuple(reasons)),
             start_s=start,  # position in the source video, not in the padded section file
             end_s=end,
         )

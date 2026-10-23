@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -200,7 +201,7 @@ def fake_media(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return state
 
 
-JOIN_WORDS = [("so", 13.4, 13.7), ("we", 13.75, 13.9), ("back", 15.1, 15.4)]
+JOIN_WORDS = [("hi", 10.1, 10.4), ("so", 13.4, 13.7), ("we", 13.75, 13.9), ("back", 15.1, 15.4)]
 HEARD = [("so", 3.4, 3.7), ("we", 3.75, 3.9), ("back", 4.1, 4.4)]
 
 
@@ -282,3 +283,31 @@ def _raise(exc: BaseException) -> Any:
         raise exc
 
     return fail
+
+
+def _tone_video(path: Path, gain_db: float) -> Path:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg not installed")
+    subprocess.run(  # noqa: S603
+        [
+            ffmpeg, "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=64x112:r=10:d=6",
+            "-f", "lavfi", "-i", "sine=frequency=1000:duration=6",
+            "-af", f"volume={gain_db:.2f}dB", "-shortest",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path),
+        ],
+        check=True,
+    )  # fmt: skip
+    return path
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(("target", "reasons"), [(-20.0, ["loudness"]), (-14.0, [])])
+def test_loudness_gate_on_real_audio(tmp_path: Path, target: float, reasons: list[str]) -> None:
+    """A clip at -20 LUFS fails the loudness gate; one at -14 LUFS passes (real ffmpeg)."""
+    measured, _ = q.measure_loudness(_tone_video(tmp_path / "raw.mp4", 0.0), 60.0)
+    video = _tone_video(tmp_path / "v1.mp4", target - measured)
+    edl = _edl([("hi", 10.1, 10.4)])
+    got = q.check_clip(edl, video, language=None, asr=FakeAsr(), deadline=Deadline())
+    assert got == reasons

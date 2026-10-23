@@ -1201,7 +1201,9 @@ def test_gates_get_the_creators_language_and_threads(
     config = AppConfig(
         settings=Settings(whisper_cpu_threads=2),
         creators=(
-            Creator(name="Raffy", region="ph", language="tl", youtube=YouTubeChannel(handle="@r")),
+            Creator(
+                name="Raffy", region="ph", language="tl", youtube=YouTubeChannel(handle="@raffy")
+            ),
         ),
     )
     job, _ = enqueue(conn, SourceRef("youtube", "dQw4w9WgXcQ"), T0, creator="Raffy")

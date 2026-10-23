@@ -19,7 +19,14 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from starlette.datastructures import State
 
 from clipper import clips
-from clipper.clips import REJECT_REASONS, ClipStatus, InvalidTransition, QueueFilter
+from clipper.clips import (
+    GATE_REASON_LABELS,
+    REJECT_REASONS,
+    REVIEWABLE,
+    ClipStatus,
+    InvalidTransition,
+    QueueFilter,
+)
 from clipper.db import connect
 from clipper.export import export_clip, sweep_staging
 from clipper.review.app import flash, get_db, render, require_user
@@ -158,7 +165,8 @@ def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn) -> R
             "next_id": clips.neighbour_pending(conn, clip_id, older=True),
             "prev_id": clips.neighbour_pending(conn, clip_id, older=False),
             "reasons": REJECT_REASONS,
-            "can_review": clip.status == ClipStatus.PENDING_REVIEW,
+            "can_review": clip.status in REVIEWABLE,
+            "gate_labels": GATE_REASON_LABELS,
             "can_retry_export": clip.status == ClipStatus.APPROVED,
         },
     )

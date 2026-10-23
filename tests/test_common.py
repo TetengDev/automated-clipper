@@ -11,7 +11,8 @@ import pytest
 
 from clipper.db import connect, migrate
 from clipper.jobs import Deferred, SkipJob
-from clipper.pipeline import common
+from clipper.jobs.stages import PermanentError
+from clipper.pipeline import common, ytdlp
 from clipper.pipeline.common import (
     Deadline,
     StageTimeout,
@@ -188,6 +189,89 @@ def test_first_seen_restarts_a_stale_marker(tmp_path: Path) -> None:
     later = T0 + timedelta(days=8)
     assert first_seen(marker, later, max_age=timedelta(days=7)) == later
     assert first_seen(marker, later + timedelta(hours=1), max_age=timedelta(days=7)) == later
+
+
+def _format_error_at(marker: Path, when: datetime) -> Exception:
+    """Run `deferring_no_format` over a format error at `when`; return what it raised."""
+    error = ytdlp.Unavailable("Requested format is not available", ytdlp.NO_FORMAT)
+    try:
+        with common.deferring_no_format(marker, lambda: when):
+            raise error
+    except Exception as exc:  # noqa: BLE001 - the test inspects whatever came out
+        return exc
+    raise AssertionError("deferring_no_format swallowed the error")
+
+
+def test_format_error_picked_up_late_still_fails_at_the_cap(tmp_path: Path) -> None:
+    # Deferred every 30 min for almost 48 h, then the worker reaches the job only 2.5 h
+    # after its last retry_at (busy, or down): the episode is the same one, so it fails
+    # now instead of starting a fresh 48 h (about 96 h in all).
+    marker = tmp_path / ".no_format_since"
+    when = T0
+    while when < T0 + common.NO_FORMAT_MAX_AGE - timedelta(hours=1):
+        assert isinstance(_format_error_at(marker, when), common.NoUsableFormat)
+        when += common.NO_FORMAT_RETRY
+
+    late = when + common.NO_FORMAT_RETRY + timedelta(hours=2)
+    assert late - T0 > common.NO_FORMAT_MAX_AGE + common.NO_FORMAT_RETRY
+    outcome = _format_error_at(marker, late)
+
+    assert type(outcome) is PermanentError and "giving up" in str(outcome)
+
+
+def test_format_error_idle_for_the_cap_starts_a_new_episode(tmp_path: Path) -> None:
+    marker = tmp_path / ".no_format_since"
+    _format_error_at(marker, T0)
+    _format_error_at(marker, T0 + timedelta(hours=1))  # last deferral of that episode
+
+    later = T0 + timedelta(hours=1) + common.NO_FORMAT_MAX_AGE + timedelta(minutes=1)
+    assert isinstance(_format_error_at(marker, later), common.NoUsableFormat)
+    assert isinstance(_format_error_at(marker, later + timedelta(hours=47)), common.NoUsableFormat)
+    outcome = _format_error_at(marker, later + common.NO_FORMAT_MAX_AGE + timedelta(minutes=1))
+    assert type(outcome) is PermanentError
+
+
+def test_format_error_marker_from_before_the_upgrade_still_counts(tmp_path: Path) -> None:
+    # A marker holding only the first-seen time (written before CLP-85) keeps its start.
+    marker = tmp_path / ".no_format_since"
+    marker.write_text(T0.isoformat())
+
+    assert isinstance(_format_error_at(marker, T0 + timedelta(hours=47)), common.NoUsableFormat)
+    assert type(_format_error_at(marker, T0 + timedelta(hours=49))) is PermanentError
+
+
+def test_format_error_marker_read_is_bounded(tmp_path: Path) -> None:
+    # Only the start of the marker is read: whatever follows it is never looked at.
+    marker = tmp_path / ".no_format_since"
+    stamps = f"{T0.isoformat()}\n{(T0 + timedelta(hours=1)).isoformat()}\n"
+    marker.write_text(stamps + " " * 300 + "not-a-time" * 100_000)
+
+    _format_error_at(marker, T0 + timedelta(hours=2))
+
+    assert marker.read_text().split() == [
+        T0.isoformat(),
+        (T0 + timedelta(hours=2)).isoformat(),
+    ]
+
+
+def test_format_error_marker_write_does_not_follow_a_planted_symlink(tmp_path: Path) -> None:
+    marker = tmp_path / ".no_format_since"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    marker.with_name(f"{marker.name}.tmp").symlink_to(victim)
+
+    assert isinstance(_format_error_at(marker, T0), common.NoUsableFormat)
+
+    assert victim.read_text() == "keep me"
+    assert not marker.is_symlink() and marker.read_text().split()[0] == T0.isoformat()
+
+
+def test_other_unavailable_errors_pass_through_untouched(tmp_path: Path) -> None:
+    marker = tmp_path / ".no_format_since"
+    error = ytdlp.Unavailable("Private video", "private")
+    with pytest.raises(ytdlp.Unavailable), common.deferring_no_format(marker, lambda: T0):
+        raise error
+    assert not marker.exists()
 
 
 def test_stderr_tail_redacts_before_cutting() -> None:

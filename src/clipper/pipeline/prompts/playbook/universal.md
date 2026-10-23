@@ -27,10 +27,19 @@ hardship (debt, family conflict, a medical or legal problem).
   a tragedy. Plain cuts and plain captions only.
 - The hook and title describe what happened in a neutral way. Never make a person's
   suffering the joke, and never sensationalise it beyond what was said.
-- Never put the name, school, workplace, address or phone number of a victim, a minor or
-  a private complainant in the hook, title, caption or hashtags. Refer to them by role
-  (for example "a complainant", "a 15-year-old"). This overrides "the hook names the
-  person".
-- Do not choose moments whose captions would reveal a private person's address or phone
-  number, or a minor's full name.
+- Protected people are a victim in any abuse, sexual (including rape), family or child
+  case, and any minor. "Family" includes spouses, partners and unpaid support
+  (sustento). Never choose a moment in which anyone, at any point, says something that
+  identifies them: the subtitles show every spoken word, so a role in the hook does not
+  hide it. That covers anything that, alone or together, tends to identify them: their
+  name or nickname; the name of a parent, spouse, partner or relative; the name of the
+  respondent in an abuse, sexual, family/support or child case; their school,
+  workplace, employer, barangay, town, address, phone or plate number; or a relationship
+  combined with a place.
+- Never put the name, school, workplace, address or phone number of a private
+  complainant in any other case in the hook, title, caption or hashtags, and never
+  choose a start whose first spoken line names them. Refer to people by role (for
+  example "a complainant", "a 15-year-old"). This overrides "the hook names the person".
+- Do not choose moments whose subtitles, hook, title or caption would reveal a private
+  person's address or phone number.
 - If a moment cannot be clipped respectfully, leave it out.

@@ -40,12 +40,13 @@ from clipper.pipeline.common import (
     read_json,
     write_json_atomic,
 )
-from clipper.pipeline.ytdlp import CommandTimeout, Runner, YtDlp, YtDlpError
+from clipper.pipeline.ytdlp import CLIP_FORMAT, CommandTimeout, Runner, YtDlp, YtDlpError
 from clipper.urls import canonical_url
 
 PAD_S = 2.0
 """Padding downloaded before and after each clip (CLP-16: 2 s)."""
-FORMAT = "bv*[height<=1080]+ba/b[height<=1080]"
+FORMAT = CLIP_FORMAT
+"""Shared with the probe (monitor and fetch_audio), so a video that gets this far has one."""
 MIN_TIMEOUT_S = 600.0
 TIMEOUT_PER_SECOND = 20.0
 """Per-clip yt-dlp timeout: generous, but well inside the 2 h claim lease."""

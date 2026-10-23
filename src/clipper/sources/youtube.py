@@ -337,10 +337,9 @@ class YtDlpProvider:
                 else:
                     result.errors[video_id] = str(exc)
             else:
-                # A probe that returns selected a format with yt-dlp's default selector
+                # A probe that returns selected a format with the worker's clip selector
                 # (it fails otherwise, without --ignore-no-formats-error), so this account
-                # can fetch the video, e.g. an 18+ or members' video with cookies; the
-                # worker's `bestaudio/best` accepts whatever that selector does.
+                # can fetch the video, e.g. an 18+ or members' video with cookies.
                 result.videos[video_id] = self._meta(video_id, info)
         return result
 

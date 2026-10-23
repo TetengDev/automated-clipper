@@ -226,19 +226,52 @@ class NoUsableFormat(Deferred):
     """yt-dlp found no format to download (a player breakage); try again later."""
 
 
+_MARKER_READ_BYTES = 256
+"""A format-error marker is two ISO times (about 70 bytes); nothing past this is read."""
+
+
+def _format_errors_since(marker: Path, now: datetime) -> datetime:
+    """When the current format-error episode began. `marker` holds that start and the last
+    format error (one ISO time per line; a marker from before CLP-85 holds only the start).
+    An episode with no format error for NO_FORMAT_MAX_AGE is over, so one picked up late
+    (a busy or stopped worker) still counts from its start, not from now."""
+    start = None
+    try:
+        with marker.open("rb") as f:
+            words = f.read(_MARKER_READ_BYTES).decode("utf-8").split()
+        first, last = datetime.fromisoformat(words[0]), datetime.fromisoformat(words[-1])
+        aware = first.tzinfo is not None and last.tzinfo is not None
+        if aware and first <= now and now - last <= NO_FORMAT_MAX_AGE:
+            start = first
+    except (OSError, ValueError, IndexError):
+        pass
+    start = start or now
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_name(f"{marker.name}.tmp")
+    stamp = "\n".join(t.astimezone(UTC).isoformat() for t in (start, now))
+    # A fresh file, never through a planted symlink (or a leftover) at the tmp name.
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(stamp)
+    os.replace(tmp, marker)
+    return start
+
+
 @contextmanager
 def deferring_no_format(marker: Path, clock: Callable[[], datetime]) -> Iterator[None]:
     """Turn a yt-dlp format error inside the block into `NoUsableFormat` (+30 min, no
     attempt used), until format errors have lasted NO_FORMAT_MAX_AGE for this stage
-    (`marker`, one per stage); then a `PermanentError`. A marker older than the cap plus
-    one retry is from an earlier episode and starts over. Remove `marker` on success."""
+    (`marker`, one per stage); then a `PermanentError`. A marker whose last format error
+    is older than the cap is from an earlier episode and starts over. Remove `marker` on
+    success."""
     try:
         yield
     except ytdlp.Unavailable as exc:
         if exc.reason != ytdlp.NO_FORMAT:
             raise
         now = clock()
-        since = first_seen(marker, now, max_age=NO_FORMAT_MAX_AGE + NO_FORMAT_RETRY)
+        since = _format_errors_since(marker, now)
         if now - since > NO_FORMAT_MAX_AGE:
             hours = NO_FORMAT_MAX_AGE.total_seconds() / 3600
             raise PermanentError(f"{exc} (for {hours:.0f} h; giving up)") from None

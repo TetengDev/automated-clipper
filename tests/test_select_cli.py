@@ -97,6 +97,7 @@ def _no_ambient_secrets(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)  # no stray .env
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
 
 def cli_ctx(conn: sqlite3.Connection, media: Path, **settings: Any) -> StageContext:
@@ -177,6 +178,14 @@ def test_cli_without_a_token_uses_the_existing_login(conn, media):
     fake = FakeCli(cli_json())
     run(make_job(conn), cli_ctx(conn, media), fake)
     assert fake.calls[0]["env"] == {}
+
+
+def test_cli_without_a_token_keeps_a_custom_config_dir(conn, media, monkeypatch, tmp_path):
+    # A login made with CLAUDE_CONFIG_DIR set lives there; dropping it means "Not logged in".
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-personal"))
+    fake = FakeCli(cli_json())
+    run(make_job(conn), cli_ctx(conn, media), fake)
+    assert fake.calls[0]["env"] == {"CLAUDE_CONFIG_DIR": str(tmp_path / "claude-personal")}
 
 
 # --- AC3: limits, login, process failures ----------------------------------------------------

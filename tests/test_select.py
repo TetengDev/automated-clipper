@@ -1194,7 +1194,7 @@ PLAYBOOK_HASHES = {
     "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
     "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
     "playbook_v4": "97b8707018c24c6772d5f76d3d637f7ed6ed8b8f620942ffb790437a6cd16689",
-    "playbook_v5": "8ff38dc35a8f740022e1cacd3cd08a235626d83ad7d08ed977c65556bf96b59b",
+    "playbook_v5": "56a43482bd6783e8100c0de00d8469017758d6a684a130b20cfbf09b162f41a9",
 }
 
 
@@ -1212,8 +1212,20 @@ def test_playbook_version_is_bumped_when_the_prompt_or_playbook_changes():
 def test_playbook_wording_review_fixes():
     assert "or mark them" not in select.load_playbook("comedy")
     public = " ".join(select.load_playbook("public_service").split())
-    assert "Leave out moments that show the face of a minor or a protected victim" in public
+    assert (
+        "Leave out moments in which the transcript shows a minor or a protected victim is on"
+        " camera (see the universal rules), or that include anything that" in public
+    )  # CLP-87 review LOW-2: what the transcript shows, not faces the model cannot see
     assert "address or phone" in select.load_playbook("universal")
+
+
+def test_no_prompt_asks_the_model_to_judge_faces():
+    """CLP-87 review LOW-2: the model sees only the transcript; faces are the reviewer's."""
+    root = Path(select.__file__).parent / "prompts"
+    for path in [*root.glob("playbook/*.md"), root / "select_v2.md"]:
+        text = _flat(path.read_text())
+        for phrase in ("show the face", "shows the face", "shows their face"):
+            assert phrase not in text, (path.name, phrase)
 
 
 def _flat(text: str) -> str:
@@ -1520,7 +1532,9 @@ def test_playbook_v5_on_camera_rule_is_in_terms_the_transcript_shows():
         assert "shows their face" not in text
 
 
-@pytest.mark.parametrize("name", ["playbook/universal.md", "select_v2.md"])
+@pytest.mark.parametrize(
+    "name", ["playbook/universal.md", "playbook/public_service.md", "select_v2.md"]
+)
 def test_prompt_lines_are_wrapped(name):
     """CLP-87 review: the reflowed rule left a 104-character line."""
     path = Path(select.__file__).parent / "prompts" / name

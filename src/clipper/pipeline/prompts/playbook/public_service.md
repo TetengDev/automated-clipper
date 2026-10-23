@@ -26,7 +26,7 @@ Minors and victims:
 - If a moment involving a minor or victim does not identify them and is still worth
   clipping, mark it `sensitive`.
 - Any moment that involves a minor in any way is always `sensitive`. This never permits
-  keeping a moment that names a minor or shows their face; leave those out.
+  keeping a moment that identifies a minor (see above); leave those out.
 - Naming the respondent in a case that is not an abuse, sexual, family/support or child
   case (for example an employer in an unpaid-wages case) is allowed; the reviewer
   decides.

@@ -40,6 +40,6 @@ hardship (debt, family conflict, a medical or legal problem).
   complainant in any other case in the hook, title, caption or hashtags, and never
   choose a start whose first spoken line names them. Refer to people by role (for
   example "a complainant", "a 15-year-old"). This overrides "the hook names the person".
-- Do not choose moments whose captions would reveal a private person's address or phone
-  number, or a minor's full name.
+- Do not choose moments whose subtitles, hook, title or caption would reveal a private
+  person's address or phone number.
 - If a moment cannot be clipped respectfully, leave it out.

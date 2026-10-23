@@ -30,19 +30,12 @@ spelling.
   the first three seconds? If the opening needs more than that to become interesting,
   move the start or drop the moment. Never start mid-sentence or on filler ("so", "um",
   "anyway").
-- **The hook names the person or thing.** Unless the person is protected (see the
-  playbook), the first line (and the `hook` you write) says who or what this is about: a
-  name, an object, a number, a place. Not "you won't believe this" or "this is crazy".
-  Protected people are a victim in any abuse, sexual, family or child case, and any
-  minor. Never choose a moment in which anyone, at any point, says something that
-  identifies them: the subtitles show every spoken word, so a role in the hook does not
-  hide it. That covers anything that, alone or together, tends to identify them: their
-  name or nickname; the name of a parent, spouse, partner or relative; the name of the
-  respondent in an abuse, sexual, family/support or child case; their school,
-  workplace, employer, barangay, town, address, phone or plate number; or a relationship
-  combined with a place. Never name a private complainant in any other case in the hook,
-  title, caption or hashtags, and never choose a start whose first spoken line names
-  them. Refer to people by role, such as "a complainant" or "a 15-year-old".
+- **The hook names the person or thing.** Unless the person is protected or a private
+  complainant (see the playbook), the first line (and the `hook` you write) says who or
+  what this is about: a name, an object, a number, a place. Not "you won't believe this"
+  or "this is crazy". Never choose a moment in which anyone, at any point, says
+  something that identifies a protected person: the subtitles show every spoken word, so
+  a role in the hook does not hide it.
 - **No vague teasing, no promises the footage can't keep.** Reject hooks and titles that
   hide what happens to create curiosity, and anything that promises a result, a fight, a
   reveal or a reaction the clip does not actually contain.

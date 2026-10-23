@@ -382,6 +382,7 @@ def test_metadata_error_leaves_item_unseen_and_is_retried(conn, cfg, source, clo
     assert json.loads(runs(conn)[-1]["errors"]) == report.errors
 
     source.meta[V1] = video(V1)
+    clock.now += timedelta(minutes=10)  # the next poll, after the first backoff step
     retried = monitor.run_cycle([cfg.creator("MrBeast")])
 
     assert retried.items_new == 1

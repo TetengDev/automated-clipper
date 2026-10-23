@@ -34,7 +34,7 @@ from defusedxml.ElementTree import fromstring
 
 from clipper.config import Secrets
 from clipper.jobs.stages import PermanentError
-from clipper.pipeline.ytdlp import Unavailable, YtDlp, YtDlpError
+from clipper.pipeline.ytdlp import DownloadBlocked, Unavailable, YtDlp, YtDlpError
 from clipper.redact import redact
 from clipper.urls import InvalidSourceURL, SourceRef, canonical_url
 
@@ -113,6 +113,9 @@ class Metadata:
     """Private, removed or members-only: never processable."""
     errors: dict[str, str] = field(default_factory=dict)
     """Retryable per-video failures (redacted)."""
+    blocked: set[str] = field(default_factory=set)
+    """The subset of `errors` where the platform refused us (bot check, rate limit): says
+    nothing about the video itself. The batch stops there."""
 
 
 @dataclass
@@ -276,6 +279,12 @@ class YtDlpProvider:
                     result.unavailable.add(video_id)
                 else:  # age gate, format errors: may work later (cookies, a yt-dlp update)
                     result.errors[video_id] = str(exc)
+            except DownloadBlocked as exc:
+                # More probes now would only deepen the block; the rest wait for next poll.
+                logger.warning("%s: blocked by YouTube; stopping this batch: %s", video_id, exc)
+                result.errors[video_id] = str(exc)
+                result.blocked.add(video_id)
+                break
             except YtDlpError as exc:
                 if _UPCOMING.search(str(exc)):
                     result.videos[video_id] = VideoMeta(video_id, None, None, "is_upcoming", None)

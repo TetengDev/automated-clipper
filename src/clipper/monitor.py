@@ -49,6 +49,11 @@ COMPONENT = "monitor:youtube"
 PLATFORM = "youtube"
 JITTER = 0.1
 """Each sleep is the poll interval +- 10 %, so creators are not polled in lockstep."""
+METADATA_RETRY_BASE = timedelta(minutes=10)
+MAX_METADATA_ATTEMPTS = 6
+"""A video whose metadata keeps failing is retried after 10, 20, 40, 80 and 160 minutes,
+then recorded as `metadata_failed` (about 5 h of failures). Platform blocks (bot check)
+are not counted: they say nothing about the video."""
 
 
 class FirstRun(StrEnum):
@@ -62,6 +67,7 @@ class SeenStatus(StrEnum):
     SKIPPED_SHORT = "skipped_short"
     WAITING_VOD = "waiting_vod"
     UNAVAILABLE = "unavailable"
+    METADATA_FAILED = "metadata_failed"
 
 
 class Source(Protocol):
@@ -82,6 +88,13 @@ class CreatorPoll:
     enqueued: list[tuple[int, str, str | None]] = field(default_factory=list)
     """(job id, video id, title) per job created."""
     errors: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class _Failure:
+    creator: str
+    attempts: int
+    retry_at: datetime
 
 
 @dataclass
@@ -107,6 +120,9 @@ class YouTubeMonitor:
     """Overrides `settings.first_run_mode` (CLI --first-run)."""
     stop: threading.Event = field(default_factory=threading.Event)
     rng: random.Random = field(default_factory=random.Random)
+    failures: dict[str, _Failure] = field(default_factory=dict)
+    """Videos whose metadata lookup failed, by id. Kept in memory: a restart only resets
+    the backoff, it cannot enqueue anything twice."""
 
     def run_forever(self, creators: Sequence[Creator]) -> None:
         """Poll every interval (with jitter) until `stop` is set. A failing cycle (e.g. the
@@ -186,24 +202,52 @@ class YouTubeMonitor:
             for video_id in old:
                 self._record(creator.name, video_id, SeenStatus.BASELINE, now)
             fresh = [u for u in fresh if u.video_id not in old]
-        if not fresh:
+        listed = {u.video_id for u in uploads}
+        for video_id, failure in list(self.failures.items()):
+            if failure.creator == creator.name and video_id not in listed:
+                del self.failures[video_id]  # dropped off the listing: forget it
+        due = [
+            u.video_id
+            for u in fresh
+            if u.video_id not in self.failures or self.failures[u.video_id].retry_at <= now
+        ]
+        if not due:
             return
-        meta = self.source.videos([u.video_id for u in fresh], self.stop.is_set)
-        for upload in fresh:
-            video_id = upload.video_id
+        meta = self.source.videos(due, self.stop.is_set)
+        for video_id in due:
             if video_id in meta.unavailable:
+                self.failures.pop(video_id, None)
                 self._record(creator.name, video_id, SeenStatus.UNAVAILABLE, now)
             elif video_id in meta.errors:
                 error = redact(meta.errors[video_id])
                 logger.warning("%s: %s: metadata failed: %s", creator.name, video_id, error)
                 poll.errors.append({"creator": creator.name, "item": video_id, "error": error})
+                if video_id not in meta.blocked:
+                    self._metadata_failed(creator.name, video_id, now)
             elif video_id in meta.videos:
+                self.failures.pop(video_id, None)
                 self._decide(creator.name, meta.videos[video_id], settings, cutoff, now, poll)
-            # else: not looked at (stop requested); stays unseen for the next poll
+            # else: not looked at (stop requested, or the batch hit a block): next poll
         if poll.new:
             logger.info(
                 "%s: %d new item(s), %d enqueued", creator.name, poll.new, len(poll.enqueued)
             )
+
+    def _metadata_failed(self, creator: str, video_id: str, now: datetime) -> None:
+        failure = self.failures.get(video_id) or _Failure(creator, 0, now)
+        failure.attempts += 1
+        if failure.attempts >= MAX_METADATA_ATTEMPTS:
+            del self.failures[video_id]
+            logger.warning(
+                "%s: %s: metadata failed %d times; giving up (enqueue it by hand if wanted)",
+                creator,
+                video_id,
+                failure.attempts,
+            )
+            self._record(creator, video_id, SeenStatus.METADATA_FAILED, now)
+            return
+        failure.retry_at = now + METADATA_RETRY_BASE * 2 ** (failure.attempts - 1)
+        self.failures[video_id] = failure
 
     def _decide(
         self,

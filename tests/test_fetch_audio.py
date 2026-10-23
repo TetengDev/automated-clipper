@@ -648,3 +648,65 @@ def test_source_is_removed_before_the_artifact_appears(
     monkeypatch.setattr(fa.os, "replace", spy)
     run(make_job(), ctx, FakeRunner())
     assert seen == [[]]
+
+
+# --- format errors: a YouTube player breakage (CLP-83) ---------------------------------------
+
+FORMAT_ERROR = "ERROR: [youtube] x: Requested format is not available. Use --list-formats"
+
+
+def _fetch_at(media_dir: Path, when: datetime, runner: FakeRunner) -> None:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        run(make_job(), StageContext(media_dir, conn, AppConfig(), clock=lambda: when), runner)
+
+
+@pytest.mark.parametrize("step", ["probe", "download"])
+def test_format_error_defers_thirty_minutes(media_dir: Path, step: str) -> None:
+    runner = FakeRunner()
+    runner.responses[step] = RunResult(1, "", FORMAT_ERROR)
+
+    with pytest.raises(Deferred) as exc:
+        _fetch_at(media_dir, T0, runner)
+
+    assert isinstance(exc.value, fa.NoUsableFormat)
+    assert exc.value.until == T0 + fa.NO_FORMAT_RETRY
+    assert (media_dir / fa.NO_FORMAT_MARKER).exists()
+    assert not (media_dir / AUDIO_NAME).exists()
+
+
+def test_format_error_past_the_age_cap_fails_for_good(media_dir: Path) -> None:
+    runner = FakeRunner()
+    runner.responses["probe"] = RunResult(1, "", FORMAT_ERROR)
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0, runner)
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0 + fa.NO_FORMAT_MAX_AGE - timedelta(hours=1), runner)
+
+    with pytest.raises(PermanentError, match="requested format not available.*giving up"):
+        _fetch_at(media_dir, T0 + fa.NO_FORMAT_MAX_AGE + timedelta(hours=1), runner)
+
+
+def test_format_marker_cleared_once_the_download_works(media_dir: Path) -> None:
+    runner = FakeRunner()
+    runner.responses["download"] = RunResult(1, "", FORMAT_ERROR)
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0, runner)
+
+    del runner.responses["download"]
+    _fetch_at(media_dir, T0 + timedelta(hours=1), runner)
+
+    assert not (media_dir / fa.NO_FORMAT_MARKER).exists()
+    assert (media_dir / AUDIO_NAME).exists()
+
+
+def test_format_error_defers_the_job_without_failing_it(db: Path, tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.responses["probe"] = RunResult(1, "", FORMAT_ERROR)
+    worker = _worker(db, tmp_path, runner)
+    with closing(worker.conn):
+        job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+        worker.run_once()  # detected -> fetching_audio
+        worker.run_once()  # format error: deferred
+    row = _row(db, job.id)
+    assert row["status"] == JobStatus.FETCHING_AUDIO.value
+    assert row["next_attempt_at"] is not None

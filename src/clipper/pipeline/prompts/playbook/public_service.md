@@ -20,4 +20,5 @@ Minors and victims:
 - Leave out moments that identify a minor or a victim (name, face, school, address).
 - If a moment involving a minor or victim does not identify them and is still worth
   clipping, mark it `sensitive`.
-- Any moment with a minor on screen or named is always `sensitive`.
+- If you keep a moment with a minor on screen or named despite the above, it is always
+  `sensitive`.

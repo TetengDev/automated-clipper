@@ -35,7 +35,8 @@ spelling.
   believe this" or "this is crazy". Exception: never name a victim, a minor or a private
   complainant (and never give their school, workplace, address or phone number) in the
   hook, title, caption or hashtags; refer to them by role, such as "a complainant" or "a
-  15-year-old".
+  15-year-old". Never choose a start whose first spoken line names one of them: the name
+  is still heard and shown in the captions even when the hook uses a role.
 - **No vague teasing, no promises the footage can't keep.** Reject hooks and titles that
   hide what happens to create curiosity, and anything that promises a result, a fight, a
   reveal or a reaction the clip does not actually contain.

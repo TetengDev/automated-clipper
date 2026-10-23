@@ -700,61 +700,22 @@ def test_format_and_age_errors_are_retryable_not_unavailable(stderr: str) -> Non
 
 
 FORMAT_ERROR = "ERROR: [youtube] x: Requested format is not available. Use --list-formats"
-STORYBOARD = {"format_id": "sb0", "ext": "mhtml", "url": "https://i.ytimg.com/sb/x"}
+AUDIO = {"format_id": "140", "ext": "m4a", "acodec": "mp4a.40.2", "url": "https://x/140"}
 
 
-def answers(*results: RunResult) -> Callable[[], RunResult]:
-    """One URL answered differently per call (probe, then re-probe)."""
-    queue = iter(results)
-    return lambda: next(queue)
-
-
-def test_format_error_is_reprobed_ignoring_missing_formats() -> None:
-    # A player breakage (SABR, n-sig): only storyboard images are left, so format
-    # selection fails. Extraction itself worked, so its metadata is valid.
-    body = info(V1, formats=[STORYBOARD])
-    runner = FakeRunner({watch(V1): answers(RunResult(1, "", FORMAT_ERROR), ok_json(body))})
-
-    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
-
-    assert set(meta.videos) == {V1} and meta.errors == {}
-    first, again = runner.calls
-    assert "--ignore-no-formats-error" not in first
-    assert "--ignore-no-formats-error" in again
-
-
-@pytest.mark.parametrize(
-    "reprobe",
-    [
-        # Without formats the re-probe may hide a playability failure (private, bot
-        # check): yt-dlp downgrades those to a warning only when nothing is playable.
-        ok_json(info(V1, formats=[], availability="private")),
-        RunResult(1, "", "ERROR: unable to download: Connection reset by peer"),
-        RunResult(1, "", FORMAT_ERROR),
-    ],
-)
-def test_format_error_not_resolved_by_the_reprobe_is_an_uncounted_error(
-    reprobe: RunResult,
-) -> None:
-    runner = FakeRunner({watch(V1): answers(RunResult(1, "", FORMAT_ERROR), reprobe)})
-
-    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
-
-    assert set(meta.errors) == {V1} and "Requested format" in meta.errors[V1]
-    assert meta.format_errors == {V1}
-    assert meta.videos == {} and meta.unavailable == set() and meta.blocked == set()
-
-
-def test_bot_check_on_the_reprobe_stops_the_batch() -> None:
-    bot = RunResult(1, "", "ERROR: [youtube] x: Sign in to confirm you're not a bot")
-    runner = FakeRunner(
-        {watch(V1): answers(RunResult(1, "", FORMAT_ERROR), bot), watch(V2): ok_json(info(V2))}
-    )
+def test_format_error_stops_the_batch_and_is_never_reprobed() -> None:
+    # A player breakage (SABR, n-sig) hits every video alike: one probe tells.
+    runner = FakeRunner({watch(V1): RunResult(1, "", FORMAT_ERROR), watch(V2): ok_json(info(V2))})
 
     meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1, V2])
 
-    assert runner.urls() == [watch(V1), watch(V1)]
-    assert meta.blocked == {V1} and meta.format_errors == set()
+    assert runner.urls() == [watch(V1)]  # V2 waits for the next poll
+    assert set(meta.errors) == {V1} and "Requested format" in meta.errors[V1]
+    assert meta.format_errors == {V1}
+    assert meta.videos == {} and meta.unavailable == set() and meta.blocked == set()
+    # With the flag, the YouTube extractor appends storyboard formats after its
+    # playability check, so a private or bot-checked video would look fetchable.
+    assert all("--ignore-no-formats-error" not in call for call in runner.calls)
 
 
 def test_bot_check_stops_probing_the_rest_of_the_batch() -> None:
@@ -791,7 +752,7 @@ def test_metadata_probes_never_ignore_missing_formats() -> None:
 def test_probe_listing_formats_is_fetchable_whatever_its_availability(availability: str) -> None:
     # With CLIPPER_YTDLP_COOKIES, an 18+ or members' video the account can watch exits 0
     # with formats: it is fetchable, so it is returned, not retried or dropped.
-    body = info(V1, formats=[STORYBOARD], availability=availability)
+    body = info(V1, formats=[AUDIO], availability=availability)
     runner = FakeRunner({watch(V1): ok_json(body)})
 
     meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])

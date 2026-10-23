@@ -123,6 +123,7 @@ class FakeSource:
             elif isinstance(answer, str) and answer.startswith("format"):
                 result.errors[vid] = answer
                 result.format_errors.add(vid)
+                break
             elif isinstance(answer, str):
                 result.errors[vid] = answer
             else:
@@ -497,21 +498,59 @@ def test_bot_check_is_retried_every_poll_and_never_gives_up(conn, cfg, source, c
     ]
 
 
-def test_format_errors_are_retried_every_poll_and_never_given_up(conn, cfg, source, clock) -> None:
+def test_format_errors_back_off_to_hourly_and_never_give_up(conn, cfg, source, clock) -> None:
     not_first_poll(conn)
     source.feeds[BEAST] = [Upload(V1, T0)]
     source.meta[V1] = "format: Requested format is not available"
     monitor = make(conn, cfg, source, clock)
+    attempts_at: list[int] = []
 
-    for _ in range(MAX_METADATA_ATTEMPTS * 3):
+    for minute in range(0, 24 * 60, 10):  # a day of 10-minute polls
+        clock.now = T0 + timedelta(minutes=minute)
+        before = calls_for(source, V1)
         report = monitor.run_cycle([cfg.creator("MrBeast")])
-        clock.now += timedelta(minutes=10)
+        if calls_for(source, V1) > before:
+            attempts_at.append(minute)
 
-    assert calls_for(source, V1) == MAX_METADATA_ATTEMPTS * 3
+    assert attempts_at[:6] == [0, 10, 30, 70, 130, 190]  # 10 min doubling, capped at 1 h
+    assert len(attempts_at) == 4 + (24 * 60 - 130) // 60 + 1
     assert V1 not in seen(conn) and monitor.failures == {}
-    assert report.errors == [
-        {"creator": "MrBeast", "item": V1, "error": "format: Requested format is not available"}
-    ]
+    assert report.errors in (
+        [],
+        [{"creator": "MrBeast", "item": V1, "error": "format: Requested format is not available"}],
+    )
+
+
+def test_format_error_stops_the_batch_with_one_error_per_poll(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0), Upload(V2, T0), Upload(V3, T0)]
+    source.meta.update({V1: "format: Requested format is not available", V2: video(V2)})
+    source.meta[V3] = "format: Requested format is not available"
+    monitor = make(conn, cfg, source, clock)
+
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert source.metadata_calls == [[V1, V2, V3]]
+    assert report.polls[0].new == 1  # V2 and V3 were never looked at
+    assert len(json.loads(runs(conn)[-1]["errors"])) == 1
+    assert seen(conn) == {"zzzzzzzzzzz": "baseline"}
+
+
+def test_format_backoff_is_forgotten_when_the_item_leaves_the_listing(
+    conn, cfg, source, clock
+) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.meta[V1] = "format: Requested format is not available"
+    monitor = make(conn, cfg, source, clock)
+    monitor.run_cycle([cfg.creator("MrBeast")])
+    assert V1 in monitor.format_retries
+
+    source.feeds[BEAST] = [Upload(V2, T0)]
+    source.meta[V2] = video(V2)
+    monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert monitor.format_retries == {}
 
 
 def test_upload_probed_during_a_player_breakage_is_still_enqueued(conn, cfg, source, clock) -> None:
@@ -519,15 +558,13 @@ def test_upload_probed_during_a_player_breakage_is_still_enqueued(conn, cfg, sou
 
     format_error = "ERROR: [youtube] x: Requested format is not available. Use --list-formats"
     body = {"id": V1, "title": "Big video", "duration": 1500, "timestamp": T0.timestamp()}
-    body["formats"] = [{"format_id": "sb0", "ext": "mhtml", "url": "https://i.ytimg.com/sb"}]
-    fixed = False  # the breakage lasts 8 h: the re-probe fails too until then
+    body["formats"] = [{"format_id": "140", "acodec": "mp4a.40.2", "url": "https://x/140"}]
+    fixed = False  # an 8 h breakage, until a yt-dlp update fixes the player
+    calls: list[list[str]] = []
 
     def ytdlp(args, timeout_s):
-        if "--ignore-no-formats-error" not in args:
-            return RunResult(1, "", format_error)
-        if not fixed:
-            return RunResult(1, "", "ERROR: unable to download: Connection reset by peer")
-        return RunResult(0, json.dumps(body), "")
+        calls.append(list(args))
+        return RunResult(0, json.dumps(body), "") if fixed else RunResult(1, "", format_error)
 
     not_first_poll(conn)
     source.feeds[BEAST] = [Upload(V1, T0)]
@@ -540,10 +577,13 @@ def test_upload_probed_during_a_player_breakage_is_still_enqueued(conn, cfg, sou
     assert V1 not in seen(conn)
 
     fixed = True
+    clock.now += timedelta(hours=1)  # past the longest backoff
     report = monitor.run_cycle([cfg.creator("MrBeast")])
 
     assert seen(conn) == {"zzzzzzzzzzz": "baseline", V1: "enqueued"}
     assert report.items_new == 1
+    assert monitor.format_retries == {} and monitor.failures == {}
+    assert all("--ignore-no-formats-error" not in call for call in calls)
 
 
 def test_age_restricted_upload_fetchable_with_cookies_is_enqueued(conn, cfg, source, clock) -> None:

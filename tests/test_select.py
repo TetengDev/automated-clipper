@@ -1185,6 +1185,7 @@ def test_load_playbook_rejects_unknown_sections(bad):
 PLAYBOOK_HASHES = {
     "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
     "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
+    "playbook_v4": "dbc3274be8354df8137b2e4652125ae5b76f4051f6da25dcd3c28c1dca6b579b",
 }
 
 
@@ -1204,6 +1205,40 @@ def test_playbook_wording_review_fixes():
     public = select.load_playbook("public_service")
     assert "Leave out moments that identify a minor or a victim" in public
     assert "address or phone" in select.load_playbook("universal")
+
+
+def test_playbook_v4_never_starts_on_a_protected_name():
+    """CLP-77: a role in the hook is not enough if the first spoken line says the name."""
+    assert select.PLAYBOOK_VERSION == "playbook_v4"
+    hook_rule = " ".join(select.load_system_prompt().split())
+    assert "Never choose a start whose first spoken line names one of them" in hook_rule
+    assert "still heard and shown in the captions" in hook_rule
+
+
+def test_playbook_v4_protects_indirect_identifiers():
+    """CLP-77: RA 9262 / RA 7610 cover anything that tends to identify the victim."""
+    universal = " ".join(select.load_playbook("universal").split())
+    assert "or anyone whose name would identify them" in universal
+    assert "a parent, spouse or the respondent in an abuse or child case" in universal
+
+
+def test_playbook_v4_minor_rule_is_a_fallback():
+    public = " ".join(select.load_playbook("public_service").split())
+    assert (
+        "If you keep a moment with a minor on screen or named despite the above, it is always"
+        " `sensitive`." in public
+    )
+    assert "- Any moment with a minor" not in public
+
+
+def test_playbook_v4_still_allows_naming_a_private_respondent():
+    """CLP-77: naming e.g. an employer who refuses to pay wages stays a reviewer decision."""
+    text = " ".join(
+        f"{select.load_system_prompt()} {select.load_playbook('universal')}"
+        f" {select.load_playbook('public_service')}".split()
+    )
+    assert "never name a respondent" not in text.lower()
+    assert "respondent in an abuse or child case" in text
 
 
 def test_v1_recorded_reply_still_parses(conn, media):
@@ -1265,7 +1300,7 @@ def test_victims_minors_and_complainants_are_never_named():
     assert "never name a victim, a minor or a private\n  complainant" in prompt
     public = select.load_playbook("public_service")
     assert "does not identify them and is still worth" in public
-    assert "Any moment with a minor on screen or named is always `sensitive`." in public
+    assert "it is always\n  `sensitive`." in public  # v4 fallback wording (CLP-77)
 
 
 def test_payoff_after_a_clamped_end_drops_the_candidate():

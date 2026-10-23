@@ -4,6 +4,7 @@ HTTP is mocked with respx; yt-dlp runs through a recording fake runner. No netwo
 """
 
 import json
+import logging
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 
@@ -354,7 +355,8 @@ def test_api_videos_are_batched_fifty_per_call(api: respx.MockRouter, http: http
     ids = [f"{i:011d}" for i in range(120)]
 
     def answer(request: httpx.Request) -> httpx.Response:
-        assert request.url.params["key"] == KEY
+        assert request.headers["X-Goog-Api-Key"] == KEY
+        assert "key" not in request.url.params
         assert request.url.params["part"] == "snippet,contentDetails,liveStreamingDetails"
         batch = request.url.params["id"].split(",")
         return httpx.Response(200, json={"items": [api_video(v) for v in batch]})
@@ -594,3 +596,41 @@ def test_build_source_uses_api_with_key(http: httpx.Client) -> None:
     source = yt.build_source(Secrets(youtube_api_key=KEY), http, YtDlp(runner=FakeRunner({})))
 
     assert isinstance(source.provider, ApiProvider)
+
+
+# --- review fixes -------------------------------------------------------------------------
+
+
+def test_api_key_travels_in_a_header_and_never_reaches_the_httpx_log(
+    api: respx.MockRouter, http: httpx.Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    route = api.get("/videos").mock(
+        return_value=httpx.Response(200, json={"items": [api_video(V1)]})
+    )
+    api.get("/channels").mock(return_value=httpx.Response(200, json={"items": [{"id": CHANNEL}]}))
+
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        provider = ApiProvider(http, KEY)
+        provider.videos([V1])
+        provider.channel_id("@MrBeast")
+
+    request = route.calls[0].request
+    assert request.headers["X-Goog-Api-Key"] == KEY
+    assert "key" not in request.url.params
+    assert "HTTP Request" in caplog.text  # httpx did log the request line ...
+    assert KEY not in caplog.text  # ... without the key
+
+
+def test_cli_logging_keeps_httpx_request_lines_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    from clipper import cli
+
+    for name in ("httpx", "httpcore"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+    # What basicConfig(level=INFO) does to the root logger, without touching handlers.
+    monkeypatch.setattr(logging.getLogger(), "level", logging.INFO)
+    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
+
+    cli._setup_logging()
+
+    assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
+    assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING

@@ -166,8 +166,12 @@ class YouTubeMonitor:
                 self._poll(creator, creator.youtube.channel_id, poll)
             except Exception as exc:
                 error = redact(f"{type(exc).__name__}: {exc}")
-                logger.error("%s: poll failed: %s", creator.name, error)
-                poll.errors.append({"creator": creator.name, "error": error})
+                if self.stop.is_set():
+                    # Most likely its yt-dlp child killed by the stop: not a failure.
+                    logger.info("%s: poll ended by stop: %s", creator.name, error)
+                else:
+                    logger.error("%s: poll failed: %s", creator.name, error)
+                    poll.errors.append({"creator": creator.name, "error": error})
             report.errors.extend(poll.errors)
         report.quota_units = self.source.quota_units - quota_before
         with transaction(self.conn):

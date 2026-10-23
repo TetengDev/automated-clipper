@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import re
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -54,8 +55,12 @@ FALLBACK_ITEMS = 15
 FEED_MAX_BYTES = 2 * 1024 * 1024
 API_MAX_BYTES = 4 * 1024 * 1024
 """50 videos with full snippets stay well under 1 MiB."""
-HTTP_TIMEOUT = httpx.Timeout(8.0, connect=5.0)
-"""Short, so a request in flight cannot hold up shutdown for long (SIGTERM: 10 s)."""
+HTTP_TIMEOUT = httpx.Timeout(3.0, connect=2.0)
+HTTP_DEADLINE_S = 5.0
+"""A request in flight must not hold up shutdown past SIGTERM's 10 s. Per request: at most
+connect + 2 reads (headers, first chunk) = 8 s before the first deadline check, and at
+most the deadline plus one blocked read = 8 s after it; `get_capped` gives up at the
+first chunk past the deadline."""
 _HTTPX_ERRORS = (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, httpx.CookieConflict)
 """Everything httpx raises for a request; InvalidURL and StreamError are not HTTPErrors."""
 CHANNEL_ID = re.compile(r"UC[A-Za-z0-9_-]{22}")
@@ -209,6 +214,10 @@ class _TooLarge(Exception):
     pass
 
 
+class _TooSlow(Exception):
+    pass
+
+
 def get_capped(
     http: httpx.Client,
     url: str,
@@ -217,12 +226,17 @@ def get_capped(
     limit: int,
     what: str,
     headers: Mapping[str, str] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> tuple[int, bytes]:
     """GET `url`, streaming the (decompressed) body and giving up past `limit` bytes, so
     neither a huge nor a compression-bomb response is ever held in memory.
 
+    A body still arriving after HTTP_DEADLINE_S is abandoned too (a trickle would
+    otherwise reset the read timeout forever).
+
     Returns (status, body). Any httpx failure becomes a SourceError naming only the
     exception type: messages and chains can carry the request, headers included."""
+    started = clock()
     try:
         with http.stream("GET", url, params=params, headers=headers) as response:
             body = bytearray()
@@ -230,9 +244,13 @@ def get_capped(
                 body += chunk
                 if len(body) > limit:
                     raise _TooLarge
+                if clock() - started > HTTP_DEADLINE_S:
+                    raise _TooSlow
             return response.status_code, bytes(body)
     except _TooLarge:
         raise SourceError(f"{what}: response too large (over {limit} bytes)") from None
+    except _TooSlow:
+        raise SourceError(f"{what}: response took longer than {HTTP_DEADLINE_S:g} s") from None
     except _HTTPX_ERRORS as exc:
         raise SourceError(f"{what} request failed ({type(exc).__name__})") from None
 

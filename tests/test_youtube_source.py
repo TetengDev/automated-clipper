@@ -636,6 +636,62 @@ def test_cli_logging_keeps_httpx_request_lines_out(monkeypatch: pytest.MonkeyPat
     assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "ERROR: [youtube] x: Private video. Sign in if you've been granted access",
+        "ERROR: [youtube] x: Video unavailable. This video has been removed by the uploader",
+        "ERROR: [youtube] x: Join this channel to get access to members-only content",
+    ],
+)
+def test_only_private_removed_and_members_only_are_unavailable(
+    stderr: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    runner = FakeRunner({watch(V1): RunResult(1, "", stderr)})
+
+    with caplog.at_level(logging.WARNING):
+        meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
+
+    assert meta.unavailable == {V1} and meta.errors == {}
+    assert f"{V1}: unavailable" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # Also what a YouTube player / n-sig breakage looks like: retry, never give up.
+        "ERROR: [youtube] x: Requested format is not available. Use --list-formats",
+        "ERROR: [youtube] x: Sign in to confirm your age. This video may be inappropriate",
+    ],
+)
+def test_format_and_age_errors_are_retryable_not_unavailable(stderr: str) -> None:
+    runner = FakeRunner({watch(V1): RunResult(1, "", stderr)})
+
+    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
+
+    assert meta.unavailable == set()
+    assert set(meta.errors) == {V1}
+
+
+def test_metadata_probes_and_listings_ignore_missing_formats() -> None:
+    url = f"https://www.youtube.com/channel/{CHANNEL}/videos"
+    runner = FakeRunner({watch(V1): ok_json(info(V1)), url: ok_json({"entries": []})})
+    provider = YtDlpProvider(YtDlp(runner=runner))
+
+    provider.videos([V1])
+    provider.uploads(CHANNEL)
+
+    assert all("--ignore-no-formats-error" in call for call in runner.calls)
+
+
+def test_pipeline_probe_still_fails_on_missing_formats() -> None:
+    runner = FakeRunner({watch(V1): ok_json(info(V1))})
+
+    YtDlp(runner=runner).probe(watch(V1))
+
+    assert "--ignore-no-formats-error" not in runner.calls[0]
+
+
 def test_lookalike_channel_id_from_ytdlp_is_rejected() -> None:
     lookalike = "UCХ6OQ3DkcsbYNE6H8uQQuVA"  # Cyrillic Ha instead of X
     runner = FakeRunner(

@@ -152,7 +152,14 @@ def make_job(conn: sqlite3.Connection, *, is_stream: bool = False) -> Job:
 
 
 def make_ctx(conn: sqlite3.Connection, media: Path, **settings: Any) -> StageContext:
-    config = AppConfig(settings=Settings(**settings))
+    """MrBeast is configured (challenge_stunt): an unknown creator is always sensitive."""
+    mrbeast = {
+        "name": "MrBeast",
+        "region": "global",
+        "content_type": "challenge_stunt",
+        "youtube": {"handle": "@MrBeast"},
+    }
+    config = AppConfig.model_validate({"settings": settings, "creators": [mrbeast]})
     return StageContext(media, conn, config, clock=lambda: T0)
 
 
@@ -819,7 +826,8 @@ def test_unknown_transcript_language_falls_back_to_creator_language(conn, media)
 
     (media / ARTIFACT).unlink()
     plain = FakeAnthropic("valid.json")
-    run(make_job(conn), make_ctx(conn, media), plain)  # unknown creator: stays "unknown"
+    unknown = StageContext(media, conn, AppConfig(), clock=lambda: T0)
+    run(make_job(conn), unknown, plain)  # unknown creator: stays "unknown"
     assert "Video language: unknown" in plain.requests[0]["system"][1]["text"]
 
 
@@ -1451,22 +1459,28 @@ def test_other_content_types_keep_the_models_sensitive_value(conn, media, conten
     assert out["clips"][0]["sensitive"] is flag
 
 
-def test_creator_without_content_type_keeps_the_models_sensitive_value(conn, media):
-    reply = (200, _message([_cand(30.1, 60.6, payoff_s=40.0, open_question="", sensitive=True)]))
-    plain = run(_raffy_job(conn), _raffy_ctx(conn, media, None), FakeAnthropic("valid.json"))
-    (media / ARTIFACT).unlink()
-    flagged = run(_raffy_job(conn), _raffy_ctx(conn, media, None), FakeAnthropic(reply))
-    assert [c["sensitive"] for c in plain["clips"]] == [False, False, False]
-    assert flagged["clips"][0]["sensitive"] is True
+def test_creator_without_content_type_is_forced_sensitive(conn, media):
+    """CLP-87 review M1: no content type means the rule is unknown; fail closed."""
+    out = run(_raffy_job(conn), _raffy_ctx(conn, media, None), FakeAnthropic("valid.json"))
+    assert [c["sensitive"] for c in out["clips"]] == [True, True, True]
 
 
-def test_finalize_forces_sensitive_only_for_public_service():
+@pytest.mark.parametrize("creator", ["manual", "Raffy Tulfo In Action!", "MrBeast2"])
+def test_unconfigured_creator_is_forced_sensitive(conn, media, creator):
+    """CLP-87 review M1: `clipper enqueue` (creator "manual"), a renamed creator or a
+    look-alike name has no config entry; its clips are always sensitive."""
+    job, _ = enqueue(conn, YT, T0, creator=creator)
+    out = run(job, make_ctx(conn, media), FakeAnthropic("valid.json"))
+    assert [c["sensitive"] for c in out["clips"]] == [True, True, True]
+
+
+def test_finalize_forces_sensitive_only_when_asked():
     words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(100)]
     base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
     cand = Candidate(start_s=10.1, end_s=40.6, sensitive=False, **base)
 
-    (forced,) = select.finalize([cand], words, Settings(), 3, ContentType.PUBLIC_SERVICE)
-    (kept,) = select.finalize([cand], words, Settings(), 3, ContentType.COMEDY)
+    (forced,) = select.finalize([cand], words, Settings(), 3, force_sensitive=True)
+    (kept,) = select.finalize([cand], words, Settings(), 3, force_sensitive=False)
     (default,) = select.finalize([cand], words, Settings(), 3)
 
     assert (forced["sensitive"], kept["sensitive"], default["sensitive"]) == (True, False, False)

@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from clipper.config import AppConfig, Settings
+from clipper.config import AppConfig, ContentType, Settings
 from clipper.jobs import Deferred, Job, PermanentError, StageContext
 from clipper.pipeline import select
 from clipper.pipeline.select import ARTIFACT, MODEL, OUTPUT_SCHEMA, InvalidModelOutput
@@ -156,7 +156,7 @@ def test_cli_command_is_isolated_and_has_no_tools(conn, media):
     assert _flag(args, "--output-format") == "json"
     assert json.loads(_flag(args, "--json-schema")) == OUTPUT_SCHEMA
     # System prompt: the same blocks the API path sends, joined.
-    system = select.build_system("MrBeast", "en", ())
+    system = select.build_system("MrBeast", "en", (), ContentType.CHALLENGE_STUNT)
     assert call["system"] == "\n\n".join(block["text"] for block in system)
     # The untrusted transcript goes on stdin, never into argv.
     assert "<transcript>" in call["stdin"] and "w42" in call["stdin"]

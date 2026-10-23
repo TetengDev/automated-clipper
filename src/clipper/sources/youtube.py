@@ -17,10 +17,11 @@ Network XML is parsed with defusedxml only. Every video ID is validated against 
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -45,7 +46,11 @@ API_BATCH = 50
 FALLBACK_ITEMS = 15
 """The feed carries the latest 15 uploads; the fallback listing asks for as many."""
 FEED_MAX_BYTES = 2 * 1024 * 1024
+API_MAX_BYTES = 4 * 1024 * 1024
+"""50 videos with full snippets stay well under 1 MiB."""
 HTTP_TIMEOUT = httpx.Timeout(20.0)
+_HTTPX_ERRORS = (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, httpx.CookieConflict)
+"""Everything httpx raises for a request; InvalidURL and StreamError are not HTTPErrors."""
 CHANNEL_ID = re.compile(r"UC[\w-]{22}")
 
 LiveStatus = Literal["not_live", "is_live", "is_upcoming", "post_live", "was_live"]
@@ -182,17 +187,49 @@ def parse_feed(data: bytes) -> list[Upload]:
     )
 
 
+class _TooLarge(Exception):
+    pass
+
+
+def get_capped(
+    http: httpx.Client,
+    url: str,
+    *,
+    params: Mapping[str, str | int],
+    limit: int,
+    what: str,
+    headers: Mapping[str, str] | None = None,
+) -> tuple[int, bytes]:
+    """GET `url`, streaming the (decompressed) body and giving up past `limit` bytes, so
+    neither a huge nor a compression-bomb response is ever held in memory.
+
+    Returns (status, body). Any httpx failure becomes a SourceError naming only the
+    exception type: messages and chains can carry the request, headers included."""
+    try:
+        with http.stream("GET", url, params=params, headers=headers) as response:
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                body += chunk
+                if len(body) > limit:
+                    raise _TooLarge
+            return response.status_code, bytes(body)
+    except _TooLarge:
+        raise SourceError(f"{what}: response too large (over {limit} bytes)") from None
+    except _HTTPX_ERRORS as exc:
+        raise SourceError(f"{what} request failed ({type(exc).__name__})") from None
+
+
 def feed_uploads(http: httpx.Client, channel_id: str) -> list[Upload]:
     """The channel's latest uploads from its RSS feed (no quota)."""
     try:
-        response = http.get(FEED_URL, params={"channel_id": channel_id})
-    except httpx.HTTPError as exc:
-        raise FeedError(f"feed request failed ({type(exc).__name__})") from None
-    if response.status_code != 200:
-        raise FeedError(f"feed returned HTTP {response.status_code}")
-    if len(response.content) > FEED_MAX_BYTES:
-        raise FeedError("feed too large")
-    return parse_feed(response.content)
+        status, data = get_capped(
+            http, FEED_URL, params={"channel_id": channel_id}, limit=FEED_MAX_BYTES, what="feed"
+        )
+    except SourceError as exc:
+        raise FeedError(str(exc)) from None
+    if status != 200:
+        raise FeedError(f"feed returned HTTP {status}")
+    return parse_feed(data)
 
 
 def iso_duration(text: str) -> int | None:
@@ -306,23 +343,22 @@ class ApiProvider:
 
     def _get(self, endpoint: str, params: dict[str, str | int]) -> dict[str, Any]:
         self.quota.units += 1
+        status, data = get_capped(
+            self.http,
+            f"{API_BASE}/{endpoint}",
+            params=params,
+            headers={"X-Goog-Api-Key": self.api_key},
+            limit=API_MAX_BYTES,
+            what=f"YouTube API {endpoint}",
+        )
         try:
-            response = self.http.get(
-                f"{API_BASE}/{endpoint}", params=params, headers={"X-Goog-Api-Key": self.api_key}
-            )
-        except httpx.HTTPError as exc:
-            # `from None`: keep the request (and its headers) out of the exception chain.
-            raise SourceError(
-                f"YouTube API {endpoint} request failed ({type(exc).__name__})"
-            ) from None
-        try:
-            body = response.json()
+            body = json.loads(data)
         except ValueError:
             body = None
-        if response.status_code != 200:
+        if status != 200:
             reason = _api_reason(body)
-            message = redact(f"YouTube API {endpoint}: HTTP {response.status_code} ({reason})")
-            raise ApiError(message.replace(self.api_key, "REDACTED"), response.status_code)
+            message = redact(f"YouTube API {endpoint}: HTTP {status} ({reason})")
+            raise ApiError(message.replace(self.api_key, "REDACTED"), status)
         if not isinstance(body, dict):
             raise SourceError(f"YouTube API {endpoint}: unexpected response")
         return body

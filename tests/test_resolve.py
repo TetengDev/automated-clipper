@@ -222,6 +222,31 @@ def test_write_never_follows_a_planted_temp_symlink(small: Path, tmp_path: Path)
     assert leftovers == {f".{small.name}.resolve.tmp", f".{small.name}.tmp"}  # ours are gone
 
 
+def test_temp_file_is_written_through_its_exclusive_handle(
+    small: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_open = Path.open
+    real_write_text = Path.write_text
+
+    def no_reopen_for_writing(self: Path, mode: str = "r", *args, **kwargs):
+        if self.name.endswith(".tmp") and any(c in mode for c in "wax+"):
+            raise AssertionError(f"temp file reopened by path for writing: {self.name}")
+        return real_open(self, mode, *args, **kwargs)
+
+    def no_write_text(self: Path, *args, **kwargs):
+        if self.name.endswith(".tmp"):
+            raise AssertionError(f"temp file rewritten by path: {self.name}")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", no_reopen_for_writing)
+    monkeypatch.setattr(Path, "write_text", no_write_text)
+
+    write_ids(small, [Resolved("MrBeast", "youtube", "@MrBeast", None, IDS["@MrBeast"])])
+
+    assert load_config(small).creator("MrBeast").youtube.channel_id == IDS["@MrBeast"]
+    assert list(small.parent.iterdir()) == [small]
+
+
 # --- Twitch -------------------------------------------------------------------------------
 
 

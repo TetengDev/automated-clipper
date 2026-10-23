@@ -333,6 +333,12 @@ def test_clip_starting_on_a_scene_cut_may_start_later() -> None:
     assert q.edl_reasons(edl, starts_on_cut=True) == []
 
 
+def test_long_dead_air_after_a_scene_cut_is_still_late() -> None:
+    """The cut allowance is only the snap tolerance: 3 s of silence after a cut is flagged
+    (review pass 2; the trim falls back to a cut when the clip would be too short)."""
+    assert q.edl_reasons(_edl([("hi", 13.0, 13.3)]), starts_on_cut=True) == ["late_speech"]
+
+
 def test_join_window_counts_a_word_reaching_in_from_outside_on_both_sides() -> None:
     """An EDL word that starts before the window but runs into it is matched the same way
     on the heard side, so a perfect transcription passes (review pass 1)."""

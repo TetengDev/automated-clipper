@@ -320,7 +320,7 @@ _PERMANENT: tuple[tuple[re.Pattern[str], str], ...] = tuple(
             r"account .*has been terminated|no longer available|video .*does not exist",
             "removed or unavailable",
         ),
-        (r"requested format is not available", NO_FORMAT),
+        (r"requested format is not available|no video formats found", NO_FORMAT),
     )
 )
 # YouTube's rate-limit page says "Video unavailable ... try again later": not permanent.
@@ -465,14 +465,16 @@ class YtDlp:
     def download_audio(
         self, url: str, out_dir: Path, stem: str, *, info_json: Path | None = None
     ) -> Path:
-        """Download the best audio-only format (`-f bestaudio`, never video) into
-        `out_dir/<stem>.<ext>` and return that path.
+        """Download the best audio-only format into `out_dir/<stem>.<ext>` and return that
+        path. `-f bestaudio/best`: when a video has only muxed formats (the probe's default
+        selector accepts those), the best muxed one; the caller's ffmpeg keeps only audio.
 
         `info_json` (from a previous `probe`) skips a second metadata request. `stem` must
         be a fixed, safe name chosen by the caller.
         """
         extra = [
-            "-f", "bestaudio", "--max-filesize", AUDIO_MAX_FILESIZE, "-o", _template(out_dir, stem),
+            "-f", "bestaudio/best", "--max-filesize", AUDIO_MAX_FILESIZE,
+            "-o", _template(out_dir, stem),
         ]  # fmt: skip
         if info_json is not None:
             extra += ["--load-info-json", str(info_json)]

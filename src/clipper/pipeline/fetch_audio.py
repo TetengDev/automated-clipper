@@ -1,8 +1,9 @@
 """Stage `fetching_audio` (CLP-13): download audio only and normalize it for transcription.
 
 Steps: probe metadata (no download) -> filters (live/upcoming, min duration) -> download
-`-f bestaudio` (never a video stream) -> ffmpeg to 16 kHz mono FLAC -> ebur128 loudness
-peaks -> write `meta.json` and `signals.json` -> rename the FLAC into place LAST.
+`-f bestaudio/best` (muxed only when there is no audio-only format) -> ffmpeg to 16 kHz
+mono FLAC (audio only) -> ebur128 loudness peaks -> write `meta.json` and `signals.json`
+-> rename the FLAC into place LAST.
 
 `audio_16k.flac` is the declared artifact, so a crash anywhere before the final rename
 leaves the stage re-runnable. All file names are fixed constants inside the job's media

@@ -1194,7 +1194,7 @@ PLAYBOOK_HASHES = {
     "playbook_v2": "3dc5ccc078acc698219c935b465d53374f58c408fe0e8a6aff1a1cd0e7105398",
     "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
     "playbook_v4": "97b8707018c24c6772d5f76d3d637f7ed6ed8b8f620942ffb790437a6cd16689",
-    "playbook_v5": "78421c7efeb9bb77d09e18e3cda16d4133a944366fe88010ee694ab417d4f044",
+    "playbook_v5": "8ff38dc35a8f740022e1cacd3cd08a235626d83ad7d08ed977c65556bf96b59b",
 }
 
 
@@ -1496,13 +1496,32 @@ def test_assembled_static_prompt_carries_the_protected_people_rules():
         assert "private complainant in any other case" in static
 
 
-def test_playbook_v5_never_choose_a_moment_that_shows_a_protected_persons_face():
-    """CLP-87: the at-any-point rule covers faces too. The model cannot see the video, so
-    this only catches what the transcript gives away ("ipakita mo ang mukha"); the reviewer
-    checks the rest."""
+def test_playbook_v5_on_camera_rule_is_in_terms_the_transcript_shows():
+    """CLP-87 review: the model cannot see faces, so the rule names what a transcript shows
+    (called forward, introduced, speaking) and leaves faces to the reviewer."""
     assert select.PLAYBOOK_VERSION == "playbook_v5"
     universal = _flat(select.load_playbook("universal"))
     assert (
         "Never choose a moment in which anyone, at any point, says something that identifies"
-        " them or shows their face: the subtitles show every spoken word" in universal
+        " them: the subtitles show every spoken word" in universal
     )
+    assert (
+        "or a relationship combined with a place. Also never choose a moment in which the"
+        " transcript shows they are on camera (they are called forward, introduced, or"
+        " speak). Faces are checked by the reviewer, who sees the video." in universal
+    )
+    hook_rule = _flat(select.load_system_prompt())
+    assert (
+        "a role in the hook does not hide it. Nor one in which the transcript shows a"
+        " protected person is on camera (called forward, introduced, or speaking); the"
+        " reviewer checks faces." in hook_rule
+    )
+    for text in (universal, hook_rule):
+        assert "shows their face" not in text
+
+
+@pytest.mark.parametrize("name", ["playbook/universal.md", "select_v2.md"])
+def test_prompt_lines_are_wrapped(name):
+    """CLP-87 review: the reflowed rule left a 104-character line."""
+    path = Path(select.__file__).parent / "prompts" / name
+    assert max(len(line) for line in path.read_text().splitlines()) < 100  # existing: <= 91

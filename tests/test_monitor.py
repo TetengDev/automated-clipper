@@ -521,6 +521,44 @@ def test_upload_after_the_first_poll_is_still_enqueued_later(conn, cfg, source, 
     assert report.items_new == 1
 
 
+def test_rounded_listing_date_does_not_baseline_an_upload_after_the_first_poll(
+    conn, cfg, source, clock
+) -> None:
+    # yt-dlp's approximate_date rounds "1 hour ago" to the NEAREST hour: an upload at
+    # 12:10, listed at 13:15, gets 12:00, before the 12:01 first poll's cutoff.
+    clock.now = T0 + timedelta(minutes=1)
+    source.feeds[BEAST] = [Upload(V1, T0 - timedelta(days=1))]
+    monitor = make(conn, cfg, source, clock)
+    monitor.run_cycle([cfg.creator("MrBeast")])  # baseline at 12:01
+
+    clock.now = T0 + timedelta(minutes=75)
+    source.feeds[BEAST] = [Upload(V2, T0), *source.feeds[BEAST]]
+    source.meta[V2] = VideoMeta(V2, "New", 1200, "not_live", T0 + timedelta(minutes=10))
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert source.metadata_calls == [[V2]]  # probed, not prefiltered on the rounded date
+    assert seen(conn)[V2] == "enqueued" and report.items_new == 1
+
+
+def test_day_precision_date_gets_a_day_of_slack(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)  # first poll at 2026-10-01T00:00Z (baseline cutoff)
+    clock.now = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+    source.feeds[BEAST] = [Upload(V1, None), Upload(V2, None)]
+    midnight = datetime(2026, 10, 1, tzinfo=UTC)
+    source.meta.update(
+        {
+            # upload_date only: "some time that day", possibly after the first poll
+            V1: VideoMeta(V1, "a", 1200, "not_live", midnight - timedelta(days=1), True),
+            V2: VideoMeta(V2, "b", 1200, "not_live", midnight - timedelta(days=2), True),
+        }
+    )
+
+    make(conn, cfg, source, clock).run_cycle([cfg.creator("MrBeast")])
+
+    assert seen(conn)[V1] == "enqueued"
+    assert seen(conn)[V2] == "baseline"  # clearly before the cutoff, slack or not
+
+
 # --- isolation, runs rows, unresolved creators ---------------------------------------------
 
 

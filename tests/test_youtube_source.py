@@ -239,6 +239,12 @@ def test_ytdlp_provider_upcoming_event_error_is_upcoming() -> None:
     assert meta.videos[V1].live_status == "is_upcoming"
 
 
+def test_ytdlp_provider_exact_timestamp_is_not_day_precision() -> None:
+    runner = FakeRunner({watch(V1): ok_json(info(V1))})
+
+    assert YtDlpProvider(YtDlp(runner=runner)).videos([V1]).videos[V1].day_precision is False
+
+
 def test_ytdlp_provider_falls_back_to_upload_date_and_drops_bad_duration() -> None:
     runner = FakeRunner(
         {watch(V1): ok_json(info(V1, timestamp=None, upload_date="20261017", duration="x"))}
@@ -247,6 +253,7 @@ def test_ytdlp_provider_falls_back_to_upload_date_and_drops_bad_duration() -> No
     video = YtDlpProvider(YtDlp(runner=runner)).videos([V1]).videos[V1]
 
     assert video.published == datetime(2026, 10, 17, tzinfo=UTC)
+    assert video.day_precision is True
     assert video.duration_s is None
 
 

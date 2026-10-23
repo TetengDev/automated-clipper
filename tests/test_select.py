@@ -19,7 +19,7 @@ import anthropic
 import httpx2
 import pytest
 
-from clipper.config import AppConfig, Settings
+from clipper.config import AppConfig, ContentType, Settings
 from clipper.db import connect, migrate
 from clipper.jobs import (
     Deferred,
@@ -1388,3 +1388,85 @@ def test_non_finite_payoff_is_rejected(payoff):
     base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
     with pytest.raises(ValueError):
         Candidate(start_s=10, end_s=30, payoff_s=payoff, **base)
+
+
+# --- CLP-87: public_service clips are always sensitive ------------------------------------------
+
+RAFFY = "Raffy Tulfo in Action"
+
+
+def _raffy_ctx(conn, media, content_type: str | None = "public_service") -> StageContext:
+    creator: dict[str, Any] = {
+        "name": RAFFY,
+        "region": "ph",
+        "language": "tl",
+        "youtube": {"handle": "@RaffyTulfoInAction"},
+    }
+    if content_type is not None:
+        creator["content_type"] = content_type
+    config = AppConfig.model_validate({"creators": [creator]})
+    return StageContext(media, conn, config, clock=lambda: T0)
+
+
+def _raffy_job(conn: sqlite3.Connection) -> Job:
+    job, _ = enqueue(conn, YT, T0, creator=RAFFY)
+    return job
+
+
+def _name_a_victim_mid_clip(media: Path) -> None:
+    """A VAWC complaint whose segment at 50 s names the child (the model misses it)."""
+    path = media / "transcript.json"
+    transcript = json.loads(path.read_text())
+    lines = {
+        30: "Idol, hindi po nagbibigay ng sustento ang asawa ko",
+        40: "tatlong taon na po, may dalawa kaming anak",
+        50: "yung panganay ko po si Maria Santos, twelve years old, sa Barangay Malinis",
+        60: "sige tawagan natin ang asawa mo ngayon din",
+        70: "opo Idol, magbibigay na po ako buwan buwan",
+    }
+    for segment in transcript["segments"]:
+        if text := lines.get(int(segment["start"])):
+            segment["text"] = text
+    path.write_text(json.dumps(transcript))
+
+
+def test_public_service_clip_naming_a_victim_mid_clip_is_forced_sensitive(conn, media):
+    """CLP-87: the recorded reply leaves `sensitive` false although the child is named at
+    50 s, inside the first clip; every public_service clip ends up sensitive anyway."""
+    _name_a_victim_mid_clip(media)
+    fake = FakeAnthropic("public_service_unflagged.json")
+    out = run(_raffy_job(conn), _raffy_ctx(conn, media), fake)
+
+    assert "Maria Santos" in fake.requests[0]["messages"][0]["content"]
+    replied = json.loads(fixture("public_service_unflagged.json")["content"][-1]["text"])
+    assert [c["sensitive"] for c in replied["clips"]] == [False, False]
+    assert [(c["start_s"], c["sensitive"]) for c in out["clips"]] == [(30.1, True), (200.1, True)]
+
+
+@pytest.mark.parametrize("content_type", [t for t in CONTENT_TYPES if t != "public_service"])
+@pytest.mark.parametrize("flag", [False, True])
+def test_other_content_types_keep_the_models_sensitive_value(conn, media, content_type, flag):
+    reply = (200, _message([_cand(30.1, 60.6, payoff_s=40.0, open_question="", sensitive=flag)]))
+    out = run(_raffy_job(conn), _raffy_ctx(conn, media, content_type), FakeAnthropic(reply))
+    assert out["clips"][0]["sensitive"] is flag
+
+
+def test_creator_without_content_type_keeps_the_models_sensitive_value(conn, media):
+    reply = (200, _message([_cand(30.1, 60.6, payoff_s=40.0, open_question="", sensitive=True)]))
+    plain = run(_raffy_job(conn), _raffy_ctx(conn, media, None), FakeAnthropic("valid.json"))
+    (media / ARTIFACT).unlink()
+    flagged = run(_raffy_job(conn), _raffy_ctx(conn, media, None), FakeAnthropic(reply))
+    assert [c["sensitive"] for c in plain["clips"]] == [False, False, False]
+    assert flagged["clips"][0]["sensitive"] is True
+
+
+def test_finalize_forces_sensitive_only_for_public_service():
+    words = [select._Word(word=f"w{i}", start=i + 0.1, end=i + 0.6) for i in range(100)]
+    base = {"hook": "h", "title": "t", "caption": "c", "hashtags": [], "reason": "r", "score": 5}
+    cand = Candidate(start_s=10.1, end_s=40.6, sensitive=False, **base)
+
+    (forced,) = select.finalize([cand], words, Settings(), 3, ContentType.PUBLIC_SERVICE)
+    (kept,) = select.finalize([cand], words, Settings(), 3, ContentType.COMEDY)
+    (default,) = select.finalize([cand], words, Settings(), 3)
+
+    assert (forced["sensitive"], kept["sensitive"], default["sensitive"]) == (True, False, False)

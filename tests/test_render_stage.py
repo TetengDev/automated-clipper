@@ -1169,6 +1169,29 @@ def test_sensitive_flag_is_passed_through(
     assert [r["sensitive"] for r in _rows(conn)] == [1, 0]
 
 
+@pytest.mark.parametrize(("content_type", "expected"), [("public_service", [1, 1]), (None, [0, 0])])
+def test_public_service_creator_stores_every_clip_as_sensitive(
+    conn: sqlite3.Connection,
+    media: Path,
+    fake: FakeRender,
+    content_type: str | None,
+    expected: list[int],
+) -> None:
+    """CLP-87: a stale or hand-edited highlights.json cannot store a public_service clip
+    as not sensitive."""
+    creator = Creator(
+        name="Raffy",
+        region="ph",
+        content_type=content_type,
+        youtube=YouTubeChannel(handle="@raffy"),
+    )
+    job, _ = enqueue(conn, SourceRef("youtube", "dQw4w9WgXcQ"), T0, creator="Raffy")
+    _setup(media, [_highlight(1, 10.0, 15.0, sensitive=False), _highlight(2, 30.5, 40.5)])
+    config = AppConfig(creators=(creator,))
+    rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
+    assert [r["sensitive"] for r in _rows(conn)] == expected
+
+
 @pytest.mark.parametrize("bad", ["yes", 1, None, ["x"]])
 def test_non_boolean_sensitive_is_invalid_metadata(
     conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender, bad: Any

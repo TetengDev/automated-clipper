@@ -73,10 +73,6 @@ NOT_FINISHED: frozenset[str] = frozenset({"is_live", "is_upcoming", "post_live"}
 """Live now, scheduled, or a finished stream whose VOD is still processing."""
 GONE_REASONS: frozenset[str] = frozenset({"private", "members-only", "removed or unavailable"})
 """`Unavailable.reason`s that mean nobody can fetch it: recorded once, never retried."""
-GONE_AVAILABILITY: frozenset[str] = frozenset({"private", "subscriber_only"})
-"""yt-dlp `availability` values meaning the same, should a probe ever exit 0 for one."""
-GATED_AVAILABILITY: frozenset[str] = frozenset({"needs_auth", "premium_only"})
-"""Fetchable only with an account (cookies): retried like other metadata errors."""
 NO_FORMAT = "requested format not available"
 """The `Unavailable.reason` of a format selection failure (e.g. a YouTube player change)."""
 
@@ -336,14 +332,12 @@ class YtDlpProvider:
                 else:
                     result.errors[video_id] = str(exc)
             else:
-                availability = info.get("availability")
-                if availability in GONE_AVAILABILITY:
-                    logger.warning("%s: unavailable (%s), not retried", video_id, availability)
-                    result.unavailable.add(video_id)
-                elif availability in GATED_AVAILABILITY:
-                    result.errors[video_id] = f"video is {availability}"
-                else:
-                    result.videos[video_id] = self._meta(video_id, info)
+                # `availability` is not checked: a probe that returns always lists formats
+                # (yt-dlp fails without the flag; `_probe` rejects a re-probe without), so
+                # this account can fetch it, e.g. an 18+ or members' video with cookies.
+                # Without formats, availability could mean something, but a playability
+                # failure would then be hidden too; the next poll's plain probe says which.
+                result.videos[video_id] = self._meta(video_id, info)
         return result
 
     def _probe(self, url: str) -> dict[str, Any]:

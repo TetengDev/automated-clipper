@@ -226,19 +226,43 @@ class NoUsableFormat(Deferred):
     """yt-dlp found no format to download (a player breakage); try again later."""
 
 
+def _format_errors_since(marker: Path, now: datetime) -> datetime:
+    """When the current format-error episode began. `marker` holds that start and the last
+    format error (one ISO time per line; a marker from before CLP-85 holds only the start).
+    An episode with no format error for NO_FORMAT_MAX_AGE is over, so one picked up late
+    (a busy or stopped worker) still counts from its start, not from now."""
+    start = None
+    try:
+        stamps = [datetime.fromisoformat(s) for s in marker.read_text(encoding="utf-8").split()]
+        first, last = stamps[0], stamps[-1]
+        aware = first.tzinfo is not None and last.tzinfo is not None
+        if aware and first <= now and now - last <= NO_FORMAT_MAX_AGE:
+            start = first
+    except (OSError, ValueError, IndexError):
+        pass
+    start = start or now
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_name(f"{marker.name}.tmp")
+    stamp = "\n".join(t.astimezone(UTC).isoformat() for t in (start, now))
+    tmp.write_text(stamp, encoding="utf-8")
+    os.replace(tmp, marker)
+    return start
+
+
 @contextmanager
 def deferring_no_format(marker: Path, clock: Callable[[], datetime]) -> Iterator[None]:
     """Turn a yt-dlp format error inside the block into `NoUsableFormat` (+30 min, no
     attempt used), until format errors have lasted NO_FORMAT_MAX_AGE for this stage
-    (`marker`, one per stage); then a `PermanentError`. A marker older than the cap plus
-    one retry is from an earlier episode and starts over. Remove `marker` on success."""
+    (`marker`, one per stage); then a `PermanentError`. A marker whose last format error
+    is older than the cap is from an earlier episode and starts over. Remove `marker` on
+    success."""
     try:
         yield
     except ytdlp.Unavailable as exc:
         if exc.reason != ytdlp.NO_FORMAT:
             raise
         now = clock()
-        since = first_seen(marker, now, max_age=NO_FORMAT_MAX_AGE + NO_FORMAT_RETRY)
+        since = _format_errors_since(marker, now)
         if now - since > NO_FORMAT_MAX_AGE:
             hours = NO_FORMAT_MAX_AGE.total_seconds() / 3600
             raise PermanentError(f"{exc} (for {hours:.0f} h; giving up)") from None

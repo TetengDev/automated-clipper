@@ -599,6 +599,18 @@ def test_day_precision_date_gets_a_day_of_slack(conn, cfg, source, clock) -> Non
 # --- isolation, runs rows, unresolved creators ---------------------------------------------
 
 
+def test_listing_killed_by_stop_is_not_recorded_as_an_error(conn, cfg, source, clock) -> None:
+    monitor = make(conn, cfg, source, clock)
+    source.on_feed = lambda channel_id: monitor.stop.set()  # SIGTERM mid-listing
+    source.feeds[BEAST] = SourceError("feed: HTTP 404; fallback: yt-dlp listing failed: cancelled")
+
+    report = monitor.run_cycle([cfg.creator("MrBeast"), cfg.creator("IShowSpeed")])
+
+    assert report.errors == []
+    assert runs(conn)[-1]["errors"] is None
+    assert source.feed_calls == [BEAST]  # the cycle ends there
+
+
 def test_one_creator_raising_does_not_stop_the_others(conn, cfg, source, clock) -> None:
     source.feeds[BEAST] = SourceError("feed: HTTP 500; fallback: blocked")
     source.feeds[SPEED] = [Upload(V2, T0)]
@@ -835,11 +847,12 @@ def test_default_source_is_rss_gated_and_keyless() -> None:
 
 
 def test_http_timeouts_fit_the_shutdown_bound() -> None:
-    from clipper.sources.youtube import HTTP_TIMEOUT
+    from clipper.sources.youtube import HTTP_DEADLINE_S, HTTP_TIMEOUT
 
-    assert HTTP_TIMEOUT.connect <= 5
-    assert HTTP_TIMEOUT.read <= 8
-    assert HTTP_TIMEOUT.write <= 8 and HTTP_TIMEOUT.pool <= 8
+    # A request gives up at the first chunk past the deadline; the slowest it can get
+    # there is the deadline plus one blocked read. All of it inside SIGTERM's 10 s.
+    assert HTTP_TIMEOUT.connect <= HTTP_DEADLINE_S
+    assert HTTP_DEADLINE_S + max(HTTP_TIMEOUT.read, HTTP_TIMEOUT.pool) < 10
 
 
 def test_stop_kills_an_in_flight_probe_and_the_monitor_exits_quickly(

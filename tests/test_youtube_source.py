@@ -807,3 +807,25 @@ def test_any_httpx_failure_of_the_api_is_a_source_error(
     with pytest.raises(SourceError, match=type(error).__name__) as info_:
         ApiProvider(http, KEY).videos([V1])
     assert info_.value.__suppress_context__
+
+
+class Ticking:
+    """A clock that moves `step` seconds every time it is read."""
+
+    def __init__(self, step: float) -> None:
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        self.now += self.step
+        return self.now
+
+
+@respx.mock
+def test_trickling_response_is_cut_off_at_the_deadline(http: httpx.Client) -> None:
+    body = Endless()  # every chunk "takes" 2 s on the ticking clock
+    respx.get(yt.FEED_URL).mock(return_value=httpx.Response(200, content=body))
+
+    with pytest.raises(SourceError, match="took longer than"):
+        yt.get_capped(http, yt.FEED_URL, params={}, limit=1 << 40, what="feed", clock=Ticking(2.0))
+    assert body.pulled <= yt.HTTP_DEADLINE_S // 2 + 1

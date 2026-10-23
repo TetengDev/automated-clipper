@@ -345,9 +345,7 @@ def test_first_run_is_per_creator(conn, cfg, source, clock) -> None:
     ],
 )
 def test_new_item_filters(conn, cfg, source, clock, meta, status: SeenStatus) -> None:
-    conn.execute(  # not the creator's first poll
-        "INSERT INTO seen_items VALUES ('youtube', 'zzzzzzzzzzz', 'MrBeast', 'baseline', 'x', 'x')"
-    )
+    not_first_poll(conn)
     source.feeds[BEAST] = [Upload(V1, T0)]
     source.meta[V1] = meta
 
@@ -454,6 +452,71 @@ def test_bot_check_is_retried_every_poll_and_never_gives_up(conn, cfg, source, c
     assert report.errors == [
         {"creator": "MrBeast", "item": V1, "error": "blocked by platform (bot check)"}
     ]
+
+
+def test_interrupted_emit_first_poll_keeps_its_lookback_after_restart(
+    conn, cfg, source, clock
+) -> None:
+    source.feeds[BEAST] = [Upload(V1, T0 - timedelta(days=1)), Upload(V2, None)]  # V2: undated
+    source.meta.update({V1: video(V1, age_days=1), V2: video(V2, age_days=30)})
+    first = make(conn, cfg, source, clock, first_run_mode=FirstRun.EMIT)
+    original = source.videos
+
+    def stop_after_first(ids, should_stop):
+        return original(ids, lambda: first.stop.is_set() or bool(first.stop.set()))
+
+    source.videos = stop_after_first  # type: ignore[method-assign]
+    first.run_cycle([cfg.creator("MrBeast")])  # SIGTERM after V1: V2 never looked at
+    assert seen(conn) == {V1: "enqueued"}
+
+    source.videos = original  # type: ignore[method-assign]
+    clock.now += timedelta(minutes=10)
+    restarted = make(conn, cfg, source, clock, first_run_mode=FirstRun.EMIT)
+    report = restarted.run_cycle([cfg.creator("MrBeast")])
+
+    assert report.items_new == 0
+    assert seen(conn) == {V1: "enqueued", V2: "baseline"}  # 30 days old: outside lookback
+
+
+def test_crashed_baseline_first_poll_still_baselines_the_rest(
+    conn, cfg, source, clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source.feeds[BEAST] = [Upload(V1, T0 - timedelta(days=1)), Upload(V2, T0 - timedelta(days=2))]
+    source.meta.update({V1: video(V1, age_days=1), V2: video(V2, age_days=2)})
+    monitor = make(conn, cfg, source, clock)
+    real_record = monitor._record
+    calls = []
+
+    def crash_on_second(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 2:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(monitor, "_record", crash_on_second)
+    monitor.run_cycle([cfg.creator("MrBeast")])
+    assert seen(conn) == {V1: "baseline"}
+
+    monkeypatch.setattr(monitor, "_record", real_record)
+    clock.now += timedelta(minutes=10)
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert report.items_new == 0
+    assert seen(conn) == {V1: "baseline", V2: "baseline"}  # published before the first poll
+    assert jobs(conn) == []
+
+
+def test_upload_after_the_first_poll_is_still_enqueued_later(conn, cfg, source, clock) -> None:
+    source.feeds[BEAST] = [Upload(V1, T0 - timedelta(days=1))]
+    monitor = make(conn, cfg, source, clock)
+    monitor.run_cycle([cfg.creator("MrBeast")])  # baseline at T0
+
+    clock.now = T0 + timedelta(days=3)
+    source.feeds[BEAST] = [Upload(V2, None), *source.feeds[BEAST]]  # undated listing entry
+    source.meta[V2] = video(V2, age_days=-2)  # published a day after the first poll
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert report.items_new == 1
 
 
 # --- isolation, runs rows, unresolved creators ---------------------------------------------

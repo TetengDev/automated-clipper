@@ -369,3 +369,42 @@ def test_run_command_feeds_stdin_from_a_file_and_runs_in_cwd(tmp_path: Path) -> 
     ).stdout.splitlines()
     assert out[0] == "hello from stdin"
     assert Path(out[1]).resolve() == work.resolve()
+
+
+def test_run_command_cancel_kills_the_child_promptly(tmp_path: Path) -> None:
+    import threading
+
+    pid_file = tmp_path / "pid"
+    code = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+    cancel = threading.Event()
+    threading.Timer(0.5, cancel.set).start()
+    started = time.monotonic()
+
+    with pytest.raises(ytdlp.CommandCancelled):
+        run_command([sys.executable, "-c", code], 120, cancel=cancel)
+
+    assert time.monotonic() - started < 5
+    assert ytdlp._group_exists(int(pid_file.read_text())) is False
+
+
+def test_ytdlp_hands_its_cancel_event_to_the_runner() -> None:
+    import threading
+
+    seen: list[object] = []
+
+    def runner(args, timeout_s, **kwargs):
+        seen.append(kwargs.get("cancel"))
+        return ok(json.dumps({"id": "x"}))
+
+    cancel = threading.Event()
+    YtDlp(runner=runner, cancel=cancel).probe(URL)
+    YtDlp(runner=Recorder(ok(json.dumps({"id": "x"})))).probe(URL)  # no cancel: not passed
+
+    assert seen == [cancel]
+
+
+def test_from_env_passes_cancel() -> None:
+    import threading
+
+    cancel = threading.Event()
+    assert YtDlp.from_env(run_command, {}, cancel=cancel).cancel is cancel

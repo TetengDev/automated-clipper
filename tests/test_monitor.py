@@ -7,6 +7,8 @@ import json
 import os
 import signal
 import sqlite3
+import sys
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import closing
@@ -639,7 +641,12 @@ def cli_env(tmp_path: Path, source: FakeSource, monkeypatch: pytest.MonkeyPatch)
     config = tmp_path / "creators.yaml"
     config.write_text(CONFIG)
     db = tmp_path / "scratch" / "state.db"
-    monkeypatch.setattr(cli, "_youtube_source", lambda secrets, http: source)
+
+    def fake_source(secrets, http, cancel):
+        source.cancel = cancel  # the monitor's stop event, for in-flight yt-dlp children
+        return source
+
+    monkeypatch.setattr(cli, "_youtube_source", fake_source)
     return ["--config", str(config), "--db", str(db)], db
 
 
@@ -713,6 +720,7 @@ def test_cli_sigterm_finishes_the_poll_and_exits_quickly(
     assert result.exit_code == 0, result.output
     assert time.monotonic() - started < 10
     assert source.feed_calls == [BEAST]  # the current creator's poll finished; then exit
+    assert source.cancel.is_set()  # the same event cancels a running yt-dlp child
     assert signal.getsignal(signal.SIGTERM) == previous
     with closing(connect(db)) as c:
         [row] = c.execute("SELECT finished_at FROM runs").fetchall()
@@ -742,8 +750,53 @@ def test_cli_missing_cookies_file_fails_cleanly(
 
 
 def test_default_source_is_rss_gated_and_keyless() -> None:
+    stop = threading.Event()
     with httpx.Client() as http:
-        source = cli._youtube_source(Secrets(), http)
+        source = cli._youtube_source(Secrets(), http, stop)
 
     assert isinstance(source, YouTubeSource)
     assert isinstance(source.provider, YtDlpProvider)
+    assert source.provider.ytdlp.cancel is stop
+
+
+def test_http_timeouts_fit_the_shutdown_bound() -> None:
+    from clipper.sources.youtube import HTTP_TIMEOUT
+
+    assert HTTP_TIMEOUT.connect <= 5
+    assert HTTP_TIMEOUT.read <= 8
+    assert HTTP_TIMEOUT.write <= 8 and HTTP_TIMEOUT.pool <= 8
+
+
+def test_stop_kills_an_in_flight_probe_and_the_monitor_exits_quickly(
+    conn, cfg, source, clock, tmp_path: Path
+) -> None:
+    from clipper.pipeline.ytdlp import YtDlp, run_command
+
+    pid_file = tmp_path / "pid"
+    slow = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+
+    def slow_ytdlp(args, timeout_s, **kwargs):  # a yt-dlp probe that hangs
+        return run_command([sys.executable, "-c", slow], timeout_s, **kwargs)
+
+    monitor = make(conn, cfg, source, clock, first_run_mode=FirstRun.EMIT)
+    provider = YtDlpProvider(YtDlp(runner=slow_ytdlp, cancel=monitor.stop))
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.videos = provider.videos  # type: ignore[method-assign]
+    thread = threading.Thread(target=monitor.run_forever, args=([cfg.creator("MrBeast")],))
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert pid_file.exists(), "probe never started"
+
+    stopped_at = time.monotonic()
+    monitor.stop.set()
+    thread.join(10)
+
+    assert not thread.is_alive()
+    assert time.monotonic() - stopped_at < 5
+    assert seen(conn) == {}  # interrupted: V1 is probed again next start
+    assert runs(conn)[-1]["finished_at"] is not None
+    pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

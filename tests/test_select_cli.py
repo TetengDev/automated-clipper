@@ -34,6 +34,7 @@ from test_select import (  # noqa: F401 - pytest fixtures
 
 VALID = json.loads(fixture("valid.json")["content"][-1]["text"])
 TOKEN = "sk-ant-oat01-test-token-value"
+QUIET = {"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
 
 
 def cli_json(structured: Any = VALID, **over: Any) -> str:
@@ -151,6 +152,7 @@ def test_cli_command_is_isolated_and_has_no_tools(conn, media):
     for flag in ("--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"):
         assert flag in args
     assert _flag(args, "--model") == MODEL
+    assert _flag(args, "--max-turns") == "3"  # structured output takes 2
     assert _flag(args, "--output-format") == "json"
     assert json.loads(_flag(args, "--json-schema")) == OUTPUT_SCHEMA
     # System prompt: the same blocks the API path sends, joined.
@@ -170,7 +172,7 @@ def test_cli_env_carries_only_the_subscription_token(conn, media, monkeypatch):
     fake = FakeCli(cli_json())
     run(make_job(conn), cli_ctx(conn, media), fake)
     env = fake.calls[0]["env"]
-    assert set(env) == {"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"}
+    assert set(env) == {"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", *QUIET}
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
     # A token login gets a throwaway config dir (the image's root fs is read-only).
     assert not Path(env["CLAUDE_CONFIG_DIR"]).exists()
@@ -179,7 +181,7 @@ def test_cli_env_carries_only_the_subscription_token(conn, media, monkeypatch):
 def test_cli_without_a_token_uses_the_existing_login(conn, media):
     fake = FakeCli(cli_json())
     run(make_job(conn), cli_ctx(conn, media), fake)
-    assert fake.calls[0]["env"] == {}
+    assert fake.calls[0]["env"] == QUIET
 
 
 def test_cli_without_a_token_keeps_what_the_local_login_needs(conn, media, monkeypatch, tmp_path):
@@ -194,6 +196,7 @@ def test_cli_without_a_token_keeps_what_the_local_login_needs(conn, media, monke
         "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-personal"),
         "USER": "someone",
         "LOGNAME": "someone",
+        **QUIET,
     }
 
 
@@ -296,6 +299,12 @@ def test_invalid_output_twice_raises_invalid_model_output(conn, media):
     with pytest.raises(InvalidModelOutput):
         run(make_job(conn), cli_ctx(conn, media), fake)
     assert len(fake.calls) == 2
+
+
+def test_hitting_the_turn_limit_counts_as_invalid_output(conn, media):
+    over = cli_json(None, is_error=True, subtype="error_max_turns", result="")
+    with pytest.raises(InvalidModelOutput):
+        run(make_job(conn), cli_ctx(conn, media), FakeCli(over, over))
 
 
 def test_refusal_counts_as_an_empty_window(conn, media):

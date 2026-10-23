@@ -358,3 +358,26 @@ def test_invalid_content_type_rejected(tmp_path: Path, bad: str) -> None:
     )
     with pytest.raises(ConfigError, match="content_type"):
         load_config(path)
+
+
+def test_selector_defaults_to_api_with_creator_override() -> None:
+    from clipper.config import AppConfig, Creator, CreatorOverrides, Settings, YouTubeChannel
+
+    creator = Creator(
+        name="Sub",
+        region="ph",
+        youtube=YouTubeChannel(handle="@sub"),
+        overrides=CreatorOverrides(selector="claude_cli"),
+    )
+    cfg = AppConfig(creators=(creator,))
+    assert cfg.settings.selector == "api"
+    assert cfg.effective_settings("Sub").selector == "claude_cli"
+    with pytest.raises(ValidationError):
+        Settings(selector="openai")  # type: ignore[arg-type]
+
+
+def test_claude_code_oauth_token_is_a_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-secret-value")
+    secrets = Secrets()
+    assert secrets.require("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-secret-value"
+    assert "sk-ant-oat01-secret-value" not in repr(secrets)

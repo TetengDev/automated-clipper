@@ -43,9 +43,9 @@ from clipper.config import AppConfig, Creator, Settings
 from clipper.db import transaction
 from clipper.jobs.models import Clock, from_iso, to_iso, utcnow
 from clipper.jobs.queue import insert_job
+from clipper.pipeline.ytdlp import GATED_AVAILABILITY
 from clipper.redact import redact
 from clipper.sources.youtube import (
-    GATED_AVAILABILITY,
     NOT_FINISHED,
     Metadata,
     SourceCancelled,

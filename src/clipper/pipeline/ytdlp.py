@@ -116,6 +116,12 @@ NO_FORMAT = "requested format not available"
 (SABR, n-sig) that a yt-dlp update fixes, not the video itself."""
 
 
+GATED_AVAILABILITY: frozenset[str] = frozenset({"subscriber_only", "premium_only"})
+"""yt-dlp `availability` of members-only and Premium videos: fetchable with the right
+cookies, but skipped unless `allow_gated_content`. yt-dlp derives it from page badges,
+which can be missing (then `availability` is None), so the check is best-effort."""
+
+
 class Unavailable(PermanentError):
     """The video cannot be fetched by anyone without special access; do not retry.
 

@@ -21,6 +21,8 @@ Live / upcoming / still-processing sources raise `SourceNotReady`, a `Deferred` 
 no attempt used); once the job is older than 48 h that becomes a `PermanentError`. The
 stream path reaches this stage only after `waiting_vod`. Sources longer than
 `max_duration_seconds` are skipped, and yt-dlp is capped with `--max-filesize`.
+Members-only and Premium videos (yt-dlp `availability`) are skipped unless
+`allow_gated_content`.
 
 "Requested format is not available" from the probe or the download (usually a YouTube
 player change that a yt-dlp update fixes) raises `NoUsableFormat`, the same kind of
@@ -60,7 +62,7 @@ from clipper.pipeline.common import (
     settings_for,
     write_json_atomic,
 )
-from clipper.pipeline.ytdlp import NO_FORMAT, Runner, Unavailable, YtDlp
+from clipper.pipeline.ytdlp import GATED_AVAILABILITY, NO_FORMAT, Runner, Unavailable, YtDlp
 from clipper.urls import canonical_url
 
 __all__ = [
@@ -149,6 +151,10 @@ def fetch_audio(
     if live_status in NOT_READY_LIVE_STATUSES or info.get("is_live") is True:
         raise _not_ready(media_dir, ctx.clock(), live_status)
     (media_dir / NOT_READY_MARKER).unlink(missing_ok=True)
+    availability = info.get("availability")
+    if availability in GATED_AVAILABILITY and not settings.allow_gated_content:
+        # Checked here too: the monitor's check misses Data API and manual jobs.
+        raise SkipJob(f"{availability} content (allow_gated_content is off)")
     duration = _positive_float(info.get("duration"))
     if duration is not None:
         _check_duration(duration, settings)

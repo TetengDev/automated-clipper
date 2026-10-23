@@ -7,7 +7,7 @@ settings:
   first_run_mode: baseline        # baseline = mark existing as seen, clip only new uploads
   lookback_days: 7
   min_duration_seconds: 300       # excludes Shorts (now up to 3 min)
-  allow_gated_content: false      # true: also clip members-only/Premium videos the cookies account can watch (ToS/licensing risk)
+  allow_gated_content: false      # true: also clip members-only/Premium videos the cookies account can watch (ToS/licensing risk); best-effort, relies on yt-dlp availability badges
   clip_min_seconds: 20
   clip_max_seconds: 60
   max_clips_per_source: 3

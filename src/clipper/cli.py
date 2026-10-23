@@ -27,6 +27,7 @@ from clipper.config import (
 )
 from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version, migrate
 from clipper.export import DEFAULT_OUTPUT_DIR
+from clipper.monitor import CycleReport, FirstRun, YouTubeMonitor
 from clipper.pipeline import build_stages
 from clipper.urls import InvalidSourceURL, parse_source_url
 
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
     import httpx
 
     from clipper.resolve import Resolved
-    from clipper.sources.youtube import MetadataProvider
+    from clipper.sources.youtube import MetadataProvider, YouTubeSource
 
 EXIT_NOT_IMPLEMENTED = 70  # EX_SOFTWARE; distinct from Click's usage-error code 2
 MANUAL_CREATOR = "manual"
@@ -115,10 +116,93 @@ def migrate_cmd(ctx: typer.Context) -> None:
         typer.echo(f"schema up to date (version {version})")
 
 
+def _youtube_source(secrets: Secrets, http: httpx.Client) -> YouTubeSource:
+    """RSS gate plus `_youtube_provider`'s metadata. A seam for tests."""
+    from clipper.sources.youtube import YouTubeSource
+
+    return YouTubeSource(http, _youtube_provider(secrets, http))
+
+
+def _print_cycle(report: CycleReport) -> None:
+    from clipper.pipeline.common import strip_control
+
+    for poll in report.polls:
+        first = " (first poll)" if poll.first_run else ""
+        typer.echo(f"{poll.creator}: {poll.new} new{first}")
+        for job_id, video_id, title in poll.enqueued:
+            typer.echo(f"  enqueued job {job_id}: {video_id} {strip_control(title or '')}")
+    for name in report.unresolved:
+        typer.echo(f"{name}: no channel_id; run `clipper resolve`")
+    for error in report.errors:
+        item = f" {error['item']}" if "item" in error else ""
+        typer.echo(f"{error['creator']}{item}: error: {error['error']}", err=True)
+    typer.echo(
+        f"cycle done: {report.items_new} job(s) enqueued, {report.quota_units} quota unit(s),"
+        f" {len(report.errors)} error(s)"
+    )
+
+
 @app.command("run-monitor")
-def run_monitor() -> None:
-    """Poll creators 24/7 and enqueue new content."""
-    _not_implemented("CLP-24")
+def run_monitor(
+    ctx: typer.Context,
+    once: Annotated[bool, typer.Option(help="Run a single poll cycle, then exit.")] = False,
+    creator: Annotated[
+        list[str] | None,
+        typer.Option("--creator", help="Only poll this creator (repeatable)."),
+    ] = None,
+    first_run: Annotated[
+        FirstRun | None,
+        typer.Option(
+            "--first-run", help="Override first_run_mode for creators polled the first time."
+        ),
+    ] = None,
+) -> None:
+    """Poll creators 24/7 and enqueue new content.
+
+    SIGTERM/SIGINT finish the current creator's poll, then exit."""
+    from clipper.pipeline.ytdlp import YtDlpError
+
+    app_ctx = _app(ctx)
+    try:
+        cfg = load_config(app_ctx.config_path)
+        secrets = Secrets()
+    except ConfigError as exc:
+        _fail(str(exc))
+    except ValidationError as exc:
+        _fail(f"run-monitor: {exc}")
+    creators = list(cfg.creators)
+    if creator:
+        try:
+            creators = list({c.name: c for c in map(cfg.creator, creator)}.values())
+        except KeyError as exc:
+            _fail(f"unknown creator: {exc.args[0]}")
+    _setup_logging()
+    conn = _open_db(app_ctx.db_path)
+    try:
+        with _http_client() as http:
+            try:
+                source = _youtube_source(secrets, http)
+            except YtDlpError as exc:
+                _fail(f"run-monitor: {exc}")
+            monitor = YouTubeMonitor(conn, cfg, source, first_run_mode=first_run)
+            if once:
+                report = monitor.run_cycle(creators)
+                _print_cycle(report)
+                if report.errors:
+                    raise typer.Exit(code=1)
+                return
+
+            def stop(*_: object) -> None:
+                monitor.stop.set()
+
+            previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+            try:
+                monitor.run_forever(creators)
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
+    finally:
+        conn.close()
 
 
 def _open_db(db_path: Path) -> sqlite3.Connection:

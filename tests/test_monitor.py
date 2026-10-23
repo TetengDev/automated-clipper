@@ -13,16 +13,24 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
 from clipper import cli
 from clipper.cli import app
-from clipper.config import AppConfig, load_config
+from clipper.config import AppConfig, Secrets, load_config
 from clipper.db import connect, migrate
 from clipper.jobs.queue import enqueue
 from clipper.monitor import COMPONENT, FirstRun, SeenStatus, YouTubeMonitor
-from clipper.sources.youtube import Metadata, SourceError, Upload, VideoMeta
+from clipper.sources.youtube import (
+    Metadata,
+    SourceError,
+    Upload,
+    VideoMeta,
+    YouTubeSource,
+    YtDlpProvider,
+)
 from clipper.urls import SourceRef
 
 T0 = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
@@ -506,7 +514,7 @@ def test_cli_once_with_creator_filter_and_emit(cli_env, source: FakeSource) -> N
 
     assert result.exit_code == 0, result.output
     assert source.feed_calls == [BEAST]
-    assert f"MrBeast: 1 new, enqueued job 1: {V1} Big video" in result.output
+    assert f"MrBeast: 1 new (first poll)\n  enqueued job 1: {V1} Big video\n" in result.output
     assert "cycle done: 1 job(s) enqueued, 0 quota unit(s), 0 error(s)" in result.output
     with closing(connect(db)) as c:
         assert [r[0] for r in c.execute("SELECT item_id FROM jobs")] == [V1]
@@ -568,3 +576,33 @@ def test_cli_sigterm_finishes_the_poll_and_exits_quickly(
     with closing(connect(db)) as c:
         [row] = c.execute("SELECT finished_at FROM runs").fetchall()
     assert row[0] is not None
+
+
+def test_cli_invalid_config_fails_cleanly(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["--config", str(tmp_path / "nope.yaml"), "run-monitor", "--once"])
+
+    assert result.exit_code == 1
+    assert "config file not found" in result.stderr
+
+
+def test_cli_missing_cookies_file_fails_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "creators.yaml"
+    config.write_text(CONFIG)
+    monkeypatch.setenv("CLIPPER_YTDLP_COOKIES", str(tmp_path / "missing.txt"))
+
+    result = runner.invoke(
+        app, ["--config", str(config), "--db", str(tmp_path / "s.db"), "run-monitor", "--once"]
+    )
+
+    assert result.exit_code == 1
+    assert "CLIPPER_YTDLP_COOKIES points to a missing file" in result.stderr
+
+
+def test_default_source_is_rss_gated_and_keyless() -> None:
+    with httpx.Client() as http:
+        source = cli._youtube_source(Secrets(), http)
+
+    assert isinstance(source, YouTubeSource)
+    assert isinstance(source.provider, YtDlpProvider)

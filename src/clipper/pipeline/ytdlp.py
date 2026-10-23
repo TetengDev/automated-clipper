@@ -49,6 +49,12 @@ REDACT_WINDOW_CHARS = 4096
 COOKIES_ENV = "CLIPPER_YTDLP_COOKIES"
 PROXY_ENV = "CLIPPER_YTDLP_PROXY"
 AUDIO_MAX_FILESIZE = "4G"
+AUDIO_FORMAT = "bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none]"
+"""Audio-only when there is one; else a muxed format of 480p at most, else the smallest
+muxed one. `--max-filesize` is checked per HTTP request, so for HLS per fragment: it does
+not bound a whole muxed download, the height cap does. `[acodec!=none]`: never a
+video-only format (plain `best` falls back to one, and ffmpeg -vn then fails). The probe
+selects with this too, so a video the probe accepts is one the download can fetch."""
 SECTION_MAX_FILESIZE = "2G"
 STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
 """yt-dlp's probe JSON is often several MB; anything bigger is cut (and fails to parse)."""
@@ -423,8 +429,11 @@ class YtDlp:
         members-only, age-gate and bot-check failures to a warning and exit 0, so they
         could not be classified. The YouTube extractor also appends storyboard images to
         the formats after its playability check, so even a non-empty format list would
-        not prove the video playable."""
-        extra = ["--dump-single-json", "--skip-download"]
+        not prove the video playable.
+
+        `-f AUDIO_FORMAT`: the probe fails with a format error unless the audio download
+        would find a format, so the monitor and the worker judge a video as it is fetched."""
+        extra = ["--dump-single-json", "--skip-download", "-f", AUDIO_FORMAT]
         return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
     def listing(
@@ -466,14 +475,14 @@ class YtDlp:
         self, url: str, out_dir: Path, stem: str, *, info_json: Path | None = None
     ) -> Path:
         """Download the best audio-only format into `out_dir/<stem>.<ext>` and return that
-        path. `-f bestaudio/best`: when a video has only muxed formats (the probe's default
-        selector accepts those), the best muxed one; the caller's ffmpeg keeps only audio.
+        path. `-f AUDIO_FORMAT`: when a video has only muxed formats, a small one with audio
+        (480p at most when there is one); the caller's ffmpeg keeps only the audio.
 
         `info_json` (from a previous `probe`) skips a second metadata request. `stem` must
         be a fixed, safe name chosen by the caller.
         """
         extra = [
-            "-f", "bestaudio/best", "--max-filesize", AUDIO_MAX_FILESIZE,
+            "-f", AUDIO_FORMAT, "--max-filesize", AUDIO_MAX_FILESIZE,
             "-o", _template(out_dir, stem),
         ]  # fmt: skip
         if info_json is not None:

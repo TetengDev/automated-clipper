@@ -206,6 +206,22 @@ def test_write_refuses_a_result_that_breaks_the_config(small: Path) -> None:
     assert list(small.parent.iterdir()) == [small]
 
 
+def test_write_never_follows_a_planted_temp_symlink(small: Path, tmp_path: Path) -> None:
+    victim = tmp_path / "elsewhere" / "victim.txt"
+    victim.parent.mkdir()
+    victim.write_text("untouched")
+    for name in (f".{small.name}.resolve.tmp", f".{small.name}.tmp"):
+        (small.parent / name).symlink_to(victim)
+
+    write_ids(small, [Resolved("MrBeast", "youtube", "@MrBeast", None, IDS["@MrBeast"])])
+
+    assert victim.read_text() == "untouched"
+    assert not small.is_symlink()
+    assert load_config(small).creator("MrBeast").youtube.channel_id == IDS["@MrBeast"]
+    leftovers = {p.name for p in small.parent.iterdir()} - {small.name, "elsewhere"}
+    assert leftovers == {f".{small.name}.resolve.tmp", f".{small.name}.tmp"}  # ours are gone
+
+
 # --- Twitch -------------------------------------------------------------------------------
 
 

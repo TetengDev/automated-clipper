@@ -57,7 +57,8 @@ DAY = timedelta(days=1)
 MAX_METADATA_ATTEMPTS = 6
 """A video whose metadata keeps failing is retried after 10, 20, 40, 80 and 160 minutes,
 then recorded as `metadata_failed` (about 5 h of failures). Platform blocks (bot check)
-are not counted: they say nothing about the video."""
+and format errors (a YouTube player breakage) are not counted: they say nothing about the
+video, and they are retried every poll."""
 
 
 class FirstRun(StrEnum):
@@ -243,7 +244,7 @@ class YouTubeMonitor:
                 error = redact(meta.errors[video_id])
                 logger.warning("%s: %s: metadata failed: %s", creator.name, video_id, error)
                 poll.errors.append({"creator": creator.name, "item": video_id, "error": error})
-                if video_id not in meta.blocked:
+                if video_id not in meta.blocked and video_id not in meta.format_errors:
                     self._metadata_failed(creator.name, video_id, now, poll)
             elif video_id in meta.videos:
                 self.failures.pop(video_id, None)

@@ -77,6 +77,8 @@ GONE_AVAILABILITY: frozenset[str] = frozenset({"private", "subscriber_only"})
 """yt-dlp `availability` values meaning the same, should a probe ever exit 0 for one."""
 GATED_AVAILABILITY: frozenset[str] = frozenset({"needs_auth", "premium_only"})
 """Fetchable only with an account (cookies): retried like other metadata errors."""
+NO_FORMAT = "requested format not available"
+"""The `Unavailable.reason` of a format selection failure (e.g. a YouTube player change)."""
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _YT = "{http://www.youtube.com/xml/schemas/2015}"
@@ -134,6 +136,9 @@ class Metadata:
     blocked: set[str] = field(default_factory=set)
     """The subset of `errors` where the platform refused us (bot check, rate limit): says
     nothing about the video itself. The batch stops there."""
+    format_errors: set[str] = field(default_factory=set)
+    """The subset of `errors` where extraction worked but no format could be selected (a
+    YouTube player breakage): says nothing about the video either."""
 
 
 @dataclass
@@ -289,6 +294,10 @@ def _title(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+class _NoFormat(Exception):
+    """A format error the re-probe did not resolve. Message: the original error."""
+
+
 @dataclass
 class YtDlpProvider:
     """Keyless metadata: one yt-dlp probe per new video (~1-2 s each, no quota)."""
@@ -303,14 +312,17 @@ class YtDlpProvider:
                 break
             url = canonical_url(SourceRef("youtube", video_id))
             try:
-                info = self.ytdlp.probe(url)
+                info = self._probe(url)
             except CommandCancelled:
                 break  # shutting down; this one and the rest wait for the next start
+            except _NoFormat as exc:
+                result.errors[video_id] = str(exc)
+                result.format_errors.add(video_id)
             except Unavailable as exc:
                 if exc.reason in GONE_REASONS:
                     logger.warning("%s: unavailable, not retried: %s", video_id, exc)
                     result.unavailable.add(video_id)
-                else:  # age gate, format errors: may work later (cookies, a yt-dlp update)
+                else:  # age gate: may work later (cookies)
                     result.errors[video_id] = str(exc)
             except DownloadBlocked as exc:
                 # More probes now would only deepen the block; the rest wait for next poll.
@@ -333,6 +345,32 @@ class YtDlpProvider:
                 else:
                     result.videos[video_id] = self._meta(video_id, info)
         return result
+
+    def _probe(self, url: str) -> dict[str, Any]:
+        """`ytdlp.probe`, re-probed once with `--ignore-no-formats-error` on a format error.
+
+        yt-dlp raises "Requested format is not available" in format selection, after the
+        extractor returned (YoutubeDL.process_video_result), so this video passed the
+        playability checks: its metadata is good even with no usable format. The re-probe
+        is trusted only when it lists formats: with the flag, a playability failure that
+        appears meanwhile (private, bot check) is only a warning, and yt-dlp's YouTube
+        extractor raises those only when it found no formats at all. Raises `_NoFormat`
+        when the re-probe does not resolve it; a bot check or cancel propagates as is."""
+        try:
+            return self.ytdlp.probe(url)
+        except Unavailable as exc:
+            if exc.reason != NO_FORMAT:
+                raise
+            error = str(exc)
+        try:
+            info = self.ytdlp.probe(url, ignore_no_formats=True)
+        except DownloadBlocked:
+            raise
+        except (YtDlpError, PermanentError):
+            raise _NoFormat(error) from None
+        if not info.get("formats"):
+            raise _NoFormat(error)
+        return info
 
     @staticmethod
     def _meta(video_id: str, info: dict[str, Any]) -> VideoMeta:

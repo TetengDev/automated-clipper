@@ -405,13 +405,16 @@ class YtDlp:
             raise classify_error(result.stderr, secrets=secrets)
         return result
 
-    def probe(self, url: str) -> dict[str, Any]:
+    def probe(self, url: str, *, ignore_no_formats: bool = False) -> dict[str, Any]:
         """Metadata only (`--dump-single-json --skip-download`); nothing is downloaded.
 
-        Never with `--ignore-no-formats-error`: yt-dlp would then downgrade private,
+        Normally without `--ignore-no-formats-error`: yt-dlp would then downgrade private,
         members-only, age-gate and bot-check failures to a warning and exit 0, so they
-        could not be classified."""
+        could not be classified. `ignore_no_formats` is for the monitor's re-probe after
+        a format error only, and its result is trusted only when it lists formats."""
         extra = ["--dump-single-json", "--skip-download"]
+        if ignore_no_formats:
+            extra.append("--ignore-no-formats-error")
         return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
     def listing(

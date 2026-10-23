@@ -33,6 +33,7 @@ from clipper.monitor import (
 )
 from clipper.sources.youtube import (
     Metadata,
+    SourceCancelled,
     SourceError,
     Upload,
     VideoMeta,
@@ -118,6 +119,10 @@ class FakeSource:
             elif isinstance(answer, str) and answer.startswith("blocked"):
                 result.errors[vid] = answer
                 result.blocked.add(vid)
+                break
+            elif isinstance(answer, str) and answer.startswith("format"):
+                result.errors[vid] = answer
+                result.format_errors.add(vid)
                 break
             elif isinstance(answer, str):
                 result.errors[vid] = answer
@@ -493,6 +498,177 @@ def test_bot_check_is_retried_every_poll_and_never_gives_up(conn, cfg, source, c
     ]
 
 
+def test_format_errors_back_off_to_hourly_and_never_give_up(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.meta[V1] = "format: Requested format is not available"
+    monitor = make(conn, cfg, source, clock)
+    attempts_at: list[int] = []
+    error = {"creator": "MrBeast", "item": V1, "error": "format: Requested format is not available"}
+
+    for minute in range(0, 24 * 60, 10):  # a day of 10-minute polls
+        clock.now = T0 + timedelta(minutes=minute)
+        before = calls_for(source, V1)
+        report = monitor.run_cycle([cfg.creator("MrBeast")])
+        attempted = calls_for(source, V1) > before
+        if attempted:
+            attempts_at.append(minute)
+        assert report.errors == ([error] if attempted else [])  # backing off: no error
+
+    assert attempts_at[:6] == [0, 10, 30, 70, 130, 190]  # 10 min doubling, capped at 1 h
+    assert len(attempts_at) == 4 + (24 * 60 - 130) // 60 + 1
+    assert V1 not in seen(conn) and monitor.failures == {}
+
+
+@pytest.mark.parametrize("interval_minutes", [60, 90])
+def test_a_video_stuck_on_format_errors_does_not_starve_the_ones_behind_it(
+    conn, cfg, source, clock, interval_minutes: int
+) -> None:
+    # X never gets a usable format; by the time the backoff (capped at 1 h) is over it is
+    # due again each poll, and it is listed first (newest). V2 and V3 still get probed.
+    x = "x" * 11
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(x, T0), Upload(V2, T0), Upload(V3, T0)]
+    source.meta.update({x: "format: Requested format is not available"})
+    source.meta.update({V2: video(V2), V3: video(V3)})
+    monitor = make(conn, cfg, source, clock)
+
+    for _ in range(3):
+        monitor.run_cycle([cfg.creator("MrBeast")])
+        clock.now += timedelta(minutes=interval_minutes)
+
+    assert seen(conn) == {"zzzzzzzzzzz": "baseline", V2: "enqueued", V3: "enqueued"}
+    assert x in monitor.format_retries
+
+
+def test_new_items_are_probed_before_retries(conn, cfg, source, clock) -> None:
+    x, y = "x" * 11, "y" * 11
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(x, T0), Upload(y, T0)]
+    source.meta.update({x: "format: Requested format is not available", y: "yt-dlp failed"})
+    monitor = make(conn, cfg, source, clock)
+    monitor.run_cycle([cfg.creator("MrBeast")])  # x: format error, the batch stops
+    clock.now += timedelta(hours=2)
+    monitor.run_cycle([cfg.creator("MrBeast")])  # y (new): generic error; x: format error
+    clock.now += timedelta(hours=2)
+    source.feeds[BEAST] = [Upload(x, T0), Upload(y, T0), Upload(V1, T0)]
+    source.meta[V1] = video(V1)
+
+    monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert source.metadata_calls[-1] == [V1, y, x]  # new, then failures, then format errors
+
+
+def test_format_error_stops_the_batch_with_one_error_per_poll(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0), Upload(V2, T0), Upload(V3, T0)]
+    source.meta.update({V1: "format: Requested format is not available", V2: video(V2)})
+    source.meta[V3] = "format: Requested format is not available"
+    monitor = make(conn, cfg, source, clock)
+
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert source.metadata_calls == [[V1, V2, V3]]
+    assert report.polls[0].new == 1  # V2 and V3 were never looked at
+    assert len(json.loads(runs(conn)[-1]["errors"])) == 1
+    assert seen(conn) == {"zzzzzzzzzzz": "baseline"}
+
+
+def test_format_backoff_is_forgotten_when_the_item_leaves_the_listing(
+    conn, cfg, source, clock
+) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.meta[V1] = "format: Requested format is not available"
+    monitor = make(conn, cfg, source, clock)
+    monitor.run_cycle([cfg.creator("MrBeast")])
+    assert V1 in monitor.format_retries
+
+    source.feeds[BEAST] = [Upload(V2, T0)]
+    source.meta[V2] = video(V2)
+    monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert monitor.format_retries == {}
+
+
+def test_upload_probed_during_a_player_breakage_is_still_enqueued(conn, cfg, source, clock) -> None:
+    from clipper.pipeline.ytdlp import RunResult, YtDlp
+
+    format_error = "ERROR: [youtube] x: Requested format is not available. Use --list-formats"
+    body = {"id": V1, "title": "Big video", "duration": 1500, "timestamp": T0.timestamp()}
+    body["formats"] = [{"format_id": "140", "acodec": "mp4a.40.2", "url": "https://x/140"}]
+    fixed = False  # an 8 h breakage, until a yt-dlp update fixes the player
+    calls: list[list[str]] = []
+
+    def ytdlp(args, timeout_s):
+        calls.append(list(args))
+        return RunResult(0, json.dumps(body), "") if fixed else RunResult(1, "", format_error)
+
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.videos = YtDlpProvider(YtDlp(runner=ytdlp)).videos  # type: ignore[method-assign]
+    monitor = make(conn, cfg, source, clock)
+
+    for _ in range(8 * 6):
+        monitor.run_cycle([cfg.creator("MrBeast")])
+        clock.now += timedelta(minutes=10)
+    assert V1 not in seen(conn)
+
+    fixed = True
+    clock.now += timedelta(hours=1)  # past the longest backoff
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert seen(conn) == {"zzzzzzzzzzz": "baseline", V1: "enqueued"}
+    assert report.items_new == 1
+    assert monitor.format_retries == {} and monitor.failures == {}
+    assert all("--ignore-no-formats-error" not in call for call in calls)
+
+
+def poll_probed(conn, cfg, source, clock, availability: str):
+    """One poll of V1 through the real yt-dlp provider; the probe (with cookies) works."""
+    from clipper.pipeline.ytdlp import RunResult, YtDlp
+
+    body = {"id": V1, "title": "Gated", "duration": 1500, "timestamp": T0.timestamp()}
+    body |= {"availability": availability, "formats": [{"format_id": "140", "url": "https://x"}]}
+    ytdlp = YtDlp(runner=lambda args, timeout_s: RunResult(0, json.dumps(body), ""))
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.videos = YtDlpProvider(ytdlp).videos  # type: ignore[method-assign]
+    return make(conn, cfg, source, clock).run_cycle([cfg.creator("MrBeast")])
+
+
+def test_age_restricted_upload_fetchable_with_cookies_is_enqueued(conn, cfg, source, clock) -> None:
+    report = poll_probed(conn, cfg, source, clock, "needs_auth")
+
+    assert seen(conn)[V1] == "enqueued"
+    assert report.items_new == 1 and report.errors == []
+
+
+@pytest.mark.parametrize("availability", ["subscriber_only", "premium_only"])
+def test_members_and_premium_uploads_are_skipped_by_default(
+    conn, cfg, source, clock, availability: str
+) -> None:
+    assert cfg.settings.allow_gated_content is False
+
+    report = poll_probed(conn, cfg, source, clock, availability)
+
+    assert seen(conn)[V1] == "unavailable"  # never retried
+    assert jobs(conn) == [] and report.errors == []
+
+
+@pytest.mark.parametrize("availability", ["subscriber_only", "premium_only", "needs_auth"])
+def test_gated_uploads_are_enqueued_when_allowed(
+    conn, source, clock, tmp_path: Path, availability: str
+) -> None:
+    path = tmp_path / "gated.yaml"
+    path.write_text(CONFIG.replace("settings:\n", "settings:\n  allow_gated_content: true\n", 1))
+    cfg = load_config(path)
+
+    poll_probed(conn, cfg, source, clock, availability)
+
+    assert seen(conn)[V1] == "enqueued"
+
+
 def test_interrupted_emit_first_poll_keeps_its_lookback_after_restart(
     conn, cfg, source, clock
 ) -> None:
@@ -602,13 +778,28 @@ def test_day_precision_date_gets_a_day_of_slack(conn, cfg, source, clock) -> Non
 def test_listing_killed_by_stop_is_not_recorded_as_an_error(conn, cfg, source, clock) -> None:
     monitor = make(conn, cfg, source, clock)
     source.on_feed = lambda channel_id: monitor.stop.set()  # SIGTERM mid-listing
-    source.feeds[BEAST] = SourceError("feed: HTTP 404; fallback: yt-dlp listing failed: cancelled")
+    source.feeds[BEAST] = SourceCancelled("yt-dlp listing cancelled")
 
     report = monitor.run_cycle([cfg.creator("MrBeast"), cfg.creator("IShowSpeed")])
 
     assert report.errors == []
     assert runs(conn)[-1]["errors"] is None
     assert source.feed_calls == [BEAST]  # the cycle ends there
+
+
+@pytest.mark.parametrize(
+    "error",
+    [SourceError("feed: HTTP 500; fallback: HTTP 500"), sqlite3.OperationalError("disk I/O error")],
+)
+def test_real_error_during_shutdown_is_still_recorded(conn, cfg, source, clock, error) -> None:
+    monitor = make(conn, cfg, source, clock)
+    source.on_feed = lambda channel_id: monitor.stop.set()  # SIGTERM mid-listing
+    source.feeds[BEAST] = error
+
+    report = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert [e["creator"] for e in report.errors] == ["MrBeast"]
+    assert str(error) in json.loads(runs(conn)[-1]["errors"])[0]["error"]
 
 
 def test_one_creator_raising_does_not_stop_the_others(conn, cfg, source, clock) -> None:
@@ -685,6 +876,32 @@ def test_stop_during_metadata_leaves_the_rest_for_next_time(conn, cfg, source, c
     monitor.run_cycle([cfg.creator("MrBeast")])
 
     assert seen(conn) == {V1: "enqueued"}  # V2 stays unseen: fetched next poll
+
+
+def test_items_not_looked_at_are_not_counted_as_new(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0), Upload(V2, T0), Upload(V3, T0)]
+    source.meta.update({V1: video(V1), V2: video(V2), V3: video(V3)})
+    monitor = make(conn, cfg, source, clock)
+    original = source.videos
+
+    def stop_after_first(ids, should_stop):
+        return original(ids, lambda: monitor.stop.is_set() or bool(monitor.stop.set()))
+
+    source.videos = stop_after_first  # type: ignore[method-assign]
+    stopped = monitor.run_cycle([cfg.creator("MrBeast")])
+    source.videos = original  # type: ignore[method-assign]
+    monitor.stop.clear()
+    clock.now += timedelta(minutes=10)
+    source.meta[V2] = "blocked by platform (bot check)"  # V3 waits behind the block
+    blocked = monitor.run_cycle([cfg.creator("MrBeast")])
+    clock.now += timedelta(minutes=10)
+    source.meta[V2] = video(V2)
+    rest = monitor.run_cycle([cfg.creator("MrBeast")])
+
+    assert [r.polls[0].new for r in (stopped, blocked, rest)] == [1, 1, 2]
+    assert [r["items_new"] for r in runs(conn)] == [1, 0, 2]
+    assert seen(conn) == {"zzzzzzzzzzz": "baseline", V1: "enqueued", V2: "enqueued", V3: "enqueued"}
 
 
 # --- run_forever -------------------------------------------------------------------------------

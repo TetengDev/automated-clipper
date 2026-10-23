@@ -1,8 +1,9 @@
 """Stage `fetching_audio` (CLP-13): download audio only and normalize it for transcription.
 
 Steps: probe metadata (no download) -> filters (live/upcoming, min duration) -> download
-`-f bestaudio` (never a video stream) -> ffmpeg to 16 kHz mono FLAC -> ebur128 loudness
-peaks -> write `meta.json` and `signals.json` -> rename the FLAC into place LAST.
+`-f bestaudio/best` (muxed only when there is no audio-only format) -> ffmpeg to 16 kHz
+mono FLAC (audio only) -> ebur128 loudness peaks -> write `meta.json` and `signals.json`
+-> rename the FLAC into place LAST.
 
 `audio_16k.flac` is the declared artifact, so a crash anywhere before the final rename
 leaves the stage re-runnable. All file names are fixed constants inside the job's media
@@ -21,6 +22,12 @@ Live / upcoming / still-processing sources raise `SourceNotReady`, a `Deferred` 
 no attempt used); once the job is older than 48 h that becomes a `PermanentError`. The
 stream path reaches this stage only after `waiting_vod`. Sources longer than
 `max_duration_seconds` are skipped, and yt-dlp is capped with `--max-filesize`.
+Members-only and Premium videos (yt-dlp `availability`) are skipped unless
+`allow_gated_content`.
+
+"Requested format is not available" from the probe or the download (usually a YouTube
+player change that a yt-dlp update fixes) raises `NoUsableFormat`, the same kind of
+Deferred (+30 min); past 48 h of it in this stage it fails for good, as before.
 
 The whole run shares one `Deadline` (100 min, inside the 2 h lease): every yt-dlp/ffmpeg
 call's timeout is shrunk to what is left, and running out is a retryable `StageTimeout`.
@@ -46,20 +53,32 @@ from clipper.config import Settings
 from clipper.jobs.models import Job
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext, StageDef
 from clipper.pipeline.common import (
+    NO_FORMAT_MAX_AGE,
+    NO_FORMAT_RETRY,
     PROTOCOL_WHITELIST,
     Deadline,
     MediaError,
+    NoUsableFormat,
     default_runner,
+    deferring_no_format,
     ffprobe_duration,
     first_seen,
     run_media,
     settings_for,
     write_json_atomic,
 )
-from clipper.pipeline.ytdlp import Runner, YtDlp
+from clipper.pipeline.ytdlp import GATED_AVAILABILITY, Runner, YtDlp
 from clipper.urls import canonical_url
 
-__all__ = ["STAGE", "MediaError", "SourceNotReady", "fetch_audio"]  # MediaError re-exported
+__all__ = [  # MediaError, NoUsableFormat and NO_FORMAT_* re-exported
+    "NO_FORMAT_MAX_AGE",
+    "NO_FORMAT_RETRY",
+    "STAGE",
+    "MediaError",
+    "NoUsableFormat",
+    "SourceNotReady",
+    "fetch_audio",
+]
 
 AUDIO_NAME = "audio_16k.flac"
 META_NAME = "meta.json"
@@ -76,6 +95,7 @@ SILENCE_LUFS = -70.0
 NOT_READY_RETRY = timedelta(minutes=30)
 NOT_READY_MAX_AGE = timedelta(hours=48)
 NOT_READY_MARKER = ".not_ready_since"
+NO_FORMAT_MARKER = ".no_format_since"
 NOT_READY_LIVE_STATUSES = frozenset({"is_live", "is_upcoming", "post_live"})
 WAS_LIVE_STATUSES = frozenset({"is_live", "was_live", "post_live"})
 
@@ -113,11 +133,17 @@ def fetch_audio(
     ytdlp = YtDlp.from_env(runner, env, cap_timeout=deadline.timeout)
     settings = settings_for(job, ctx.config)
 
-    info = ytdlp.probe(url)
+    no_format = media_dir / NO_FORMAT_MARKER
+    with deferring_no_format(no_format, ctx.clock):
+        info = ytdlp.probe(url)
     live_status = info.get("live_status")
     if live_status in NOT_READY_LIVE_STATUSES or info.get("is_live") is True:
         raise _not_ready(media_dir, ctx.clock(), live_status)
     (media_dir / NOT_READY_MARKER).unlink(missing_ok=True)
+    availability = info.get("availability")
+    if availability in GATED_AVAILABILITY and not settings.allow_gated_content:
+        # Checked here too: the monitor's check misses Data API and manual jobs.
+        raise SkipJob(f"{availability} content (allow_gated_content is off)")
     duration = _positive_float(info.get("duration"))
     if duration is not None:
         _check_duration(duration, settings)
@@ -127,7 +153,9 @@ def fetch_audio(
     _remove_stale_sources(media_dir)
     try:
         write_json_atomic(info_tmp, info, indent=None)
-        source = ytdlp.download_audio(url, media_dir, SOURCE_STEM, info_json=info_tmp)
+        with deferring_no_format(no_format, ctx.clock):
+            source = ytdlp.download_audio(url, media_dir, SOURCE_STEM, info_json=info_tmp)
+        no_format.unlink(missing_ok=True)
         _to_flac(runner, source, flac_tmp, deadline)
         if duration is None:
             timeout = deadline.timeout(PROBE_TIMEOUT_S)

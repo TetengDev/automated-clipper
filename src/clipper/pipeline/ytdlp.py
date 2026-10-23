@@ -111,6 +111,17 @@ class DownloadBlocked(YtDlpError):
     """The platform is refusing us (bot check / rate limit). Retryable; alert on it."""
 
 
+NO_FORMAT = "requested format not available"
+"""`Unavailable.reason` when no format could be selected: usually a YouTube player change
+(SABR, n-sig) that a yt-dlp update fixes, not the video itself."""
+
+
+GATED_AVAILABILITY: frozenset[str] = frozenset({"subscriber_only", "premium_only"})
+"""yt-dlp `availability` of members-only and Premium videos: fetchable with the right
+cookies, but skipped unless `allow_gated_content`. yt-dlp derives it from page badges,
+which can be missing (then `availability` is None), so the check is best-effort."""
+
+
 class Unavailable(PermanentError):
     """The video cannot be fetched by anyone without special access; do not retry.
 
@@ -309,7 +320,7 @@ _PERMANENT: tuple[tuple[re.Pattern[str], str], ...] = tuple(
             r"account .*has been terminated|no longer available|video .*does not exist",
             "removed or unavailable",
         ),
-        (r"requested format is not available", "requested format not available"),
+        (r"requested format is not available|no video formats found", NO_FORMAT),
     )
 )
 # YouTube's rate-limit page says "Video unavailable ... try again later": not permanent.
@@ -410,7 +421,9 @@ class YtDlp:
 
         Never with `--ignore-no-formats-error`: yt-dlp would then downgrade private,
         members-only, age-gate and bot-check failures to a warning and exit 0, so they
-        could not be classified."""
+        could not be classified. The YouTube extractor also appends storyboard images to
+        the formats after its playability check, so even a non-empty format list would
+        not prove the video playable."""
         extra = ["--dump-single-json", "--skip-download"]
         return _json_object(self._run(extra, url, self.probe_timeout_s).stdout)
 
@@ -452,14 +465,16 @@ class YtDlp:
     def download_audio(
         self, url: str, out_dir: Path, stem: str, *, info_json: Path | None = None
     ) -> Path:
-        """Download the best audio-only format (`-f bestaudio`, never video) into
-        `out_dir/<stem>.<ext>` and return that path.
+        """Download the best audio-only format into `out_dir/<stem>.<ext>` and return that
+        path. `-f bestaudio/best`: when a video has only muxed formats (the probe's default
+        selector accepts those), the best muxed one; the caller's ffmpeg keeps only audio.
 
         `info_json` (from a previous `probe`) skips a second metadata request. `stem` must
         be a fixed, safe name chosen by the caller.
         """
         extra = [
-            "-f", "bestaudio", "--max-filesize", AUDIO_MAX_FILESIZE, "-o", _template(out_dir, stem),
+            "-f", "bestaudio/best", "--max-filesize", AUDIO_MAX_FILESIZE,
+            "-o", _template(out_dir, stem),
         ]  # fmt: skip
         if info_json is not None:
             extra += ["--load-info-json", str(info_json)]

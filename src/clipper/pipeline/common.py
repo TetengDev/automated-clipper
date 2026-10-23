@@ -216,6 +216,35 @@ def first_seen(marker: Path, now: datetime, *, max_age: timedelta | None = None)
     return now
 
 
+NO_FORMAT_RETRY = timedelta(minutes=30)
+NO_FORMAT_MAX_AGE = timedelta(hours=48)
+"""How long a stage waits out "Requested format is not available" (a YouTube player change
+until a yt-dlp update fixes it) before failing for good."""
+
+
+class NoUsableFormat(Deferred):
+    """yt-dlp found no format to download (a player breakage); try again later."""
+
+
+@contextmanager
+def deferring_no_format(marker: Path, clock: Callable[[], datetime]) -> Iterator[None]:
+    """Turn a yt-dlp format error inside the block into `NoUsableFormat` (+30 min, no
+    attempt used), until format errors have lasted NO_FORMAT_MAX_AGE for this stage
+    (`marker`, one per stage); then a `PermanentError`. A marker older than the cap plus
+    one retry is from an earlier episode and starts over. Remove `marker` on success."""
+    try:
+        yield
+    except ytdlp.Unavailable as exc:
+        if exc.reason != ytdlp.NO_FORMAT:
+            raise
+        now = clock()
+        since = first_seen(marker, now, max_age=NO_FORMAT_MAX_AGE + NO_FORMAT_RETRY)
+        if now - since > NO_FORMAT_MAX_AGE:
+            hours = NO_FORMAT_MAX_AGE.total_seconds() / 3600
+            raise PermanentError(f"{exc} (for {hours:.0f} h; giving up)") from None
+        raise NoUsableFormat(now + NO_FORMAT_RETRY, str(exc)) from None
+
+
 def next_utc_midnight(now: datetime) -> datetime:
     return datetime.combine(now.astimezone(UTC).date() + timedelta(days=1), time(0), tzinfo=UTC)
 

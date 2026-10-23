@@ -68,7 +68,9 @@ def test_download_requests_audio_only_and_returns_file(tmp_path: Path) -> None:
     path = YtDlp(runner=runner).download_audio(URL, tmp_path, ".src", info_json=info)
     assert path == tmp_path / ".src.webm"
     args, _ = runner.calls[0]
-    assert args[args.index("-f") + 1] == "bestaudio"
+    # Audio-only when there is one, else the best muxed format (ffmpeg drops the video):
+    # the probe's default selector accepts a muxed-only video, so the download must too.
+    assert args[args.index("-f") + 1] == "bestaudio/best"
     assert args[args.index("--load-info-json") + 1] == str(info)
     assert args[-2:] == ["--", URL]
     assert args.index("--") > args.index("-o")
@@ -408,3 +410,17 @@ def test_from_env_passes_cancel() -> None:
 
     cancel = threading.Event()
     assert YtDlp.from_env(run_command, {}, cancel=cancel).cancel is cancel
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "ERROR: [youtube] x: Requested format is not available. Use --list-formats",
+        "ERROR: [youtube] x: No video formats found!; please report this issue",
+    ],
+)
+def test_format_errors_share_one_reason(stderr: str) -> None:
+    # Both mean yt-dlp found nothing it could fetch: usually a player change, not the video.
+    error = classify_error(stderr)
+
+    assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT

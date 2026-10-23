@@ -19,7 +19,8 @@ Per creator:
 - Otherwise only unseen IDs get metadata. Then: live, upcoming, or a finished stream
   whose VOD is still processing -> `waiting_vod`, not enqueued (the S3 live-VOD work,
   CLP-26, rechecks these); shorter than min_duration_seconds (Shorts) -> `skipped_short`;
-  private/removed -> `unavailable`; anything else is enqueued.
+  private/removed, or members-only/Premium unless `allow_gated_content` -> `unavailable`;
+  anything else is enqueued.
 - An item's seen_items row and its job are written in one transaction, so it is enqueued
   exactly once, across crashes and restarts too. A failed metadata lookup leaves the item
   unseen; the next poll retries it.
@@ -42,8 +43,15 @@ from clipper.config import AppConfig, Creator, Settings
 from clipper.db import transaction
 from clipper.jobs.models import Clock, from_iso, to_iso, utcnow
 from clipper.jobs.queue import insert_job
+from clipper.pipeline.ytdlp import GATED_AVAILABILITY
 from clipper.redact import redact
-from clipper.sources.youtube import NOT_FINISHED, Metadata, Upload, VideoMeta
+from clipper.sources.youtube import (
+    NOT_FINISHED,
+    Metadata,
+    SourceCancelled,
+    Upload,
+    VideoMeta,
+)
 from clipper.urls import SourceRef
 
 logger = logging.getLogger(__name__)
@@ -57,7 +65,11 @@ DAY = timedelta(days=1)
 MAX_METADATA_ATTEMPTS = 6
 """A video whose metadata keeps failing is retried after 10, 20, 40, 80 and 160 minutes,
 then recorded as `metadata_failed` (about 5 h of failures). Platform blocks (bot check)
-are not counted: they say nothing about the video."""
+and format errors (a YouTube player breakage) are not counted: they say nothing about the
+video. Blocks are retried every poll, format errors after FORMAT_RETRY_MAX at most."""
+FORMAT_RETRY_MAX = timedelta(hours=1)
+"""A video hit by a format error is retried after 10, 20, 40, then every 60 minutes until a
+yt-dlp update fixes the player; never given up."""
 
 
 class FirstRun(StrEnum):
@@ -89,7 +101,8 @@ class CreatorPoll:
     first_run: bool = False
     new: int = 0
     """Items not seen before that this poll handled (enqueued or not); items whose
-    metadata lookup is still backing off are not counted."""
+    metadata lookup is still backing off, or that a stopped or blocked batch never got
+    to, are not counted."""
     enqueued: list[tuple[int, str, str | None]] = field(default_factory=list)
     """(job id, video id, title) per job created."""
     errors: list[dict[str, str]] = field(default_factory=list)
@@ -128,6 +141,9 @@ class YouTubeMonitor:
     failures: dict[str, _Failure] = field(default_factory=dict)
     """Videos whose metadata lookup failed, by id. Kept in memory: a restart only resets
     the backoff, it cannot enqueue anything twice."""
+    format_retries: dict[str, _Failure] = field(default_factory=dict)
+    """Videos whose last lookup was a format error, by id (`attempts`: the streak). Kept
+    apart from `failures` because these never count toward giving up."""
 
     def run_forever(self, creators: Sequence[Creator]) -> None:
         """Poll every interval (with jitter) until `stop` is set. A failing cycle (e.g. the
@@ -166,8 +182,9 @@ class YouTubeMonitor:
                 self._poll(creator, creator.youtube.channel_id, poll)
             except Exception as exc:
                 error = redact(f"{type(exc).__name__}: {exc}")
-                if self.stop.is_set():
-                    # Most likely its yt-dlp child killed by the stop: not a failure.
+                if isinstance(exc, SourceCancelled):
+                    # Its yt-dlp child killed by the stop: not a failure. Anything else
+                    # during shutdown (HTTP 500, sqlite) still is.
                     logger.info("%s: poll ended by stop: %s", creator.name, error)
                 else:
                     logger.error("%s: poll failed: %s", creator.name, error)
@@ -204,10 +221,10 @@ class YouTubeMonitor:
             start if mode is FirstRun.BASELINE else start - timedelta(days=settings.lookback_days)
         )
         fresh = [u for u in uploads if not self._is_seen(u.video_id)]
-        poll.new = len(fresh)
         if poll.first_run and mode is FirstRun.BASELINE:
             for upload in fresh:
                 self._record(creator.name, upload.video_id, SeenStatus.BASELINE, now)
+            poll.new = len(fresh)
             if fresh:
                 logger.info(
                     "%s: first poll, %d item(s) recorded as baseline", creator.name, poll.new
@@ -222,20 +239,27 @@ class YouTubeMonitor:
             for video_id in old:
                 self._record(creator.name, video_id, SeenStatus.BASELINE, now)
             fresh = [u for u in fresh if u.video_id not in old]
+            poll.new = len(old)
         listed = {u.video_id for u in uploads}
-        for video_id, failure in list(self.failures.items()):
-            if failure.creator == creator.name and video_id not in listed:
-                del self.failures[video_id]  # dropped off the listing: forget it
-        due = [
-            u.video_id
-            for u in fresh
-            if u.video_id not in self.failures or self.failures[u.video_id].retry_at <= now
-        ]
-        poll.new -= len(fresh) - len(due)  # still backing off: not looked at this poll
+        for retries in (self.failures, self.format_retries):
+            for video_id, failure in list(retries.items()):
+                if failure.creator == creator.name and video_id not in listed:
+                    del retries[video_id]  # dropped off the listing: forget it
+        due = [u.video_id for u in fresh if not self._backing_off(u.video_id, now)]
+        # New items first, then retries, format errors last (stable: newest first within
+        # each). A format error or block stops the batch, so a video stuck on one must
+        # not keep the uploads behind it from ever being probed.
+        due.sort(key=lambda v: (v in self.format_retries, v in self.failures))
         if not due:
             return
         meta = self.source.videos(due, self.stop.is_set)
+        # Only IDs looked at: the rest (stop requested, a block) are counted when they are.
+        poll.new += len(set(due) & (meta.videos.keys() | meta.unavailable | meta.errors.keys()))
         for video_id in due:
+            if video_id in meta.format_errors:
+                self._format_failed(creator.name, video_id, now)
+            elif video_id in meta.unavailable | meta.errors.keys() | meta.videos.keys():
+                self.format_retries.pop(video_id, None)
             if video_id in meta.unavailable:
                 self.failures.pop(video_id, None)
                 self._record(creator.name, video_id, SeenStatus.UNAVAILABLE, now)
@@ -243,7 +267,7 @@ class YouTubeMonitor:
                 error = redact(meta.errors[video_id])
                 logger.warning("%s: %s: metadata failed: %s", creator.name, video_id, error)
                 poll.errors.append({"creator": creator.name, "item": video_id, "error": error})
-                if video_id not in meta.blocked:
+                if video_id not in meta.blocked and video_id not in meta.format_errors:
                     self._metadata_failed(creator.name, video_id, now, poll)
             elif video_id in meta.videos:
                 self.failures.pop(video_id, None)
@@ -253,6 +277,19 @@ class YouTubeMonitor:
             logger.info(
                 "%s: %d new item(s), %d enqueued", creator.name, poll.new, len(poll.enqueued)
             )
+
+    def _backing_off(self, video_id: str, now: datetime) -> bool:
+        return any(
+            video_id in retries and retries[video_id].retry_at > now
+            for retries in (self.failures, self.format_retries)
+        )
+
+    def _format_failed(self, creator: str, video_id: str, now: datetime) -> None:
+        failure = self.format_retries.get(video_id) or _Failure(creator, 0, now)
+        failure.attempts += 1
+        delay = METADATA_RETRY_BASE * 2 ** min(failure.attempts - 1, 6)
+        failure.retry_at = now + min(delay, FORMAT_RETRY_MAX)
+        self.format_retries[video_id] = failure
 
     def _metadata_failed(
         self, creator: str, video_id: str, now: datetime, poll: CreatorPoll
@@ -298,6 +335,10 @@ class YouTubeMonitor:
             old = video.published < cutoff - slack
         if old:
             status = SeenStatus.BASELINE
+        elif video.availability in GATED_AVAILABILITY and not settings.allow_gated_content:
+            # Fetchable only through the cookies account's membership or Premium.
+            logger.info("%s: %s is %s; skipped", creator, video.video_id, video.availability)
+            status = SeenStatus.UNAVAILABLE
         elif video.live_status in NOT_FINISHED:
             status = SeenStatus.WAITING_VOD
         elif video.duration_s is not None and video.duration_s < settings.min_duration_seconds:

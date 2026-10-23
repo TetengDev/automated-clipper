@@ -593,6 +593,25 @@ def test_source_raises_when_feed_and_fallback_fail(http: httpx.Client) -> None:
         YouTubeSource(http, provider).recent_uploads(CHANNEL)
 
 
+def test_cancelled_listing_raises_source_cancelled() -> None:
+    from clipper.pipeline.ytdlp import CommandCancelled
+
+    def cancelled(args, timeout_s):
+        raise CommandCancelled("python cancelled")
+
+    with pytest.raises(yt.SourceCancelled):
+        YtDlpProvider(YtDlp(runner=cancelled)).uploads(CHANNEL)
+
+
+@respx.mock
+def test_source_does_not_rewrap_a_cancelled_fallback(http: httpx.Client) -> None:
+    respx.get(yt.FEED_URL).mock(return_value=httpx.Response(500))
+    provider = StubProvider(yt.SourceCancelled("yt-dlp listing cancelled"))
+
+    with pytest.raises(yt.SourceCancelled):
+        YouTubeSource(http, provider).recent_uploads(CHANNEL)
+
+
 def test_build_source_is_keyless_without_api_key(http: httpx.Client) -> None:
     source = yt.build_source(Secrets(), http, YtDlp(runner=FakeRunner({})))
 
@@ -680,6 +699,25 @@ def test_format_and_age_errors_are_retryable_not_unavailable(stderr: str) -> Non
     assert set(meta.errors) == {V1}
 
 
+FORMAT_ERROR = "ERROR: [youtube] x: Requested format is not available. Use --list-formats"
+AUDIO = {"format_id": "140", "ext": "m4a", "acodec": "mp4a.40.2", "url": "https://x/140"}
+
+
+def test_format_error_stops_the_batch_and_is_never_reprobed() -> None:
+    # A player breakage (SABR, n-sig) hits every video alike: one probe tells.
+    runner = FakeRunner({watch(V1): RunResult(1, "", FORMAT_ERROR), watch(V2): ok_json(info(V2))})
+
+    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1, V2])
+
+    assert runner.urls() == [watch(V1)]  # V2 waits for the next poll
+    assert set(meta.errors) == {V1} and "Requested format" in meta.errors[V1]
+    assert meta.format_errors == {V1}
+    assert meta.videos == {} and meta.unavailable == set() and meta.blocked == set()
+    # With the flag, the YouTube extractor appends storyboard formats after its
+    # playability check, so a private or bot-checked video would look fetchable.
+    assert all("--ignore-no-formats-error" not in call for call in runner.calls)
+
+
 def test_bot_check_stops_probing_the_rest_of_the_batch() -> None:
     runner = FakeRunner(
         {
@@ -710,28 +748,17 @@ def test_metadata_probes_never_ignore_missing_formats() -> None:
     assert "--ignore-no-formats-error" in listing  # harmless with --flat-playlist
 
 
-@pytest.mark.parametrize("availability", ["private", "subscriber_only"])
-def test_probe_exiting_zero_without_formats_for_restricted_video_is_unavailable(
-    availability: str,
-) -> None:
-    body = info(V1, formats=[], availability=availability, duration=None)
-    runner = FakeRunner({watch(V1): RunResult(0, json.dumps(body), "")})
+@pytest.mark.parametrize("availability", ["needs_auth", "subscriber_only", "premium_only"])
+def test_probe_listing_formats_is_fetchable_whatever_its_availability(availability: str) -> None:
+    # With CLIPPER_YTDLP_COOKIES, an 18+ or members' video the account can watch exits 0
+    # with formats: it is fetchable, so it is returned, not retried or dropped.
+    body = info(V1, formats=[AUDIO], availability=availability)
+    runner = FakeRunner({watch(V1): ok_json(body)})
 
     meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
 
-    assert meta.unavailable == {V1}
-    assert meta.videos == {} and meta.errors == {}
-
-
-@pytest.mark.parametrize("availability", ["needs_auth", "premium_only"])
-def test_probe_exiting_zero_for_gated_video_is_a_retryable_error(availability: str) -> None:
-    body = info(V1, formats=[], availability=availability)
-    runner = FakeRunner({watch(V1): RunResult(0, json.dumps(body), "")})
-
-    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1])
-
-    assert set(meta.errors) == {V1} and availability in meta.errors[V1]
-    assert meta.videos == {} and meta.unavailable == set()
+    assert set(meta.videos) == {V1}
+    assert meta.errors == {} and meta.unavailable == set()
 
 
 def test_pipeline_probe_still_fails_on_missing_formats() -> None:
@@ -829,3 +856,12 @@ def test_trickling_response_is_cut_off_at_the_deadline(http: httpx.Client) -> No
     with pytest.raises(SourceError, match="took longer than"):
         yt.get_capped(http, yt.FEED_URL, params={}, limit=1 << 40, what="feed", clock=Ticking(2.0))
     assert body.pulled <= yt.HTTP_DEADLINE_S // 2 + 1
+
+
+def test_no_video_formats_found_is_a_format_error() -> None:
+    stderr = "ERROR: [youtube] x: No video formats found!"
+    runner = FakeRunner({watch(V1): RunResult(1, "", stderr), watch(V2): ok_json(info(V2))})
+
+    meta = YtDlpProvider(YtDlp(runner=runner)).videos([V1, V2])
+
+    assert meta.format_errors == {V1} and runner.urls() == [watch(V1)]

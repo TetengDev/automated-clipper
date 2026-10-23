@@ -11,15 +11,22 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from clipper.jobs.models import Job, JobStatus
-from clipper.jobs.stages import PermanentError, SkipJob, StageContext
+from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext
 from clipper.pipeline import fetch_clips as fc
-from clipper.pipeline.common import Deadline, StageTimeout
+from clipper.pipeline.common import (
+    NO_FORMAT_MAX_AGE,
+    NO_FORMAT_RETRY,
+    Deadline,
+    NoUsableFormat,
+    StageTimeout,
+)
 from clipper.pipeline.ytdlp import (
     CommandTimeout,
     DownloadBlocked,
@@ -452,3 +459,50 @@ def test_clip_downloaded_with_another_format_is_redownloaded(
     fc.fetch_clips(_job(), _ctx(tmp_path), runner=again)
     assert len(again.calls) == 1
     assert again.calls[0][again.calls[0].index("-f") + 1] == "bv*[height<=720]+ba/b[height<=720]"
+
+
+# --- format errors: a YouTube player breakage (CLP-83) ---------------------------------------
+
+FORMAT_ERROR = "ERROR: [youtube] x: Requested format is not available. Use --list-formats"
+T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+
+def _fetch_at(media: Path, when: datetime, runner: FakeYtdlp) -> None:
+    ctx = StageContext(media_dir=media, conn=None, config=None, clock=lambda: when)  # type: ignore[arg-type]
+    fc.fetch_clips(_job(), ctx, runner=runner)
+
+
+def test_format_error_defers_the_clip_download(tmp_path: Path) -> None:
+    # After paid transcription and selection, a player breakage must not fail the job.
+    _setup(tmp_path, [_clip(1, 5.0, 8.0)])
+
+    with pytest.raises(Deferred) as exc:
+        _fetch_at(tmp_path, T0, FakeYtdlp(returncode=1, stderr=FORMAT_ERROR))
+
+    assert isinstance(exc.value, NoUsableFormat)
+    assert exc.value.until == T0 + NO_FORMAT_RETRY
+    assert (tmp_path / fc.NO_FORMAT_MARKER).exists()
+    assert not (tmp_path / "sections.json").exists()
+
+
+def test_format_error_past_the_age_cap_fails_the_clips_for_good(tmp_path: Path) -> None:
+    _setup(tmp_path, [_clip(1, 5.0, 8.0)])
+    broken = FakeYtdlp(returncode=1, stderr=FORMAT_ERROR)
+    with pytest.raises(NoUsableFormat):
+        _fetch_at(tmp_path, T0, broken)
+    with pytest.raises(NoUsableFormat):
+        _fetch_at(tmp_path, T0 + NO_FORMAT_MAX_AGE - timedelta(hours=1), broken)
+
+    with pytest.raises(PermanentError, match="requested format not available.*giving up"):
+        _fetch_at(tmp_path, T0 + NO_FORMAT_MAX_AGE + timedelta(minutes=10), broken)
+
+
+def test_format_marker_cleared_once_the_clips_download(tmp_path: Path) -> None:
+    _setup(tmp_path, [_clip(1, 5.0, 8.0)])
+    with pytest.raises(NoUsableFormat):
+        _fetch_at(tmp_path, T0, FakeYtdlp(returncode=1, stderr=FORMAT_ERROR))
+
+    _fetch_at(tmp_path, T0 + timedelta(hours=1), FakeYtdlp())
+
+    assert not (tmp_path / fc.NO_FORMAT_MARKER).exists()
+    assert (tmp_path / "sections.json").exists()

@@ -219,7 +219,7 @@ def test_audio_only_download_and_16k_mono_conversion(ctx: StageContext) -> None:
     runner = FakeRunner()
     run(make_job(), ctx, runner)
     (download,) = runner.of("download")
-    assert download[download.index("-f") + 1] == "bestaudio"
+    assert download[download.index("-f") + 1] == "bestaudio/best"
     (convert,) = runner.of("convert")
     for flag, value in (("-ac", "1"), ("-ar", "16000"), ("-c:a", "flac")):
         assert convert[convert.index(flag) + 1] == value
@@ -648,3 +648,115 @@ def test_source_is_removed_before_the_artifact_appears(
     monkeypatch.setattr(fa.os, "replace", spy)
     run(make_job(), ctx, FakeRunner())
     assert seen == [[]]
+
+
+# --- format errors: a YouTube player breakage (CLP-83) ---------------------------------------
+
+FORMAT_ERROR = "ERROR: [youtube] x: Requested format is not available. Use --list-formats"
+
+
+def _fetch_at(media_dir: Path, when: datetime, runner: FakeRunner) -> None:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        run(make_job(), StageContext(media_dir, conn, AppConfig(), clock=lambda: when), runner)
+
+
+@pytest.mark.parametrize("step", ["probe", "download"])
+def test_format_error_defers_thirty_minutes(media_dir: Path, step: str) -> None:
+    runner = FakeRunner()
+    runner.responses[step] = RunResult(1, "", FORMAT_ERROR)
+
+    with pytest.raises(Deferred) as exc:
+        _fetch_at(media_dir, T0, runner)
+
+    assert isinstance(exc.value, fa.NoUsableFormat)
+    assert exc.value.until == T0 + fa.NO_FORMAT_RETRY
+    assert (media_dir / fa.NO_FORMAT_MARKER).exists()
+    assert not (media_dir / AUDIO_NAME).exists()
+
+
+def test_format_error_past_the_age_cap_fails_for_good(media_dir: Path) -> None:
+    runner = FakeRunner()
+    runner.responses["probe"] = RunResult(1, "", FORMAT_ERROR)
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0, runner)
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0 + fa.NO_FORMAT_MAX_AGE - timedelta(hours=1), runner)
+
+    with pytest.raises(PermanentError, match="requested format not available.*giving up"):
+        _fetch_at(media_dir, T0 + fa.NO_FORMAT_MAX_AGE + timedelta(minutes=10), runner)
+
+
+def test_stale_format_marker_does_not_fail_a_new_breakage_at_once(media_dir: Path) -> None:
+    # A marker left by an earlier episode (e.g. the job was then skipped) is restarted.
+    (media_dir / fa.NO_FORMAT_MARKER).write_text((T0 - timedelta(days=10)).isoformat())
+    runner = FakeRunner()
+    runner.responses["probe"] = RunResult(1, "", FORMAT_ERROR)
+
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0, runner)
+
+
+def test_format_marker_cleared_once_the_download_works(media_dir: Path) -> None:
+    runner = FakeRunner()
+    runner.responses["download"] = RunResult(1, "", FORMAT_ERROR)
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0, runner)
+
+    del runner.responses["download"]
+    _fetch_at(media_dir, T0 + timedelta(hours=1), runner)
+
+    assert not (media_dir / fa.NO_FORMAT_MARKER).exists()
+    assert (media_dir / AUDIO_NAME).exists()
+
+
+def test_format_error_defers_the_job_without_failing_it(db: Path, tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.responses["probe"] = RunResult(1, "", FORMAT_ERROR)
+    worker = _worker(db, tmp_path, runner)
+    with closing(worker.conn):
+        job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+        worker.run_once()  # detected -> fetching_audio
+        worker.run_once()  # format error: deferred
+    row = _row(db, job.id)
+    assert row["status"] == JobStatus.FETCHING_AUDIO.value
+    assert row["next_attempt_at"] is not None
+
+
+# --- gated content: members-only and Premium (CLP-83) ----------------------------------------
+
+
+def _fetch_with(media_dir: Path, info: dict[str, Any], allow: bool) -> FakeRunner:
+    runner = FakeRunner(info)
+    config = AppConfig(settings=Settings(allow_gated_content=allow))
+    with closing(sqlite3.connect(":memory:")) as conn:
+        run(make_job(), StageContext(media_dir, conn, config), runner)
+    return runner
+
+
+@pytest.mark.parametrize("availability", ["subscriber_only", "premium_only"])
+def test_gated_video_is_skipped_when_not_allowed(media_dir: Path, availability: str) -> None:
+    # The monitor's check relies on yt-dlp's badges and the Data API has none: the worker
+    # checks again on its own probe.
+    with pytest.raises(SkipJob, match=f"{availability}.*allow_gated_content"):
+        _fetch_with(media_dir, base_info(availability=availability), allow=False)
+
+
+@pytest.mark.parametrize("availability", ["subscriber_only", "premium_only"])
+def test_gated_video_is_fetched_when_allowed(media_dir: Path, availability: str) -> None:
+    runner = _fetch_with(media_dir, base_info(availability=availability), allow=True)
+
+    assert runner.of("download") and (media_dir / AUDIO_NAME).is_file()
+
+
+def test_age_restricted_video_is_fetched_with_gating_off(media_dir: Path) -> None:
+    _fetch_with(media_dir, base_info(availability="needs_auth"), allow=False)
+
+    assert (media_dir / AUDIO_NAME).is_file()
+
+
+def test_no_video_formats_found_defers_too(media_dir: Path) -> None:
+    runner = FakeRunner()
+    runner.responses["probe"] = RunResult(1, "", "ERROR: [youtube] x: No video formats found!")
+
+    with pytest.raises(fa.NoUsableFormat):
+        _fetch_at(media_dir, T0, runner)

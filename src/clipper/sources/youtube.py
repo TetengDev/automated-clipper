@@ -36,6 +36,7 @@ from defusedxml.ElementTree import fromstring
 from clipper.config import Secrets
 from clipper.jobs.stages import PermanentError
 from clipper.pipeline.ytdlp import (
+    NO_FORMAT,
     CommandCancelled,
     DownloadBlocked,
     Unavailable,
@@ -73,10 +74,6 @@ NOT_FINISHED: frozenset[str] = frozenset({"is_live", "is_upcoming", "post_live"}
 """Live now, scheduled, or a finished stream whose VOD is still processing."""
 GONE_REASONS: frozenset[str] = frozenset({"private", "members-only", "removed or unavailable"})
 """`Unavailable.reason`s that mean nobody can fetch it: recorded once, never retried."""
-GONE_AVAILABILITY: frozenset[str] = frozenset({"private", "subscriber_only"})
-"""yt-dlp `availability` values meaning the same, should a probe ever exit 0 for one."""
-GATED_AVAILABILITY: frozenset[str] = frozenset({"needs_auth", "premium_only"})
-"""Fetchable only with an account (cookies): retried like other metadata errors."""
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _YT = "{http://www.youtube.com/xml/schemas/2015}"
@@ -88,6 +85,10 @@ _ISO_DURATION = re.compile(r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?
 
 class SourceError(RuntimeError):
     """Listing or metadata failed in a way that may work next poll. Message is redacted."""
+
+
+class SourceCancelled(SourceError):
+    """A yt-dlp call was killed by the caller's stop (shutdown): not a failure."""
 
 
 class FeedError(SourceError):
@@ -119,6 +120,8 @@ class VideoMeta:
     published: datetime | None
     day_precision: bool = False
     """`published` is only a calendar day (yt-dlp's upload_date at midnight UTC)."""
+    availability: str | None = None
+    """yt-dlp's `availability` (public, unlisted, needs_auth, subscriber_only, ...)."""
 
 
 @dataclass
@@ -134,6 +137,9 @@ class Metadata:
     blocked: set[str] = field(default_factory=set)
     """The subset of `errors` where the platform refused us (bot check, rate limit): says
     nothing about the video itself. The batch stops there."""
+    format_errors: set[str] = field(default_factory=set)
+    """The subset of `errors` where no format could be selected, typically a YouTube player
+    breakage: says nothing about the video either. The batch stops there too."""
 
 
 @dataclass
@@ -307,10 +313,17 @@ class YtDlpProvider:
             except CommandCancelled:
                 break  # shutting down; this one and the rest wait for the next start
             except Unavailable as exc:
+                if exc.reason == NO_FORMAT:
+                    # A YouTube player change (SABR, n-sig) hits every video alike, so
+                    # the rest of the batch would only fail the same way: next poll.
+                    logger.warning("%s: no usable format; stopping this batch: %s", video_id, exc)
+                    result.errors[video_id] = str(exc)
+                    result.format_errors.add(video_id)
+                    break
                 if exc.reason in GONE_REASONS:
                     logger.warning("%s: unavailable, not retried: %s", video_id, exc)
                     result.unavailable.add(video_id)
-                else:  # age gate, format errors: may work later (cookies, a yt-dlp update)
+                else:  # age gate: may work later (cookies)
                     result.errors[video_id] = str(exc)
             except DownloadBlocked as exc:
                 # More probes now would only deepen the block; the rest wait for next poll.
@@ -324,14 +337,11 @@ class YtDlpProvider:
                 else:
                     result.errors[video_id] = str(exc)
             else:
-                availability = info.get("availability")
-                if availability in GONE_AVAILABILITY:
-                    logger.warning("%s: unavailable (%s), not retried", video_id, availability)
-                    result.unavailable.add(video_id)
-                elif availability in GATED_AVAILABILITY:
-                    result.errors[video_id] = f"video is {availability}"
-                else:
-                    result.videos[video_id] = self._meta(video_id, info)
+                # A probe that returns selected a format with yt-dlp's default selector
+                # (it fails otherwise, without --ignore-no-formats-error), so this account
+                # can fetch the video, e.g. an 18+ or members' video with cookies; the
+                # worker's `bestaudio/best` accepts whatever that selector does.
+                result.videos[video_id] = self._meta(video_id, info)
         return result
 
     @staticmethod
@@ -354,6 +364,7 @@ class YtDlpProvider:
             status,
             published,
             day_precision,
+            info["availability"] if isinstance(info.get("availability"), str) else None,
         )
 
     def uploads(self, channel_id: str) -> list[Upload]:
@@ -366,7 +377,9 @@ class YtDlpProvider:
             info = self.ytdlp.listing(
                 url, f"1:{FALLBACK_ITEMS}", extractor_args="youtubetab:approximate_date"
             )
-        except (YtDlpError, PermanentError, CommandCancelled) as exc:
+        except CommandCancelled:
+            raise SourceCancelled("yt-dlp listing cancelled") from None
+        except (YtDlpError, PermanentError) as exc:
             raise SourceError(f"yt-dlp listing failed: {exc}") from None
         entries = info.get("entries")
         rows = entries if isinstance(entries, list) else []
@@ -533,6 +546,8 @@ class YouTubeSource:
             logger.warning("%s: %s; listing uploads instead", channel_id, feed_error)
             try:
                 return self.provider.uploads(channel_id)
+            except SourceCancelled:
+                raise
             except SourceError as exc:
                 raise SourceError(f"feed: {feed_error}; fallback: {exc}") from None
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import io
 import os
-import shutil
+import stat
 import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -137,20 +137,28 @@ def write_ids(path: Path, results: Sequence[Resolved]) -> int:
             _insert_after(node, handle_key, id_key, value)
     out = io.StringIO()
     yaml.dump(doc, out)
-    # Same directory (atomic replace); a fresh random name created with O_EXCL, so a file
-    # or symlink planted at a predictable name is never written through.
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
-    ) as handle:
-        tmp = Path(handle.name)
+    # Same directory (atomic replace). The temp file gets a fresh random name created with
+    # O_EXCL and is written and chmod-ed only through that one handle, so a file or symlink
+    # planted in the directory is never written through.
+    tmp: Path | None = None
     try:
-        tmp.write_text(out.getvalue(), encoding="utf-8")
-        shutil.copymode(path, tmp)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp = Path(handle.name)
+            handle.write(out.getvalue())
+            os.fchmod(handle.fileno(), stat.S_IMODE(path.stat().st_mode))
         try:
             load_config(tmp)
         except ConfigError as exc:
             raise ValueError(f"not writing {path}: the result would be invalid: {exc}") from None
         os.replace(tmp, path)
     finally:
-        tmp.unlink(missing_ok=True)
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
     return len(changes)

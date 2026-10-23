@@ -26,6 +26,7 @@ from clipper.jobs import (
     enqueue,
 )
 from clipper.pipeline import fetch_audio as fa
+from clipper.pipeline import ytdlp
 from clipper.pipeline.common import Deadline, StageTimeout
 from clipper.pipeline.fetch_audio import (
     AUDIO_NAME,
@@ -219,7 +220,9 @@ def test_audio_only_download_and_16k_mono_conversion(ctx: StageContext) -> None:
     runner = FakeRunner()
     run(make_job(), ctx, runner)
     (download,) = runner.of("download")
-    assert download[download.index("-f") + 1] == "bestaudio/best"
+    (probe,) = runner.of("probe")
+    assert download[download.index("-f") + 1] == ytdlp.AUDIO_FORMAT  # probe and download agree
+    assert probe[probe.index("-f") + 1] == ytdlp.AUDIO_FORMAT
     (convert,) = runner.of("convert")
     for flag, value in (("-ac", "1"), ("-ar", "16000"), ("-c:a", "flac")):
         assert convert[convert.index(flag) + 1] == value

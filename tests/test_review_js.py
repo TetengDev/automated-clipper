@@ -106,10 +106,27 @@ def _sensitive_page(checked: bool) -> list[list[object]]:
 
 
 def test_a_on_unconfirmed_sensitive_clip_focuses_the_confirm_box() -> None:
-    """CLP-87: like `r` and the reason picker; `a` in the unticked box does nothing."""
+    """CLP-87: like `r` and the reason picker; never approves while the box is unticked."""
     log = run(_sensitive_page(False), [["a", None], ["a", "confirm-sensitive"]])
 
-    assert log == ["focus:confirm-sensitive", "prevent:a"]
+    assert "click:approve-btn" not in log
+    assert log[:2] == ["focus:confirm-sensitive", "prevent:a"]
+
+
+def test_shortcuts_still_work_with_focus_on_the_confirm_box() -> None:
+    """Review: a checkbox is not text entry, so j/k/r keep working after `a` focused it."""
+    keys = [["j", "confirm-sensitive"], ["k", "confirm-sensitive"], ["r", "confirm-sensitive"]]
+
+    log = run(_sensitive_page(False), keys)
+
+    assert log == [
+        "go:/clip/2",
+        "prevent:j",
+        "go:/clip/4",
+        "prevent:k",
+        "focus:reason-tag",
+        "prevent:r",
+    ]
 
 
 def test_a_approves_once_the_sensitive_clip_is_confirmed() -> None:

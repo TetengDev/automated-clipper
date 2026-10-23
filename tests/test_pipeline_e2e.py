@@ -543,9 +543,10 @@ def test_real_render_reaches_review_and_export(
     clip_id = rows[0]["id"]
     assert rows[0]["title"] in client.get("/queue").text
     assert client.get(f"/media/clip/{clip_id}/1/video").status_code == 200
+    assert rows[0]["sensitive"] == 1  # creator "manual" is not configured: fails closed
     response = client.post(
         f"/clip/{clip_id}/approve",
-        data={"version": 1},
+        data={"version": 1, "confirm_sensitive": "1"},
         headers={"X-CSRF-Token": csrf, "HX-Request": "true"},
     )
     assert response.status_code == 200

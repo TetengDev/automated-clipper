@@ -208,7 +208,7 @@ def test_card_shows_the_rendered_duration(client: TestClient, env: Env) -> None:
 
 
 def test_sensitive_badge_only_on_sensitive_cards(client: TestClient, env: Env) -> None:
-    job = env.job("Raffy Tulfo in Action", title="Case")
+    job = env.job("Kai Cenat", title="Case")
     flagged = env.clip(job, title="Flagged one", sensitive=True, created_at="2027-01-02T00:00:00Z")
     env.clip(job, title="Plain one", created_at="2027-01-01T00:00:00Z")
 
@@ -224,7 +224,7 @@ def test_sensitive_badge_only_on_sensitive_cards(client: TestClient, env: Env) -
 def test_sensitive_cards_carry_the_face_check_note(client: TestClient, env: Env) -> None:
     """CLP-87: visible text, not only the badge's hover title (no hover on a phone)."""
     note = "Check faces of minors and victims; the model cannot see the video."
-    job = env.job("Raffy Tulfo in Action", title="Case")
+    job = env.job("Kai Cenat", title="Case")
     env.clip(job, title="Flagged one", sensitive=True, created_at="2027-01-02T00:00:00Z")
     env.clip(job, title="Plain one", created_at="2027-01-01T00:00:00Z")
 
@@ -232,6 +232,20 @@ def test_sensitive_cards_carry_the_face_check_note(client: TestClient, env: Env)
 
     assert f'<span class="sensitive-note">{note}</span>' in cards[0]
     assert note not in cards[1]
+
+
+@pytest.mark.parametrize("creator", ["Raffy Tulfo in Action", "manual"])
+def test_always_sensitive_creator_cards_show_badge_and_note_without_the_flag(
+    client: TestClient, env: Env, creator: str
+) -> None:
+    """CLP-87 review M2: clips stored before the fix (sensitive=0) of a public_service
+    creator, or of a creator not in the config, still get the faces check."""
+    env.clip(env.job(creator, title="Case"), title="Old clip")
+
+    (card,) = client.get("/queue").text.split('class="clip-card"')[1:]
+
+    assert 'class="badge sensitive"' in card
+    assert "Check faces of minors and victims; the model cannot see the video." in card
 
 
 def test_needs_attention_has_its_own_tab(client: TestClient, env: Env) -> None:

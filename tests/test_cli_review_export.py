@@ -18,12 +18,34 @@ runner = CliRunner()
 
 
 @pytest.fixture
-def captured(monkeypatch: pytest.MonkeyPatch) -> dict[str, FastAPI]:
+def captured(monkeypatch: pytest.MonkeyPatch, config_file: Path) -> dict[str, FastAPI]:
     calls: dict[str, FastAPI] = {}
     monkeypatch.setattr("uvicorn.run", lambda application, **_kw: calls.update(app=application))
     monkeypatch.setenv("REVIEW_PASSWORD_HASH", PASSWORD_HASH)
     monkeypatch.setenv("SESSION_SECRET", SECRET)
+    monkeypatch.setenv("CLIPPER_CONFIG", str(config_file))
     return calls
+
+
+def test_run_review_loads_the_creator_config(captured: dict[str, FastAPI], tmp_path: Path) -> None:
+    """CLP-87 review M2: the app needs each creator's content type for the faces check."""
+    result = runner.invoke(cli_app, ["--db", str(tmp_path / "x.db"), "run-review"])
+
+    assert result.exit_code == 0, result.output
+    config = captured["app"].state.config
+    assert [c.name for c in config.creators] == ["MrBeast", "Kai Cenat", "Raffy Tulfo in Action"]
+
+
+def test_run_review_refuses_a_missing_config(
+    captured: dict[str, FastAPI], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLIPPER_CONFIG", str(tmp_path / "nope.yaml"))
+
+    result = runner.invoke(cli_app, ["--db", str(tmp_path / "x.db"), "run-review"])
+
+    assert result.exit_code == 1
+    assert "run-review: config file not found" in result.output
+    assert "app" not in captured
 
 
 @pytest.fixture

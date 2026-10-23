@@ -454,6 +454,28 @@ def test_items_still_backing_off_are_not_counted_as_new(conn, cfg, source, clock
     assert calls_for(source, V1) == 1
 
 
+def test_giving_up_is_reported_in_the_poll_errors(conn, cfg, source, clock) -> None:
+    not_first_poll(conn)
+    source.feeds[BEAST] = [Upload(V1, T0)]
+    source.meta[V1] = "yt-dlp failed: Connection reset"
+    monitor = make(conn, cfg, source, clock)
+
+    for _ in range(MAX_METADATA_ATTEMPTS):
+        if V1 in monitor.failures:  # skip the backoff wait
+            monitor.failures[V1].retry_at = clock.now
+        report = monitor.run_cycle([cfg.creator("MrBeast")])
+        clock.now += timedelta(minutes=1)
+
+    assert seen(conn)[V1] == "metadata_failed"
+    gave_up = {
+        "creator": "MrBeast",
+        "item": V1,
+        "error": f"metadata failed {MAX_METADATA_ATTEMPTS} times; given up",
+    }
+    assert report.errors[-1] == gave_up
+    assert json.loads(runs(conn)[-1]["errors"])[-1] == gave_up
+
+
 def test_bot_check_is_retried_every_poll_and_never_gives_up(conn, cfg, source, clock) -> None:
     not_first_poll(conn)
     source.feeds[BEAST] = [Upload(V1, T0), Upload(V2, T0)]

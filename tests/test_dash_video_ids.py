@@ -91,6 +91,11 @@ class Recorder:
             out = Path(argv[argv.index("-o") + 1].replace("%(ext)s", "mp4"))
             out.write_bytes(b"media")
             return RunResult(0, "", "")
+        if "clipper.pipeline.local_asr" in argv:
+            words = [{"word": "hi", "start": 1.0, "end": 1.5}]
+            body = {"language": "en", "words": words, "segments": [], "dropped": {}}
+            body["segments"] = [{"start": 1.0, "end": 1.5, "text": "hi"}]
+            return RunResult(0, json.dumps(body), "")
         if argv[0] == "ffprobe":
             probe = {
                 "format": {"duration": "900"},
@@ -224,15 +229,158 @@ def test_quality_gate_and_transcribe_cuts(
     assert_id_is_never_an_option(rec.calls, ref)
 
 
-def test_review_media_and_export_paths_need_no_argv(ref: SourceRef) -> None:
-    """Export runs rclone on a staging dir named after the clip (never the id); the
-    review app serves files by clip id and links the canonical URL."""
-    from clipper.clips import source_url_at
-    from clipper.export import rclone_args
+def test_ffprobe_duration(ref: SourceRef, media: Path) -> None:
+    audio = media / "audio_16k.flac"
+    audio.write_bytes(b"flac")
+    rec = Recorder(ref)
 
-    args = rclone_args("remote:", Path("/abs/stage/creator_title-1_v1.x"), "2026-10-23")
+    assert common.ffprobe_duration(audio, runner=rec) == 900.0
+
+    assert_id_is_never_an_option(rec.calls, ref)
+
+
+@pytest.fixture
+def local_asr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ref: SourceRef
+) -> tuple[transcribe.FasterWhisperTranscriber, Recorder]:
+    """The local whisper backend with its model check skipped; every child (ffmpeg,
+    ffprobe, the ASR child) goes to one recorder."""
+    rec = Recorder(ref)
+    monkeypatch.setattr(common, "default_runner", lambda: rec)
+    monkeypatch.setattr(transcribe, "default_runner", lambda: rec)
+    monkeypatch.setattr(
+        transcribe.FasterWhisperTranscriber,
+        "ensure_model",
+        lambda self, timeout_s=0: self.snapshot_dir,
+    )
+    return transcribe.FasterWhisperTranscriber(models_dir=tmp_path / "models"), rec
+
+
+def test_quality_join_check_audio_and_asr_child(
+    ref: SourceRef, media: Path, local_asr: tuple[transcribe.FasterWhisperTranscriber, Recorder]
+) -> None:
+    asr, rec = local_asr
+    video = media / "clips" / "1" / "v1.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+
+    heard = quality._hear(video, None, asr, Deadline())
+
+    assert heard == [("hi", 1.0, 1.5)]
+    assert [c[0] for c in rec.calls] == ["ffmpeg", rec.calls[1][0]]  # extract, then ASR
+    assert "clipper.pipeline.local_asr" in rec.calls[1]
+    assert_id_is_never_an_option(rec.calls, ref)
+
+
+def test_transcribe_stage(
+    ref: SourceRef,
+    media: Path,
+    tmp_path: Path,
+    local_asr: tuple[transcribe.FasterWhisperTranscriber, Recorder],
+) -> None:
+    from datetime import UTC, datetime
+
+    from clipper.db import connect, migrate
+    from clipper.jobs import enqueue
+
+    asr, rec = local_asr
+    (media / "audio_16k.flac").write_bytes(b"flac")
+    with closing(connect(tmp_path / "state.db")) as conn:
+        migrate(conn)
+        queued, _ = enqueue(conn, ref, datetime(2026, 1, 1, tzinfo=UTC), creator="MrBeast")
+        ctx = StageContext(media, conn, AppConfig())
+        transcribe.transcribe(queued, ctx, transcriber=asr)
+
+    kinds = [("asr" if "clipper.pipeline.local_asr" in c else c[0]) for c in rec.calls]
+    assert kinds[0] == "ffprobe" and {"ffmpeg", "asr"} <= set(kinds)
+    assert_id_is_never_an_option(rec.calls, ref)
+    assert (media / "transcript.json").is_file()
+
+
+def test_select_stage_claude_cli(
+    ref: SourceRef, media: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clipper.db import connect, migrate
+    from clipper.jobs import enqueue
+    from clipper.pipeline import select
+    from test_select import T0, make_ctx, write_transcript
+    from test_select_cli import FakeCli, cli_json
+
+    for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    write_transcript(media)
+    meta = {"title": "t", "duration_s": 600, "uploader": "MrBeast", "is_live": False}
+    (media / "meta.json").write_text(json.dumps(meta | {"webpage_url": canonical_url(ref)}))
+    fake = FakeCli(cli_json())
+    with closing(connect(tmp_path / "state.db")) as conn:
+        migrate(conn)
+        queued, _ = enqueue(conn, ref, T0, creator="MrBeast")
+        select.select_highlights(queued, make_ctx(conn, media, selector="claude_cli"), runner=fake)
+
+    (call,) = fake.calls
+    assert not any(ref.item_id in arg for arg in call["args"])
+    assert_id_is_never_an_option([[*call["args"], "--", canonical_url(ref)]], ref)
+    cwd = Path(call["cwd"])
+    assert cwd.is_absolute() and ref.item_id not in str(cwd)
+
+
+def test_export_rclone_argv(ref: SourceRef, tmp_path: Path) -> None:
+    """The real export path: package staged, then rclone, for a clip of a dash-id job."""
+    from review_support import make_env
+    from test_export import approved_clip
+    from test_export import run as export
+
+    env = make_env(tmp_path)
+    try:
+        clip_id = approved_clip(
+            env, creator="MrBeast", item_id=ref.item_id, video=f"{ref.key}/clips/1/v1.mp4"
+        )
+        result = export(env, clip_id, rclone_remote="gdrive:clips")
+    finally:
+        env.conn.close()
+
+    assert result.status == "exported"
+    (args,) = env.runner.calls
     assert args[:3] == ["rclone", "copy", "--"]
+    assert Path(args[3]).is_absolute()
+    assert not any(ref.item_id in arg for arg in args)  # staged by clip, never by id
+    assert_id_is_never_an_option(env.runner.calls, ref)
+    assert all(ref.item_id not in p.name for p in result.files)
+
+
+def test_review_source_link_is_the_canonical_url(ref: SourceRef) -> None:
+    from clipper.clips import source_url_at
+
     assert source_url_at("youtube", ref.item_id, 75) == f"{canonical_url(ref)}&t=75s"
+
+
+# --- invariant guard ---------------------------------------------------------------------
+
+SRC = Path(__file__).resolve().parents[1] / "src" / "clipper"
+ITEM_ID_ALLOWLIST: dict[str, int] = {}
+"""`relative path -> number of item_id uses` reviewed as safe (logging, SQL,
+canonical_url). Empty: the pipeline and the renderer only use `ref.key` and
+`canonical_url(ref)`."""
+
+
+def test_pipeline_and_render_never_touch_item_id() -> None:
+    """A new `.item_id` in an argv/path-building module must go through review (CLP-84)."""
+    import ast
+
+    files = [*sorted((SRC / "pipeline").rglob("*.py")), SRC / "render.py"]
+    uses: dict[str, int] = {}
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        count = sum(
+            (isinstance(n, ast.Attribute) and n.attr == "item_id")
+            or (isinstance(n, ast.Name) and n.id == "item_id")
+            or (isinstance(n, ast.keyword) and n.arg == "item_id")
+            for n in ast.walk(tree)
+        )
+        if count:
+            uses[str(path.relative_to(SRC))] = count
+    assert len(files) > 10
+    assert uses == ITEM_ID_ALLOWLIST
 
 
 @pytest.mark.parametrize(

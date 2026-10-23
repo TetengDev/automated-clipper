@@ -14,8 +14,12 @@ from urllib.parse import urlsplit
 Platform = Literal["youtube", "twitch"]
 
 MAX_URL_LENGTH = 2048
+# A YouTube id may start with "-" (e.g. "-4mo8fGTST0", CLP-84). Such an id never sits in
+# an argv position where it could be read as an option: subprocesses only see it inside
+# `canonical_url(ref)` (after "--") or inside a path under the `ref.key` media dir
+# ("youtube_<id>"), never as a bare argument or file name.
 _ITEM_ID = {
-    "youtube": re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{10}"),
+    "youtube": re.compile(r"[A-Za-z0-9_-]{11}"),
     "twitch": re.compile(r"[1-9][0-9]{0,19}"),
 }
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
@@ -30,6 +34,8 @@ class InvalidSourceURL(ValueError):
 class SourceRef:
     platform: Platform
     item_id: str
+    """May start with "-": never use it as a bare file name or argv value; use `key` (paths)
+    or `canonical_url(ref)` (after "--") instead."""
 
     def __post_init__(self) -> None:
         pattern = _ITEM_ID.get(self.platform)

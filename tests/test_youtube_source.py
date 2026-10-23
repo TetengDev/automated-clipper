@@ -131,6 +131,41 @@ def test_feed_skips_entries_with_invalid_video_ids(http: httpx.Client) -> None:
     assert yt.feed_uploads(http, CHANNEL) == [Upload(V1, None)]
 
 
+@respx.mock
+def test_feed_keeps_video_ids_that_start_with_a_dash(
+    http: httpx.Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Real MrBeast uploads (CLP-84): YouTube ids may start with "-".
+    respx.get(yt.FEED_URL).mock(
+        return_value=httpx.Response(
+            200,
+            text=feed_xml(
+                ("-4mo8fGTST0", "2026-10-17T15:00:18+00:00"),
+                ("-HgaXKz0rtg", "2026-10-10T12:00:00+00:00"),
+                ("-4mo8fGTST", "2026-10-09T12:00:00+00:00"),  # 10 chars: still invalid
+            ),
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        uploads = yt.feed_uploads(http, CHANNEL)
+
+    assert [u.video_id for u in uploads] == ["-4mo8fGTST0", "-HgaXKz0rtg"]
+    assert caplog.text.count("ignoring invalid YouTube video id") == 1
+    assert "'-4mo8fGTST'" in caplog.text
+
+
+def test_listing_keeps_video_ids_that_start_with_a_dash() -> None:
+    url = f"https://www.youtube.com/channel/{CHANNEL}/videos"
+    runner = FakeRunner(
+        {url: ok_json({"entries": [{"id": "-4mo8fGTST0", "timestamp": 1792252818}]})}
+    )
+
+    uploads = YtDlpProvider(YtDlp(runner=runner)).uploads(CHANNEL)
+
+    assert [u.video_id for u in uploads] == ["-4mo8fGTST0"]
+
+
 @pytest.mark.parametrize("status", [404, 500, 503])
 @respx.mock
 def test_feed_http_error_raises_feed_error(http: httpx.Client, status: int) -> None:

@@ -22,6 +22,10 @@ no attempt used); once the job is older than 48 h that becomes a `PermanentError
 stream path reaches this stage only after `waiting_vod`. Sources longer than
 `max_duration_seconds` are skipped, and yt-dlp is capped with `--max-filesize`.
 
+"Requested format is not available" from the probe or the download (usually a YouTube
+player change that a yt-dlp update fixes) raises `NoUsableFormat`, the same kind of
+Deferred (+30 min); past 48 h of it in this stage it fails for good, as before.
+
 The whole run shares one `Deadline` (100 min, inside the 2 h lease): every yt-dlp/ffmpeg
 call's timeout is shrunk to what is left, and running out is a retryable `StageTimeout`.
 
@@ -56,10 +60,16 @@ from clipper.pipeline.common import (
     settings_for,
     write_json_atomic,
 )
-from clipper.pipeline.ytdlp import Runner, YtDlp
+from clipper.pipeline.ytdlp import NO_FORMAT, Runner, Unavailable, YtDlp
 from clipper.urls import canonical_url
 
-__all__ = ["STAGE", "MediaError", "SourceNotReady", "fetch_audio"]  # MediaError re-exported
+__all__ = [
+    "STAGE",
+    "MediaError",
+    "NoUsableFormat",
+    "SourceNotReady",
+    "fetch_audio",
+]  # MediaError re-exported
 
 AUDIO_NAME = "audio_16k.flac"
 META_NAME = "meta.json"
@@ -76,6 +86,9 @@ SILENCE_LUFS = -70.0
 NOT_READY_RETRY = timedelta(minutes=30)
 NOT_READY_MAX_AGE = timedelta(hours=48)
 NOT_READY_MARKER = ".not_ready_since"
+NO_FORMAT_RETRY = NOT_READY_RETRY
+NO_FORMAT_MAX_AGE = NOT_READY_MAX_AGE
+NO_FORMAT_MARKER = ".no_format_since"
 NOT_READY_LIVE_STATUSES = frozenset({"is_live", "is_upcoming", "post_live"})
 WAS_LIVE_STATUSES = frozenset({"is_live", "was_live", "post_live"})
 
@@ -84,6 +97,19 @@ _EBUR128_LINE = re.compile(r"\bt:\s*(?P<t>[0-9.]+)\s.*?\bM:\s*(?P<m>-?inf|nan|-?
 
 class SourceNotReady(Deferred):
     """The source is live, upcoming, or still being processed; try again later."""
+
+
+class NoUsableFormat(Deferred):
+    """yt-dlp found no format to download (a player breakage); try again later."""
+
+
+def _no_format(media_dir: Path, now: datetime, error: Unavailable) -> Exception:
+    """Deferred, until format errors have lasted NO_FORMAT_MAX_AGE in this stage."""
+    since = first_seen(media_dir / NO_FORMAT_MARKER, now)
+    if now - since > NO_FORMAT_MAX_AGE:
+        hours = NO_FORMAT_MAX_AGE.total_seconds() / 3600
+        return PermanentError(f"{error} (for {hours:.0f} h; giving up)")
+    return NoUsableFormat(now + NO_FORMAT_RETRY, str(error))
 
 
 def _not_ready(media_dir: Path, now: datetime, live_status: object) -> Exception:
@@ -113,7 +139,12 @@ def fetch_audio(
     ytdlp = YtDlp.from_env(runner, env, cap_timeout=deadline.timeout)
     settings = settings_for(job, ctx.config)
 
-    info = ytdlp.probe(url)
+    try:
+        info = ytdlp.probe(url)
+    except Unavailable as exc:
+        if exc.reason != NO_FORMAT:
+            raise
+        raise _no_format(media_dir, ctx.clock(), exc) from None
     live_status = info.get("live_status")
     if live_status in NOT_READY_LIVE_STATUSES or info.get("is_live") is True:
         raise _not_ready(media_dir, ctx.clock(), live_status)
@@ -127,7 +158,13 @@ def fetch_audio(
     _remove_stale_sources(media_dir)
     try:
         write_json_atomic(info_tmp, info, indent=None)
-        source = ytdlp.download_audio(url, media_dir, SOURCE_STEM, info_json=info_tmp)
+        try:
+            source = ytdlp.download_audio(url, media_dir, SOURCE_STEM, info_json=info_tmp)
+        except Unavailable as exc:
+            if exc.reason != NO_FORMAT:
+                raise
+            raise _no_format(media_dir, ctx.clock(), exc) from None
+        (media_dir / NO_FORMAT_MARKER).unlink(missing_ok=True)
         _to_flac(runner, source, flac_tmp, deadline)
         if duration is None:
             timeout = deadline.timeout(PROBE_TIMEOUT_S)

@@ -43,7 +43,7 @@ from clipper.db import transaction
 from clipper.jobs.models import Clock, from_iso, to_iso, utcnow
 from clipper.jobs.queue import insert_job
 from clipper.redact import redact
-from clipper.sources.youtube import NOT_FINISHED, Metadata, Upload, VideoMeta
+from clipper.sources.youtube import NOT_FINISHED, Metadata, SourceCancelled, Upload, VideoMeta
 from clipper.urls import SourceRef
 
 logger = logging.getLogger(__name__)
@@ -168,8 +168,9 @@ class YouTubeMonitor:
                 self._poll(creator, creator.youtube.channel_id, poll)
             except Exception as exc:
                 error = redact(f"{type(exc).__name__}: {exc}")
-                if self.stop.is_set():
-                    # Most likely its yt-dlp child killed by the stop: not a failure.
+                if isinstance(exc, SourceCancelled):
+                    # Its yt-dlp child killed by the stop: not a failure. Anything else
+                    # during shutdown (HTTP 500, sqlite) still is.
                     logger.info("%s: poll ended by stop: %s", creator.name, error)
                 else:
                     logger.error("%s: poll failed: %s", creator.name, error)

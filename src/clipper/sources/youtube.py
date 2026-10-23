@@ -88,6 +88,10 @@ class SourceError(RuntimeError):
     """Listing or metadata failed in a way that may work next poll. Message is redacted."""
 
 
+class SourceCancelled(SourceError):
+    """A yt-dlp call was killed by the caller's stop (shutdown): not a failure."""
+
+
 class FeedError(SourceError):
     """The RSS feed failed (HTTP error, timeout, malformed XML); use the fallback listing."""
 
@@ -398,7 +402,9 @@ class YtDlpProvider:
             info = self.ytdlp.listing(
                 url, f"1:{FALLBACK_ITEMS}", extractor_args="youtubetab:approximate_date"
             )
-        except (YtDlpError, PermanentError, CommandCancelled) as exc:
+        except CommandCancelled:
+            raise SourceCancelled("yt-dlp listing cancelled") from None
+        except (YtDlpError, PermanentError) as exc:
             raise SourceError(f"yt-dlp listing failed: {exc}") from None
         entries = info.get("entries")
         rows = entries if isinstance(entries, list) else []
@@ -565,6 +571,8 @@ class YouTubeSource:
             logger.warning("%s: %s; listing uploads instead", channel_id, feed_error)
             try:
                 return self.provider.uploads(channel_id)
+            except SourceCancelled:
+                raise
             except SourceError as exc:
                 raise SourceError(f"feed: {feed_error}; fallback: {exc}") from None
 

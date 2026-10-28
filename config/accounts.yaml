@@ -10,7 +10,9 @@
 # platform and market (US or PH) is used. Windows are in the account's local timezone.
 # warmup_start ramps an account from 1 post/day up to posts_per_day over warmup_days (14).
 # Creators whose content type is public_service or vlog_lifestyle (or unset) are refused
-# unless the account sets `licence: <reference to the signed licence>`.
+# unless the account sets `licence: <reference to the signed licence>`. One licence covers
+# one creator. Windows hold posts from start through end, and the plan must fit in them.
+# Quote country codes YAML could misread, e.g. market: "NO".
 #
 # Raffy Tulfo in Action, Ivana Alawi and Cong TV are paused until licensed (CLP-90): do
 # not add accounts for them before a licence is signed.

@@ -150,15 +150,21 @@ To add an account:
 2. Choose the plan. `posts_per_day`, `min_gap_minutes` and `windows` can be left out for
    the US and PH markets, and then the research defaults from
    [CLP-90](https://linear.app/tengdev/issue/CLP-90) apply. Other markets must set all
-   three. Windows are `HH:MM-HH:MM` in the account's own timezone and may not overlap.
+   three. Fields that are set are kept, and only the missing ones are filled in. Windows
+   are `HH:MM-HH:MM` in the account's own timezone, may not overlap, and a post may go out
+   at any minute from a window's start through its end. The plan must fit:
+   `posts_per_day` posts, `min_gap_minutes` apart, have to fit inside the windows.
    `posts_per_day` may not exceed the platform cap (TikTok 15, Facebook 30, Instagram 50,
    YouTube 100). `warmup_start` ramps a new account from 1 post a day up to
    `posts_per_day` over `warmup_days` (14 by default).
 3. Check the licence rule. A creator whose `content_type` is `public_service` or
    `vlog_lifestyle`, or who has no `content_type`, can only be assigned to an account that
    sets `licence:` to a reference to the signed licence. Without it, `clipper
-   check-config` fails and names the creator and the account. Raffy Tulfo in Action, Ivana
+   check-config` fails and names the creator and the account. One licence covers one
+   creator, so an account can hold at most one creator that needs a licence. Raffy Tulfo in Action, Ivana
    Alawi and Cong TV are paused until they are licensed.
+   Quote country codes and names that YAML could read as something else, such as
+   `market: "NO"` (a bare `NO` is read as false).
 4. Put the tokens in `/srv/clipper/.env`, never in YAML. The names are
    `CLIPPER_<KIND>_<ACCOUNT_ID>`, upper-cased. For the account `mrbeast_clips_tt`:
 
@@ -168,8 +174,10 @@ To add an account:
    ```
 
    Any other value a platform needs follows the same pattern, for example
-   `CLIPPER_CLIENT_SECRET_MRBEAST_CLIPS_TT`. The values are read into secret strings, so
-   they never appear in logs or error messages.
+   `CLIPPER_CLIENT_SECRET_MRBEAST_CLIPS_TT`. Only exact upper-case names count, and the
+   app's own `CLIPPER_*` settings are never read as tokens; an account id that would make
+   one of them look like a token (such as `id` or `proxy`) is refused. The values are read
+   into secret strings, so they never appear in logs or error messages.
 5. Run `clipper check-config` (`docker compose run --rm worker clipper check-config` on the
    server). It validates the file and prints one line per account with its platform,
    handle, market, posts a day, windows and timezone. For each token it prints only `set`

@@ -191,9 +191,9 @@ def test_platform_daily_caps() -> None:
 
 
 def test_posts_per_day_over_platform_cap_is_refused() -> None:
-    Account.model_validate(_account(posts_per_day=15))
+    Account.model_validate(_account(posts_per_day=15, min_gap_minutes=30))
     with pytest.raises(ValidationError, match="posts_per_day 16 exceeds the tiktok cap of 15"):
-        Account.model_validate(_account(posts_per_day=16))
+        Account.model_validate(_account(posts_per_day=16, min_gap_minutes=30))
     with pytest.raises(ValidationError):
         Account.model_validate(_account(posts_per_day=0))
 
@@ -211,6 +211,13 @@ def test_posts_per_day_over_platform_cap_is_refused() -> None:
         ("windows", ["17:00-14:00"], "start must be before end"),
         ("windows", ["10:00-12:00", "11:00-13:00"], "overlap"),
         ("windows", [], "windows"),
+        ("windows", ["10:00-11:00\n"], "HH:MM-HH:MM"),
+        ("market", False, "quote the country code"),
+        ("market", "US\n", "market"),
+        ("creators", ["MrBeast", "mrbeast"], "duplicate creator"),
+        ("licence", "  ", "at least 3 characters"),
+        ("licence", "ok\u202elicence", "invisible"),
+        ("licence", "ok\x9b31m licence", "invisible"),
         ("creators", [], "creators"),
         ("warmup_days", 0, "warmup_days"),
         ("surprise", 1, "surprise"),
@@ -222,9 +229,34 @@ def test_account_field_validation(field: str, value: object, message: str) -> No
 
 
 def test_touching_windows_are_not_an_overlap() -> None:
-    account = Account.model_validate(_account(windows=["10:00-12:00", "12:00-13:00"]))
+    account = Account.model_validate(
+        _account(windows=["10:00-12:00", "12:00-13:00"], min_gap_minutes=60)
+    )
 
     assert account.windows == ["10:00-12:00", "12:00-13:00"]
+
+
+def test_partial_plan_fills_the_rest_from_the_default() -> None:
+    account = Account.model_validate(_account(posts_per_day=2, windows=None))
+
+    assert account.posts_per_day == 2
+    assert account.min_gap_minutes == 180
+    assert account.windows == ["14:00-17:00", "18:00-22:00"]
+
+
+def test_plan_that_cannot_fit_is_refused() -> None:
+    with pytest.raises(ValidationError, match="posts_per_day 15 cannot fit.*hold only 3"):
+        Account.model_validate(_account(posts_per_day=15))
+    with pytest.raises(ValidationError, match="cannot fit"):
+        Account.model_validate(
+            _account(posts_per_day=2, min_gap_minutes=600, windows=["10:00-10:30"])
+        )
+
+
+def test_shipped_and_default_plans_fit() -> None:
+    for market in ("US", "PH"):
+        for platform in PLATFORM_DAILY_CAPS:
+            Account.model_validate(_account(platform=platform, market=market))
 
 
 def test_duplicate_account_ids_are_refused() -> None:
@@ -238,6 +270,13 @@ def test_duplicate_platform_handle_is_refused() -> None:
     with pytest.raises(ValidationError, match="duplicate tiktok handle: @ACCT.ONE"):
         AccountsConfig.model_validate(
             {"accounts": [_account(), _account(id="acct_two", handle="@ACCT.ONE")]}
+        )
+
+
+def test_duplicate_handle_with_and_without_at_is_refused() -> None:
+    with pytest.raises(ValidationError, match="duplicate tiktok handle"):
+        AccountsConfig.model_validate(
+            {"accounts": [_account(), _account(id="acct_two", handle="acct.one")]}
         )
 
 
@@ -260,6 +299,47 @@ def test_account_id_that_ends_another_id_is_refused() -> None:
                 ]
             }
         )
+
+
+@pytest.mark.parametrize("account_id", ["id", "proxy", "dir", "tag"])
+def test_account_id_that_makes_an_app_setting_look_like_a_token_is_refused(
+    account_id: str,
+) -> None:
+    with pytest.raises(ValidationError, match="app setting CLIPPER_"):
+        AccountsConfig.model_validate({"accounts": [_account(id=account_id)]})
+
+
+def test_creator_names_are_stored_as_in_creators_yaml(
+    tmp_path: Path, creators_cfg: AppConfig
+) -> None:
+    text = ACCOUNTS_YAML.replace("creators: [MrBeast]", "creators: [mrbeast]", 1)
+
+    cfg = load_accounts(_write(tmp_path, text), creators_cfg)
+
+    assert cfg.accounts[0].creators == ["MrBeast"]
+
+
+def test_one_licence_covers_only_one_creator(tmp_path: Path, creators_cfg: AppConfig) -> None:
+    text = ACCOUNTS_YAML.replace(
+        "creators: [MrBeast]\n    posts_per_day",
+        'creators: [Raffy Tulfo in Action, Ivana Alawi]\n    licence: "RTIA 2026-12"\n'
+        "    posts_per_day",
+    )
+
+    with pytest.raises(ConfigError) as exc:
+        load_accounts(_write(tmp_path, text), creators_cfg)
+
+    assert "'Raffy Tulfo in Action', 'Ivana Alawi' each need their own licence" in str(exc.value)
+
+
+def test_yaml_error_does_not_quote_the_file(tmp_path: Path, creators_cfg: AppConfig) -> None:
+    text = f"accounts:\n  - id: x\n    access_token: {TOKEN}: [\n"
+
+    with pytest.raises(ConfigError) as exc:
+        load_accounts(_write(tmp_path, text), creators_cfg)
+
+    assert "line 3" in str(exc.value)
+    assert TOKEN not in str(exc.value)
 
 
 def test_unknown_creator_is_refused_by_name(tmp_path: Path, creators_cfg: AppConfig) -> None:
@@ -450,6 +530,7 @@ def test_account_tokens_read_from_env_by_account_id() -> None:
         "CLIPPER_CLIENT_SECRET_MRBEAST_CLIPS_TT": "cs_secret_value",
         "CLIPPER_ACCESS_TOKEN_MRBEAST_CLIPS_YT": "other_account_token",
         "CLIPPER_CONFIG": "/app/config/creators.yaml",
+        "CLIPPER_Access_Token_MRBEAST_CLIPS_TT": "mixed_case_value",
     }
 
     tokens = account_tokens("mrbeast_clips_tt", env=env)
@@ -461,6 +542,13 @@ def test_account_tokens_read_from_env_by_account_id() -> None:
     assert tokens.refresh_token.get_secret_value() == REFRESH
     assert set(tokens.extra) == {"client_secret"}
     assert tokens.extra["client_secret"].get_secret_value() == "cs_secret_value"
+
+
+def test_app_settings_are_never_read_as_tokens() -> None:
+    env = {"CLIPPER_YTDLP_PROXY": "http://user:pw@proxy", "CLIPPER_WORKER_ID": "w1"}
+
+    assert account_tokens("proxy", env=env).extra == {}
+    assert account_tokens("id", env=env).extra == {}
 
 
 def test_account_tokens_missing_or_empty_is_none() -> None:

@@ -92,6 +92,12 @@
     "Hook": {
       "additionalProperties": false,
       "properties": {
+        "ai_generated": {
+          "default": false,
+          "description": "Synthetic voice or text (CLP-96 disclosure).",
+          "title": "Ai Generated",
+          "type": "boolean"
+        },
         "duration_s": {
           "default": 2.0,
           "description": "Seconds from clip start.",
@@ -140,6 +146,12 @@
       "additionalProperties": false,
       "description": "A kept range of the clip, seconds in the source.",
       "properties": {
+        "ai_generated": {
+          "default": false,
+          "description": "Generated footage, e.g. b-roll (CLP-96).",
+          "title": "Ai Generated",
+          "type": "boolean"
+        },
         "in_s": {
           "minimum": 0,
           "title": "In S",

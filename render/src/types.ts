@@ -23,6 +23,8 @@ export type SourceSegment = {
 export type Segment = {
   in_s: number;
   out_s: number;
+  /** Generated footage (AI disclosure, CLP-96); not used by the renderer. */
+  ai_generated?: boolean;
 };
 
 export type CutKind = "silence" | "stutter" | "retake" | "false_start" | "filler";
@@ -42,6 +44,8 @@ export type Hook = {
   style: HookStyle;
   /** Seconds from the start of the clip (1..3). */
   duration_s: number;
+  /** Synthetic voice or text (AI disclosure, CLP-96); not used by the renderer. */
+  ai_generated?: boolean;
 };
 
 export type Word = {

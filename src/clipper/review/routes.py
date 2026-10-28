@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Path, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from pydantic import ValidationError
 from starlette.datastructures import State
 
 from clipper import clips
@@ -31,6 +32,7 @@ from clipper.clips import (
 from clipper.config import always_sensitive
 from clipper.db import connect
 from clipper.export import export_clip, sweep_staging
+from clipper.metadata import PLATFORM_LIMITS, PLATFORMS, Variant
 from clipper.review.app import flash, get_db, render, require_user
 
 router = APIRouter()
@@ -191,6 +193,7 @@ def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn) -> R
             "can_review": clip.status in REVIEWABLE,
             "gate_labels": GATE_REASON_LABELS,
             "can_retry_export": clip.status == ClipStatus.APPROVED,
+            "platform_limits": PLATFORM_LIMITS,
         },
     )
 
@@ -334,3 +337,84 @@ def clip_media(
         media_type=media_type,
         headers={"Cache-Control": MEDIA_CACHE_CONTROL},
     )
+
+
+# Form bounds only cap the request size; the platform limits are checked by `Variant`.
+VariantTitle = Annotated[str | None, Form(max_length=1_000)]
+VariantCaption = Annotated[str | None, Form(max_length=20_000)]
+
+
+@router.post("/clip/{clip_id}/variants")
+def edit_variants(
+    request: Request,
+    clip_id: ClipId,
+    _user: User,
+    conn: Conn,
+    version: Annotated[int, Form(ge=1, le=MAX_ID)],
+    tiktok_title: VariantTitle = None,
+    tiktok_caption: VariantCaption = None,
+    instagram_title: VariantTitle = None,
+    instagram_caption: VariantCaption = None,
+    youtube_title: VariantTitle = None,
+    youtube_caption: VariantCaption = None,
+    facebook_title: VariantTitle = None,
+    facebook_caption: VariantCaption = None,
+) -> Response:
+    """The reviewer's per-platform title and caption (CLP-96), before approval only. Fields
+    left out keep their text; hashtags are not edited here. Audited as `variants_edited`."""
+    clip = clips.get_clip(conn, clip_id)
+    if clip is None:
+        raise HTTPException(status_code=404, detail="clip not found")
+    if version != clip.current_version or clip.status not in REVIEWABLE:
+        current = f"{clip.status} (version {clip.current_version})"
+        return _action_error(request, f"Cannot edit: clip is {current}.", 409)
+    edits = {
+        "tiktok": (tiktok_title, tiktok_caption),
+        "instagram": (instagram_title, instagram_caption),
+        "youtube": (youtube_title, youtube_caption),
+        "facebook": (facebook_title, facebook_caption),
+    }
+    variants = dict(clip.current.variants)
+    changed: list[str] = []
+    problems: list[str] = []
+    for platform in PLATFORMS:
+        title, caption = edits[platform]
+        old = variants[platform]
+        if title is None and caption is None:
+            continue
+        try:
+            new = Variant.model_validate(
+                {
+                    "title": old.title if title is None else title,
+                    "caption": old.caption if caption is None else caption,
+                    "hashtags": old.hashtags,
+                },
+                context={"platform": platform},
+            )
+        except ValidationError as exc:
+            problems += [e["msg"].removeprefix("Value error, ") for e in exc.errors()]
+            continue
+        if new != old:
+            variants[platform] = new
+            changed.append(platform)
+    if problems:
+        return _action_error(request, "Not saved. " + "; ".join(problems), 422)
+    if changed:
+        try:
+            clips.edit_variants(
+                conn,
+                clip_id,
+                variants,
+                _now(request),
+                expected_version=version,
+                platforms=changed,
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="clip not found") from None
+        except InvalidTransition as exc:
+            return _action_error(request, f"Cannot edit: clip is {exc.current}.", 409)
+        flash(request, f"Saved the platform text for clip {clip_id}.")
+    location = f"/clip/{clip_id}"
+    if _is_htmx(request):
+        return Response(status_code=200, headers={"HX-Redirect": location})
+    return RedirectResponse(location, status_code=303)

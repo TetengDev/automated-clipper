@@ -248,3 +248,33 @@ def test_edit_requires_login(env: Env) -> None:
 
     assert response.status_code in (401, 403)
     assert stored(env, clip_id) == STORED
+
+
+def test_unchanged_text_writes_no_audit_row(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    store(env, clip_id, STORED)
+
+    response = post(client, clip_id, version=1, tiktok_title="tiktok title")
+
+    assert response.status_code == 200
+    assert env.reviews(clip_id) == []
+
+
+def test_edit_variants_checks_the_version_inside_the_transaction(env: Env) -> None:
+    """The route checks first; the write re-checks under the lock (a version or status
+    change in between is a conflict, not a silent overwrite)."""
+    from datetime import UTC, datetime
+
+    from clipper import clips
+    from clipper.metadata import derive_variants
+
+    clip_id = env.clip(versions=2)
+    variants = derive_variants("T", "C", ["#a1"])
+    now = datetime(2027, 1, 15, tzinfo=UTC)
+    with pytest.raises(clips.InvalidTransition):
+        clips.edit_variants(
+            env.conn, clip_id, variants, now, expected_version=1, platforms=["tiktok"]
+        )
+    with pytest.raises(LookupError):
+        clips.edit_variants(env.conn, 999, variants, now, expected_version=1, platforms=[])
+    assert env.reviews(clip_id) == []

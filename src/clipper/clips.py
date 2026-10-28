@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any, Literal
 
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
+from clipper.metadata import Variant, coerce_variants, variants_json
 from clipper.urls import InvalidSourceURL, SourceRef, canonical_url
 
 PAGE_SIZE = 24
@@ -38,6 +40,7 @@ class ReviewAction(StrEnum):
     REJECT = "reject"
     EXPORT = "export"
     EXPORT_FAILED = "export_failed"
+    VARIANTS_EDITED = "variants_edited"
 
 
 REJECT_REASONS: tuple[str, ...] = (
@@ -129,6 +132,9 @@ class ClipVersion:
     sensitive: bool = False
     gate_reasons: tuple[str, ...] = ()
     """Quality gates this version failed (CLP-74)."""
+    variants: Mapping[str, Variant] = field(default_factory=dict)
+    """Title, caption and hashtags per platform (CLP-96); derived from the single copy for
+    versions stored before CLP-96."""
 
     @property
     def duration_s(self) -> float:
@@ -136,13 +142,14 @@ class ClipVersion:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ClipVersion:
+        hashtags = parse_hashtags(row["hashtags"])
         return cls(
             version=row["version"],
             start_s=row["start_s"],
             end_s=row["end_s"],
             title=row["title"],
             caption=row["caption"],
-            hashtags=parse_hashtags(row["hashtags"]),
+            hashtags=hashtags,
             score=row["score"],
             reason=row["reason"],
             video_path=row["video_path"],
@@ -153,6 +160,9 @@ class ClipVersion:
             rendered_s=row["duration_s"],
             sensitive=bool(row["sensitive"]),
             gate_reasons=_reasons(row["gate_reasons"]),
+            variants=coerce_variants(
+                _json_or_none(row["variants"]), row["title"], row["caption"], hashtags
+            ),
         )
 
 
@@ -175,6 +185,13 @@ class ClipDetail:
             return source_url_at(self.platform, self.item_id, self.current.start_s)
         except InvalidSourceURL:
             return None
+
+
+def _json_or_none(raw: str | None) -> object:
+    try:
+        return json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        return None
 
 
 def _reasons(raw: str | None) -> tuple[str, ...]:
@@ -488,3 +505,41 @@ def reject(
         reason_tag=reason_tag,
         repeat_ok=frozenset({ClipStatus.REJECTED}),
     )
+
+
+def edit_variants(
+    conn: sqlite3.Connection,
+    clip_id: int,
+    variants: Mapping[str, Variant],
+    now: datetime,
+    *,
+    expected_version: int,
+    platforms: list[str],
+) -> None:
+    """Store the reviewer's per-platform text on the current version (CLP-96), audited as
+    `variants_edited` with the platforms changed. Only before approval, and only on the
+    version the reviewer saw: anything else is an InvalidTransition."""
+    with transaction(conn):
+        row = conn.execute(
+            "SELECT status, current_version FROM clips WHERE id = ?", (clip_id,)
+        ).fetchone()
+        if row is None:
+            raise LookupError(clip_id)
+        status, version = row["status"], row["current_version"]
+        if version != expected_version or status not in REVIEWABLE:
+            raise InvalidTransition(
+                clip_id, f"{status} (version {version})", ClipStatus.PENDING_REVIEW
+            )
+        conn.execute(
+            "UPDATE clip_versions SET variants = ? WHERE clip_id = ? AND version = ?",
+            (json.dumps(variants_json(variants), ensure_ascii=False), clip_id, version),
+        )
+        conn.execute("UPDATE clips SET updated_at = ? WHERE id = ?", (to_iso(now), clip_id))
+        record_review(
+            conn,
+            clip_id,
+            version,
+            ReviewAction.VARIANTS_EDITED,
+            now,
+            payload={"platforms": platforms},
+        )

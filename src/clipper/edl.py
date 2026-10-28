@@ -115,6 +115,7 @@ class Hook(_Strict):
     text: str = Field(min_length=1, max_length=120, pattern=r"\S")
     style: HookStyle = HookStyle.STAKES
     duration_s: float = Field(2.0, ge=1.0, le=3.0, description="Seconds from clip start.")
+    ai_generated: bool = Field(False, description="Synthetic voice or text (CLP-96 disclosure).")
 
 
 class Word(_Strict):
@@ -134,6 +135,7 @@ class Segment(_Strict):
 
     in_s: float = Field(ge=0)
     out_s: float = Field(gt=0)
+    ai_generated: bool = Field(False, description="Generated footage, e.g. b-roll (CLP-96).")
 
     @model_validator(mode="after")
     def _check(self) -> Segment:
@@ -242,8 +244,20 @@ class EDL(_Strict):
         return max(1, sum(frames(b - a) for a, b in self.spans))
 
     def to_props(self) -> dict[str, Any]:
-        """JSON-ready composition props (defaults included, so TS never guesses)."""
-        return self.model_dump(mode="json")
+        """JSON-ready composition props (defaults included, so TS never guesses). An unset
+        `ai_generated` flag is left out, so props without AI elements are unchanged."""
+        props = self.model_dump(mode="json")
+        for element in [props["hook"], *(props["segments"] or ())]:
+            if element is not None and not element["ai_generated"]:
+                del element["ai_generated"]
+        return props
+
+
+def has_ai_elements(edl: EDL) -> bool:
+    """Whether the clip has an AI-generated element (a synthetic hook voice or generated
+    footage): the platforms' AI disclosure flags must then be set (CLP-96)."""
+    hook = edl.hook is not None and edl.hook.ai_generated
+    return hook or any(s.ai_generated for s in edl.segments or ())
 
 
 def parse_edl(data: str | bytes | dict[str, Any]) -> EDL:

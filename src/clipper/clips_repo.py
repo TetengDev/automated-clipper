@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -53,6 +53,9 @@ class ClipMeta:
     note: str | None = None
     gate_reasons: Sequence[str] | None = None
     """Failed quality gates; () passed every gate, None was not gated."""
+    variants: Mapping[str, Mapping[str, object]] | None = None
+    """Per-platform title, caption and hashtags (CLP-96, `clipper.metadata`); None on a new
+    version keeps the previous version's."""
 
 
 def _status(meta: ClipMeta) -> ClipStatus:
@@ -80,8 +83,8 @@ def _insert_version(
     conn.execute(
         "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption, hashtags,"
         " score, reason, captions_enabled, note, video_path, thumb_path, prompt_version,"
-        " playbook_version, sensitive, created_at, duration_s, gate_reasons)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " playbook_version, sensitive, created_at, duration_s, gate_reasons, variants)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             clip_id,
             version,
@@ -102,6 +105,7 @@ def _insert_version(
             now,
             result.duration_s,
             None if meta.gate_reasons is None else json.dumps(list(meta.gate_reasons)),
+            None if meta.variants is None else json.dumps(meta.variants, ensure_ascii=False),
         ),
     )
 
@@ -178,6 +182,13 @@ def add_clip_version(
             "SELECT COALESCE(MAX(sensitive), 0) FROM clip_versions WHERE clip_id = ?", (clip_id,)
         ).fetchone()[0]
         meta = meta or ClipMeta()
+        if meta.variants is None:  # keep the reviewer's per-platform text (CLP-96)
+            previous = conn.execute(
+                "SELECT variants FROM clip_versions WHERE clip_id = ? AND version = ?",
+                (clip_id, version - 1),
+            ).fetchone()
+            if previous is not None and previous[0] is not None:
+                meta = replace(meta, variants=json.loads(previous[0]))
         _insert_version(
             conn,
             clip_id=clip_id,

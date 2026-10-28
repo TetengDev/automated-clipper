@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from clipper import render
-from clipper.edl import parse_edl
+from clipper.edl import has_ai_elements, parse_edl
 from clipper.render import InvalidClipError, RenderError, render_clip
 
 LOUDNORM_STDERR = """\
@@ -811,3 +811,24 @@ def test_publish_rollback_covers_partial_replace(
     assert not finals[0].exists()
     assert not finals[1].exists()
     assert not finals[2].exists()
+
+
+def test_segment_props_keep_the_ai_flags() -> None:
+    """CLP-96: pre-cutting keeps which elements are AI-generated (disclosure flags)."""
+    edl = parse_edl(
+        {
+            "source": {"path": "a.mp4", "in_s": 10.0, "out_s": 16.0},
+            "hook": {"text": "Narrated", "ai_generated": True},
+            "segments": [
+                {"in_s": 10.0, "out_s": 12.0},
+                {"in_s": 13.2, "out_s": 16.0, "ai_generated": True},
+            ],
+        }
+    )
+
+    props = render.segment_props(edl)
+
+    assert props["hook"]["ai_generated"] is True
+    assert "ai_generated" not in props["segments"][0]
+    assert props["segments"][1]["ai_generated"] is True
+    assert has_ai_elements(parse_edl(props))

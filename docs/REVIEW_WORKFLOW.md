@@ -13,6 +13,7 @@ Every clip is reviewed by a person before anything is exported. Review happens i
    - **Adjust edit (EDL)**: switch the layout (blurred fill, face-track, split-screen), edit the hook text, change the caption style, or toggle b-roll, SFX, and emoji (all at once or per cue). The clip is re-rendered as version n+1.
    - **Regenerate with note**: Claude picks a new cut within ±60 s of the original, guided by the reviewer's note. This also produces version n+1 in `pending_review`.
    - **Comment**: adds to the clip's thread. Comments persist across all versions of the clip.
+   - **Per-platform text** (CLP-96): the clip page shows a title, caption and hashtags for TikTok, Instagram, YouTube and Facebook. Before approval the reviewer can edit each platform's title and caption and save them (`POST /clip/{id}/variants`). The edit is stored on the current version, kept by later re-renders, and recorded as `variants_edited` in the clip's history. Each platform's limits apply: titles at most 100 characters, captions at most 2,200 characters (the YouTube description at most 5,000), and at most 5 hashtags with no generic tags such as #fyp or #viral.
 4. Pending clips older than `review_expiry_days` (default 7) are archived automatically.
 
 ## Clip state machine
@@ -45,7 +46,7 @@ Each export writes three files to `output/ready/<YYYY-MM-DD>/`:
 
 - `<creator>_<slug>_v<n>.mp4`
 - `<creator>_<slug>_v<n>.caption.txt`, containing the caption and hashtags, ready to paste
-- `<creator>_<slug>_v<n>.json`, containing the title, source URL with timestamp, creator, score, reason, and prompt version
+- `<creator>_<slug>_v<n>.json`, containing the title, source URL with timestamp, creator, score, reason, prompt version, and the per-platform `variants` (title, caption and hashtags for each platform)
 
 If `RCLONE_REMOTE` is set, the files are also copied to Drive.
 

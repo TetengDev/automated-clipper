@@ -7,6 +7,9 @@ import dataclasses
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
+
+from clipper.edl import has_ai_elements, parse_edl
 from clipper.metadata import (
     GENERIC_HASHTAGS,
     PLATFORM_LIMITS,
@@ -15,14 +18,15 @@ from clipper.metadata import (
     PostMetadata,
     Variant,
     build_post_metadata,
+    caption_room,
+    clean_hashtags,
     coerce_variants,
     derive_variants,
+    fingerprint,
+    links_or_mentions,
     preflight,
     truncate_words,
 )
-from pydantic import ValidationError
-
-from clipper.edl import has_ai_elements, parse_edl
 
 EDL = {"source": {"path": "a.mp4", "in_s": 10, "out_s": 45}}
 LONG_TITLE = "MrBeast gives away a private island " + "and then some more " * 10
@@ -352,3 +356,83 @@ def test_preflight_forbidden_keywords_match_whole_words_only():
 def test_preflight_rejects_unknown_platform():
     with pytest.raises(ValueError, match="unknown platform"):
         preflight(build_post_metadata(variants(), "tiktok"), "vine", 35.0)
+
+
+# --- review fixes (CLP-96 review) ------------------------------------------------------------
+
+
+def test_malformed_campaign_tag_is_an_error_not_dropped():
+    with pytest.raises(ValueError, match="invalid campaign tag"):
+        build_post_metadata(variants(), "tiktok", campaign_tags=["#brand-name"])
+
+
+def test_campaign_over_the_instagram_cap_keeps_every_tag_and_preflight_blocks():
+    campaign = [f"#c{i}" for i in range(6)]
+    meta = build_post_metadata(variants(), "instagram", campaign_tags=campaign)
+    assert meta.hashtags == campaign
+    assert any("at most 5" in p for p in preflight(meta, "instagram", 35.0))
+
+
+@pytest.mark.parametrize("tag", ["#\uff46\uff59\uff50", "#FyP", "#ad", "#Sponsored", "#partner"])
+def test_lookalike_generic_and_disclosure_tags_are_rejected(tag):
+    with pytest.raises(ValidationError):
+        variant(hashtags=["#mrbeast", tag, "#island"])
+    assert clean_hashtags(["#mrbeast", tag]) == ["#mrbeast"]
+
+
+def test_campaign_may_add_a_partner_tag():
+    meta = build_post_metadata(variants(), "tiktok", campaign_tags=["#ad"])
+    assert meta.hashtags[-1] == "#ad"
+
+
+def test_youtube_text_never_holds_angle_brackets():
+    derived = derive_variants("Kai <3 chair", "a > b", ["#kai"])
+    assert derived["youtube"].title == "Kai 3 chair" and "<" not in derived["youtube"].caption
+    assert derived["tiktok"].title == "Kai <3 chair"
+    with pytest.raises(ValidationError, match="< or >"):
+        Variant.model_validate(
+            {"title": "<b>", "caption": "", "hashtags": []}, context={"platform": "youtube"}
+        )
+    bad = PostMetadata(title="T <x>", caption="C", hashtags=["#a", "#b", "#c"], flags={})
+    assert any("< or >" in p for p in preflight(bad, "youtube", 35.0))
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["visit https://x.example/win", "go to www.prize.io", "claim-prize dot com", "tag @someone"],
+)
+def test_preflight_flags_links_and_mentions(text):
+    meta = build_post_metadata(variants(caption=text), "tiktok")
+    assert any("links or mentions" in p for p in preflight(meta, "tiktok", 35.0))
+    assert links_or_mentions(text)
+
+
+def test_preflight_ignores_plain_text_and_emails_are_not_mentions():
+    assert links_or_mentions("Karl wins $10,000. Then Chandler... wow") == []
+
+
+def test_caption_room_includes_the_hashtag_line():
+    tags = ["#a1", "#b1", "#c1"]
+    room = caption_room("tiktok", tags)
+    assert room == 2200 - len("\n\n#a1 #b1 #c1")
+    Variant.model_validate(
+        {"title": "", "caption": "c" * room, "hashtags": tags}, context={"platform": "tiktok"}
+    )
+    with pytest.raises(ValidationError, match="with the hashtag line"):
+        Variant.model_validate(
+            {"title": "", "caption": "c" * (room + 1), "hashtags": tags},
+            context={"platform": "tiktok"},
+        )
+
+
+def test_coerce_keeps_a_valid_stored_entry_exactly():
+    stored = {"title": "T", "caption": "word " * 5 + "end", "hashtags": ["#a1", "#b1", "#c1"]}
+    out = coerce_variants({"tiktok": stored}, "x", "y", [])
+    assert out["tiktok"].model_dump() == stored
+
+
+def test_fingerprint_changes_with_the_text():
+    a = derive_variants("T", "C", ["#a1"])
+    b = {**a, "tiktok": variant(title="Other")}
+    assert fingerprint(a) == fingerprint(derive_variants("T", "C", ["#a1"]))
+    assert fingerprint(a) != fingerprint(b)

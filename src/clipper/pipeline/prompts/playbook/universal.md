@@ -35,7 +35,11 @@ Instagram, YouTube and Facebook.
   may reuse the title as the first caption line.
 - Campaign and sponsor tags are added later by the scheduler; never add them yourself.
 - The sensitive-moment rules below apply to every variant: no protected person's or
-  private complainant's identifiers in any title, caption or hashtag.
+  private complainant's identifiers in any title, caption or hashtag. When `sensitive` is
+  true, the search keyword is the event, never a person, and no hashtag names or locates a
+  person. This overrides "lead with the keyword".
+- No links, web addresses or @mentions in any title or caption, even if the speaker says
+  them, and no #ad, #sponsored or #partner tags.
 
 ### Sensitive moments
 

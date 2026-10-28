@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from clipper import clips
+from clipper.metadata import fingerprint
 from review_support import Env, login, make_env
 
 PLATFORMS = ("tiktok", "instagram", "youtube", "facebook")
@@ -29,10 +31,19 @@ def env(tmp_path: Path) -> Iterator[Env]:
 def client(env: Env) -> TestClient:
     client = env.client()
     client.csrf = login(client)  # type: ignore[attr-defined]
+    client.env = env  # type: ignore[attr-defined]
     return client
 
 
+def current_fingerprint(env: Env, clip_id: int) -> str:
+    clip = clips.get_clip(env.conn, clip_id)
+    return fingerprint(clip.current.variants) if clip else "none"
+
+
 def post(client: TestClient, clip_id: int, htmx: bool = True, **data: object):
+    """Posts with the fingerprint of what is stored now, unless the test passes one."""
+    if "version" in data and "fingerprint" not in data:
+        data["fingerprint"] = current_fingerprint(client.env, clip_id)  # type: ignore[attr-defined]
     headers = {"X-CSRF-Token": client.csrf}  # type: ignore[attr-defined]
     if htmx:
         headers["HX-Request"] = "true"
@@ -133,7 +144,11 @@ def test_edit_saves_title_and_caption_and_is_audited(client: TestClient, env: En
     assert saved["instagram"] == STORED["instagram"]
     (review,) = env.reviews(clip_id)
     assert (review["action"], review["version"]) == ("variants_edited", 1)
-    assert json.loads(review["payload"]) == {"platforms": ["tiktok", "youtube"]}
+    payload = json.loads(review["payload"])
+    assert payload["platforms"] == ["tiktok", "youtube"]
+    assert payload["before"]["tiktok"] == STORED["tiktok"]
+    assert payload["after"]["tiktok"]["title"] == "Kai Cenat chair collapse"
+    assert set(payload["before"]) == set(payload["after"]) == {"tiktok", "youtube"}
     assert env.status(clip_id) == "pending_review"
 
 
@@ -273,8 +288,80 @@ def test_edit_variants_checks_the_version_inside_the_transaction(env: Env) -> No
     now = datetime(2027, 1, 15, tzinfo=UTC)
     with pytest.raises(clips.InvalidTransition):
         clips.edit_variants(
-            env.conn, clip_id, variants, now, expected_version=1, platforms=["tiktok"]
+            env.conn, clip_id, variants, now, expected_version=1, expected_fingerprint="x"
         )
     with pytest.raises(LookupError):
-        clips.edit_variants(env.conn, 999, variants, now, expected_version=1, platforms=[])
-    assert env.reviews(clip_id) == []
+        clips.edit_variants(
+            env.conn, 999, variants, now, expected_version=1, expected_fingerprint="x"
+        )
+    fresh = env.clip()
+    with pytest.raises(clips.InvalidTransition, match="edited since"):
+        clips.edit_variants(
+            env.conn, fresh, variants, now, expected_version=1, expected_fingerprint="stale"
+        )
+    assert env.reviews(clip_id) == [] and env.reviews(fresh) == []
+
+
+def test_save_from_a_stale_page_is_409_not_an_overwrite(client: TestClient, env: Env) -> None:
+    """Two tabs: B was loaded before A saved; B's save must not put A's old text back."""
+    clip_id = env.clip()
+    store(env, clip_id, STORED)
+    seen = current_fingerprint(env, clip_id)
+    form = {f"{p}_title": f"{p} title" for p in PLATFORMS}
+
+    first = post(client, clip_id, version=1, fingerprint=seen, **{**form, "tiktok_title": "A"})
+    second = post(client, clip_id, version=1, fingerprint=seen, **{**form, "youtube_title": "B"})
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert "changed since this page loaded" in second.text
+    saved = stored(env, clip_id)
+    assert (saved["tiktok"]["title"], saved["youtube"]["title"]) == ("A", "youtube title")
+
+
+def test_caption_saved_at_the_limit_reads_back_unchanged(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    store(env, clip_id, STORED)
+    room = 2200 - len("\n\n#kai #chair #fall")
+    caption = ("word " * 600)[:room].strip()
+
+    accepted = post(client, clip_id, version=1, tiktok_caption=caption)
+    too_long = post(client, clip_id, version=1, tiktok_caption=caption + " more words")
+
+    assert accepted.status_code == 200
+    detail = clips.get_clip(env.conn, clip_id)
+    assert detail is not None and detail.current.variants["tiktok"].caption == caption
+    assert too_long.status_code == 422
+    html = client.get(f"/clip/{clip_id}").text
+    assert f'name="tiktok_caption" rows="4" maxlength="{room}"' in html
+
+
+def test_every_platform_is_shown_open_with_link_warnings(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    risky = {
+        **STORED,
+        "facebook": {**STORED["facebook"], "caption": "Go to claim-prize dot com @kai"},
+    }
+    store(env, clip_id, risky)
+
+    html = client.get(f"/clip/{clip_id}").text
+
+    for p in PLATFORMS:
+        assert f'<details class="variant" id="variant-{p}" open>' in html
+    assert "links or mentions: claim-prize dot com, @kai" in html
+
+
+def test_youtube_title_cannot_be_emptied_or_hold_angle_brackets(
+    client: TestClient, env: Env
+) -> None:
+    clip_id = env.clip()
+    store(env, clip_id, STORED)
+
+    empty = post(client, clip_id, version=1, youtube_title="")
+    blank = post(client, clip_id, version=1, youtube_title="   ")
+    angle = post(client, clip_id, version=1, youtube_title="Kai <b>falls</b>")
+
+    assert empty.status_code == 200  # an empty field keeps the stored text
+    assert blank.status_code == 422 and "cannot be empty" in blank.text
+    assert angle.status_code == 422
+    assert stored(env, clip_id) == STORED

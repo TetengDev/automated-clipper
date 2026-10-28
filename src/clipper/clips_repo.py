@@ -110,6 +110,30 @@ def _insert_version(
     )
 
 
+def _carried_variants(
+    conn: sqlite3.Connection, clip_id: int, version: int, meta: ClipMeta
+) -> Mapping[str, Mapping[str, object]] | None:
+    """The previous version's per-platform text (CLP-96), kept by a re-render that does not
+    change the single title, caption or hashtags; None (derive from the new text) when it
+    does, or when the stored JSON is missing or unreadable."""
+    row = conn.execute(
+        "SELECT variants, title, caption, hashtags FROM clip_versions"
+        " WHERE clip_id = ? AND version = ?",
+        (clip_id, version),
+    ).fetchone()
+    if row is None or row["variants"] is None:
+        return None
+    same_text = (meta.title is None or meta.title == row["title"]) and (
+        meta.caption is None or meta.caption == row["caption"]
+    )
+    try:
+        same_tags = not meta.hashtags or list(meta.hashtags) == json.loads(row["hashtags"] or "[]")
+        variants = json.loads(row["variants"])
+    except json.JSONDecodeError:
+        return None
+    return variants if same_text and same_tags and isinstance(variants, dict) else None
+
+
 def insert_pending_clip(
     conn: sqlite3.Connection,
     *,
@@ -182,13 +206,8 @@ def add_clip_version(
             "SELECT COALESCE(MAX(sensitive), 0) FROM clip_versions WHERE clip_id = ?", (clip_id,)
         ).fetchone()[0]
         meta = meta or ClipMeta()
-        if meta.variants is None:  # keep the reviewer's per-platform text (CLP-96)
-            previous = conn.execute(
-                "SELECT variants FROM clip_versions WHERE clip_id = ? AND version = ?",
-                (clip_id, version - 1),
-            ).fetchone()
-            if previous is not None and previous[0] is not None:
-                meta = replace(meta, variants=json.loads(previous[0]))
+        if meta.variants is None:
+            meta = replace(meta, variants=_carried_variants(conn, clip_id, version - 1, meta))
         _insert_version(
             conn,
             clip_id=clip_id,

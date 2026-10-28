@@ -7,16 +7,19 @@
         hx-target="#action-error" hx-disabled-elt="find button">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="version" value="{{ v.version }}">
+    <input type="hidden" name="fingerprint" value="{{ variants_fingerprint }}">
   {% endif %}
     {% for platform, variant in v.variants.items() %}
     {% set limits = platform_limits[platform] %}
-    <details class="variant" id="variant-{{ platform }}"{% if loop.first %} open{% endif %}>
+    {# All open: the reviewer approves every platform's text, so none may stay hidden. #}
+    <details class="variant" id="variant-{{ platform }}" open>
       <summary>{{ names.get(platform, platform) }} · {{ variant.title or "Untitled" }}</summary>
+      {% if variant_warnings[platform] %}<p class="error variant-warning">Check before approving, links or mentions: {{ variant_warnings[platform] | join(", ") }}</p>{% endif %}
       {% if can_review %}
       <label for="{{ platform }}-title">Title</label>
       <input id="{{ platform }}-title" name="{{ platform }}_title" maxlength="{{ limits.title_max }}" value="{{ variant.title }}">
       <label for="{{ platform }}-caption">{{ "Description" if platform == "youtube" else "Caption" }}</label>
-      <textarea id="{{ platform }}-caption" name="{{ platform }}_caption" rows="4" maxlength="{{ limits.caption_max }}">{{ variant.caption }}</textarea>
+      <textarea id="{{ platform }}-caption" name="{{ platform }}_caption" rows="4" maxlength="{{ caption_room(platform, variant.hashtags) }}">{{ variant.caption }}</textarea>
       {% else %}
       <p class="caption">{{ variant.caption }}</p>
       {% endif %}

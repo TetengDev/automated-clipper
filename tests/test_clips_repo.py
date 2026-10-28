@@ -304,3 +304,35 @@ def test_new_version_carries_the_variants_forward(conn: sqlite3.Connection, tmp_
         meta=ClipMeta(variants=own),
     )
     assert _variants(conn, ref.clip_id) == [VARIANTS, VARIANTS, own]
+
+
+def test_new_text_on_a_re_render_derives_fresh_variants(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Review fix: variants never contradict the version's own title and caption."""
+    edl = parse_edl(EDL_DATA)
+    meta = ClipMeta(title="T", caption="C", hashtags=("#a1",), variants=VARIANTS)
+    ref = insert_pending_clip(conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), meta=meta)
+    same = ClipMeta(title="T", caption="C", hashtags=("#a1",))
+    add_clip_version(conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"), meta=same)
+    add_clip_version(
+        conn,
+        clip_id=ref.clip_id,
+        edl=edl,
+        result=_result(tmp_path, "v3"),
+        meta=ClipMeta(title="New title"),
+    )
+    assert _variants(conn, ref.clip_id) == [VARIANTS, VARIANTS, None]
+
+
+def test_unreadable_stored_variants_do_not_break_a_re_render(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    edl = parse_edl(EDL_DATA)
+    ref = insert_pending_clip(conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path))
+    conn.execute("UPDATE clip_versions SET variants = '{broken' WHERE clip_id = ?", (ref.clip_id,))
+    add_clip_version(conn, clip_id=ref.clip_id, edl=edl, result=_result(tmp_path, "v2"))
+    row = conn.execute(
+        "SELECT variants FROM clip_versions WHERE clip_id = ? AND version = 2", (ref.clip_id,)
+    ).fetchone()
+    assert row[0] is None

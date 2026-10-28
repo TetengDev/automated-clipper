@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
-from clipper.metadata import Variant, coerce_variants, variants_json
+from clipper.metadata import PLATFORMS, Variant, coerce_variants, fingerprint, variants_json
 from clipper.urls import InvalidSourceURL, SourceRef, canonical_url
 
 PAGE_SIZE = 24
@@ -510,18 +510,23 @@ def reject(
 def edit_variants(
     conn: sqlite3.Connection,
     clip_id: int,
-    variants: Mapping[str, Variant],
+    changed: Mapping[str, Variant],
     now: datetime,
     *,
     expected_version: int,
-    platforms: list[str],
+    expected_fingerprint: str,
 ) -> None:
     """Store the reviewer's per-platform text on the current version (CLP-96), audited as
-    `variants_edited` with the platforms changed. Only before approval, and only on the
-    version the reviewer saw: anything else is an InvalidTransition."""
+    `variants_edited` with each changed platform's text before and after. Only before
+    approval, only on the version the reviewer saw, and only if nobody saved other
+    variants since that page loaded (`expected_fingerprint`): anything else is an
+    InvalidTransition, never a silent overwrite."""
     with transaction(conn):
         row = conn.execute(
-            "SELECT status, current_version FROM clips WHERE id = ?", (clip_id,)
+            "SELECT c.status, c.current_version, v.variants, v.title, v.caption, v.hashtags"
+            " FROM clips c JOIN clip_versions v ON v.clip_id = c.id"
+            " AND v.version = c.current_version WHERE c.id = ?",
+            (clip_id,),
         ).fetchone()
         if row is None:
             raise LookupError(clip_id)
@@ -530,16 +535,32 @@ def edit_variants(
             raise InvalidTransition(
                 clip_id, f"{status} (version {version})", ClipStatus.PENDING_REVIEW
             )
+        current = coerce_variants(
+            _json_or_none(row["variants"]),
+            row["title"],
+            row["caption"],
+            parse_hashtags(row["hashtags"]),
+        )
+        if fingerprint(current) != expected_fingerprint:
+            raise InvalidTransition(
+                clip_id, f"{status} (version {version}, edited since)", ClipStatus.PENDING_REVIEW
+            )
+        merged = {**current, **changed}
         conn.execute(
             "UPDATE clip_versions SET variants = ? WHERE clip_id = ? AND version = ?",
-            (json.dumps(variants_json(variants), ensure_ascii=False), clip_id, version),
+            (json.dumps(variants_json(merged), ensure_ascii=False), clip_id, version),
         )
         conn.execute("UPDATE clips SET updated_at = ? WHERE id = ?", (to_iso(now), clip_id))
+        platforms = [p for p in PLATFORMS if p in changed]
         record_review(
             conn,
             clip_id,
             version,
             ReviewAction.VARIANTS_EDITED,
             now,
-            payload={"platforms": platforms},
+            payload={
+                "platforms": platforms,
+                "before": {p: current[p].model_dump() for p in platforms},
+                "after": {p: changed[p].model_dump() for p in platforms},
+            },
         )

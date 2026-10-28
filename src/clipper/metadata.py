@@ -18,12 +18,23 @@ for field; the two are merged into one definition when both land.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from clipper.edl import EDL, has_ai_elements
 from clipper.pipeline.common import strip_control
@@ -31,8 +42,19 @@ from clipper.pipeline.common import strip_control
 PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
 GENERIC_HASHTAGS = frozenset({"#fyp", "#foryou", "#foryoupage", "#viral", "#trending", "#fy"})
 """Reach tags that say nothing about the clip; rejected in variants, flagged in pre-flight."""
+DISCLOSURE_HASHTAGS = frozenset({"#ad", "#ads", "#sponsored", "#paid", "#partner", "#promo"})
+"""Tags that read as a paid-partnership disclosure: only a campaign may add them (as campaign
+tags at scheduling), never the model or a variant."""
+LINK_OR_MENTION = re.compile(
+    r"(?i)\b(?:https?://|www\.)\S+"
+    r"|\b[\w-]+\s*(?:\.|\bdot\b)\s*(?:com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop)\b"
+    r"|(?<![\w@])@\w+"
+)
+"""A link, a bare domain (also "name dot com") or an @mention: the transcript is untrusted,
+so text like this in a post is flagged for the reviewer and in pre-flight."""
 HASHTAG = re.compile(r"^#\w{1,50}$")
-MAX_BLANK_LINES = 1
+_ANGLE = re.compile(r"[<>]")
+"""The YouTube Data API rejects titles and descriptions containing < or >."""
 
 
 @dataclass(frozen=True)
@@ -93,8 +115,22 @@ def normalize_hashtag(raw: str) -> str:
     return tag if tag.startswith("#") else f"#{tag}"
 
 
+def _fold(tag: str) -> str:
+    """Compatibility-folded and case-folded, so fullwidth `#ｆｙｐ` matches `#fyp`."""
+    return unicodedata.normalize("NFKC", tag).casefold()
+
+
 def is_generic(tag: str) -> bool:
-    return tag.lower() in GENERIC_HASHTAGS
+    return _fold(tag) in GENERIC_HASHTAGS
+
+
+def is_disclosure(tag: str) -> bool:
+    return _fold(tag) in DISCLOSURE_HASHTAGS
+
+
+def links_or_mentions(text: str) -> list[str]:
+    """Links, domains and @mentions in `text`, in order."""
+    return [m.group(0) for m in LINK_OR_MENTION.finditer(text)]
 
 
 def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -> list[str]:
@@ -105,8 +141,10 @@ def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -
         if not isinstance(raw, str):
             continue
         tag = normalize_hashtag(raw)
-        if HASHTAG.fullmatch(tag) and not is_generic(tag) and tag.lower() not in seen:
-            seen.add(tag.lower())
+        key = _fold(tag)
+        usable = HASHTAG.fullmatch(tag) and not is_generic(tag) and not is_disclosure(tag)
+        if usable and key not in seen:
+            seen.add(key)
             out.append(tag)
     return out[:limit]
 
@@ -156,7 +194,9 @@ class Variant(BaseModel):
                 raise ValueError(f"invalid hashtag {tag!r}")
             if is_generic(tag):
                 raise ValueError(f"generic hashtag {tag} says nothing about the clip")
-        if len({t.lower() for t in tags}) != len(tags):
+            if is_disclosure(tag):
+                raise ValueError(f"hashtag {tag} reads as a paid-partnership disclosure")
+        if len({_fold(t) for t in tags}) != len(tags):
             raise ValueError("duplicate hashtags")
         return tags
 
@@ -169,8 +209,15 @@ class Variant(BaseModel):
         where = f"{platform} " if platform else ""
         if len(self.title) > title_max:
             raise ValueError(f"{where}title is longer than {title_max} characters")
-        if len(self.caption) > caption_max:
-            raise ValueError(f"{where}caption is longer than {caption_max} characters")
+        # The posted caption is the body plus a blank line and the hashtag line.
+        room = caption_room(platform, self.hashtags) if platform else caption_max
+        if len(self.caption) > room:
+            raise ValueError(
+                f"{where}caption is longer than {room} characters"
+                f" ({caption_max} with the hashtag line)"
+            )
+        if platform == "youtube" and _ANGLE.search(self.title + self.caption):
+            raise ValueError("youtube title and description cannot contain < or >")
         return self
 
 
@@ -178,19 +225,22 @@ def _hashtag_line(tags: Sequence[str]) -> str:
     return " ".join(tags)
 
 
-def _caption_room(platform: str, tags: Sequence[str]) -> int:
+def caption_room(platform: str, tags: Sequence[str]) -> int:
     """Characters left for the caption body once the hashtag line is appended."""
     line = _hashtag_line(tags)
     return _limits(platform).caption_max - (len(line) + 2 if line else 0)
 
 
-def _fit(platform: str, title: str, caption: str, tags: Sequence[str]) -> Variant:
+def _fit(platform: str, title: str, caption: str, tags: Sequence[object]) -> Variant:
     limits = _limits(platform)
     hashtags = clean_hashtags(tags, limits.hashtags_max)
+    title, caption = strip_control(title), clean_caption(caption)
+    if platform == "youtube":
+        title, caption = _ANGLE.sub("", title), _ANGLE.sub("", caption)
     return Variant.model_validate(
         {
-            "title": truncate_words(strip_control(title), limits.title_max),
-            "caption": truncate_words(clean_caption(caption), _caption_room(platform, hashtags)),
+            "title": truncate_words(title, limits.title_max),
+            "caption": truncate_words(caption, caption_room(platform, hashtags)),
             "hashtags": hashtags,
         },
         context={"platform": platform},
@@ -209,29 +259,41 @@ def derive_variants(
 def coerce_variants(
     raw: object, title: str | None, caption: str | None, hashtags: Iterable[object]
 ) -> dict[str, Variant]:
-    """Variants from untrusted JSON (model output, a stored column): each well-formed
-    platform entry is cleaned into its limits, anything else is derived from the single
-    title, caption and hashtags."""
-    derived = derive_variants(title, caption, hashtags)
-    if not isinstance(raw, Mapping):
-        return derived
+    """Variants from untrusted JSON (model output, a stored column). An entry that is
+    already valid for its platform is kept exactly (a reviewer's saved text reads back
+    unchanged); another well-formed entry is cleaned into the limits; anything else is
+    derived from the single title, caption and hashtags."""
+    entries = raw if isinstance(raw, Mapping) else {}
+    tags = list(hashtags)
     out: dict[str, Variant] = {}
     for platform in PLATFORMS:
-        entry = raw.get(platform)
-        if (
+        entry = entries.get(platform)
+        if not (
             isinstance(entry, Mapping)
             and isinstance(entry.get("title"), str)
             and isinstance(entry.get("caption"), str)
             and isinstance(entry.get("hashtags"), list)
         ):
+            out[platform] = _fit(platform, title or "", caption or "", tags)
+            continue
+        try:
+            out[platform] = Variant.model_validate(
+                {k: entry[k] for k in ("title", "caption", "hashtags")},
+                context={"platform": platform},
+            )
+        except ValidationError:
             out[platform] = _fit(platform, entry["title"], entry["caption"], entry["hashtags"])
-        else:
-            out[platform] = derived[platform]
     return out
 
 
 def variants_json(variants: Mapping[str, Variant]) -> dict[str, dict[str, Any]]:
     return {p: variants[p].model_dump() for p in PLATFORMS if p in variants}
+
+
+def fingerprint(variants: Mapping[str, Variant]) -> str:
+    """A short digest of the variants, so an edit made from a stale page is detected."""
+    text = json.dumps(variants_json(variants), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 # --- posting ---------------------------------------------------------------------------------
@@ -270,20 +332,24 @@ def build_post_metadata(
     paid_partnership: bool = False,
 ) -> PostMetadata:
     """The post for one platform. Campaign tags go last and are never dropped; where the
-    platform caps hashtags (Instagram: 5) the model's last tags make room. The caption body
-    is cut at a word boundary so the caption with its hashtag line fits the limit."""
+    platform caps hashtags (Instagram: 5) the model's last tags make room. A campaign with
+    more tags than the cap still gets all of them, and `preflight` blocks the post. The
+    caption body is cut at a word boundary so the caption with its hashtag line fits the
+    limit. A malformed campaign tag is a ValueError (a config error, never dropped)."""
     limits = _limits(platform)
     variant = variants[platform]
     campaign: list[str] = []
     for raw in campaign_tags:
         tag = normalize_hashtag(raw)
-        if HASHTAG.fullmatch(tag) and tag.lower() not in {t.lower() for t in campaign}:
+        if not HASHTAG.fullmatch(tag):
+            raise ValueError(f"invalid campaign tag {raw!r}")
+        if _fold(tag) not in {_fold(t) for t in campaign}:
             campaign.append(tag)
-    taken = {t.lower() for t in campaign}
-    own = [t for t in variant.hashtags if t.lower() not in taken]
+    taken = {_fold(t) for t in campaign}
+    own = [t for t in variant.hashtags if _fold(t) not in taken]
     own = own[: max(0, limits.post_hashtags_max - len(campaign))]
     hashtags = [*own, *campaign]
-    body = truncate_words(variant.caption, max(0, _caption_room(platform, hashtags)))
+    body = truncate_words(variant.caption, max(0, caption_room(platform, hashtags)))
     line = _hashtag_line(hashtags)
     caption = "\n\n".join(part for part in (body, line) if part)
     ai = edl is not None and has_ai_elements(edl)
@@ -341,6 +407,11 @@ def preflight(
         problems.append(f"{platform}: generic hashtags {' '.join(generic)}")
     if platform == "youtube" and not metadata.title.strip():
         problems.append("youtube: the title is empty")
+    if platform == "youtube" and _ANGLE.search(metadata.title + metadata.caption):
+        problems.append("youtube: title or description contains < or >")
+    found = links_or_mentions(f"{metadata.title}\n{metadata.caption}")
+    if found:
+        problems.append(f"{platform}: links or mentions to check: {', '.join(found)}")
     if len(metadata.title) > limits.title_max:
         problems.append(f"{platform}: title is longer than {limits.title_max} characters")
     if len(metadata.caption) > limits.caption_max:

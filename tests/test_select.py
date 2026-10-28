@@ -1196,7 +1196,7 @@ PLAYBOOK_HASHES = {
     "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
     "playbook_v4": "97b8707018c24c6772d5f76d3d637f7ed6ed8b8f620942ffb790437a6cd16689",
     "playbook_v5": "56a43482bd6783e8100c0de00d8469017758d6a684a130b20cfbf09b162f41a9",
-    "playbook_v6": "d37ff2d760f2bedd7bdbb26d9b6b1d520870541b85685365bc2ffe26187288cf",
+    "playbook_v6": "8de100d3f78f2480b35d76d13f06fc6b92246908edf2765a7dd5ad413f5d28ac",
 }
 
 
@@ -1568,6 +1568,11 @@ def test_playbook_v6_per_platform_rules():
     assert "Instagram allows at most 5." in universal
     assert "Campaign and sponsor tags are added later by the scheduler" in universal
     assert "The sensitive-moment rules below apply to every variant" in universal
+    assert (
+        "When `sensitive` is true, the search keyword is the event, never a person, and no"
+        " hashtag names or locates a person." in universal
+    )
+    assert "No links, web addresses or @mentions in any title or caption" in universal
     prompt = _flat(select.load_system_prompt())
     assert "`hashtags`: 3 to 5 specific hashtags" in prompt
     assert "`variants`: an object with `tiktok`, `instagram`, `youtube` and `facebook`" in prompt

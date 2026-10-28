@@ -32,7 +32,14 @@ from clipper.clips import (
 from clipper.config import always_sensitive
 from clipper.db import connect
 from clipper.export import export_clip, sweep_staging
-from clipper.metadata import PLATFORM_LIMITS, PLATFORMS, Variant
+from clipper.metadata import (
+    PLATFORM_LIMITS,
+    PLATFORMS,
+    Variant,
+    caption_room,
+    fingerprint,
+    links_or_mentions,
+)
 from clipper.review.app import flash, get_db, render, require_user
 
 router = APIRouter()
@@ -194,6 +201,12 @@ def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn) -> R
             "gate_labels": GATE_REASON_LABELS,
             "can_retry_export": clip.status == ClipStatus.APPROVED,
             "platform_limits": PLATFORM_LIMITS,
+            "caption_room": caption_room,
+            "variants_fingerprint": fingerprint(clip.current.variants),
+            "variant_warnings": {
+                p: links_or_mentions(f"{v.title}\n{v.caption}")
+                for p, v in clip.current.variants.items()
+            },
         },
     )
 
@@ -351,6 +364,7 @@ def edit_variants(
     _user: User,
     conn: Conn,
     version: Annotated[int, Form(ge=1, le=MAX_ID)],
+    fingerprint_seen: Annotated[str, Form(alias="fingerprint", max_length=64)],
     tiktok_title: VariantTitle = None,
     tiktok_caption: VariantCaption = None,
     instagram_title: VariantTitle = None,
@@ -361,21 +375,27 @@ def edit_variants(
     facebook_caption: VariantCaption = None,
 ) -> Response:
     """The reviewer's per-platform title and caption (CLP-96), before approval only. Fields
-    left out keep their text; hashtags are not edited here. Audited as `variants_edited`."""
+    left out keep their text; hashtags are not edited here. `fingerprint` is the variants the
+    page showed: a save made after another one (a second tab) is a 409, not an overwrite.
+    Audited as `variants_edited`."""
     clip = clips.get_clip(conn, clip_id)
     if clip is None:
         raise HTTPException(status_code=404, detail="clip not found")
     if version != clip.current_version or clip.status not in REVIEWABLE:
         current = f"{clip.status} (version {clip.current_version})"
         return _action_error(request, f"Cannot edit: clip is {current}.", 409)
+    if fingerprint(clip.current.variants) != fingerprint_seen:
+        return _action_error(
+            request, "Cannot edit: the platform text was changed since this page loaded.", 409
+        )
     edits = {
         "tiktok": (tiktok_title, tiktok_caption),
         "instagram": (instagram_title, instagram_caption),
         "youtube": (youtube_title, youtube_caption),
         "facebook": (facebook_title, facebook_caption),
     }
-    variants = dict(clip.current.variants)
-    changed: list[str] = []
+    variants = clip.current.variants
+    changed: dict[str, Variant] = {}
     problems: list[str] = []
     for platform in PLATFORMS:
         title, caption = edits[platform]
@@ -394,9 +414,10 @@ def edit_variants(
         except ValidationError as exc:
             problems += [e["msg"].removeprefix("Value error, ") for e in exc.errors()]
             continue
-        if new != old:
-            variants[platform] = new
-            changed.append(platform)
+        if platform == "youtube" and title is not None and not new.title:
+            problems.append("youtube title cannot be empty")
+        elif new != old:
+            changed[platform] = new
     if problems:
         return _action_error(request, "Not saved. " + "; ".join(problems), 422)
     if changed:
@@ -404,10 +425,10 @@ def edit_variants(
             clips.edit_variants(
                 conn,
                 clip_id,
-                variants,
+                changed,
                 _now(request),
                 expected_version=version,
-                platforms=changed,
+                expected_fingerprint=fingerprint_seen,
             )
         except LookupError:
             raise HTTPException(status_code=404, detail="clip not found") from None

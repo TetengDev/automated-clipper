@@ -62,6 +62,21 @@ def test_gap_is_kept_against_posts_before_the_candidate_too() -> None:
     assert pick_slot(account, [local(15, 9, 30)], NOW) == local(15, 10, 30)
 
 
+def test_the_window_end_minute_is_inside_the_window() -> None:
+    # CLP-91's rule: "09:00-11:00" accepts an 11:00 slot.
+    account = FakeAccount(windows=["09:00-11:00", "18:00-22:00"])
+
+    assert pick_slot(account, [local(15, 9)], NOW) == local(15, 11)
+
+
+def test_the_gap_does_not_carry_over_midnight() -> None:
+    # CLP-91's rule: the minimum gap applies within one local day only.
+    account = FakeAccount(windows=["00:00-23:59"], min_gap_minutes=120)
+    now = local(15, 23, 50)
+
+    assert pick_slot(account, [local(15, 23, 50)], now) == local(16, 0)
+
+
 def test_after_todays_windows_close_the_slot_is_tomorrow() -> None:
     now = local(15, 22, 5)
 

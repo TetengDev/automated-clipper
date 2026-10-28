@@ -2,8 +2,9 @@
 
 `pick_slot` is pure: given an account, the times of its existing posts and `now`, it
 returns the earliest UTC time that is inside one of the account's local posting windows,
-at least `min_gap_minutes` from every other post of the account, and on a local day that
-still has room under `posts_per_day`, the warm-up ramp and the platform's daily API cap.
+at least `min_gap_minutes` from the account's other posts that local day (the gap does
+not carry over midnight), and on a local day that still has room under `posts_per_day`,
+the warm-up ramp and the platform's daily API cap.
 It fills today's windows first, then the following days, up to `MAX_DAYS_AHEAD`.
 
 `schedule_for_clip` creates one `scheduled` post per eligible account when a clip is
@@ -63,7 +64,8 @@ class AccountLike(Protocol):
 def parse_windows(windows: Sequence[str]) -> list[tuple[time, time]]:
     """`"HH:MM-HH:MM"` strings as (start, end) local times, sorted by start.
 
-    The end is exclusive; `"22:00-00:00"` runs to midnight. A window may not wrap past
+    The end minute is inside the window (`"14:00-17:00"` accepts 17:00, as in CLP-91);
+    `"22:00-00:00"` runs up to, but not including, midnight. A window may not wrap past
     midnight or be empty.
     """
     parsed = []
@@ -106,10 +108,15 @@ def _ceil_minute(moment: datetime) -> datetime:
 
 
 def _first_free(
-    start: datetime, end: datetime, taken: Sequence[datetime], gap: timedelta
+    start: datetime,
+    end: datetime,
+    taken: Sequence[datetime],
+    gap: timedelta,
+    *,
+    end_inclusive: bool,
 ) -> datetime | None:
     candidate = start
-    while candidate < end:
+    while candidate < end or (end_inclusive and candidate == end):
         clashes = [t for t in taken if abs(t - candidate) < gap]
         if not clashes:
             return candidate
@@ -140,11 +147,21 @@ def pick_slot(account: AccountLike, existing: Sequence[datetime], now: datetime)
         day = today + timedelta(days=offset)
         if per_day.get(day, 0) >= daily_limit(account, day):
             continue
+        # The minimum gap applies within one local day only (CLP-91's rule).
+        day_taken = [t for t in taken if t.astimezone(tz).date() == day]
         for start, end in windows:
             opens = datetime.combine(day, start, tz).astimezone(UTC)
             end_day = day + timedelta(days=1) if end == _MIDNIGHT else day
             closes = datetime.combine(end_day, end, tz).astimezone(UTC)
-            slot = _first_free(max(opens, earliest), closes, taken, gap)
+            # The end minute is inside the window (CLP-91's rule), except a midnight end,
+            # which already belongs to the next local day.
+            slot = _first_free(
+                max(opens, earliest),
+                closes,
+                day_taken,
+                gap,
+                end_inclusive=end != _MIDNIGHT,
+            )
             if slot is not None:
                 return slot
     return None

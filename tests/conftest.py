@@ -48,6 +48,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "SESSION_SECRET",
         "REVIEW_PASSWORD_HASH",
         "CLIPPER_CONFIG",
+        "CLIPPER_ACCOUNTS",
         "CLIPPER_DB",
         "RCLONE_REMOTE",
         "CLIPPER_MEDIA_DIR",

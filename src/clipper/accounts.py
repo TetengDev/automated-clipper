@@ -144,10 +144,15 @@ def _window_bounds(window: str) -> tuple[int, int]:
     return start, end
 
 
+def _hidden(ch: str) -> bool:
+    category = unicodedata.category(ch)
+    return category.startswith("C") or category in ("Zl", "Zp")
+
+
 def _posts_that_fit(windows: list[str], posts_per_day: int, min_gap_minutes: int) -> int:
     """How many posts fit in the windows with at least `min_gap_minutes` between them.
     Greedy from the earliest window; a post may go out at any minute from a window's
-    start through its end."""
+    start through its end (inclusive). The gap applies within one local day."""
     count, earliest = 0, 0
     for start, end in sorted(_window_bounds(w) for w in windows):
         t = max(earliest, start)
@@ -222,9 +227,9 @@ class Account(BaseModel):
     def _readable_licence(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        # No control, format (bidi overrides, zero-width) or other C* characters: the
-        # reference is shown to the operator and must read as what it is.
-        if any(unicodedata.category(ch).startswith("C") for ch in value):
+        # No control, format (bidi overrides, zero-width) or other C* characters, and no
+        # line or paragraph separators: the reference is shown to the operator on one line.
+        if any(_hidden(ch) for ch in value):
             raise ValueError("licence must not contain control or invisible characters")
         if len(value.strip()) < 3:
             raise ValueError("licence must name the signed licence (at least 3 characters)")

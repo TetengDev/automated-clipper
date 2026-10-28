@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 from datetime import date
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from clipper.accounts import (
+    APP_ENV_NAMES,
     PLATFORM_DAILY_CAPS,
     Account,
     AccountsConfig,
@@ -86,8 +89,6 @@ REFRESH = "ref_z9y8x7w6v5u4t3s2"
 @pytest.fixture(autouse=True)
 def _no_account_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLIPPER_ACCOUNTS", raising=False)
-    import os
-
     for name in list(os.environ):
         if name.startswith(("CLIPPER_ACCESS_TOKEN_", "CLIPPER_REFRESH_TOKEN_")):
             monkeypatch.delenv(name)
@@ -218,6 +219,7 @@ def test_posts_per_day_over_platform_cap_is_refused() -> None:
         ("licence", "  ", "at least 3 characters"),
         ("licence", "ok\u202elicence", "invisible"),
         ("licence", "ok\x9b31m licence", "invisible"),
+        ("licence", "line one\u2028line two", "invisible"),
         ("creators", [], "creators"),
         ("warmup_days", 0, "warmup_days"),
         ("surprise", 1, "surprise"),
@@ -549,6 +551,22 @@ def test_app_settings_are_never_read_as_tokens() -> None:
 
     assert account_tokens("proxy", env=env).extra == {}
     assert account_tokens("id", env=env).extra == {}
+
+
+def test_every_app_clipper_setting_is_reserved() -> None:
+    """A new CLIPPER_* setting must join APP_ENV_NAMES, or an account id matching its
+    suffix would read it as a token."""
+    sources = [*(REPO / "src").rglob("*.py"), *(REPO / "scripts").rglob("*")]
+    sources += [*(REPO / ".github").rglob("*.yml"), *REPO.glob("docker-compose*.yml")]
+    sources += [REPO / "Dockerfile", REPO / ".env.example", *(REPO / "docs").rglob("*.md")]
+    names: set[str] = set()
+    for path in sources:
+        if path.is_file():
+            names |= set(re.findall(r"CLIPPER_[A-Z0-9_]*[A-Z0-9]", path.read_text("utf-8")))
+    token_kinds = ("CLIPPER_ACCESS_TOKEN", "CLIPPER_REFRESH_TOKEN", "CLIPPER_CLIENT_SECRET")
+    unreserved = {n for n in names if n not in APP_ENV_NAMES and not n.startswith(token_kinds)}
+
+    assert unreserved == set()
 
 
 def test_account_tokens_missing_or_empty_is_none() -> None:

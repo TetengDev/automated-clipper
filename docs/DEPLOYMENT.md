@@ -153,7 +153,8 @@ To add an account:
    three. Fields that are set are kept, and only the missing ones are filled in. Windows
    are `HH:MM-HH:MM` in the account's own timezone, may not overlap, and a post may go out
    at any minute from a window's start through its end. The plan must fit:
-   `posts_per_day` posts, `min_gap_minutes` apart, have to fit inside the windows.
+   `posts_per_day` posts, `min_gap_minutes` apart, have to fit inside the windows of one
+   local day.
    `posts_per_day` may not exceed the platform cap (TikTok 15, Facebook 30, Instagram 50,
    YouTube 100). `warmup_start` ramps a new account from 1 post a day up to
    `posts_per_day` over `warmup_days` (14 by default).

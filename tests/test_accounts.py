@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-# ruff: noqa: I001 -- clipper.accounts lands in the next commit (TDD)
-
 import logging
 from datetime import date
 from pathlib import Path

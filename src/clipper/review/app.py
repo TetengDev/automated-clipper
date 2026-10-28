@@ -25,10 +25,10 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping, MutableMapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import quote, urlsplit
 
 import bcrypt
@@ -44,6 +44,9 @@ from clipper.config import MIN_SESSION_SECRET_LENGTH, AppConfig
 from clipper.db import connect
 from clipper.export import DEFAULT_OUTPUT_DIR, ExportLocks, Runner, run_subprocess
 from clipper.jobs.worker import DEFAULT_MEDIA_ROOT
+
+if TYPE_CHECKING:
+    from clipper.posting.scheduler import AccountLike
 
 PACKAGE_DIR = Path(__file__).parent
 TEMPLATES_DIR = PACKAGE_DIR / "templates"
@@ -417,6 +420,7 @@ def create_app(
     rclone_remote: str | None = None,
     export_runner: Runner = run_subprocess,
     config: AppConfig | None = None,
+    accounts: Sequence[AccountLike] = (),
 ) -> FastAPI:
     """Build the review app. All config is passed in so tests need no environment.
 
@@ -427,6 +431,8 @@ def create_app(
     stamps and ages sessions. Routes render templates with the module-level `render`.
     `config` gives each creator's content type for the faces check (CLP-87); without it
     every creator is unknown, so every clip needs the check (fails closed).
+    `accounts` are the posting accounts an approved clip is scheduled on (CLP-92); none
+    means approving schedules nothing.
     """
     if not _BCRYPT_HASH.match(password_hash):
         raise ValueError("REVIEW_PASSWORD_HASH must be a bcrypt hash ($2b$...)")
@@ -453,6 +459,7 @@ def create_app(
     app.state.export_runner = export_runner
     app.state.export_locks = ExportLocks()
     app.state.config = config or AppConfig()
+    app.state.accounts = tuple(accounts)
     app.state.wall_clock = wall_clock
     app.state.login_throttle = throttle
     app.state.session_policy = policy
@@ -520,7 +527,9 @@ def create_app(
         flash(request, "Signed out.")
         return RedirectResponse("/login", status_code=303)
 
+    from clipper.review.posts import router as posts_router
     from clipper.review.routes import router  # imports this module's helpers
 
     app.include_router(router)
+    app.include_router(posts_router)
     return app

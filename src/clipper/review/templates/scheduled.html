@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Scheduled · Clipper review{% endblock %}
+{% block content %}
+<h1>Scheduled posts <span class="muted count" id="upcoming-total">{{ upcoming | length }}</span></h1>
+<p class="muted">Times are UTC. Posts go out when the worker has a publisher for the platform.</p>
+
+<h2>Upcoming</h2>
+{% if upcoming %}
+<ul class="posts" id="upcoming">
+  {% for post in upcoming %}{% include "_post_row.html" %}{% endfor %}
+</ul>
+{% else %}
+<p class="muted">No upcoming posts.</p>
+{% endif %}
+
+<h2>Failed</h2>
+{% if failed %}
+<ul class="posts" id="failed">
+  {% for post in failed %}{% include "_post_row.html" %}{% endfor %}
+</ul>
+{% else %}
+<p class="muted">No failed posts.</p>
+{% endif %}
+
+{% if posted %}
+<h2>Recently posted</h2>
+<ul class="posts" id="posted">
+  {% for post in posted %}{% include "_post_row.html" %}{% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

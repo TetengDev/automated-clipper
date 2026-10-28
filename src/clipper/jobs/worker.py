@@ -14,11 +14,13 @@ import os
 import socket
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+from typing import Protocol
 
 from clipper.config import AppConfig
 from clipper.jobs.models import TERMINAL, Clock, Job, JobStatus, utcnow
@@ -49,6 +51,12 @@ DEFAULT_POLL_SECONDS = 5.0
 logger = logging.getLogger(__name__)
 
 
+class PeriodicPass(Protocol):
+    """Work the loop runs once per poll besides the job stages (CLP-92's posting stage)."""
+
+    def run_once(self) -> int: ...
+
+
 def default_worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -62,6 +70,8 @@ class Worker:
     media_root: Path = DEFAULT_MEDIA_ROOT
     clock: Clock = utcnow
     lease: timedelta = DEFAULT_LEASE
+    posting: PeriodicPass | None = None
+    """Posting pass (`clipper.posting.stage.PostingStage`), run at most once per poll."""
 
     def recover(self, dead_worker_id: str) -> int:
         """Release claims of a worker known to be dead, without waiting for lease expiry."""
@@ -151,7 +161,16 @@ class Worker:
         """
         unhandled = [s.value for s in JobStatus if s not in self.stages and s not in TERMINAL]
         logger.info("worker %s started; not handling: %s", self.worker_id, ", ".join(unhandled))
+        last_post_pass: float | None = None
         while not stop_event.is_set():
+            if self.posting is not None and (
+                last_post_pass is None or time.monotonic() - last_post_pass >= poll_seconds
+            ):
+                last_post_pass = time.monotonic()
+                try:
+                    self.posting.run_once()
+                except Exception:
+                    logger.exception("posting pass failed; retrying next poll")
             try:
                 busy = self.run_once()
             except Exception:

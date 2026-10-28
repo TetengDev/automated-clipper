@@ -1,0 +1,33 @@
+{# One post with its actions (CLP-92). Needs `post` and `next` (where to go after an action). #}
+<li class="post" id="post-{{ post.id }}" data-status="{{ post.status }}">
+  <div class="post-meta">
+    <span class="badge post-status-{{ post.status }}">{{ post.status | replace("_", " ") }}</span>
+    <strong>{{ post.account_id }}</strong> · {{ post.platform }} ·
+    <a href="/clip/{{ post.clip_id }}">clip {{ post.clip_id }}</a> v{{ post.clip_version }} ·
+    {% if post.posted_at %}posted {{ post.posted_at.strftime("%Y-%m-%d %H:%M") }} UTC
+    {% else %}<time datetime="{{ post.scheduled_at.isoformat() }}">{{ post.scheduled_at.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% endif %}
+    {% if post.attempts %} · {{ post.attempts }} attempt(s){% endif %}
+    {% if post.safe_url %} · <a href="{{ post.safe_url }}" target="_blank" rel="noopener noreferrer">view post</a>{% endif %}
+  </div>
+  {% if post.error and post.status != "posted" %}<p class="error">{{ post.error }}</p>{% endif %}
+  {% if post.status in ("scheduled", "post_failed") %}
+  <div class="post-actions">
+    <form method="post" action="/posts/{{ post.id }}/reschedule" hx-post="/posts/{{ post.id }}/reschedule"
+          hx-target="#post-error-{{ post.id }}" hx-disabled-elt="find button" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label>New time (UTC)
+        <input type="datetime-local" name="scheduled_at" required
+               value="{{ post.scheduled_at.strftime('%Y-%m-%dT%H:%M') }}"></label>
+      <button type="submit">{{ "Retry at" if post.status == "post_failed" else "Reschedule" }}</button>
+    </form>
+    <form method="post" action="/posts/{{ post.id }}/cancel" hx-post="/posts/{{ post.id }}/cancel"
+          hx-target="#post-error-{{ post.id }}" hx-disabled-elt="find button" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="{{ next }}">
+      <button type="submit" class="danger">Cancel post</button>
+    </form>
+  </div>
+  <div id="post-error-{{ post.id }}" aria-live="polite"></div>
+  {% endif %}
+</li>

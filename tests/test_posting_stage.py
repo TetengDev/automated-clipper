@@ -118,7 +118,7 @@ def test_due_post_is_published_and_recorded(env: Env, clock: Clock) -> None:
     assert done.url == f"https://example.test/p/{post.id}"
     assert done.posted_at == T0
     actions = [r["action"] for r in env.reviews(post.clip_id)]
-    assert actions == ["post_uploading", "post_posted"]
+    assert actions == ["post_scheduled", "post_uploading", "post_posted"]
 
 
 def test_post_not_yet_due_is_left_alone(env: Env, clock: Clock) -> None:
@@ -207,7 +207,8 @@ def test_three_failures_mark_post_failed_and_alert(env: Env, clock: Clock) -> No
     assert failed.attempts == 3
     assert len(alerts) == 1
     assert f"post {post.id}" in alerts[0] and "tiktok" in alerts[0]
-    assert "post_failed" in [r["action"] for r in env.reviews(post.clip_id)]
+    actions = [r["action"] for r in env.reviews(post.clip_id)]
+    assert actions[-1] == "post_failed", actions
 
 
 def test_backoff_doubles_each_attempt(env: Env, clock: Clock) -> None:
@@ -402,3 +403,68 @@ def test_worker_loop_survives_a_posting_error(env: Env, caplog: pytest.LogCaptur
 
     assert len(calls) == 2
     assert "posting pass failed" in caplog.text
+
+
+def test_lookup_error_counts_as_a_failed_attempt(env: Env, clock: Clock) -> None:
+    class Broken(LookupPublisher):
+        def lookup(self, idempotency_key: str) -> PublishResult | None:
+            raise RuntimeError("platform API down")
+
+    post = make_post(env)
+    stuck(env, post, T0 - STALE_UPLOAD - timedelta(minutes=1))
+
+    stage(env, clock, {"tiktok": Broken()}).run_once()
+
+    again = repo.get_post(env.conn, post.id)
+    assert again is not None
+    assert again.status == PostStatus.SCHEDULED and again.attempts == 1
+    assert again.error is not None and "platform API down" in again.error
+
+
+def test_result_for_a_post_taken_over_meanwhile_is_dropped(
+    env: Env, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    post = make_post(env)
+
+    @dataclass
+    class TakenOver:
+        def publish(self, sent: Post, *_: object) -> PublishResult:
+            env.conn.execute("UPDATE posts SET worker_id = 'other' WHERE id = ?", (sent.id,))
+            return PublishResult(external_id="x")
+
+    stage(env, clock, {"tiktok": TakenOver()}).run_once()
+
+    assert status(env, post.id) == PostStatus.UPLOADING
+    assert "result dropped" in caplog.text
+
+
+def test_failure_for_a_post_taken_over_meanwhile_is_dropped(
+    env: Env, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    post = make_post(env)
+
+    @dataclass
+    class TakenOver:
+        def publish(self, sent: Post, *_: object) -> PublishResult:
+            env.conn.execute("UPDATE posts SET worker_id = 'other' WHERE id = ?", (sent.id,))
+            raise RuntimeError("upload failed")
+
+    stage(env, clock, {"tiktok": TakenOver()}).run_once()
+
+    assert repo.get_post(env.conn, post.id).attempts == 0  # type: ignore[union-attr]
+    assert "failure not recorded" in caplog.text
+
+
+def test_a_failing_alert_is_logged_not_raised(
+    env: Env, clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    post = make_post(env)
+    env.conn.execute("UPDATE posts SET attempts = 2 WHERE id = ?", (post.id,))
+
+    def broken_alert(_: str) -> None:
+        raise RuntimeError("webhook down")
+
+    stage(env, clock, {"tiktok": FakePublisher(fail=1)}, alert=broken_alert).run_once()
+
+    assert status(env, post.id) == PostStatus.POST_FAILED
+    assert "alert failed" in caplog.text

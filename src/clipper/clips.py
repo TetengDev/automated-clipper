@@ -7,6 +7,7 @@ double-submitted action changes state (and writes its audit row) at most once.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Mapping
@@ -185,6 +186,15 @@ class ClipDetail:
             return source_url_at(self.platform, self.item_id, self.current.start_s)
         except InvalidSourceURL:
             return None
+
+
+def _digest(variant: Variant) -> dict[str, object]:
+    text = json.dumps(variant.model_dump(), sort_keys=True, ensure_ascii=False)
+    return {
+        "sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "title_chars": len(variant.title),
+        "caption_chars": len(variant.caption),
+    }
 
 
 def _json_or_none(raw: str | None) -> object:
@@ -560,7 +570,9 @@ def edit_variants(
             now,
             payload={
                 "platforms": platforms,
-                "before": {p: current[p].model_dump() for p in platforms},
+                # Only a digest of the old text: a name the reviewer removed must not
+                # live on in the audit log.
+                "before": {p: _digest(current[p]) for p in platforms},
                 "after": {p: changed[p].model_dump() for p in platforms},
             },
         )

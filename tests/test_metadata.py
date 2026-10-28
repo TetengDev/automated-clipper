@@ -204,12 +204,18 @@ def test_instagram_drops_the_models_last_tags_never_the_campaign_tags():
 
 
 @pytest.mark.parametrize("platform", PLATFORMS)
-def test_final_caption_stays_within_the_limit_with_the_hashtag_line(platform):
+def test_campaign_tags_never_cut_the_caption_silently(platform):
+    """Review fix: a caption that fits with its own tags but not with the campaign tags is
+    kept whole and blocked by pre-flight, never shortened without a word."""
     limit = PLATFORM_LIMITS[platform].caption_max
-    long = variants(caption=truncate_words(LONG_CAPTION, limit))
-    meta = build_post_metadata(long, platform, campaign_tags=["#mrbeastpartner"])
-    assert len(meta.caption) <= limit
+    tags = ["#mrbeast", "#island", "#money"]
+    full = variants(caption=truncate_words(LONG_CAPTION, caption_room(platform, tags)))
+    fits = build_post_metadata(full, platform)
+    assert len(fits.caption) <= limit and preflight(fits, platform, 35.0) == []
+    meta = build_post_metadata(full, platform, campaign_tags=["#mrbeastpartner"])
+    assert meta.caption.startswith(full[platform].caption)
     assert meta.caption.endswith("#mrbeastpartner")
+    assert any("caption is longer" in p for p in preflight(meta, platform, 35.0))
 
 
 def test_post_metadata_is_frozen_with_the_shared_fields():
@@ -436,3 +442,18 @@ def test_fingerprint_changes_with_the_text():
     b = {**a, "tiktok": variant(title="Other")}
     assert fingerprint(a) == fingerprint(derive_variants("T", "C", ["#a1"]))
     assert fingerprint(a) != fingerprint(b)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "the store. Me and my friend",
+        "the CEO. Co-founder too",
+        "it. TV was on",
+        "out. App is great",
+        "Wait. Net worth",
+        "email me at home",
+    ],
+)
+def test_sentence_breaks_are_not_links(text):
+    assert links_or_mentions(text) == []

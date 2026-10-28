@@ -46,8 +46,10 @@ DISCLOSURE_HASHTAGS = frozenset({"#ad", "#ads", "#sponsored", "#paid", "#partner
 """Tags that read as a paid-partnership disclosure: only a campaign may add them (as campaign
 tags at scheduling), never the model or a variant."""
 LINK_OR_MENTION = re.compile(
-    r"(?i)\b(?:https?://|www\.)\S+"
-    r"|\b[\w-]+\s*(?:\.|\bdot\b)\s*(?:com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop)\b"
+    r"(?i:\b(?:https?://|www\.)\S+)"
+    # A domain: "name.com" with no space around the dot, or spelled out "name dot com".
+    # Lowercase TLDs only, so a sentence break ("the store. Me and") is not a domain.
+    r"|\b[\w-]+(?:\.|\s+(?i:dot)\s+)(?:com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop)\b"
     r"|(?<![\w@])@\w+"
 )
 """A link, a bare domain (also "name dot com") or an @mention: the transcript is untrusted,
@@ -334,8 +336,9 @@ def build_post_metadata(
     """The post for one platform. Campaign tags go last and are never dropped; where the
     platform caps hashtags (Instagram: 5) the model's last tags make room. A campaign with
     more tags than the cap still gets all of them, and `preflight` blocks the post. The
-    caption body is cut at a word boundary so the caption with its hashtag line fits the
-    limit. A malformed campaign tag is a ValueError (a config error, never dropped)."""
+    caption is never cut here: when campaign tags push it past the limit, `preflight`
+    reports it, so the reviewer's text is shortened by a person, not silently. A malformed
+    campaign tag is a ValueError (a config error, never dropped)."""
     limits = _limits(platform)
     variant = variants[platform]
     campaign: list[str] = []
@@ -349,9 +352,8 @@ def build_post_metadata(
     own = [t for t in variant.hashtags if _fold(t) not in taken]
     own = own[: max(0, limits.post_hashtags_max - len(campaign))]
     hashtags = [*own, *campaign]
-    body = truncate_words(variant.caption, max(0, caption_room(platform, hashtags)))
     line = _hashtag_line(hashtags)
-    caption = "\n\n".join(part for part in (body, line) if part)
+    caption = "\n\n".join(part for part in (variant.caption, line) if part)
     ai = edl is not None and has_ai_elements(edl)
     return PostMetadata(
         title=variant.title,

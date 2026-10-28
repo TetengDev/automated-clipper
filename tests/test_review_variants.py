@@ -146,7 +146,9 @@ def test_edit_saves_title_and_caption_and_is_audited(client: TestClient, env: En
     assert (review["action"], review["version"]) == ("variants_edited", 1)
     payload = json.loads(review["payload"])
     assert payload["platforms"] == ["tiktok", "youtube"]
-    assert payload["before"]["tiktok"] == STORED["tiktok"]
+    assert set(payload["before"]["tiktok"]) == {"sha256", "title_chars", "caption_chars"}
+    assert payload["before"]["tiktok"]["title_chars"] == len("tiktok title")
+    assert "tiktok caption" not in review["payload"]  # no old text in the audit log
     assert payload["after"]["tiktok"]["title"] == "Kai Cenat chair collapse"
     assert set(payload["before"]) == set(payload["after"]) == {"tiktok", "youtube"}
     assert env.status(clip_id) == "pending_review"

@@ -93,7 +93,6 @@
       "additionalProperties": false,
       "properties": {
         "ai_generated": {
-          "default": false,
           "description": "Synthetic voice or text (CLP-96 disclosure).",
           "title": "Ai Generated",
           "type": "boolean"
@@ -147,7 +146,6 @@
       "description": "A kept range of the clip, seconds in the source.",
       "properties": {
         "ai_generated": {
-          "default": false,
           "description": "Generated footage, e.g. b-roll (CLP-96).",
           "title": "Ai Generated",
           "type": "boolean"

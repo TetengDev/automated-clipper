@@ -111,11 +111,25 @@ class SourceSegment(_Strict):
         return self.out_s - self.in_s
 
 
+def _no_schema_default(schema: dict[str, Any]) -> None:
+    """Drop `default` from a field's JSON Schema.
+
+    ajv runs with `useDefaults` and `strict`; a default inside a schema that ajv inlines
+    under `anyOf` (Segment has no `$ref`, so it is inlined) raises "default is ignored".
+    The Python default still applies; the TypeScript type keeps the field optional.
+    """
+    schema.pop("default", None)
+
+
 class Hook(_Strict):
     text: str = Field(min_length=1, max_length=120, pattern=r"\S")
     style: HookStyle = HookStyle.STAKES
     duration_s: float = Field(2.0, ge=1.0, le=3.0, description="Seconds from clip start.")
-    ai_generated: bool = Field(False, description="Synthetic voice or text (CLP-96 disclosure).")
+    ai_generated: bool = Field(
+        False,
+        description="Synthetic voice or text (CLP-96 disclosure).",
+        json_schema_extra=_no_schema_default,
+    )
 
 
 class Word(_Strict):
@@ -135,7 +149,11 @@ class Segment(_Strict):
 
     in_s: float = Field(ge=0)
     out_s: float = Field(gt=0)
-    ai_generated: bool = Field(False, description="Generated footage, e.g. b-roll (CLP-96).")
+    ai_generated: bool = Field(
+        False,
+        description="Generated footage, e.g. b-roll (CLP-96).",
+        json_schema_extra=_no_schema_default,
+    )
 
     @model_validator(mode="after")
     def _check(self) -> Segment:

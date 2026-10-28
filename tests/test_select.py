@@ -62,6 +62,7 @@ CLIP_KEYS = {
     "payoff_s",
     "open_question",
     "sensitive",
+    "variants",
 }
 
 
@@ -1195,6 +1196,7 @@ PLAYBOOK_HASHES = {
     "playbook_v3": "d993ef065a093fac60c3f91d959c8ab7d21e90eedbc076221e4b0a26b470132f",
     "playbook_v4": "97b8707018c24c6772d5f76d3d637f7ed6ed8b8f620942ffb790437a6cd16689",
     "playbook_v5": "56a43482bd6783e8100c0de00d8469017758d6a684a130b20cfbf09b162f41a9",
+    "playbook_v6": "d37ff2d760f2bedd7bdbb26d9b6b1d520870541b85685365bc2ffe26187288cf",
 }
 
 
@@ -1511,7 +1513,7 @@ def test_assembled_static_prompt_carries_the_protected_people_rules():
 def test_playbook_v5_on_camera_rule_is_in_terms_the_transcript_shows():
     """CLP-87 review: the model cannot see faces, so the rule names what a transcript shows
     (called forward, introduced, speaking) and leaves faces to the reviewer."""
-    assert select.PLAYBOOK_VERSION == "playbook_v5"
+    assert select.PLAYBOOK_VERSION in ("playbook_v5", "playbook_v6")
     universal = _flat(select.load_playbook("universal"))
     assert (
         "Never choose a moment in which anyone, at any point, says something that identifies"
@@ -1539,3 +1541,83 @@ def test_prompt_lines_are_wrapped(name):
     """CLP-87 review: the reflowed rule left a 104-character line."""
     path = Path(select.__file__).parent / "prompts" / name
     assert max(len(line) for line in path.read_text().splitlines()) < 100  # existing: <= 91
+
+
+# --- per-platform variants (CLP-96) -------------------------------------------------------------
+
+
+def test_output_schema_requires_variants_for_every_platform():
+    from clipper.metadata import PLATFORMS
+
+    items = select.OUTPUT_SCHEMA["properties"]["clips"]["items"]
+    assert "variants" in items["required"]
+    variants = items["properties"]["variants"]
+    assert variants["additionalProperties"] is False
+    assert set(variants["required"]) == set(variants["properties"]) == set(PLATFORMS)
+    for schema in variants["properties"].values():
+        assert set(schema["required"]) == {"title", "caption", "hashtags"}
+        assert schema["additionalProperties"] is False
+
+
+def test_playbook_v6_per_platform_rules():
+    assert select.PLAYBOOK_VERSION == "playbook_v6"
+    universal = _flat(select.load_playbook("universal"))
+    assert "Lead with the keyword a viewer would search." in universal
+    assert "The first 60 characters of every caption" in universal
+    assert "never #fyp, #foryou, #foryoupage, #viral, #trending or #fy" in universal
+    assert "Instagram allows at most 5." in universal
+    assert "Campaign and sponsor tags are added later by the scheduler" in universal
+    assert "The sensitive-moment rules below apply to every variant" in universal
+    prompt = _flat(select.load_system_prompt())
+    assert "`hashtags`: 3 to 5 specific hashtags" in prompt
+    assert "`variants`: an object with `tiktok`, `instagram`, `youtube` and `facebook`" in prompt
+
+
+def test_recorded_reply_with_variants_is_kept_within_limits(conn, media):
+    from clipper.metadata import PLATFORM_LIMITS, PLATFORMS, Variant
+
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic("valid_variants.json"))
+
+    top = out["clips"][0]
+    assert top["hook"] == "Hook 3"
+    variants = top["variants"]
+    assert set(variants) == set(PLATFORMS)
+    assert variants["tiktok"] == {
+        "title": "MrBeast challenge 3",
+        "caption": "MrBeast challenge 3: who wins the money?",
+        "hashtags": ["#mrbeast", "#challenge3", "#money"],
+    }
+    assert variants["instagram"]["hashtags"] == [
+        "#mrbeast",
+        "#challenge3",
+        "#money",
+        "#karl",
+        "#chandler",
+    ]
+    assert len(variants["youtube"]["title"]) <= 100
+    assert variants["youtube"]["title"].startswith("MrBeast challenge 3")
+    assert variants["facebook"]["hashtags"] == ["#mrbeast", "#challenge3", "#money"]
+    for clip in out["clips"]:
+        for platform, raw in clip["variants"].items():
+            Variant.model_validate(raw, context={"platform": platform})
+            assert len(raw["hashtags"]) <= PLATFORM_LIMITS[platform].hashtags_max
+
+
+def test_reply_without_variants_derives_them_from_the_single_copy(conn, media):
+    from clipper.metadata import PLATFORMS, derive_variants
+
+    out = run(make_job(conn), make_ctx(conn, media), FakeAnthropic("valid.json"))
+
+    for clip in out["clips"]:
+        derived = derive_variants(clip["title"], clip["caption"], clip["hashtags"])
+        assert clip["variants"] == {p: derived[p].model_dump() for p in PLATFORMS}
+
+
+def test_cached_window_without_variants_still_loads(tmp_path):
+    path = tmp_path / "000-abc.json"
+    path.write_text(fixture("valid.json")["content"][-1]["text"])
+    found = select._load_window(path)
+    assert found is not None
+    assert all(
+        set(c.variants or {}) == {"tiktok", "instagram", "youtube", "facebook"} for c in found
+    )

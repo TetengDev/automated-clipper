@@ -1884,3 +1884,30 @@ def test_worker_failing_ranks_in_front_of_good_ones_still_reach_clips_ready(
 
     assert done.status is JobStatus.CLIPS_READY
     assert [r["rank"] for r in _rows(conn)] == [bad + 1, bad + 2]
+
+
+# --- per-platform variants (CLP-96) -----------------------------------------------------------
+
+
+def test_highlight_variants_are_stored_on_the_clip_version(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    own = {
+        p: {"title": f"{p} t", "caption": f"{p} c", "hashtags": ["#clip", "#r1", "#x1"]}
+        for p in ("tiktok", "instagram", "youtube", "facebook")
+    }
+    own["instagram"]["hashtags"] = ["#fyp", *[f"#i{n}" for n in range(7)]]
+    _setup(media, [_highlight(1, 10.0, 15.0, variants=own), _highlight(2, 30.5, 40.5)])
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    first, second = (json.loads(r["variants"]) for r in _rows(conn))
+    assert first["tiktok"] == own["tiktok"]
+    assert first["instagram"]["hashtags"] == [f"#i{n}" for n in range(5)]
+    # A highlight from before CLP-96 gets variants derived from its single copy.
+    assert set(second) == {"tiktok", "instagram", "youtube", "facebook"}
+    assert second["youtube"] == {
+        "title": "Title 2",
+        "caption": "Caption 2",
+        "hashtags": ["#clip", "#r2"],
+    }

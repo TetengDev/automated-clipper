@@ -1,0 +1,26 @@
+{
+  "id": "msg_01Fixture0096",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-5-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "sig"
+    },
+    {
+      "type": "text",
+      "text": "{\"clips\": [{\"start_s\": 30.1, \"end_s\": 60.6, \"hook\": \"Hook 1\", \"title\": \"Title 1\", \"caption\": \"Caption 1\", \"hashtags\": [\"#mrbeast\", \"#challenge1\", \"#money\"], \"score\": 88, \"reason\": \"Reason 1\", \"payoff_s\": 40.1, \"open_question\": \"What happens after Hook 1?\", \"sensitive\": false, \"variants\": {\"tiktok\": {\"title\": \"MrBeast challenge 1\", \"caption\": \"MrBeast challenge 1: who wins the money?\", \"hashtags\": [\"#mrbeast\", \"#challenge1\", \"#money\"]}, \"instagram\": {\"title\": \"MrBeast challenge 1\", \"caption\": \"MrBeast challenge 1 ends with a twist\", \"hashtags\": [\"#mrbeast\", \"#challenge1\", \"#money\", \"#karl\", \"#chandler\", \"#feastables\"]}, \"youtube\": {\"title\": \"MrBeast challenge 1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\", \"caption\": \"MrBeast challenge 1, the full moment.\", \"hashtags\": [\"#mrbeast\", \"#challenge1\", \"#shorts\"]}, \"facebook\": {\"title\": \"MrBeast challenge 1\", \"caption\": \"MrBeast challenge 1 for the win\", \"hashtags\": [\"#fyp\", \"#mrbeast\", \"#challenge1\", \"#viral\", \"#money\"]}}}, {\"start_s\": 200.1, \"end_s\": 235.6, \"hook\": \"Hook 2\", \"title\": \"Title 2\", \"caption\": \"Caption 2\", \"hashtags\": [\"#mrbeast\", \"#challenge2\", \"#money\"], \"score\": 75, \"reason\": \"Reason 2\", \"payoff_s\": 210.1, \"open_question\": \"What happens after Hook 2?\", \"sensitive\": false, \"variants\": {\"tiktok\": {\"title\": \"MrBeast challenge 2\", \"caption\": \"MrBeast challenge 2: who wins the money?\", \"hashtags\": [\"#mrbeast\", \"#challenge2\", \"#money\"]}, \"instagram\": {\"title\": \"MrBeast challenge 2\", \"caption\": \"MrBeast challenge 2 ends with a twist\", \"hashtags\": [\"#mrbeast\", \"#challenge2\", \"#money\", \"#karl\", \"#chandler\", \"#feastables\"]}, \"youtube\": {\"title\": \"MrBeast challenge 2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\", \"caption\": \"MrBeast challenge 2, the full moment.\", \"hashtags\": [\"#mrbeast\", \"#challenge2\", \"#shorts\"]}, \"facebook\": {\"title\": \"MrBeast challenge 2\", \"caption\": \"MrBeast challenge 2 for the win\", \"hashtags\": [\"#fyp\", \"#mrbeast\", \"#challenge2\", \"#viral\", \"#money\"]}}}, {\"start_s\": 400.1, \"end_s\": 445.6, \"hook\": \"Hook 3\", \"title\": \"Title 3\", \"caption\": \"Caption 3\", \"hashtags\": [\"#mrbeast\", \"#challenge3\", \"#money\"], \"score\": 92, \"reason\": \"Reason 3\", \"payoff_s\": 410.1, \"open_question\": \"What happens after Hook 3?\", \"sensitive\": false, \"variants\": {\"tiktok\": {\"title\": \"MrBeast challenge 3\", \"caption\": \"MrBeast challenge 3: who wins the money?\", \"hashtags\": [\"#mrbeast\", \"#challenge3\", \"#money\"]}, \"instagram\": {\"title\": \"MrBeast challenge 3\", \"caption\": \"MrBeast challenge 3 ends with a twist\", \"hashtags\": [\"#mrbeast\", \"#challenge3\", \"#money\", \"#karl\", \"#chandler\", \"#feastables\"]}, \"youtube\": {\"title\": \"MrBeast challenge 3 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\", \"caption\": \"MrBeast challenge 3, the full moment.\", \"hashtags\": [\"#mrbeast\", \"#challenge3\", \"#shorts\"]}, \"facebook\": {\"title\": \"MrBeast challenge 3\", \"caption\": \"MrBeast challenge 3 for the win\", \"hashtags\": [\"#fyp\", \"#mrbeast\", \"#challenge3\", \"#viral\", \"#money\"]}}}]}"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 800,
+    "cache_creation_input_tokens": 1500,
+    "cache_read_input_tokens": 0
+  }
+}

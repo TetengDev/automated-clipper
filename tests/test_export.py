@@ -641,3 +641,19 @@ def test_run_subprocess_uses_argv_without_shell(monkeypatch: pytest.MonkeyPatch)
     assert seen["args"] == ["rclone", "copy", "--", "a", "b"]
     assert seen["kwargs"]["check"] is True  # type: ignore[index]
     assert "shell" not in seen["kwargs"]  # type: ignore[operator]
+
+
+def test_sidecar_carries_the_per_platform_variants(env: Env) -> None:
+    """CLP-96: the export sidecar has each platform's title, caption and hashtags."""
+    clip_id = approved_clip(env, hashtags=["funny", "#viral", "#kai"])
+
+    run(env, clip_id)
+
+    (sidecar,) = (env.output_dir / "ready" / "2027-01-15").glob("*.json")
+    variants = json.loads(sidecar.read_text())["variants"]
+    assert set(variants) == {"tiktok", "instagram", "youtube", "facebook"}
+    assert variants["instagram"] == {
+        "title": "Big Moment!",
+        "caption": "Watch this",
+        "hashtags": ["#funny", "#kai"],
+    }

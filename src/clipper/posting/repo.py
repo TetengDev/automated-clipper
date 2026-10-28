@@ -300,14 +300,24 @@ def claim_due(
 
 
 def claim_stale(
-    conn: sqlite3.Connection, now: datetime, worker_id: str, *, older_than: timedelta
+    conn: sqlite3.Connection,
+    now: datetime,
+    worker_id: str,
+    *,
+    older_than: timedelta,
+    platforms: Collection[str],
 ) -> list[Post]:
-    """Take over posts left `uploading` longer than `older_than` (a crashed worker)."""
+    """Take over posts on `platforms` left `uploading` longer than `older_than` (a crashed
+    worker). Only platforms this worker publishes to: it must be able to `lookup` them."""
+    wanted = sorted(platforms)
+    if not wanted:
+        return []
+    marks = ", ".join("?" for _ in wanted)
     with transaction(conn):
+        where = f"status = ? AND (claimed_at IS NULL OR claimed_at <= ?) AND platform IN ({marks})"
+        sql = f"SELECT * FROM posts WHERE {where} ORDER BY claimed_at, id"  # noqa: S608
         rows = conn.execute(
-            "SELECT * FROM posts WHERE status = ? AND (claimed_at IS NULL OR claimed_at <= ?)"
-            " ORDER BY claimed_at, id",
-            (str(PostStatus.UPLOADING), to_iso(now - older_than)),
+            sql, (str(PostStatus.UPLOADING), to_iso(now - older_than), *wanted)
         ).fetchall()
         taken = []
         for row in rows:
@@ -325,7 +335,16 @@ def claim_stale(
                 ),
             )
             if cur.rowcount == 1:
-                taken.append(_require(conn, post.id))
+                recovered = _require(conn, post.id)
+                _audit(
+                    conn,
+                    recovered,
+                    "post_recovered",
+                    now,
+                    worker_id=worker_id,
+                    previous_worker=post.worker_id,
+                )
+                taken.append(recovered)
         return taken
 
 

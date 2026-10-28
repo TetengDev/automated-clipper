@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -44,6 +44,28 @@ POST_TRANSITIONS: dict[PostStatus, frozenset[PostStatus]] = {
 
 OPEN_STATUSES = (PostStatus.SCHEDULED, PostStatus.UPLOADING, PostStatus.POST_FAILED)
 """What `clipper posts list` shows by default."""
+
+RESCHEDULE_HORIZON = timedelta(days=366)
+RESCHEDULE_PAST_SLACK = timedelta(minutes=1)
+
+
+def parse_utc(text: str) -> datetime | None:
+    """An ISO 8601 / `datetime-local` time as aware UTC (no offset means UTC), or None."""
+    try:
+        moment = datetime.fromisoformat(text.strip())
+        return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def reschedule_problem(when: datetime, now: datetime) -> str | None:
+    """Why `when` is not an acceptable new post time, or None. Shared by the review app
+    and the CLI."""
+    if when < now - RESCHEDULE_PAST_SLACK:
+        return "Pick a time in the future."
+    if when > now + RESCHEDULE_HORIZON:
+        return "Pick a time within a year."
+    return None
 
 
 class InvalidPostTransition(Exception):
@@ -140,10 +162,14 @@ class PublishResult:
 class Publisher(Protocol):
     """A platform publisher (CLP-93/94/95), registered per platform in the posting stage.
 
+    `publish` must give up (time out) well within `stage.STALE_UPLOAD` (30 minutes) and
+    should dedupe on `post.idempotency_key` where the platform allows it.
+
     It may also implement `lookup(idempotency_key: str) -> PublishResult | None`: the
-    posting stage calls it before retrying a post a crashed worker left `uploading`, so
-    an upload that did go through is recorded instead of posted twice. Without `lookup`
-    such a post becomes `post_failed` ("uploading state unresolved") for a human to check.
+    posting stage calls it before re-publishing a post after a failed attempt and for a
+    post a crashed worker left `uploading`, so an upload that did go through is recorded
+    instead of posted twice. Without `lookup` a crashed upload becomes `post_failed`
+    ("uploading state unresolved") for a human to check.
     """
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult: ...

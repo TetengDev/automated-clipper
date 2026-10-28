@@ -305,17 +305,83 @@ def test_stale_upload_found_by_lookup_is_marked_posted_without_reposting(
     assert done.status == PostStatus.POSTED and done.external_id == "ext-9"
 
 
-def test_stale_upload_not_found_is_retried_later(env: Env, clock: Clock) -> None:
+def test_stale_upload_not_found_is_handed_to_a_human(env: Env, clock: Clock) -> None:
+    # Not found may mean still in flight on a slow worker: never re-publish automatically.
     post = make_post(env)
     stuck(env, post, T0 - STALE_UPLOAD - timedelta(minutes=1))
+    publisher = LookupPublisher()
+    alerts: list[str] = []
+
+    stage(env, clock, {"tiktok": publisher}, alert=alerts.append).run_once()
+
+    assert publisher.calls == []
+    failed = repo.get_post(env.conn, post.id)
+    assert failed is not None
+    assert failed.status == PostStatus.POST_FAILED
+    assert failed.error is not None and failed.error.startswith("uploading state unresolved")
+    assert len(alerts) == 1
+    actions = [r["action"] for r in env.reviews(post.clip_id)]
+    assert actions[-2:] == ["post_recovered", "post_failed"]
+
+
+def test_stale_uploads_are_only_taken_over_for_platforms_with_a_publisher(
+    env: Env, clock: Clock
+) -> None:
+    post = make_post(env, platform="youtube", account="yt_main")
+    stuck(env, post, T0 - STALE_UPLOAD - timedelta(minutes=1), worker="other")
+
+    stage(env, clock, {"tiktok": FakePublisher()}).run_once()
+
+    still = repo.get_post(env.conn, post.id)
+    assert still is not None
+    assert still.status == PostStatus.UPLOADING and still.worker_id == "other"
+
+
+def test_posts_are_claimed_one_at_a_time(env: Env, clock: Clock) -> None:
+    first = make_post(env)
+    second = make_post(env, account="tt_alt")
+    seen: list[PostStatus] = []
+
+    @dataclass
+    class Watching:
+        def publish(self, sent: Post, *_: object) -> PublishResult:
+            other = second if sent.id == first.id else first
+            seen.append(status(env, other.id))
+            clock.now += timedelta(minutes=20)  # a slow upload
+            return PublishResult(external_id=f"x{sent.id}")
+
+    stage(env, clock, {"tiktok": Watching()}).run_once()
+
+    # While the first uploads, the second is still scheduled (not claimed and ageing).
+    assert seen == [PostStatus.SCHEDULED, PostStatus.POSTED]
+    second_done = repo.get_post(env.conn, second.id)
+    assert second_done is not None and second_done.claimed_at == T0 + timedelta(minutes=20)
+
+
+def test_retry_asks_lookup_first_and_does_not_republish_a_live_post(env: Env, clock: Clock) -> None:
+    post = make_post(env)
+    env.conn.execute("UPDATE posts SET attempts = 1 WHERE id = ?", (post.id,))
+    publisher = LookupPublisher(
+        found={post.idempotency_key: PublishResult(external_id="late", url=None)}
+    )
+
+    stage(env, clock, {"tiktok": publisher}).run_once()
+
+    assert publisher.calls == []
+    done = repo.get_post(env.conn, post.id)
+    assert done is not None and done.status == PostStatus.POSTED and done.external_id == "late"
+
+
+def test_retry_publishes_when_lookup_finds_nothing(env: Env, clock: Clock) -> None:
+    post = make_post(env)
+    env.conn.execute("UPDATE posts SET attempts = 1 WHERE id = ?", (post.id,))
     publisher = LookupPublisher()
 
     stage(env, clock, {"tiktok": publisher}).run_once()
 
-    assert publisher.calls == []  # not in this pass: it backs off first
-    again = repo.get_post(env.conn, post.id)
-    assert again is not None
-    assert again.status == PostStatus.SCHEDULED and again.attempts == 1
+    assert publisher.lookups == [post.idempotency_key]
+    assert len(publisher.calls) == 1
+    assert status(env, post.id) == PostStatus.POSTED
 
 
 def test_stale_upload_without_lookup_fails_rather_than_double_posting(
@@ -405,20 +471,34 @@ def test_worker_loop_survives_a_posting_error(env: Env, caplog: pytest.LogCaptur
     assert "posting pass failed" in caplog.text
 
 
-def test_lookup_error_counts_as_a_failed_attempt(env: Env, clock: Clock) -> None:
-    class Broken(LookupPublisher):
-        def lookup(self, idempotency_key: str) -> PublishResult | None:
-            raise RuntimeError("platform API down")
+class BrokenLookup(LookupPublisher):
+    def lookup(self, idempotency_key: str) -> PublishResult | None:
+        raise RuntimeError("platform API down")
 
+
+def test_lookup_error_on_a_stale_upload_never_republishes(env: Env, clock: Clock) -> None:
     post = make_post(env)
     stuck(env, post, T0 - STALE_UPLOAD - timedelta(minutes=1))
+    publisher = BrokenLookup()
 
-    stage(env, clock, {"tiktok": Broken()}).run_once()
+    stage(env, clock, {"tiktok": publisher}, alert=lambda _: None).run_once()
 
-    again = repo.get_post(env.conn, post.id)
-    assert again is not None
-    assert again.status == PostStatus.SCHEDULED and again.attempts == 1
-    assert again.error is not None and "platform API down" in again.error
+    assert publisher.calls == []
+    failed = repo.get_post(env.conn, post.id)
+    assert failed is not None
+    assert failed.status == PostStatus.POST_FAILED
+    assert failed.error is not None and "platform API down" in failed.error
+
+
+def test_lookup_error_before_a_retry_never_republishes(env: Env, clock: Clock) -> None:
+    post = make_post(env)
+    env.conn.execute("UPDATE posts SET attempts = 1 WHERE id = ?", (post.id,))
+    publisher = BrokenLookup()
+
+    stage(env, clock, {"tiktok": publisher}, alert=lambda _: None).run_once()
+
+    assert publisher.calls == []
+    assert status(env, post.id) == PostStatus.POST_FAILED
 
 
 def test_result_for_a_post_taken_over_meanwhile_is_dropped(
@@ -432,10 +512,13 @@ def test_result_for_a_post_taken_over_meanwhile_is_dropped(
             env.conn.execute("UPDATE posts SET worker_id = 'other' WHERE id = ?", (sent.id,))
             return PublishResult(external_id="x")
 
-    stage(env, clock, {"tiktok": TakenOver()}).run_once()
+    alerts: list[str] = []
+
+    stage(env, clock, {"tiktok": TakenOver()}, alert=alerts.append).run_once()
 
     assert status(env, post.id) == PostStatus.UPLOADING
     assert "result dropped" in caplog.text
+    assert len(alerts) == 1 and "duplicate" in alerts[0] and "external id x" in alerts[0]
 
 
 def test_failure_for_a_post_taken_over_meanwhile_is_dropped(

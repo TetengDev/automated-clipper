@@ -265,14 +265,12 @@ def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.Clip
     accounts = request.app.state.accounts
     if not accounts:
         return
+    sensitive = _sensitive(request, clip.creator, clip.current.sensitive)
+    if sensitive:  # never auto-posted, even after the faces check (CLP-92)
+        flash(request, f"Clip {clip.id} is sensitive: not scheduled for posting.")
+        return
     try:
-        created = schedule_for_clip(
-            conn,
-            clip.id,
-            accounts,
-            _now(request),
-            sensitive=_sensitive(request, clip.creator, clip.current.sensitive),
-        )
+        created = schedule_for_clip(conn, clip.id, accounts, _now(request))
     except Exception:
         logger.exception("scheduling posts for clip %d failed", clip.id)
         flash(request, f"Clip {clip.id}: scheduling posts failed; see the server log.")

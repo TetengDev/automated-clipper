@@ -211,3 +211,33 @@ def test_warmup_starting_after_the_horizon_returns_none() -> None:
     account = FakeAccount(warmup_start=TODAY + timedelta(days=MAX_DAYS_AHEAD + 1))
 
     assert pick_slot(account, [], NOW) is None
+
+
+# --- daylight saving time -----------------------------------------------------------------
+
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def test_window_starting_in_the_spring_forward_gap_opens_at_a_real_time() -> None:
+    # 2027-03-14: 02:00 EST jumps to 03:00 EDT, so 02:00 never happens in New York.
+    account = FakeAccount(timezone="America/New_York", windows=["02:00-04:00"])
+    now = datetime(2027, 3, 14, 5, 0, tzinfo=UTC)  # 00:00 EST
+
+    slot = pick_slot(account, [], now)
+
+    assert slot == datetime(2027, 3, 14, 7, 0, tzinfo=UTC)
+    assert slot.astimezone(NEW_YORK).hour == 3  # 03:00 EDT, a real local time
+
+
+def test_fall_back_day_counts_posts_on_the_local_day() -> None:
+    # 2027-11-07: 01:00-02:00 happens twice in New York (EDT, then EST).
+    account = FakeAccount(
+        timezone="America/New_York", windows=["00:00-23:59"], posts_per_day=2, min_gap_minutes=30
+    )
+    now = datetime(2027, 11, 7, 4, 0, tzinfo=UTC)  # 00:00 EDT
+    taken = [datetime(2027, 11, 7, 5, 0, tzinfo=UTC), datetime(2027, 11, 7, 6, 0, tzinfo=UTC)]
+
+    slot = pick_slot(account, taken, now)
+
+    # Both 01:00 EDT and 01:00 EST are on 7 November: the day is full, so the 8th.
+    assert slot == datetime(2027, 11, 8, 5, 0, tzinfo=UTC)

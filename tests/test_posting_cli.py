@@ -15,7 +15,9 @@ from clipper.posting.models import Post, PostStatus
 from review_support import Env, make_env
 
 runner = CliRunner()
-AT = datetime(2030, 1, 15, 9, 0, tzinfo=UTC)  # in the future for the CLI's real clock
+# The CLI uses the real clock: keep test times a few days ahead of it.
+AT = (datetime.now(UTC) + timedelta(days=5)).replace(hour=9, minute=0, second=0, microsecond=0)
+LATER = AT + timedelta(days=2)
 
 
 @pytest.fixture
@@ -65,7 +67,7 @@ def test_list_shows_open_posts(env: Env) -> None:
     assert result.exit_code == 0, result.output
     assert f"{first.id}" in result.output
     assert "tt_main" in result.output and "scheduled" in result.output
-    assert "2030-01-15T09:00:00Z" in result.output
+    assert AT.strftime("%Y-%m-%dT%H:%M:%SZ") in result.output
     assert "yt_main" not in result.output  # cancelled is hidden by default
 
 
@@ -121,18 +123,25 @@ def test_cancel_unknown_or_posted_fails(env: Env) -> None:
 def test_reschedule(env: Env) -> None:
     target = make_post(env)
 
-    result = run(env, "reschedule", str(target.id), "2030-02-01T10:15:00+08:00")
+    local = LATER.replace(hour=10, minute=15).strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"
+
+    result = run(env, "reschedule", str(target.id), local)
 
     assert result.exit_code == 0, result.output
-    assert current(env, target).scheduled_at == datetime(2030, 2, 1, 2, 15, tzinfo=UTC)
+    assert current(env, target).scheduled_at == LATER.replace(hour=2, minute=15)
 
 
 def test_reschedule_naive_time_is_utc(env: Env) -> None:
     target = make_post(env)
 
-    run(env, "reschedule", str(target.id), "2030-02-01T10:15")
+    run(
+        env,
+        "reschedule",
+        str(target.id),
+        LATER.replace(hour=10, minute=15).strftime("%Y-%m-%dT%H:%M"),
+    )
 
-    assert current(env, target).scheduled_at == datetime(2030, 2, 1, 10, 15, tzinfo=UTC)
+    assert current(env, target).scheduled_at == LATER.replace(hour=10, minute=15)
 
 
 def test_reschedule_rejects_a_bad_time(env: Env) -> None:
@@ -142,6 +151,16 @@ def test_reschedule_rejects_a_bad_time(env: Env) -> None:
 
     assert result.exit_code == 1
     assert "ISO 8601" in result.stderr
+
+
+@pytest.mark.parametrize("when", ["2001-01-01T00:00", "9999-12-31T23:59-01:00"])
+def test_reschedule_rejects_past_far_or_overflowing_times(env: Env, when: str) -> None:
+    target = make_post(env)
+
+    result = run(env, "reschedule", str(target.id), when)
+
+    assert result.exit_code == 1
+    assert current(env, target).scheduled_at == AT
 
 
 def test_retry_requeues_a_failed_post(env: Env) -> None:

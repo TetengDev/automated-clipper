@@ -10,6 +10,9 @@
     {% if post.safe_url %} · <a href="{{ post.safe_url }}" target="_blank" rel="noopener noreferrer">view post</a>{% endif %}
   </div>
   {% if post.error and post.status != "posted" %}<p class="error">{{ post.error }}</p>{% endif %}
+  {% if post.status == "post_failed" and post.error and post.error.startswith("uploading state unresolved") %}
+  <p class="error unresolved">This upload may already be live: check the account on {{ post.platform }} before retrying, or cancel the post.</p>
+  {% endif %}
   {% if post.status in ("scheduled", "post_failed") %}
   <div class="post-actions">
     <form method="post" action="/posts/{{ post.id }}/reschedule" hx-post="/posts/{{ post.id }}/reschedule"

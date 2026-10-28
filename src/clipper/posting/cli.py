@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -14,7 +14,14 @@ from clipper.db import MigrationError, connect, migrate
 from clipper.jobs.models import to_iso, utcnow
 from clipper.pipeline.common import strip_control
 from clipper.posting import repo
-from clipper.posting.models import OPEN_STATUSES, InvalidPostTransition, Post, PostStatus
+from clipper.posting.models import (
+    OPEN_STATUSES,
+    InvalidPostTransition,
+    Post,
+    PostStatus,
+    parse_utc,
+    reschedule_problem,
+)
 
 app = typer.Typer(
     help="Scheduled posts: list, cancel, reschedule, retry.",
@@ -59,11 +66,13 @@ def _line(post: Post) -> str:
 
 
 def _parse_time(text: str) -> datetime:
-    try:
-        moment = datetime.fromisoformat(text.strip())
-    except ValueError:
+    when = parse_utc(text)
+    if when is None:
         _fail(f"invalid time {text!r}; use ISO 8601, e.g. 2027-01-16T09:30 (UTC) or +08:00")
-    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    problem = reschedule_problem(when, utcnow())
+    if problem:
+        _fail(f"invalid time {text!r}: {problem}")
+    return when
 
 
 def _act(

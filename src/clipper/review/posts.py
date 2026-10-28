@@ -8,7 +8,6 @@ Same auth and CSRF as the other review routes: the app-wide gate and `csrf_prote
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Form, HTTPException, Path, Request
@@ -16,7 +15,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from clipper import clips
 from clipper.posting import repo
-from clipper.posting.models import InvalidPostTransition, Post, PostStatus
+from clipper.posting.models import (
+    InvalidPostTransition,
+    Post,
+    PostStatus,
+    parse_utc,
+    reschedule_problem,
+)
 from clipper.review.app import flash, render, safe_next_path
 from clipper.review.routes import MAX_ID, ClipId, Conn, User, _action_error, _is_htmx, _now
 
@@ -24,7 +29,6 @@ router = APIRouter()
 
 PostId = Annotated[int, Path(ge=1, le=MAX_ID)]
 NextPath = Annotated[str, Form(max_length=2048)]
-RESCHEDULE_HORIZON = timedelta(days=366)
 SCHEDULED_PAGE = "/scheduled"
 RECENT_POSTED = 20
 
@@ -86,15 +90,6 @@ def cancel_post(
     return _done(request, next, f"Post {post_id} cancelled.")
 
 
-def _parse_when(value: str) -> datetime | None:
-    """A `datetime-local` value (or ISO 8601); without an offset it is UTC."""
-    try:
-        moment = datetime.fromisoformat(value.strip())
-    except ValueError:
-        return None
-    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
-
-
 @router.post("/posts/{post_id}/reschedule")
 def reschedule_post(
     request: Request,
@@ -105,13 +100,12 @@ def reschedule_post(
     next: NextPath = SCHEDULED_PAGE,
 ) -> Response:
     now = _now(request)
-    when = _parse_when(scheduled_at)
+    when = parse_utc(scheduled_at)
     if when is None:
         return _action_error(request, "Enter a date and time (UTC).", 422)
-    if when < now - timedelta(minutes=1):
-        return _action_error(request, "Pick a time in the future.", 422)
-    if when > now + RESCHEDULE_HORIZON:
-        return _action_error(request, "Pick a time within a year.", 422)
+    problem = reschedule_problem(when, now)
+    if problem:
+        return _action_error(request, problem, 422)
     result = _apply(
         request,
         post_id,

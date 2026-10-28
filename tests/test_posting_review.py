@@ -111,6 +111,7 @@ def test_approving_a_sensitive_clip_schedules_nothing(client: TestClient, env: E
     assert response.status_code == 200
     assert env.status(clip_id) in ("approved", "exported")
     assert posts_for(env, clip_id) == []
+    assert "sensitive: not scheduled for posting" in client.get("/queue").text
 
 
 def test_approving_a_clip_of_an_always_sensitive_creator_schedules_nothing(env: Env) -> None:
@@ -172,6 +173,17 @@ def test_scheduled_page_lists_upcoming_and_failed_posts(client: TestClient, env:
     assert f'action="/posts/{upcoming.id}/cancel"' in html
     assert f'action="/posts/{upcoming.id}/reschedule"' in html
     assert 'href="/scheduled"' in html  # nav link
+
+
+def test_unresolved_upload_warns_before_retrying(client: TestClient, env: Env) -> None:
+    target = scheduled_post(env)
+    env.conn.execute(
+        "UPDATE posts SET status = 'post_failed', error = 'uploading state unresolved'"
+        " WHERE id = ?",
+        (target.id,),
+    )
+
+    assert "may already be live" in client.get("/scheduled").text
 
 
 def test_scheduled_page_shows_an_empty_state(client: TestClient) -> None:
@@ -289,7 +301,10 @@ def test_reschedule_requeues_a_failed_post(client: TestClient, env: Env) -> None
     assert moved.status == PostStatus.SCHEDULED and moved.attempts == 0
 
 
-@pytest.mark.parametrize("value", ["", "tomorrow", "2027-01-14T09:00", "2029-01-01T00:00"])
+@pytest.mark.parametrize(
+    "value",
+    ["", "tomorrow", "2027-01-14T09:00", "2029-01-01T00:00", "9999-12-31T23:59-01:00"],
+)
 def test_reschedule_rejects_bad_or_past_or_far_times(
     client: TestClient, env: Env, value: str
 ) -> None:

@@ -131,6 +131,7 @@ jobs:
             fi
             echo "remotion versions: only the deliberate zod override differs (CLP-108)"
           else
+            echo "$out"
             echo "::warning::remotion versions passes cleanly; remove the CLP-108 zod exception here and the zod override in render/package.json"
           fi
 

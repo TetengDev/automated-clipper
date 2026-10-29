@@ -114,7 +114,26 @@ jobs:
           $run --entrypoint yt-dlp clipper:ci --version
           $run --entrypoint ffmpeg clipper:ci -version
           $run --entrypoint node clipper:ci --version
-          $run --read-only --tmpfs /tmp -w /app/render --entrypoint node clipper:ci node_modules/@remotion/cli/remotion-cli.js versions
+          # `remotion versions` fails when any package differs from what Remotion pins. The
+          # zod override (GHSA-mrhx-c7xc-m3w5, CLP-108) is a deliberate mismatch, so allow
+          # exactly that one and fail on anything else. Drop this once Remotion pins zod >= 4.6.6.
+          if ! out="$($run --read-only --tmpfs /tmp -w /app/render --entrypoint node clipper:ci node_modules/@remotion/cli/remotion-cli.js versions 2>&1)"; then
+            echo "$out"
+            mismatches="$(printf '%s\n' "$out" | grep -E '^- [^ ]+: installed ' || true)"
+            # Remotion reports its own package disagreements as "Version mismatch: ...";
+            # those must always fail, as must output with no single "On version:" line.
+            if [ -z "$mismatches" ] \
+              || printf '%s\n' "$out" | grep -q 'Version mismatch' \
+              || [ "$(printf '%s\n' "$out" | grep -c '^On version: ')" != 1 ] \
+              || printf '%s\n' "$mismatches" | grep -qvE '^- zod: installed 4\.(6\.([6-9]|[1-9][0-9])|([7-9]|[1-9][0-9])\.[0-9]+), required '; then
+              echo "remotion versions failed for a reason other than the zod override" >&2
+              exit 1
+            fi
+            echo "remotion versions: only the deliberate zod override differs (CLP-108)"
+          else
+            echo "$out"
+            echo "::warning::remotion versions passes cleanly; remove the CLP-108 zod exception here and the zod override in render/package.json"
+          fi
 
       - name: Render smoke test (read-only, non-root)
         timeout-minutes: 10

@@ -34,6 +34,7 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 - `GROQ_API_KEY`, only with `transcriber: groq` (transcription runs locally by default; see [Local transcription](#local-transcription))
 - `DISCORD_WEBHOOK_URL`, `DISCORD_ALERTS_WEBHOOK_URL`, `HEALTHCHECK_URL_*`
 - `REVIEW_PASSWORD_HASH`, `SESSION_SECRET`, `RCLONE_REMOTE`
+- `CLIPPER_ACCESS_TOKEN_<ACCOUNT_ID>` and `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>` for each posting account (see [Posting accounts](#posting-accounts))
 - the restic credentials
 
 GitHub Actions secrets contain only the SSH key, host, and user.
@@ -130,6 +131,61 @@ model sees only the transcript.
 - Until `review` is restarted, a creator newly set to `public_service` gates only clips
   stored as sensitive (by a restarted worker). Its older clips need the confirmation only
   once `review` has been restarted.
+
+## Posting accounts
+
+`config/accounts.yaml` lists the accounts that approved clips are posted to. Each account
+names one platform (`tiktok`, `instagram`, `youtube` or `facebook`), its handle, its market
+and timezone, the creators whose clips it may post, and its posting plan. Set
+`CLIPPER_ACCOUNTS` to read the file from somewhere else; by default it sits next to
+`creators.yaml`. Without the file nothing is posted and the rest of the pipeline runs as
+before.
+
+To add an account:
+
+1. Add an entry to `config/accounts.yaml`. The `id` is a lower-case slug (letters, digits,
+   underscores) that never changes, because the token names are derived from it. No id may
+   end another id after an underscore (`clips_tt` next to `mrbeast_clips_tt`), since their
+   token names would be ambiguous.
+2. Choose the plan. `posts_per_day`, `min_gap_minutes` and `windows` can be left out for
+   the US and PH markets, and then the research defaults from
+   [CLP-90](https://linear.app/tengdev/issue/CLP-90) apply. Other markets must set all
+   three. Fields that are set are kept, and only the missing ones are filled in. Windows
+   are `HH:MM-HH:MM` in the account's own timezone, may not overlap, and a post may go out
+   at any minute from a window's start through its end. The plan must fit:
+   `posts_per_day` posts, `min_gap_minutes` apart, have to fit inside the windows of one
+   local day.
+   `posts_per_day` may not exceed the platform cap (TikTok 15, Facebook 30, Instagram 50,
+   YouTube 100). `warmup_start` ramps a new account from 1 post a day up to
+   `posts_per_day` over `warmup_days` (14 by default).
+3. Check the licence rule. A creator whose `content_type` is `public_service` or
+   `vlog_lifestyle`, or who has no `content_type`, can only be assigned to an account that
+   sets `licence:` to a reference to the signed licence. Without it, `clipper
+   check-config` fails and names the creator and the account. One licence covers one
+   creator, so an account can hold at most one creator that needs a licence. Raffy Tulfo in Action, Ivana
+   Alawi and Cong TV are paused until they are licensed.
+   Quote country codes and names that YAML could read as something else, such as
+   `market: "NO"` (a bare `NO` is read as false).
+4. Put the tokens in `/srv/clipper/.env`, never in YAML. The names are
+   `CLIPPER_<KIND>_<ACCOUNT_ID>`, upper-cased. For the account `mrbeast_clips_tt`:
+
+   ```sh
+   CLIPPER_ACCESS_TOKEN_MRBEAST_CLIPS_TT=...
+   CLIPPER_REFRESH_TOKEN_MRBEAST_CLIPS_TT=...
+   ```
+
+   Any other value a platform needs follows the same pattern, for example
+   `CLIPPER_CLIENT_SECRET_MRBEAST_CLIPS_TT`. Only exact upper-case names count, and the
+   app's own `CLIPPER_*` settings are never read as tokens; an account id that would make
+   one of them look like a token (such as `id` or `proxy`) is refused. The values are read
+   into secret strings, so they never appear in logs or error messages.
+5. Run `clipper check-config` (`docker compose run --rm worker clipper check-config` on the
+   server). It validates the file and prints one line per account with its platform,
+   handle, market, posts a day, windows and timezone. For each token it prints only `set`
+   or `missing`, never the value. It exits non-zero on any error.
+
+The tokens sit in `.env` like the other keys. Encrypting refresh tokens at rest is a
+planned follow-up.
 
 ## CI/CD
 

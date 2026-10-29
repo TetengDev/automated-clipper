@@ -20,6 +20,7 @@ from clipper import jobs
 from clipper.config import (
     CREATOR_NAME_PATTERN,
     DEFAULT_CONFIG_PATH,
+    AppConfig,
     ConfigError,
     MissingSecretError,
     Secrets,
@@ -99,6 +100,34 @@ def check_config(ctx: typer.Context) -> None:
     for creator in cfg.creators:
         platforms = [p for p in ("youtube", "twitch") if getattr(creator, p) is not None]
         typer.echo(f"  - {creator.name} [{creator.region}] {', '.join(platforms)}")
+    _check_accounts(_app(ctx).config_path, cfg)
+
+
+def _check_accounts(config_path: Path, cfg: AppConfig) -> None:
+    """Accounts summary for check-config (CLP-91): token status only, never values."""
+    from clipper.accounts import (
+        account_tokens,
+        accounts_path,
+        load_accounts,
+        token_environment,
+        token_status,
+    )
+
+    path = accounts_path(config_path)
+    try:
+        accounts = load_accounts(path, cfg)
+    except ConfigError as exc:
+        _fail(str(exc))
+    found = "" if path.exists() else f" ({path} not found; posting is off)"
+    env = token_environment()
+    typer.echo(f"ok: {len(accounts.accounts)} accounts{found}")
+    for a in accounts.accounts:
+        state = "" if a.enabled else " (disabled)"
+        typer.echo(
+            f"  - {a.id}{state} {a.platform} {a.handle} [{a.market}] {a.posts_per_day}/day "
+            f"windows {', '.join(a.windows)} {a.timezone}; "
+            f"tokens: {token_status(account_tokens(a.id, env))}"
+        )
 
 
 @app.command("migrate")

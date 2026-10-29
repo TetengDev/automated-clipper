@@ -40,6 +40,7 @@ from clipper.metadata import (
     fingerprint,
     links_or_mentions,
 )
+from clipper.posting.scheduler import schedule_for_clip
 from clipper.review.app import flash, get_db, render, require_user
 
 router = APIRouter()
@@ -259,6 +260,7 @@ def approve_clip(
         raise HTTPException(status_code=404, detail="clip not found") from None
     except InvalidTransition as exc:
         return _action_error(request, f"Cannot approve: clip is {exc.current}.", 409)
+    _schedule_posts(request, conn, clip)
     if result.status == ClipStatus.APPROVED:
         if request.app.state.export_locks.busy(clip_id):
             flash(request, f"Export already in progress for clip {clip_id}.")
@@ -271,6 +273,26 @@ def approve_clip(
             else f"Retrying export of clip {clip_id}.",
         )
     return _move_on(request, conn, clip_id)
+
+
+def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.ClipDetail) -> None:
+    """Schedule the approved clip on its creator's posting accounts (CLP-92). Safe to repeat
+    (one post per clip and account); an error is logged and never fails the approval."""
+    accounts = request.app.state.accounts
+    if not accounts:
+        return
+    sensitive = _sensitive(request, clip.creator, clip.current.sensitive)
+    if sensitive:  # never auto-posted, even after the faces check (CLP-92)
+        flash(request, f"Clip {clip.id} is sensitive: not scheduled for posting.")
+        return
+    try:
+        created = schedule_for_clip(conn, clip.id, accounts, _now(request))
+    except Exception:
+        logger.exception("scheduling posts for clip %d failed", clip.id)
+        flash(request, f"Clip {clip.id}: scheduling posts failed; see the server log.")
+        return
+    if created:
+        flash(request, f"Scheduled {len(created)} post(s) for clip {clip.id}.")
 
 
 def export_in_background(state: State, clip_id: int) -> None:

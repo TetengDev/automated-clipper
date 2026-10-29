@@ -30,6 +30,8 @@ from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version
 from clipper.export import DEFAULT_OUTPUT_DIR
 from clipper.monitor import CycleReport, FirstRun, YouTubeMonitor
 from clipper.pipeline import build_stages
+from clipper.posting.cli import app as posts_app
+from clipper.posting.stage import PostingStage
 from clipper.urls import InvalidSourceURL, parse_source_url
 
 if TYPE_CHECKING:
@@ -46,6 +48,7 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+app.add_typer(posts_app, name="posts")
 
 
 @dataclass(frozen=True)
@@ -288,6 +291,10 @@ def run_worker(
         worker_id=worker_id or jobs.default_worker_id(),
         stages=build_stages(),
         media_root=media_dir,
+    )
+    # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
+    worker.posting = PostingStage(
+        conn=conn, publishers={}, worker_id=worker.worker_id, media_root=media_dir
     )
     try:
         if recover_id:

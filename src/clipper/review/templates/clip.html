@@ -79,6 +79,7 @@
         {% if ver.note %}· {{ ver.note }}{% endif %}{% if ver.version == clip.current_version %} <strong>(current)</strong>{% endif %}</li>
       {% endfor %}
     </ul>
+    {% include "_clip_posts.html" %}
     {% if reviews %}
     <h2>History</h2>
     <ul class="history">

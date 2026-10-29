@@ -140,3 +140,10 @@ p.sensitive-note { font-weight: 600; margin: 0 0 0.75rem; }
 .reject { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 button.danger { background: var(--error); }
 .versions, .history { padding-left: 1.25rem; font-size: 0.9rem; }
+/* Posts (CLP-92): Scheduled page and the clip page's Posts section. */
+.posts { list-style: none; padding: 0; display: grid; gap: 0.75rem; }
+.post { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.75rem; font-size: 0.9rem; }
+.post-meta { display: flex; flex-wrap: wrap; gap: 0.25rem; align-items: center; }
+.post-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: flex-end; margin-top: 0.5rem; }
+.inline-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: flex-end; }
+.post-status-post_failed { color: var(--error); border-color: var(--error); }

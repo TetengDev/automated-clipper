@@ -1,0 +1,8 @@
+{# Posts of this clip (CLP-92). Loaded by HTMX after the page renders, so the clip page
+   route stays unchanged; rows come from /clip/<id>/posts (_clip_posts_rows.html). #}
+<section class="clip-posts" aria-labelledby="posts-heading">
+  <h2 id="posts-heading">Posts</h2>
+  <div id="clip-posts" hx-get="/clip/{{ clip.id }}/posts" hx-trigger="load" hx-swap="innerHTML">
+    <p class="muted">Loading posts… (<a href="/scheduled">all scheduled posts</a>)</p>
+  </div>
+</section>

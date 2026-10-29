@@ -1,0 +1,81 @@
+# Posting accounts (CLP-91): where approved clips are posted, and when.
+# Validate with: uv run clipper check-config
+#
+# Token secrets are never written here. Each account reads them from the environment
+# (or .env) by its id, e.g. for `mrbeast_clips_tt`:
+#   CLIPPER_ACCESS_TOKEN_MRBEAST_CLIPS_TT, CLIPPER_REFRESH_TOKEN_MRBEAST_CLIPS_TT
+# See docs/DEPLOYMENT.md, "Posting accounts".
+#
+# posts_per_day, min_gap_minutes and windows may be left out: the default plan for the
+# platform and market (US or PH) is used. Windows are in the account's local timezone.
+# warmup_start ramps an account from 1 post/day up to posts_per_day over warmup_days (14).
+# Creators whose content type is public_service or vlog_lifestyle (or unset) are refused
+# unless the account sets `licence: <reference to the signed licence>`. One licence covers
+# one creator. Windows hold posts from start through end, and the plan must fit in them.
+# Quote country codes YAML could misread, e.g. market: "NO".
+#
+# Raffy Tulfo in Action, Ivana Alawi and Cong TV are paused until licensed (CLP-90): do
+# not add accounts for them before a licence is signed.
+
+accounts:
+  - id: mrbeast_clips_tt
+    platform: tiktok
+    handle: "@mrbeast.clips.daily"
+    market: US
+    timezone: America/New_York
+    creators: [MrBeast]
+    posts_per_day: 3
+    min_gap_minutes: 180
+    windows: ["14:00-17:00", "18:00-22:00"]
+    warmup_start: 2026-11-01
+    campaign: vyro_mrbeast
+
+  - id: mrbeast_clips_yt
+    platform: youtube
+    handle: "@mrbeast.clips.daily"
+    market: US
+    timezone: America/New_York
+    creators: [MrBeast]
+    posts_per_day: 2
+    min_gap_minutes: 240
+    windows: ["10:00-11:00", "13:00-14:00"]
+    warmup_start: 2026-11-01
+    campaign: vyro_mrbeast
+
+  - id: mrbeast_clips_ig
+    platform: instagram
+    handle: "@mrbeast.clips.daily"
+    market: US
+    timezone: America/New_York
+    creators: [MrBeast]
+    posts_per_day: 2
+    min_gap_minutes: 240
+    windows: ["10:00-15:00"]
+    warmup_start: 2026-11-01
+    campaign: vyro_mrbeast
+
+  - id: mrbeast_clips_fb
+    platform: facebook
+    handle: "mrbeast.clips.daily"
+    market: US
+    timezone: America/New_York
+    creators: [MrBeast]
+    posts_per_day: 2
+    min_gap_minutes: 240
+    windows: ["10:00-15:00"]
+    warmup_start: 2026-11-01
+    campaign: vyro_mrbeast
+
+# Example: a PH account for a creator that needs a licence. Uncomment only once the
+# licence is signed, and put its reference in `licence:`. The plan fields are left out,
+# so the PH default applies (2/day, 3 h gap, 07:00-09:00, 12:00-13:00, 18:00-21:00).
+#
+#  - id: tulfo_clips_tt
+#    platform: tiktok
+#    handle: "@tulfo.clips"
+#    market: PH
+#    timezone: Asia/Manila
+#    creators: [Raffy Tulfo in Action]
+#    licence: "RTIA clip licence 2026-12, signed copy in Drive/licences"
+#    warmup_start: 2026-12-01
+#    enabled: false

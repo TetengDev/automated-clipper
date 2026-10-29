@@ -7,9 +7,11 @@ double-submitted action changes state (and writes its audit row) at most once.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Any, Literal
 
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
+from clipper.metadata import PLATFORMS, Variant, coerce_variants, fingerprint, variants_json
 from clipper.urls import InvalidSourceURL, SourceRef, canonical_url
 
 PAGE_SIZE = 24
@@ -38,6 +41,7 @@ class ReviewAction(StrEnum):
     REJECT = "reject"
     EXPORT = "export"
     EXPORT_FAILED = "export_failed"
+    VARIANTS_EDITED = "variants_edited"
 
 
 REJECT_REASONS: tuple[str, ...] = (
@@ -129,6 +133,9 @@ class ClipVersion:
     sensitive: bool = False
     gate_reasons: tuple[str, ...] = ()
     """Quality gates this version failed (CLP-74)."""
+    variants: Mapping[str, Variant] = field(default_factory=dict)
+    """Title, caption and hashtags per platform (CLP-96); derived from the single copy for
+    versions stored before CLP-96."""
 
     @property
     def duration_s(self) -> float:
@@ -136,13 +143,14 @@ class ClipVersion:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ClipVersion:
+        hashtags = parse_hashtags(row["hashtags"])
         return cls(
             version=row["version"],
             start_s=row["start_s"],
             end_s=row["end_s"],
             title=row["title"],
             caption=row["caption"],
-            hashtags=parse_hashtags(row["hashtags"]),
+            hashtags=hashtags,
             score=row["score"],
             reason=row["reason"],
             video_path=row["video_path"],
@@ -153,6 +161,9 @@ class ClipVersion:
             rendered_s=row["duration_s"],
             sensitive=bool(row["sensitive"]),
             gate_reasons=_reasons(row["gate_reasons"]),
+            variants=coerce_variants(
+                _json_or_none(row["variants"]), row["title"], row["caption"], hashtags
+            ),
         )
 
 
@@ -175,6 +186,22 @@ class ClipDetail:
             return source_url_at(self.platform, self.item_id, self.current.start_s)
         except InvalidSourceURL:
             return None
+
+
+def _digest(variant: Variant) -> dict[str, object]:
+    text = json.dumps(variant.model_dump(), sort_keys=True, ensure_ascii=False)
+    return {
+        "sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "title_chars": len(variant.title),
+        "caption_chars": len(variant.caption),
+    }
+
+
+def _json_or_none(raw: str | None) -> object:
+    try:
+        return json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        return None
 
 
 def _reasons(raw: str | None) -> tuple[str, ...]:
@@ -488,3 +515,64 @@ def reject(
         reason_tag=reason_tag,
         repeat_ok=frozenset({ClipStatus.REJECTED}),
     )
+
+
+def edit_variants(
+    conn: sqlite3.Connection,
+    clip_id: int,
+    changed: Mapping[str, Variant],
+    now: datetime,
+    *,
+    expected_version: int,
+    expected_fingerprint: str,
+) -> None:
+    """Store the reviewer's per-platform text on the current version (CLP-96), audited as
+    `variants_edited` with each changed platform's text before and after. Only before
+    approval, only on the version the reviewer saw, and only if nobody saved other
+    variants since that page loaded (`expected_fingerprint`): anything else is an
+    InvalidTransition, never a silent overwrite."""
+    with transaction(conn):
+        row = conn.execute(
+            "SELECT c.status, c.current_version, v.variants, v.title, v.caption, v.hashtags"
+            " FROM clips c JOIN clip_versions v ON v.clip_id = c.id"
+            " AND v.version = c.current_version WHERE c.id = ?",
+            (clip_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(clip_id)
+        status, version = row["status"], row["current_version"]
+        if version != expected_version or status not in REVIEWABLE:
+            raise InvalidTransition(
+                clip_id, f"{status} (version {version})", ClipStatus.PENDING_REVIEW
+            )
+        current = coerce_variants(
+            _json_or_none(row["variants"]),
+            row["title"],
+            row["caption"],
+            parse_hashtags(row["hashtags"]),
+        )
+        if fingerprint(current) != expected_fingerprint:
+            raise InvalidTransition(
+                clip_id, f"{status} (version {version}, edited since)", ClipStatus.PENDING_REVIEW
+            )
+        merged = {**current, **changed}
+        conn.execute(
+            "UPDATE clip_versions SET variants = ? WHERE clip_id = ? AND version = ?",
+            (json.dumps(variants_json(merged), ensure_ascii=False), clip_id, version),
+        )
+        conn.execute("UPDATE clips SET updated_at = ? WHERE id = ?", (to_iso(now), clip_id))
+        platforms = [p for p in PLATFORMS if p in changed]
+        record_review(
+            conn,
+            clip_id,
+            version,
+            ReviewAction.VARIANTS_EDITED,
+            now,
+            payload={
+                "platforms": platforms,
+                # Only a digest of the old text: a name the reviewer removed must not
+                # live on in the audit log.
+                "before": {p: _digest(current[p]) for p in platforms},
+                "after": {p: changed[p].model_dump() for p in platforms},
+            },
+        )

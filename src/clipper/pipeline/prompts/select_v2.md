@@ -72,7 +72,10 @@ candidate:
 - `title`: a short, punchy title for the clip, at most 70 characters, no clickbait lies
   and no vague teasing.
 - `caption`: a one or two sentence social caption, written in the language of the video.
-- `hashtags`: 3 to 6 relevant hashtags, each starting with `#`, no spaces.
+- `hashtags`: 3 to 5 specific hashtags, each starting with `#`, no spaces, the most
+  specific first; never generic tags such as #fyp or #viral.
+- `variants`: an object with `tiktok`, `instagram`, `youtube` and `facebook`, each with
+  its own `title`, `caption` and `hashtags`, following the playbook's per-platform rules.
 - `score`: an integer from 0 to 100 for how likely this clip is to perform well and be
   approved. Use the full range: 90+ only for exceptional moments, below 50 for weak ones.
 - `reason`: one sentence explaining why this moment works (or what could hold it back).

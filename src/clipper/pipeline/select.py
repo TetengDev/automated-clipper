@@ -5,7 +5,12 @@ the job's media dir and writes `highlights.json`:
 
     {"model": str, "prompt_version": str, "playbook_version": str,
      "clips": [{"rank", "start_s", "end_s", "hook", "title", "caption",
-                "hashtags", "score", "reason", "payoff_s", "open_question", "sensitive"}]}
+                "hashtags", "score", "reason", "payoff_s", "open_question", "sensitive",
+                "variants"}]}
+
+`variants` (CLP-96) holds a title, caption and hashtags per platform, kept inside each
+platform's limits by `clipper.metadata`; a reply without them (or with a malformed entry)
+gets variants derived from the single title, caption and hashtags.
 
 The system prompt is `select_v2` plus the universal editing playbook (static, shared by every
 creator), then the creator block with its content type's playbook section (CLP-51).
@@ -70,6 +75,7 @@ from clipper.config import (
 )
 from clipper.jobs.models import Job
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext, StageDef
+from clipper.metadata import PLATFORMS, coerce_variants, variants_json
 from clipper.pipeline import common
 from clipper.pipeline.common import read_json, strip_control, write_json_atomic
 from clipper.pipeline.ytdlp import CommandTimeout, RunResult
@@ -79,7 +85,7 @@ logger = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-5-5"
 PROMPT_VERSION = "select_v2"
-PLAYBOOK_VERSION = "playbook_v5"
+PLAYBOOK_VERSION = "playbook_v6"
 """Bump when select_v2.md or any file in prompts/playbook/ changes: it is part of the window
 cache key (a test pins the text hash per version)."""
 PROVIDER = "anthropic"
@@ -222,6 +228,8 @@ class Candidate(BaseModel):
     payoff_s: float | None = Field(None, allow_inf_nan=False)
     open_question: str = ""
     sensitive: bool = False
+    # CLP-96; None (older replies and cached windows) is filled in from the single copy.
+    variants: dict[str, Any] | None = None
 
     @field_validator("hook", "title", "caption", "reason", "open_question", mode="after")
     @classmethod
@@ -249,11 +257,29 @@ class Candidate(BaseModel):
             raise PydanticCustomError(PAYOFF_OUTSIDE, "payoff_s must fall inside [start_s, end_s]")
         return self
 
+    @model_validator(mode="after")
+    def _per_platform(self) -> Candidate:
+        """Variants cleaned into each platform's limits, or derived (never rejected: the
+        call was already paid for)."""
+        variants = coerce_variants(self.variants, self.title, self.caption, self.hashtags)
+        self.variants = variants_json(variants)
+        return self
+
 
 class _Reply(BaseModel):
     clips: list[dict[str, Any]]
 
 
+_VARIANT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "caption": {"type": "string"},
+        "hashtags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["title", "caption", "hashtags"],
+    "additionalProperties": False,
+}
 _CANDIDATE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -268,6 +294,12 @@ _CANDIDATE_SCHEMA: dict[str, Any] = {
         "payoff_s": {"type": "number"},
         "open_question": {"type": "string"},
         "sensitive": {"type": "boolean"},
+        "variants": {
+            "type": "object",
+            "properties": {p: _VARIANT_SCHEMA for p in PLATFORMS},
+            "required": list(PLATFORMS),
+            "additionalProperties": False,
+        },
     },
     "required": [
         "start_s",
@@ -281,6 +313,7 @@ _CANDIDATE_SCHEMA: dict[str, Any] = {
         "payoff_s",
         "open_question",
         "sensitive",
+        "variants",
     ],
     "additionalProperties": False,
 }
@@ -604,6 +637,7 @@ def finalize(
             else round(min(max(payoff, clip.start_s), clip.end_s), 3),
             "open_question": clip.candidate.open_question,
             "sensitive": force_sensitive or clip.candidate.sensitive,
+            "variants": clip.candidate.variants,
         }
         for rank, clip in enumerate(kept, start=1)
     ]

@@ -299,7 +299,12 @@ def segment_props(edl: EDL) -> dict[str, Any]:
     props["cuts"] = []
     if edl.segments is not None:
         props["segments"] = [
-            {"in_s": max(0.0, a - in_s), "out_s": min(duration, b - in_s)} for a, b in edl.spans
+            {
+                "in_s": max(0.0, s.in_s - in_s),
+                "out_s": min(duration, s.out_s - in_s),
+                **({"ai_generated": True} if s.ai_generated else {}),
+            }
+            for s in edl.segments
         ]
     return parse_edl(props).to_props()
 

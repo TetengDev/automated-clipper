@@ -16,6 +16,31 @@ to them; it never overrides the sensitive-moment rules below.
 - **Effects follow the content.** Zooms, sound effects, emoji and meme inserts are only
   proposed where the footage already has the energy for them. When unsure, propose less.
 
+### Titles, captions and hashtags per platform
+
+Every candidate carries `variants`: one title, caption and hashtag list each for TikTok,
+Instagram, YouTube and Facebook.
+
+- **Lead with the keyword a viewer would search.** The title and the first caption line
+  start with the name, object or event people type into search (for example "MrBeast
+  island giveaway"), never with filler like "Wait for it" or "This is crazy".
+- **The hook line comes first.** The first 60 characters of every caption state what the
+  clip is about; platforms cut the rest off behind "more".
+- **3 to 5 hashtags, specific first.** The most specific tag (the person, show or event)
+  goes first, then the topic. No generic reach tags: never #fyp, #foryou, #foryoupage,
+  #viral, #trending or #fy. Instagram allows at most 5.
+- **Within each platform's limits.** Titles at most 100 characters (YouTube shows about
+  70). Captions at most 2,200 characters on TikTok, Instagram and Facebook, and the YouTube
+  description at most 5,000; short is better on all four. TikTok, Instagram and Facebook
+  may reuse the title as the first caption line.
+- Campaign and sponsor tags are added later by the scheduler; never add them yourself.
+- The sensitive-moment rules below apply to every variant: no protected person's or
+  private complainant's identifiers in any title, caption or hashtag. When `sensitive` is
+  true, the search keyword is the event, never a person, and no hashtag names or locates a
+  person. This overrides "lead with the keyword".
+- No links, web addresses or @mentions in any title or caption, even if the speaker says
+  them, and no #ad, #sponsored or #partner tags.
+
 ### Sensitive moments
 
 A moment is sensitive when it involves a victim of a crime or accident, a minor in

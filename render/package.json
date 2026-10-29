@@ -29,5 +29,9 @@
     "@types/react": "19.3.0",
     "typescript": "7.0.2",
     "vitest": "5.0.4"
-  }
+  },
+  "overrides": {
+    "zod": "^4.6.6"
+  },
+  "//": "overrides.zod pins the patched zod for GHSA-mrhx-c7xc-m3w5 (CLP-108); remove it once Remotion depends on zod >= 4.6.6."
 }

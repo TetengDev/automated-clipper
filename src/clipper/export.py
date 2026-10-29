@@ -3,7 +3,8 @@
 Package per approved version (`<base>` = `<creator-slug>_<title-slug>-<clip_id>_v<n>`):
     <base>.mp4            the rendered clip
     <base>.caption.txt    caption + hashtags, ready to paste
-    <base>.json           title, source URL with timestamp, creator, score, reason, ...
+    <base>.json           title, source URL with timestamp, creator, score, reason,
+                          per-platform variants (CLP-96), ...
 
 The date folder is the UTC date of the approval. Exactly once per version: success is
 recorded as an `export` row in clip_reviews (the clip becomes `exported`); a version that
@@ -42,6 +43,7 @@ from clipper.clips import (
 )
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
+from clipper.metadata import variants_json
 from clipper.redact import redact
 
 DEFAULT_OUTPUT_DIR = Path("output")
@@ -237,6 +239,7 @@ def _publish_package(
         "reason": ver.reason,
         "caption": ver.caption,
         "hashtags": list(ver.hashtags),
+        "variants": variants_json(ver.variants),
         "prompt_version": ver.prompt_version,
         "exported_at": to_iso(now),
     }

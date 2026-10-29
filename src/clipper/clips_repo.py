@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -53,6 +53,9 @@ class ClipMeta:
     note: str | None = None
     gate_reasons: Sequence[str] | None = None
     """Failed quality gates; () passed every gate, None was not gated."""
+    variants: Mapping[str, Mapping[str, object]] | None = None
+    """Per-platform title, caption and hashtags (CLP-96, `clipper.metadata`); None on a new
+    version keeps the previous version's."""
 
 
 def _status(meta: ClipMeta) -> ClipStatus:
@@ -80,8 +83,8 @@ def _insert_version(
     conn.execute(
         "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption, hashtags,"
         " score, reason, captions_enabled, note, video_path, thumb_path, prompt_version,"
-        " playbook_version, sensitive, created_at, duration_s, gate_reasons)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " playbook_version, sensitive, created_at, duration_s, gate_reasons, variants)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             clip_id,
             version,
@@ -102,8 +105,33 @@ def _insert_version(
             now,
             result.duration_s,
             None if meta.gate_reasons is None else json.dumps(list(meta.gate_reasons)),
+            None if meta.variants is None else json.dumps(meta.variants, ensure_ascii=False),
         ),
     )
+
+
+def _carried_variants(
+    conn: sqlite3.Connection, clip_id: int, version: int, meta: ClipMeta
+) -> Mapping[str, Mapping[str, object]] | None:
+    """The previous version's per-platform text (CLP-96), kept by a re-render that does not
+    change the single title, caption or hashtags; None (derive from the new text) when it
+    does, or when the stored JSON is missing or unreadable."""
+    row = conn.execute(
+        "SELECT variants, title, caption, hashtags FROM clip_versions"
+        " WHERE clip_id = ? AND version = ?",
+        (clip_id, version),
+    ).fetchone()
+    if row is None or row["variants"] is None:
+        return None
+    same_text = (meta.title is None or meta.title == row["title"]) and (
+        meta.caption is None or meta.caption == row["caption"]
+    )
+    try:
+        same_tags = not meta.hashtags or list(meta.hashtags) == json.loads(row["hashtags"] or "[]")
+        variants = json.loads(row["variants"])
+    except json.JSONDecodeError:
+        return None
+    return variants if same_text and same_tags and isinstance(variants, dict) else None
 
 
 def insert_pending_clip(
@@ -178,6 +206,8 @@ def add_clip_version(
             "SELECT COALESCE(MAX(sensitive), 0) FROM clip_versions WHERE clip_id = ?", (clip_id,)
         ).fetchone()[0]
         meta = meta or ClipMeta()
+        if meta.variants is None:
+            meta = replace(meta, variants=_carried_variants(conn, clip_id, version - 1, meta))
         _insert_version(
             conn,
             clip_id=clip_id,

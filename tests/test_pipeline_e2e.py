@@ -51,7 +51,7 @@ VIDEO_S = 60
 REAL_RUN = ytdlp.run_command
 CLIP_KEYS = {
     *("rank", "start_s", "end_s", "hook", "title", "caption", "hashtags", "score", "reason"),
-    *("payoff_s", "open_question", "sensitive"),
+    *("payoff_s", "open_question", "sensitive", "variants"),
 }
 SECTION_KEYS = {
     "rank",

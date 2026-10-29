@@ -1,0 +1,33 @@
+{# Per-platform title, caption and hashtags (CLP-96), editable until the clip is reviewed. #}
+{% set names = {"tiktok": "TikTok", "instagram": "Instagram", "youtube": "YouTube", "facebook": "Facebook"} %}
+<section class="variants" id="clip-variants" aria-labelledby="variants-heading">
+  <h2 id="variants-heading">Per-platform text</h2>
+  {% if can_review %}
+  <form method="post" action="/clip/{{ clip.id }}/variants" hx-post="/clip/{{ clip.id }}/variants"
+        hx-target="#action-error" hx-disabled-elt="find button">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="version" value="{{ v.version }}">
+    <input type="hidden" name="fingerprint" value="{{ variants_fingerprint }}">
+  {% endif %}
+    {% for platform, variant in v.variants.items() %}
+    {% set limits = platform_limits[platform] %}
+    {# All open: the reviewer approves every platform's text, so none may stay hidden. #}
+    <details class="variant" id="variant-{{ platform }}" open>
+      <summary>{{ names.get(platform, platform) }} · {{ variant.title or "Untitled" }}</summary>
+      {% if variant_warnings[platform] %}<p class="error variant-warning">Check before approving, links or mentions: {{ variant_warnings[platform] | join(", ") }}</p>{% endif %}
+      {% if can_review %}
+      <label for="{{ platform }}-title">Title</label>
+      <input id="{{ platform }}-title" name="{{ platform }}_title" maxlength="{{ limits.title_max }}" value="{{ variant.title }}">
+      <label for="{{ platform }}-caption">{{ "Description" if platform == "youtube" else "Caption" }}</label>
+      <textarea id="{{ platform }}-caption" name="{{ platform }}_caption" rows="4" maxlength="{{ caption_room(platform, variant.hashtags) }}">{{ variant.caption }}</textarea>
+      {% else %}
+      <p class="caption">{{ variant.caption }}</p>
+      {% endif %}
+      <p class="muted">{{ variant.hashtags | join(" ") }}</p>
+    </details>
+    {% endfor %}
+  {% if can_review %}
+    <button type="submit" id="save-variants-btn">Save platform text</button>
+  </form>
+  {% endif %}
+</section>

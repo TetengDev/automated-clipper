@@ -36,6 +36,7 @@
     <p class="muted">{{ clip.source_title or "Source" }} @ {{ at }} (no valid source link)</p>
     {% endif %}
 
+    {% include "_clip_variants.html" %}
     <div id="action-error" aria-live="polite"></div>
     {% if can_review %}
     <div class="actions">

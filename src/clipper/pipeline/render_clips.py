@@ -6,10 +6,10 @@ in the job's media dir. For each section the EDL cuts the requested range out of
 and the transcript words that overlap the clip, shifted into the section's timeline.
 `clipper.render.render_clip` writes `clips/<rank>/v1.{mp4,jpg,json}` and
 `clips_repo.insert_pending_clip` records it with the highlight's title, caption, hashtags,
-score, reason, and the prompt and playbook versions it was selected with. Before the EDL
-is final, dead air is trimmed and the clip edges are snapped to scene cuts (CLP-68,
-`clipper.pipeline.boundaries`); a failed or skipped scene detection (sections over
-MAX_DETECT_PIXELS) leaves only the trim. Then, unless the
+per-platform variants (CLP-96), score, reason, and the prompt and playbook versions it was
+selected with. Before the EDL is final, dead air is trimmed and the clip edges are snapped
+to scene cuts (CLP-68, `clipper.pipeline.boundaries`); a failed or skipped scene detection
+(sections over MAX_DETECT_PIXELS) leaves only the trim. Then, unless the
 creator's `jump_cuts` is off, silences (and in `full` stutters and fillers) inside the
 clip are cut and the EDL gets v2 segments plus the cut records (CLP-73,
 `clipper.pipeline.jumpcuts`); a failed silencedetect makes no silence cuts. Then, unless
@@ -73,6 +73,7 @@ from clipper.edl import EDL, FPS, MAX_CLIP_SECONDS, frames, parse_edl
 from clipper.jobs.models import Job
 from clipper.jobs.queue import MAX_ATTEMPTS, backoff
 from clipper.jobs.stages import Deferred, PermanentError, StageContext, StageDef
+from clipper.metadata import coerce_variants, variants_json
 from clipper.pipeline.boundaries import DETECT_TIMEOUT_S, detect_cuts, polish
 from clipper.pipeline.common import (
     STAGE_BUDGET_S,
@@ -224,11 +225,13 @@ def _plan(
         raise PermanentError(f"clip {rank}: invalid EDL: {exc}") from None
     # Cleaned again here: highlights.json may be stale or hand-edited.
     title, caption, reason = (None if t is None else strip_control(t) for t in texts[:3])
-    tags = (strip_control(h).replace(" ", "") for h in hashtags)
+    tags = tuple(t for h in hashtags if (t := strip_control(h).replace(" ", "")))
+    variants = coerce_variants(clip.get("variants"), title, caption, tags)
     meta = ClipMeta(
         title=title,
         caption=caption,
-        hashtags=tuple(t for t in tags if t),
+        hashtags=tags,
+        variants=variants_json(variants),
         score=score,
         reason=reason,
         prompt_version=_version(selection.get("prompt_version")),

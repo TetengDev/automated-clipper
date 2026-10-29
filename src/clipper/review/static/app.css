@@ -132,6 +132,10 @@ p.sensitive-note { font-weight: 600; margin: 0 0 0.75rem; }
 .player { width: 100%; max-height: 80vh; aspect-ratio: 9 / 16; background: #000; border-radius: var(--radius); }
 .details h2 { font-size: 1.1rem; margin: 1.25rem 0 0.5rem; }
 .caption { white-space: pre-wrap; }
+.variant { border: 1px solid var(--border); border-radius: var(--radius); padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; }
+.variant summary { cursor: pointer; font-weight: 600; }
+.variant label { display: block; margin-top: 0.5rem; font-size: 0.875rem; }
+.variant input, .variant textarea { width: 100%; box-sizing: border-box; }
 .actions { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; }
 .reject { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 button.danger { background: var(--error); }

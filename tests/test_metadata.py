@@ -457,3 +457,47 @@ def test_fingerprint_changes_with_the_text():
 )
 def test_sentence_breaks_are_not_links(text):
     assert links_or_mentions(text) == []
+
+
+# --- mixed-script (homoglyph) hashtags (CLP-103) --------------------------------------------
+
+MIXED_SCRIPT = [
+    "#fyр",  # Cyrillic er: looks like #fyp
+    "#аd",  # Cyrillic a: looks like #ad
+    "#mrbeаst",  # Cyrillic a inside a campaign-looking tag
+    "#οnline",  # Greek omicron
+    "#Мαма",  # Cyrillic and Greek together
+    "#ｆyр",  # fullwidth Latin folds to Latin, still mixed with Cyrillic
+]
+SINGLE_SCRIPT = [
+    "#Москва",  # Russian
+    "#ελλάδα",  # Greek
+    "#مرحبا",  # Arabic
+    "#ᜋᜈ",  # Baybayin (Tagalog script)
+    "#東京",  # Han
+    "#ラーメン",  # Katakana with the prolonged sound mark
+    "#東京タワー",  # Japanese: Han and Katakana
+    "#iPhone買った",  # Japanese with Latin: Latin, Han, Hiragana
+    "#BTS콘서트",  # Korean with Latin: Latin and Hangul
+]
+LATIN = ["#Pilipinas", "#niño", "#mañana2024", "#tara_na", "#mrbeast2"]
+
+
+@pytest.mark.parametrize("tag", MIXED_SCRIPT)
+def test_mixed_script_hashtags_are_rejected_in_a_variant(tag):
+    with pytest.raises(ValidationError, match="mixes scripts"):
+        variant(hashtags=["#mrbeast", tag, "#island"])
+
+
+@pytest.mark.parametrize("tag", MIXED_SCRIPT)
+def test_mixed_script_hashtags_are_dropped_from_model_output(tag):
+    assert clean_hashtags(["#mrbeast", tag, "#island"]) == ["#mrbeast", "#island"]
+    reply = {"title": "T", "caption": "C", "hashtags": ["#mrbeast", tag, "#island", "#money"]}
+    out = coerce_variants({p: reply for p in PLATFORMS}, None, None, [])
+    assert all(v.hashtags == ["#mrbeast", "#island", "#money"] for v in out.values())
+
+
+@pytest.mark.parametrize("tag", SINGLE_SCRIPT + LATIN)
+def test_single_script_and_cjk_tags_still_pass(tag):
+    assert variant(hashtags=["#mrbeast", tag, "#island"]).hashtags[1] == tag
+    assert clean_hashtags(["#mrbeast", tag]) == ["#mrbeast", tag]

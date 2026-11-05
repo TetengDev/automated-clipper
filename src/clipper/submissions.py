@@ -345,7 +345,10 @@ def parse_payout(text: str) -> Decimal:
         raise ValueError(f"invalid payout {text!r}; use a number like 12.50") from None
     if not amount.is_finite() or not 0 <= amount <= MAX_PAYOUT:
         raise ValueError(f"invalid payout {text!r}; use a number from 0 to {MAX_PAYOUT}")
-    return abs(amount.quantize(RPM_PLACES))  # abs: never "-0.00"
+    cents = abs(amount.quantize(RPM_PLACES))  # abs: never "-0.00"
+    if cents != amount:
+        raise ValueError(f"invalid payout {text!r}; use at most 2 decimal places")
+    return cents
 
 
 # --- RPM ----------------------------------------------------------------------------------
@@ -447,6 +450,15 @@ def submission_message(submission: Submission, now: datetime, clip_id: int | Non
     )
 
 
+_PING_COLUMNS = frozenset({"notified_at", "reminded_at", "overdue_alerted_at"})
+
+
+def _ping_column(column: str) -> None:
+    """The column names go into SQL text: only these three ever may."""
+    if column not in _PING_COLUMNS:
+        raise ValueError(f"not a ping column: {column!r}")
+
+
 def _missed_message(submission: Submission) -> str:
     return (
         f"Campaign submission missed: {submission.campaign_id} on {submission.account_id}"
@@ -535,13 +547,13 @@ class SubmissionPass:
                 return 0
             # One message for a link first seen after its deadline (posted while the
             # worker was down, or before this feature): the alert, not ping + alert.
-            also = {"notified_at": now, "reminded_at": now} if current.notified_at is None else {}
+            also = ("notified_at", "reminded_at") if current.notified_at is None else ()
             return self._send(
                 current, "overdue_alerted_at", self.alert, now, _missed_message(current), also
             )
         if current.notified_at is None:
             near = current.deadline_at is not None and now >= current.deadline_at - REMIND_BEFORE
-            also = {"reminded_at": now} if near else {}
+            also = ("reminded_at",) if near else ()
             return self._send(
                 current, "notified_at", self.notify, now, self._first(current, now), also
             )
@@ -562,21 +574,35 @@ class SubmissionPass:
         ).fetchone()
         return submission_message(submission, now, row[0] if row else None)
 
-    def _claim(self, submission_id: int, column: str, now: datetime) -> bool:
+    def _claim(self, submission_id: int, columns: tuple[str, ...], now: datetime) -> bool:
+        """Stamp `columns` (the message's own first) in one statement, only if the first is
+        still empty: whoever stamps it sends the message."""
+        for column in columns:
+            _ping_column(column)
+        sets = ", ".join(f"{c} = COALESCE({c}, ?)" for c in columns)
+        stamp = to_iso(now)
         with transaction(self.conn):
             cur = self.conn.execute(
-                f"UPDATE campaign_submissions SET {column} = ?, updated_at = ?"  # noqa: S608 - our column names
-                f" WHERE id = ? AND {column} IS NULL",
-                (to_iso(now), to_iso(now), submission_id),
+                f"UPDATE campaign_submissions SET {sets}, updated_at = ?"  # noqa: S608 - checked names
+                f" WHERE id = ? AND {columns[0]} IS NULL",
+                (*([stamp] * len(columns)), stamp, submission_id),
             )
         return cur.rowcount == 1
 
-    def _release(self, submission_id: int, column: str, now: datetime) -> None:
-        with transaction(self.conn):
-            self.conn.execute(
-                f"UPDATE campaign_submissions SET {column} = NULL"  # noqa: S608 - our column names
-                f" WHERE id = ? AND {column} = ?",
-                (submission_id, to_iso(now)),
+    def _release(self, submission_id: int, columns: tuple[str, ...], now: datetime) -> None:
+        for column in columns:
+            _ping_column(column)
+        sets = ", ".join(f"{c} = CASE WHEN {c} = ? THEN NULL ELSE {c} END" for c in columns)
+        stamp = to_iso(now)
+        try:
+            with transaction(self.conn):
+                self.conn.execute(
+                    f"UPDATE campaign_submissions SET {sets} WHERE id = ?",  # noqa: S608 - checked names
+                    (*([stamp] * len(columns)), submission_id),
+                )
+        except sqlite3.Error:
+            logger.exception(
+                "submission %d: could not release %s for a retry", submission_id, columns[0]
             )
 
     def _send(
@@ -586,18 +612,18 @@ class SubmissionPass:
         send: Notify,
         now: datetime,
         text: str,
-        also: Mapping[str, datetime] | None = None,
+        also: tuple[str, ...] = (),
     ) -> int:
         key = id(send)
         backoff = self._backoff.get(key)
         if key in self._down or (backoff is not None and now < backoff.at):
             return 0
-        if not self._claim(submission.id, column, now):
+        columns = (column, *also)
+        if not self._claim(submission.id, columns, now):
             return 0  # another worker sent it
         try:
             send(text)
         except Exception as exc:
-            self._release(submission.id, column, now)
             delay = min(backoff.delay * 2, RETRY_MAX) if backoff else RETRY_FIRST
             self._backoff[key] = _Backoff(at=now + delay, delay=delay)
             self._down.add(key)
@@ -608,9 +634,7 @@ class SubmissionPass:
                 redact(str(exc)),
                 int(delay.total_seconds()),
             )
+            self._release(submission.id, columns, now)
             return 0
         self._backoff.pop(key, None)
-        if also:
-            with transaction(self.conn):
-                _set(self.conn, submission.id, now, **also)
         return 1

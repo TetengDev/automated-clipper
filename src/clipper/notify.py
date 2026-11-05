@@ -34,9 +34,16 @@ class DiscordWebhook:
     """Send plain-text messages to one Discord webhook."""
 
     def __init__(self, url: str, http: httpx.Client) -> None:
+        if any(c.isspace() or not c.isprintable() for c in url):
+            raise ValueError("a Discord webhook URL must be a valid URL")
         parts = urlsplit(url)
+        try:
+            port = parts.port
+        except ValueError:
+            raise ValueError("a Discord webhook URL must be a valid URL") from None
         if (
-            parts.scheme != "https"
+            port not in (None, 443)
+            or parts.scheme != "https"
             or parts.hostname not in _DISCORD_HOSTS
             or not parts.path.startswith("/api/webhooks/")
         ):

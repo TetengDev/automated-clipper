@@ -13,9 +13,15 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from clipper.cli import app
+from clipper.jobs.models import to_iso
 from clipper.posting import repo
 from clipper.posting.models import MAX_ATTEMPTS, Post, PostStatus, PublishResult
-from clipper.posting.scheduler import MAX_DAYS_AHEAD, PLATFORM_DAILY_CAPS, slot_problems
+from clipper.posting.scheduler import (
+    MAX_DAYS_AHEAD,
+    PLATFORM_DAILY_CAPS,
+    day_bounds,
+    slot_problems,
+)
 from clipper.posting.stage import BACKOFF_BASE, PostingStage
 from conftest import VALID_YAML
 from posting_support import FakeAccount, FakePublisher
@@ -78,7 +84,7 @@ def make_post(
     if status is not None:
         env.conn.execute(
             "UPDATE posts SET status = ?, posted_at = ? WHERE id = ?",
-            (status, posted_at.strftime("%Y-%m-%dT%H:%M:%SZ") if posted_at else None, post.id),
+            (status, to_iso(posted_at) if posted_at else None, post.id),
         )
     return post
 
@@ -246,7 +252,7 @@ def test_claim_counts_uploads_in_flight_toward_the_limit(env: Env, clock: Clock)
     busy = make_post(env, at=local(15, 8))
     env.conn.execute(
         "UPDATE posts SET status = 'uploading', worker_id = 'w2', claimed_at = ? WHERE id = ?",
-        (T0.strftime("%Y-%m-%dT%H:%M:%SZ"), busy.id),
+        (to_iso(T0), busy.id),
     )
     due = make_post(env)
     publisher = FakePublisher()
@@ -285,7 +291,7 @@ def test_a_deferred_post_does_not_block_other_accounts(env: Env, clock: Clock) -
 
 
 def test_posts_under_the_limit_are_claimed_as_before(env: Env, clock: Clock) -> None:
-    make_post(env, at=local(15, 8), status="posted", posted_at=local(15, 8))
+    make_post(env, at=local(15, 6), status="posted", posted_at=local(15, 6))  # outside the gap
     due = make_post(env)
 
     stage(env, clock, FakePublisher(), FakeAccount()).run_once()
@@ -315,9 +321,9 @@ def test_a_retry_that_went_through_is_recorded_even_on_a_full_day(env: Env, cloc
 
     stage(env, clock, publisher, account).run_once()
 
-    # Deferred rather than claimed; the lookup happens when it is claimed in its new slot.
     assert publisher.calls == []
-    assert get(env, due).status == PostStatus.SCHEDULED
+    done = get(env, due)
+    assert done.status == PostStatus.POSTED and done.external_id == "late"
 
 
 # --- CLI: accounts config, retry into the next free slot, flagged reschedules -------------
@@ -537,3 +543,274 @@ def test_review_reschedule_within_the_rules_is_not_flagged(env: Env) -> None:
 
     page = client.get("/scheduled").text
     assert "rescheduled" in page and "Breaks" not in page
+
+
+# --- review pass 1 -------------------------------------------------------------------------
+
+
+def failed_today(env: Env, account: str = "tt_main", attempts: int = 1) -> Post:
+    """A post whose attempt(s) reached the platform today and failed (now backing off)."""
+    post = make_post(env, account=account, at=T0 + timedelta(hours=5))
+    env.conn.execute(
+        "UPDATE posts SET attempts = ?, updated_at = ? WHERE id = ?",
+        (attempts, to_iso(T0 - timedelta(minutes=30)), post.id),
+    )
+    return post
+
+
+def test_claim_defer_with_no_free_slot_gives_up_and_alerts(env: Env, clock: Clock) -> None:
+    # Over today's limit and every searched day full: never a midnight burst; a human decides.
+    account = FakeAccount(posts_per_day=1, min_gap_minutes=0)
+    make_post(env, at=local(15, 8), status="posted", posted_at=local(15, 8))
+    for offset in range(1, MAX_DAYS_AHEAD + 2):  # the search from tomorrow finds nothing
+        make_post(env, at=local(15 + offset, 11))
+    due = make_post(env)
+    alerts: list[str] = []
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, account, alert=alerts.append).run_once()
+
+    assert publisher.calls == []
+    failed = get(env, due)
+    assert failed.status == PostStatus.POST_FAILED and failed.attempts == 0
+    assert failed.error is not None and "no free slot" in failed.error
+    assert len(alerts) == 1
+
+
+def test_failed_attempts_today_count_toward_the_daily_limit(env: Env, clock: Clock) -> None:
+    # An attempt that reached the platform and failed may still have used quota (or gone
+    # live): it counts, so a burst of failing posts cannot exceed the cap.
+    account = FakeAccount(posts_per_day=1, min_gap_minutes=0)
+    failed_today(env)
+    due = make_post(env)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, account).run_once()
+
+    assert publisher.calls == []
+    assert get(env, due).scheduled_at == local(16, 9)
+
+
+def test_an_unresolved_upload_today_counts_toward_the_daily_limit(env: Env, clock: Clock) -> None:
+    account = FakeAccount(posts_per_day=1, min_gap_minutes=0)
+    gone = make_post(env, at=local(15, 8))
+    env.conn.execute(
+        "UPDATE posts SET status = 'post_failed', error = ?, updated_at = ? WHERE id = ?",
+        ("uploading state unresolved: not found", to_iso(T0 - timedelta(minutes=5)), gone.id),
+    )
+    make_post(env)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, account).run_once()
+
+    assert publisher.calls == []
+
+
+def test_a_post_deferred_with_past_attempts_is_not_deferred_for_ever(
+    env: Env, clock: Clock
+) -> None:
+    account = FakeAccount(posts_per_day=1, min_gap_minutes=0)
+    due = make_post(env)
+    env.conn.execute(
+        "UPDATE posts SET attempts = 1, updated_at = ? WHERE id = ?",
+        (to_iso(T0 - timedelta(days=1)), due.id),
+    )
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, account).run_once()
+
+    assert get(env, due).status == PostStatus.POSTED  # its own old attempt does not block it
+
+
+def test_rolling_24_hours_cap_stops_a_burst_across_midnight(env: Env, clock: Clock) -> None:
+    # An account not in the config uses UTC days: 15 TikTok uploads late yesterday must
+    # still block more right after midnight.
+    cap = PLATFORM_DAILY_CAPS["tiktok"]
+    clock.now = datetime(2027, 1, 15, 0, 30, tzinfo=UTC)
+    for _ in range(cap):
+        late = datetime(2027, 1, 14, 23, 30, tzinfo=UTC)
+        make_post(env, account="ghost", at=late, status="posted", posted_at=late)
+    due = make_post(env, account="ghost", at=clock.now)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher).run_once()
+
+    assert publisher.calls == []
+    assert get(env, due).scheduled_at > clock.now
+
+
+def test_claim_keeps_the_gap_after_the_last_upload(env: Env, clock: Clock) -> None:
+    # Two posts squeezed into one minute by a forced reschedule do not upload back to back.
+    account = FakeAccount(min_gap_minutes=120)
+    make_post(env, at=T0, status="posted", posted_at=T0 - timedelta(minutes=10))
+    due = make_post(env)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, account).run_once()
+
+    assert publisher.calls == []
+    assert get(env, due).scheduled_at >= T0 - timedelta(minutes=10) + timedelta(minutes=120)
+
+
+def test_several_over_limit_posts_are_each_deferred_once_and_others_still_go(
+    env: Env, clock: Clock
+) -> None:
+    full = FakeAccount(id="tt_full", posts_per_day=1, min_gap_minutes=0)
+    make_post(env, account="tt_full", at=local(15, 8), status="posted", posted_at=local(15, 8))
+    blocked = [make_post(env, account="tt_full", at=T0 - timedelta(minutes=m)) for m in (3, 2)]
+    other = make_post(env, account="tt_main")
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, full, FakeAccount()).run_once()
+
+    assert [sent.id for sent, _, _ in publisher.calls] == [other.id]
+    for post in blocked:
+        assert get(env, post).scheduled_at > T0
+        actions = [r["action"] for r in env.reviews(post.clip_id)]
+        assert actions.count("post_deferred") == 1
+
+
+def test_a_database_error_in_the_cap_check_does_not_leave_the_post_uploading(
+    env: Env, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    def broken(*_: object, **__: object) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(repo, "uploads_between", broken)
+    due = make_post(env)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, FakeAccount()).run_once()
+
+    assert publisher.calls == []
+    assert get(env, due).status == PostStatus.SCHEDULED
+
+
+def test_a_bad_account_config_falls_back_to_the_platform_cap(env: Env, clock: Clock) -> None:
+    broken = FakeAccount(timezone="Nowhere/Land")
+    cap = PLATFORM_DAILY_CAPS["tiktok"]
+    for _ in range(cap):
+        make_post(env, at=T0, status="posted", posted_at=T0 - timedelta(minutes=1))
+    due = make_post(env)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, broken).run_once()
+
+    assert publisher.calls == []
+    assert get(env, due).status == PostStatus.SCHEDULED
+
+
+def test_local_day_not_utc_day_bounds_the_count() -> None:
+    # 02:00 Manila on Jan 15 is Jan 14 in UTC, but it is the Manila day of Jan 15.
+    start, end = day_bounds("Asia/Manila", local(15, 2))
+
+    assert start == local(15, 0) and end == local(16, 0)
+
+
+def test_posts_early_in_the_local_day_count_toward_it(env: Env, clock: Clock) -> None:
+    account = FakeAccount(posts_per_day=1, min_gap_minutes=0)
+    make_post(env, at=local(15, 2), status="posted", posted_at=local(15, 2))
+    make_post(env)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, account).run_once()
+
+    assert publisher.calls == []
+
+
+def test_day_bounds_on_a_dst_day() -> None:
+    ny = ZoneInfo("America/New_York")
+    start, end = day_bounds("America/New_York", datetime(2027, 3, 14, 12, tzinfo=ny))
+
+    assert end - start == timedelta(hours=23)
+    assert start == datetime(2027, 3, 14, tzinfo=ny).astimezone(UTC)
+
+
+def test_slot_problems_window_end_minute_and_midnight_end() -> None:
+    account = FakeAccount(windows=["09:00-12:00", "22:00-00:00"])
+
+    assert slot_problems(account, [], local(15, 12)) == []
+    assert slot_problems(account, [], local(15, 23, 59)) == []
+    assert slot_problems(account, [], local(15, 12, 1)) != []
+    assert slot_problems(account, [], local(16, 0)) != []
+
+
+def test_review_reschedule_for_an_account_not_in_the_config_is_not_flagged(env: Env) -> None:
+    post = make_post(env, account="ghost", at=REVIEW_NOW + timedelta(hours=6))
+    client = reviewer(env, FakeAccount(windows=["09:00-09:30"]))
+
+    reschedule(client, post, "2027-01-15T15:30")
+
+    page = client.get("/scheduled").text
+    assert "rescheduled" in page and "Breaks" not in page
+
+
+def test_cli_reschedule_of_an_uploading_post_fails_before_asking(cli_env: Env) -> None:
+    post = make_post(cli_env, at=DAY + timedelta(hours=9))
+    cli_env.conn.execute("UPDATE posts SET status = 'uploading' WHERE id = ?", (post.id,))
+    at = (DAY + timedelta(days=1, hours=15)).strftime("%Y-%m-%dT%H:%M")
+
+    result = cli(cli_env, "posts", "reschedule", str(post.id), at)
+
+    assert result.exit_code == 1
+    assert "uploading" in result.stderr
+    assert "Schedule it anyway" not in result.output
+
+
+def test_cli_reschedule_warns_about_an_account_missing_from_the_config(cli_env: Env) -> None:
+    post = make_post(cli_env, account="gone", at=DAY + timedelta(hours=9))
+    at = (DAY + timedelta(days=1, hours=15)).strftime("%Y-%m-%dT%H:%M")
+
+    result = cli(cli_env, "posts", "reschedule", str(post.id), at)
+
+    assert result.exit_code == 0, result.output
+    assert "not in the accounts config" in result.output
+
+
+def test_cli_retry_slot_is_chosen_inside_the_write(cli_env: Env, monkeypatch) -> None:
+    # The slot is picked in the same transaction that writes it, so a post scheduled in
+    # between (another process) is seen.
+    post = failed_post(cli_env)
+    seen: list[bool] = []
+    real = repo.account_post_times
+
+    def watching(conn, *args, **kwargs):
+        seen.append(conn.in_transaction)
+        return real(conn, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "account_post_times", watching)
+
+    result = cli(cli_env, "posts", "retry", str(post.id))
+
+    assert result.exit_code == 0, result.output
+    assert seen and all(seen)
+
+
+def test_stage_retry_slot_is_chosen_inside_the_write(
+    env: Env, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    post = make_post(env)
+    seen: list[bool] = []
+    real = repo.account_post_times
+
+    def watching(conn, *args, **kwargs):
+        seen.append(conn.in_transaction)
+        return real(conn, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "account_post_times", watching)
+
+    stage(env, clock, FakePublisher(fail=1), FakeAccount()).run_once()
+
+    assert get(env, post).attempts == 1
+    assert seen and all(seen)
+
+
+def test_account_post_times_can_skip_old_history(env: Env) -> None:
+    make_post(env, at=T0 - timedelta(days=30))
+    recent = make_post(env, at=T0)
+
+    times = repo.account_post_times(env.conn, "tt_main", since=T0 - timedelta(days=2))
+
+    assert times == [recent.scheduled_at]

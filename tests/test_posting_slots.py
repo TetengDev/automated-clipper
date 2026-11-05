@@ -564,12 +564,25 @@ def test_review_reschedule_within_the_rules_is_not_flagged(env: Env) -> None:
 # --- review pass 1 -------------------------------------------------------------------------
 
 
+def fail_attempt(env: Env, post: Post, at: datetime, error: str = "boom") -> Post:
+    """Record one failed upload attempt of `post` at `at`, the way a worker does."""
+    env.conn.execute(
+        "UPDATE posts SET status = 'uploading', worker_id = 'w0', claimed_at = ? WHERE id = ?",
+        (to_iso(at), post.id),
+    )
+    return repo.record_failure(
+        env.conn, get(env, post), "w0", error, at, max_attempts=MAX_ATTEMPTS, backoff=BACKOFF_BASE
+    )
+
+
 def failed_today(env: Env, account: str = "tt_main", attempts: int = 1) -> Post:
     """A post whose attempt(s) reached the platform today and failed (now backing off)."""
     post = make_post(env, account=account, at=T0 + timedelta(hours=5))
+    for _ in range(attempts):
+        post = fail_attempt(env, post, T0 - timedelta(minutes=30))
     env.conn.execute(
-        "UPDATE posts SET attempts = ?, updated_at = ? WHERE id = ?",
-        (attempts, to_iso(T0 - timedelta(minutes=30)), post.id),
+        "UPDATE posts SET scheduled_at = ? WHERE id = ?",
+        (to_iso(T0 + timedelta(hours=5)), post.id),
     )
     return post
 
@@ -610,9 +623,13 @@ def test_failed_attempts_today_count_toward_the_daily_limit(env: Env, clock: Clo
 def test_an_unresolved_upload_today_counts_toward_the_daily_limit(env: Env, clock: Clock) -> None:
     account = FakeAccount(posts_per_day=1, min_gap_minutes=0)
     gone = make_post(env, at=local(15, 8))
+    stale_at = T0 - timedelta(minutes=5)
     env.conn.execute(
-        "UPDATE posts SET status = 'post_failed', error = ?, updated_at = ? WHERE id = ?",
-        ("uploading state unresolved: not found", to_iso(T0 - timedelta(minutes=5)), gone.id),
+        "UPDATE posts SET status = 'uploading', worker_id = 'w0', claimed_at = ? WHERE id = ?",
+        (to_iso(stale_at), gone.id),
+    )
+    repo.mark_failed(
+        env.conn, get(env, gone), "w0", "uploading state unresolved: not found", stale_at
     )
     make_post(env)
     publisher = FakePublisher()
@@ -830,3 +847,145 @@ def test_account_post_times_can_skip_old_history(env: Env) -> None:
     times = repo.account_post_times(env.conn, "tt_main", since=T0 - timedelta(days=2))
 
     assert times == [recent.scheduled_at]
+
+
+# --- review pass 2 -------------------------------------------------------------------------
+
+
+def test_deferred_posts_with_old_attempts_do_not_hold_each_other_off(
+    env: Env, clock: Clock
+) -> None:
+    # A deferral is not an attempt: posts that failed twice a day and a half ago, then were
+    # deferred an hour ago, must not count each other's old attempts and stall for ever.
+    long_ago = T0 - timedelta(hours=30)
+    stuck = []
+    for _ in range(9):
+        post = make_post(env, account="ghost")
+        post = fail_attempt(env, post, long_ago)
+        post = fail_attempt(env, post, long_ago + timedelta(minutes=10))
+        stuck.append(post)
+    for post in stuck:
+        env.conn.execute(
+            "UPDATE posts SET scheduled_at = ?, updated_at = ? WHERE id = ?",
+            (to_iso(T0), to_iso(T0 - timedelta(hours=1)), post.id),
+        )
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher).run_once()
+
+    assert len(publisher.calls) == 9
+
+
+def test_a_failure_recorded_yesterday_and_changed_today_counts_yesterday(
+    env: Env, clock: Clock
+) -> None:
+    account = FakeAccount(posts_per_day=1, min_gap_minutes=0)
+    old = make_post(env, at=local(14, 20))
+    old = fail_attempt(env, old, local(14, 20))
+    env.conn.execute(  # e.g. deferred this morning
+        "UPDATE posts SET scheduled_at = ?, updated_at = ? WHERE id = ?",
+        (to_iso(local(16, 9)), to_iso(local(15, 8)), old.id),
+    )
+    due = make_post(env)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, account).run_once()
+
+    assert [sent.id for sent, _, _ in publisher.calls] == [due.id]
+
+
+def test_a_retry_does_not_erase_attempts_from_the_rolling_cap(env: Env, clock: Clock) -> None:
+    # A reviewer's retry starts the attempt count over, but the API calls already made in
+    # the last 24 hours still used the platform's quota.
+    cap = PLATFORM_DAILY_CAPS["tiktok"]
+    for _ in range(cap // MAX_ATTEMPTS):
+        post = make_post(env, account="ghost", at=T0)
+        for minutes in range(MAX_ATTEMPTS):
+            post = fail_attempt(env, post, T0 - timedelta(hours=3, minutes=-minutes))
+        assert post.status == PostStatus.POST_FAILED
+        repo.retry(env.conn, post.id, T0, at=T0 + timedelta(days=1))
+    due = make_post(env, account="ghost")
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher).run_once()
+
+    assert publisher.calls == []
+    assert get(env, due).status == PostStatus.SCHEDULED
+
+
+def test_the_claimed_posts_own_recent_attempts_count_toward_the_rolling_cap(
+    env: Env, clock: Clock
+) -> None:
+    cap = PLATFORM_DAILY_CAPS["tiktok"]
+    hour_ago = T0 - timedelta(hours=1)
+    for _ in range(cap - 1):
+        make_post(env, account="ghost", at=hour_ago, status="posted", posted_at=hour_ago)
+    due = make_post(env, account="ghost")
+    due = fail_attempt(env, due, T0 - timedelta(minutes=50))
+    env.conn.execute("UPDATE posts SET scheduled_at = ? WHERE id = ?", (to_iso(T0), due.id))
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher).run_once()
+
+    assert publisher.calls == []  # 14 uploads + its own attempt: one more would be 16
+
+
+def test_a_retried_post_with_earlier_attempts_is_looked_up_first(env: Env, clock: Clock) -> None:
+    # A reviewer's retry resets the attempt count, but an earlier attempt may have gone
+    # live: look it up before uploading again (same idempotency key).
+    from posting_support import LookupPublisher
+
+    post = make_post(env, account="ghost")
+    for minutes in range(MAX_ATTEMPTS):
+        post = fail_attempt(env, post, T0 - timedelta(hours=2, minutes=-minutes))
+    repo.retry(env.conn, post.id, T0)
+    publisher = LookupPublisher(found={post.idempotency_key: PublishResult(external_id="late")})
+
+    stage(env, clock, publisher).run_once()
+
+    assert publisher.calls == []
+    assert get(env, post).status == PostStatus.POSTED
+
+
+def test_an_unexpected_error_in_the_cap_check_releases_the_claim(
+    env: Env, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_: object, **__: object) -> int:
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(repo, "uploads_between", broken)
+    due = make_post(env)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, FakeAccount()).run_once()
+
+    assert publisher.calls == []
+    assert get(env, due).status == PostStatus.SCHEDULED
+
+
+def test_cli_retry_with_a_broken_account_rule_fails_cleanly(
+    cli_env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import clipper.posting.cli as posting_cli
+
+    def broken(*_: object, **__: object) -> None:
+        raise ValueError("bad window")
+
+    monkeypatch.setattr(posting_cli, "pick_slot", broken)
+    post = failed_post(cli_env)
+
+    result = cli(cli_env, "posts", "retry", str(post.id))
+
+    assert result.exit_code == 1
+    assert "bad window" in result.stderr and "--at" in result.stderr
+    assert get(cli_env, post).status == PostStatus.POST_FAILED
+
+
+def test_the_attempt_count_uses_an_index(env: Env) -> None:
+    plan = env.conn.execute(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM clip_reviews"
+        " WHERE action IN ('post_scheduled', 'post_failed') AND created_at >= ? AND created_at < ?",
+        ("a", "b"),
+    ).fetchall()
+
+    assert any("clip_reviews_action_time" in str(tuple(row)) for row in plan)

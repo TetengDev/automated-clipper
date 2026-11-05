@@ -132,8 +132,10 @@ def is_disclosure(tag: str) -> bool:
 
 _SCRIPT_ALIASES = {"CJK": "HAN", "IDEOGRAPHIC": "HAN"}
 """First words of Unicode character names that do not spell the script."""
-_COMMON = frozenset({"KATAKANA-HIRAGANA"})
-"""Letters shared by more than one script (the prolonged sound mark ー)."""
+_COMMON = frozenset({"KATAKANA-HIRAGANA", "MODIFIER", "VERTICAL"})
+"""Letters shared by more than one script: the prolonged sound mark ー, modifier letters
+such as the okina in #Hawaiʻi or the Ukrainian apostrophe ʼ, and the kana repeat mark 〱.
+Modifier letters that look like Latin letters (ʰ, ᵖ) fold to Latin under NFKC first."""
 _SCRIPT_MIXES = (
     frozenset({"LATIN", "HAN", "HIRAGANA", "KATAKANA"}),
     frozenset({"LATIN", "HAN", "BOPOMOFO"}),
@@ -157,12 +159,27 @@ def _scripts(tag: str) -> set[str]:
     return scripts
 
 
+def _mixed_scripts(tag: str) -> list[str]:
+    """The scripts `tag` mixes, sorted; empty when it is one writing system."""
+    scripts = _scripts(tag)
+    if len(scripts) > 1 and not any(scripts <= mix for mix in _SCRIPT_MIXES):
+        return sorted(scripts)
+    # A Latin tag with a lookalike zero from another script (#pr၀m၀, #sp〇ns〇red).
+    folded = unicodedata.normalize("NFKC", tag)
+    if "LATIN" in scripts and any(
+        not c.isascii() and unicodedata.category(c).startswith("N") for c in folded
+    ):
+        return ["LATIN", "non-ASCII digits"]
+    return []
+
+
 def is_mixed_script(tag: str) -> bool:
     """True when the letters come from more than one script, as in `#fyр` with a Cyrillic
-    р: a lookalike that gets around the generic and disclosure tags or imitates a campaign
-    tag. Japanese, Chinese and Korean mixed with Latin are one writing system each."""
-    scripts = _scripts(tag)
-    return len(scripts) > 1 and not any(scripts <= mix for mix in _SCRIPT_MIXES)
+    р, or a Latin tag holds a digit from another script: a mixed-script lookalike of a
+    generic, disclosure or campaign tag. Japanese, Chinese and Korean mixed with Latin are
+    one writing system each. A lookalike written wholly in one script (all-Cyrillic `#аԁ`)
+    is not caught here."""
+    return bool(_mixed_scripts(tag))
 
 
 def links_or_mentions(text: str) -> list[str]:
@@ -239,8 +256,8 @@ class Variant(BaseModel):
                 raise ValueError(f"generic hashtag {tag} says nothing about the clip")
             if is_disclosure(tag):
                 raise ValueError(f"hashtag {tag} reads as a paid-partnership disclosure")
-            if is_mixed_script(tag):
-                raise ValueError(f"hashtag {tag!r} mixes scripts (a lookalike tag)")
+            if mixed := _mixed_scripts(tag):
+                raise ValueError(f"hashtag {tag!r} mixes scripts ({', '.join(mixed)})")
         if len({_fold(t) for t in tags}) != len(tags):
             raise ValueError("duplicate hashtags")
         return tags

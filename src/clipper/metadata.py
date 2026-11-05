@@ -117,9 +117,19 @@ def normalize_hashtag(raw: str) -> str:
     return tag if tag.startswith("#") else f"#{tag}"
 
 
+_NEUTRAL = frozenset("ʻʼʽʾʿ")
+"""Apostrophe-like modifier letters written inside words of several scripts: the okina in
+#Hawaiʻi, the Ukrainian apostrophe ʼ and the half rings of Arabic transliteration (#Qurʾan).
+They belong to no script, and `_fold` drops them, so `#adʼ` is still `#ad`. Every other
+modifier letter (prime, colon, stress mark) counts as a script of its own, so it cannot pad
+a Latin tag."""
+_DROP_NEUTRAL = dict.fromkeys(map(ord, _NEUTRAL))
+
+
 def _fold(tag: str) -> str:
-    """Compatibility-folded and case-folded, so fullwidth `#ｆｙｐ` matches `#fyp`."""
-    return unicodedata.normalize("NFKC", tag).casefold()
+    """Compatibility-folded and case-folded without the neutral apostrophes, so fullwidth
+    `#ｆｙｐ` and `#fypʻ` match `#fyp`."""
+    return unicodedata.normalize("NFKC", tag).casefold().translate(_DROP_NEUTRAL)
 
 
 def is_generic(tag: str) -> bool:
@@ -132,10 +142,6 @@ def is_disclosure(tag: str) -> bool:
 
 _SCRIPT_ALIASES = {"CJK": "HAN", "IDEOGRAPHIC": "HAN"}
 """First words of Unicode character names that do not spell the script."""
-_NEUTRAL = frozenset("ʻʼʽ")
-"""Apostrophe-like modifier letters written inside words of several scripts: the okina in
-#Hawaiʻi and the Ukrainian apostrophe ʼ. Every other modifier letter (prime, colon, stress
-mark) counts as a script of its own, so it cannot pad a Latin tag."""
 _KANA_MARKS = frozenset("ー〱〲〳〴〵")
 """The prolonged sound mark ー and the kana repeat marks: part of a tag only next to kana."""
 _KANA = frozenset({"HIRAGANA", "KATAKANA"})
@@ -173,8 +179,9 @@ def _mixed_scripts(tag: str) -> list[str]:
     scripts = _scripts(folded)
     if len(scripts) > 1 and not any(scripts <= mix for mix in _SCRIPT_MIXES):
         return sorted(scripts)
-    # A Latin tag with a lookalike zero from another script (#pr၀m၀, #sp〇ns〇red).
-    if scripts == {"LATIN"} and any(
+    # A Latin tag with a lookalike zero from another script (#pr၀m၀, #sp〇ns〇red). An
+    # allowed CJK letter does not excuse it (#sp〇ns〇red一), so #iPhone二〇二四 is rejected too.
+    if "LATIN" in scripts and any(
         not c.isascii() and unicodedata.category(c).startswith("N") for c in folded
     ):
         return ["LATIN", "non-ASCII digits"]

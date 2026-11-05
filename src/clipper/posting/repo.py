@@ -413,6 +413,33 @@ def record_failure(
     return updated
 
 
+def defer(
+    conn: sqlite3.Connection,
+    post: Post,
+    worker_id: str,
+    reason: str,
+    until: datetime,
+    now: datetime,
+) -> Post:
+    """Put a claimed post back to `scheduled` at `until` without counting an attempt
+    (CLP-93: quota, upload limit or a paused account). Audited as `post_deferred`."""
+    with transaction(conn):
+        _update(
+            conn,
+            post,
+            PostStatus.SCHEDULED,
+            now,
+            owner=worker_id,
+            scheduled_at=until,
+            error=reason,
+            worker_id=None,
+            claimed_at=None,
+        )
+        deferred = _require(conn, post.id)
+        _audit(conn, deferred, "post_deferred", now, error=reason, scheduled_at=to_iso(until))
+    return deferred
+
+
 def mark_failed(
     conn: sqlite3.Connection, post: Post, worker_id: str, error: str, now: datetime
 ) -> Post:

@@ -158,6 +158,22 @@ class PublishResult:
     url: str | None = None
 
 
+class PublishDeferred(Exception):  # noqa: N818 - an outcome, not an error
+    """Raised by `Publisher.publish` when the post cannot go out now for a reason that is
+    not the post's fault: a platform quota or upload limit, or a paused account (CLP-93).
+
+    The posting stage moves the post back to `scheduled` at `until` without counting an
+    attempt, and sends `alert` (when set) to a human. `reason` is stored as the post's
+    error and must not contain secrets.
+    """
+
+    def __init__(self, reason: str, until: datetime, *, alert: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.until = until
+        self.alert = alert
+
+
 @runtime_checkable
 class Publisher(Protocol):
     """A platform publisher (CLP-93/94/95), registered per platform in the posting stage.
@@ -170,6 +186,9 @@ class Publisher(Protocol):
     post a crashed worker left `uploading`, so an upload that did go through is recorded
     instead of posted twice. Without `lookup` a crashed upload becomes `post_failed`
     ("uploading state unresolved") for a human to check.
+
+    `publish` may raise `PublishDeferred` to reschedule the post without counting an
+    attempt (quota, upload limit, paused account).
     """
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult: ...

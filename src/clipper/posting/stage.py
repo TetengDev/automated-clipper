@@ -165,6 +165,11 @@ class PostingStage:
             try:
                 found = lookup(post.idempotency_key)
             except Exception as exc:
+                # Never deferred: a deferred post with no attempts would be re-published
+                # without a lookup. A human checks it; the publisher's alert still goes out.
+                alert = exc.alert if isinstance(exc, PublishDeferred) else None
+                if alert:
+                    self._send(redact(alert), post)
                 self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
                 continue
             if found is not None:

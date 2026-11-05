@@ -26,16 +26,12 @@ SubmissionId = Annotated[int, Path(ge=1, le=MAX_ID)]
 
 @router.get(CAMPAIGNS_PAGE, response_class=HTMLResponse)
 def campaigns_page(request: Request, _user: User, conn: Conn) -> Response:
-    rows = submissions.list_submissions(conn, limit=5_000)
-    pending = [s for s in rows if s.status == submissions.SubmissionStatus.PENDING]
-    done = [s for s in rows if s.status == submissions.SubmissionStatus.SUBMITTED]
-    done = sorted(done, key=lambda s: s.submitted_at or s.posted_at, reverse=True)
     return render(
         request,
         "campaigns.html",
         {
-            "pending": pending,
-            "submitted": done[:RECENT_SUBMITTED],
+            "pending": submissions.pending_submissions(conn),
+            "submitted": submissions.recent_submitted(conn, RECENT_SUBMITTED),
             "rollup": submissions.rpm_rollup(conn),
             "now": _now(request),
         },

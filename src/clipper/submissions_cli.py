@@ -56,7 +56,7 @@ def _line(s: submissions.Submission) -> str:
             f"{state:<9}",
             f"{strip_control(s.campaign_id):<20}",
             f"{strip_control(s.account_id):<20}",
-            f"{s.platform:<9}",
+            f"{strip_control(s.platform):<9}",
             f"deadline {deadline}",
             strip_control(s.url),
         ]
@@ -67,11 +67,16 @@ def _line(s: submissions.Submission) -> str:
 def list_cmd(
     ctx: typer.Context,
     pending: Annotated[bool, typer.Option(help="Only links still to submit.")] = False,
+    recent: Annotated[int, typer.Option(min=0, max=10_000, help="Submitted ones shown.")] = 20,
 ) -> None:
-    """List campaign submissions, oldest post first."""
+    """Every link still to submit (nearest deadline first), then the latest submitted."""
     conn = _open(ctx)
     try:
-        rows = submissions.list_submissions(conn, pending_only=pending)
+        rows = submissions.pending_submissions(conn)
+        if not pending:
+            rows += submissions.recent_submitted(conn, recent)
+    except sqlite3.Error as exc:
+        _fail(f"cannot read submissions: {exc}")
     finally:
         conn.close()
     if not rows:
@@ -90,6 +95,8 @@ def submit_cmd(ctx: typer.Context, submission_id: Annotated[int, typer.Argument(
         _fail(f"submission {submission_id} not found")
     except submissions.AlreadySubmitted:
         _fail(f"submission {submission_id} is already submitted")
+    except sqlite3.Error as exc:
+        _fail(f"cannot record the submission: {exc}")
     finally:
         conn.close()
     typer.echo(f"submission {submission_id} submitted{' (late)' if done.late else ''}")
@@ -99,7 +106,10 @@ def submit_cmd(ctx: typer.Context, submission_id: Annotated[int, typer.Argument(
 def earnings_cmd(
     ctx: typer.Context,
     submission_id: Annotated[int, typer.Argument(min=1)],
-    views: Annotated[int, typer.Option(min=0, help="Approved views the program reported.")],
+    views: Annotated[
+        int,
+        typer.Option(min=0, max=submissions.MAX_VIEWS, help="Approved views the program reported."),
+    ],
     payout: Annotated[str, typer.Option(help="Payout for this submission, e.g. 12.50.")],
 ) -> None:
     """Record the approved views and payout for one submission."""
@@ -112,6 +122,8 @@ def earnings_cmd(
         submissions.record_earnings(conn, submission_id, views=views, payout=amount, now=utcnow())
     except LookupError:
         _fail(f"submission {submission_id} not found")
+    except (ValueError, sqlite3.Error) as exc:
+        _fail(f"cannot record earnings: {exc}")
     finally:
         conn.close()
     typer.echo(f"submission {submission_id}: {views} views, payout {amount}")
@@ -123,6 +135,8 @@ def rpm_cmd(ctx: typer.Context) -> None:
     conn = _open(ctx)
     try:
         rollup = submissions.rpm_rollup(conn)
+    except sqlite3.Error as exc:
+        _fail(f"cannot read submissions: {exc}")
     finally:
         conn.close()
     if not rollup.by_account:

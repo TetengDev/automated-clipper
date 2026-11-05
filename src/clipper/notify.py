@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 import httpx
 
 DISCORD_CONTENT_MAX = 2000
-TIMEOUT_S = 10.0
+TIMEOUT_S = 5.0
 _DISCORD_HOSTS = frozenset(
     {"discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com"}
 )
@@ -41,6 +41,10 @@ class DiscordWebhook:
             or not parts.path.startswith("/api/webhooks/")
         ):
             raise ValueError("a Discord webhook URL must be https://discord.com/api/webhooks/...")
+        try:
+            httpx.URL(url)
+        except httpx.InvalidURL:
+            raise ValueError("a Discord webhook URL must be a valid URL") from None
         self._url = url
         self._http = http
 
@@ -57,7 +61,7 @@ class DiscordWebhook:
                 json={"content": content, "allowed_mentions": {"parse": []}},
                 timeout=TIMEOUT_S,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             # httpx messages can carry the request URL, which holds the webhook token.
             raise NotifyError(f"discord webhook unreachable ({type(exc).__name__})") from None
         if response.status_code >= 300:

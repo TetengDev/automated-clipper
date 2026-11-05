@@ -28,19 +28,21 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
-from urllib.parse import urlsplit
 
 from clipper.campaigns import Campaign
+from clipper.config import ConfigError
 from clipper.db import transaction
 from clipper.jobs.models import Clock, from_iso, to_iso, utcnow
 from clipper.notify import Notify
-from clipper.posting.models import Post, PostStatus
+from clipper.posting.models import Post, PostStatus, plain_https
 from clipper.redact import redact
 
 REMIND_BEFORE = timedelta(minutes=10)
 RETRY_FIRST = timedelta(seconds=30)
 RETRY_MAX = timedelta(minutes=10)
 RPM_PLACES = Decimal("0.01")
+MAX_PAYOUT = Decimal("1000000000")
+MAX_VIEWS = 10**15
 
 logger = logging.getLogger(__name__)
 
@@ -120,8 +122,7 @@ class Submission:
     @property
     def safe_url(self) -> str | None:
         """The link if it is plain https (checked again here: templates link it)."""
-        parts = urlsplit(self.url)
-        return self.url if parts.scheme == "https" and parts.netloc else None
+        return plain_https(self.url)
 
     @property
     def rpm(self) -> Decimal | None:
@@ -145,6 +146,25 @@ def list_submissions(
     rows = conn.execute(
         f"SELECT * FROM campaign_submissions{where} ORDER BY posted_at, id LIMIT ?",  # noqa: S608 - constant
         (limit,),
+    )
+    return [Submission.from_row(r) for r in rows]
+
+
+def pending_submissions(conn: sqlite3.Connection) -> list[Submission]:
+    """Every link still to submit, the nearest deadline first (no limit: none may hide)."""
+    rows = conn.execute(
+        "SELECT * FROM campaign_submissions WHERE status = ?"
+        " ORDER BY deadline_at IS NULL, deadline_at, id",
+        (str(SubmissionStatus.PENDING),),
+    )
+    return [Submission.from_row(r) for r in rows]
+
+
+def recent_submitted(conn: sqlite3.Connection, limit: int = 50) -> list[Submission]:
+    rows = conn.execute(
+        "SELECT * FROM campaign_submissions WHERE status = ?"
+        " ORDER BY submitted_at DESC, id DESC LIMIT ?",
+        (str(SubmissionStatus.SUBMITTED), limit),
     )
     return [Submission.from_row(r) for r in rows]
 
@@ -181,7 +201,7 @@ def _audit(
 def _new_posts(conn: sqlite3.Connection) -> list[Post]:
     rows = conn.execute(
         "SELECT p.* FROM posts p WHERE p.status = ? AND p.campaign_id IS NOT NULL"
-        " AND p.url IS NOT NULL AND p.posted_at IS NOT NULL AND NOT EXISTS"
+        " AND p.url LIKE 'https://%' AND p.posted_at IS NOT NULL AND NOT EXISTS"
         " (SELECT 1 FROM campaign_submissions s WHERE s.post_id = p.id) ORDER BY p.id",
         (str(PostStatus.POSTED),),
     )
@@ -197,7 +217,7 @@ def create_due(
     for post in _new_posts(conn):
         url = post.safe_url
         if url is None or post.posted_at is None or post.campaign_id is None:
-            continue  # only a link we would hand out; logged by the pass
+            continue  # only a link we would hand out
         campaign = campaigns.get(post.campaign_id)
         minutes = campaign.submit_within_minutes if campaign else None
         deadline = post.posted_at + timedelta(minutes=minutes) if minutes else None
@@ -226,6 +246,29 @@ def create_due(
             _audit(conn, submission, "campaign_submission_created", now)
         created.append(submission)
     return created
+
+
+def fill_deadlines(
+    conn: sqlite3.Connection, campaigns: Mapping[str, Campaign], now: datetime
+) -> int:
+    """Give a pending submission recorded while its campaign was missing from the config
+    (renamed, mid-edit) the program and deadline once the campaign is back."""
+    rows = conn.execute(
+        "SELECT id, campaign_id, posted_at FROM campaign_submissions"
+        " WHERE status = ? AND program IS NULL",
+        (str(SubmissionStatus.PENDING),),
+    ).fetchall()
+    filled = 0
+    for submission_id, campaign_id, posted_at in rows:
+        campaign = campaigns.get(campaign_id)
+        if campaign is None:
+            continue
+        minutes = campaign.submit_within_minutes
+        deadline = from_iso(posted_at) + timedelta(minutes=minutes) if minutes else None
+        with transaction(conn):
+            _set(conn, submission_id, now, program=campaign.program, deadline_at=deadline)
+        filled += 1
+    return filled
 
 
 def _set(conn: sqlite3.Connection, submission_id: int, now: datetime, **fields: Any) -> None:
@@ -275,10 +318,11 @@ def record_earnings(
 ) -> Submission:
     """Store the approved views and payout the program reported for one submission
     (replacing earlier figures)."""
-    if isinstance(views, bool) or not isinstance(views, int) or views < 0:
-        raise ValueError("views must be a whole number of at least 0")
-    if not isinstance(payout, Decimal) or not payout.is_finite() or payout < 0:
-        raise ValueError("payout must be an amount of at least 0")
+    if isinstance(views, bool) or not isinstance(views, int) or not 0 <= views <= MAX_VIEWS:
+        raise ValueError(f"views must be a whole number from 0 to {MAX_VIEWS}")
+    if not isinstance(payout, Decimal) or not payout.is_finite() or not 0 <= payout <= MAX_PAYOUT:
+        raise ValueError(f"payout must be an amount from 0 to {MAX_PAYOUT}")
+    payout = payout.quantize(RPM_PLACES)
     with transaction(conn):
         current = _require(conn, submission_id)
         _set(
@@ -299,9 +343,9 @@ def parse_payout(text: str) -> Decimal:
         amount = Decimal(text.strip())
     except (InvalidOperation, AttributeError):
         raise ValueError(f"invalid payout {text!r}; use a number like 12.50") from None
-    if not amount.is_finite() or amount < 0:
-        raise ValueError(f"invalid payout {text!r}; use a number like 12.50")
-    return amount
+    if not amount.is_finite() or not 0 <= amount <= MAX_PAYOUT:
+        raise ValueError(f"invalid payout {text!r}; use a number from 0 to {MAX_PAYOUT}")
+    return abs(amount.quantize(RPM_PLACES))  # abs: never "-0.00"
 
 
 # --- RPM ----------------------------------------------------------------------------------
@@ -310,7 +354,10 @@ def parse_payout(text: str) -> Decimal:
 def _rpm(payout: Decimal, views: int) -> Decimal | None:
     if views <= 0:
         return None
-    return (payout * 1000 / views).quantize(RPM_PLACES)
+    try:
+        return (payout * 1000 / views).quantize(RPM_PLACES)
+    except ArithmeticError:  # a figure stored before the bounds; never break the page
+        return None
 
 
 @dataclass
@@ -332,6 +379,18 @@ class Rollup:
     by_campaign: list[RpmRow]
 
 
+def _stored_payout(text: str | None) -> Decimal | None:
+    """A stored payout, or None if it is missing or outside the bounds (a figure written
+    before they existed must not break the rollup)."""
+    try:
+        amount = Decimal(text) if text is not None else None
+    except InvalidOperation:
+        return None
+    if amount is None or not amount.is_finite() or not 0 <= amount <= MAX_PAYOUT:
+        return None
+    return amount
+
+
 def rpm_rollup(conn: sqlite3.Connection) -> Rollup:
     """RPM per account and per campaign over every submission. Views and payout count
     only submissions with earnings recorded, so one without figures does not skew RPM."""
@@ -344,10 +403,11 @@ def rpm_rollup(conn: sqlite3.Connection) -> Rollup:
         for table, key in ((accounts, account_id), (campaigns, campaign_id)):
             row = table.setdefault(key, RpmRow(key))
             row.submissions += 1
-            if views is not None and payout is not None:
+            amount = _stored_payout(payout)
+            if views is not None and amount is not None:
                 row.with_earnings += 1
                 row.views += views
-                row.payout += Decimal(payout)
+                row.payout += amount
     return Rollup(
         by_account=sorted(accounts.values(), key=lambda r: r.key),
         by_campaign=sorted(campaigns.values(), key=lambda r: r.key),
@@ -387,15 +447,29 @@ def submission_message(submission: Submission, now: datetime, clip_id: int | Non
     )
 
 
+def _missed_message(submission: Submission) -> str:
+    return (
+        f"Campaign submission missed: {submission.campaign_id} on {submission.account_id}"
+        f" ({submission.platform}), deadline {_when(submission.deadline_at)}. Link:"
+        f" <{submission.url}>. If you still submit it, record it with"
+        f" `clipper campaigns submit {submission.id}` (it will be flagged late)."
+    )
+
+
 @dataclass
-class _Retry:
+class _Backoff:
     at: datetime
     delay: timedelta
 
 
 @dataclass
 class SubmissionPass:
-    """One pass per worker poll: record new submissions, ping, remind, alert."""
+    """One pass per worker poll: record new submissions, ping, remind, alert.
+
+    Each message is claimed in the DB before it is sent (`<column> IS NULL` -> now), so two
+    workers never send the same one; a failed send releases the claim for a retry. When a
+    webhook fails, it is backed off as a whole (30 s doubling to 10 min) and the rest of
+    the pass skips it, so a Discord outage costs one timeout per backoff, not one per row."""
 
     conn: sqlite3.Connection
     campaigns: Mapping[str, Campaign]
@@ -403,19 +477,25 @@ class SubmissionPass:
     alert: Notify
     clock: Clock = utcnow
     submitters: Mapping[str, Submitter] = field(default_factory=dict)
-    _retry: dict[tuple[int, str], _Retry] = field(default_factory=dict, init=False, repr=False)
-    _auto_tried: set[int] = field(default_factory=set, init=False, repr=False)
+    _backoff: dict[int, _Backoff] = field(default_factory=dict, init=False, repr=False)
+    _down: set[int] = field(default_factory=set, init=False, repr=False)
 
     def run_once(self) -> int:
         now = self.clock()
-        created = create_due(self.conn, self.campaigns, now)
+        self._down = set()
+        try:
+            created = create_due(self.conn, self.campaigns, now)
+            fill_deadlines(self.conn, self.campaigns, now)
+        except ConfigError as exc:
+            # Reminders and alerts need only the stored rows: keep sending them.
+            logger.error("campaign config invalid; no new submissions this pass: %s", exc)
+            created = []
         for submission in created:
             self._auto_submit(submission, now)
         handled = len(created)
         rows = self.conn.execute(
             "SELECT * FROM campaign_submissions WHERE notified_at IS NULL OR (status = ?"
-            " AND deadline_at IS NOT NULL AND (reminded_at IS NULL OR"
-            " overdue_alerted_at IS NULL)) ORDER BY id",
+            " AND deadline_at IS NOT NULL AND overdue_alerted_at IS NULL) ORDER BY id",
             (str(SubmissionStatus.PENDING),),
         ).fetchall()
         for row in rows:
@@ -424,35 +504,48 @@ class SubmissionPass:
 
     def _auto_submit(self, submission: Submission, now: datetime) -> None:
         submitter = self.submitters.get(submission.program or "")
-        if submitter is None or submission.id in self._auto_tried:
+        if submitter is None:
             return
-        self._auto_tried.add(submission.id)
         try:
             submitter(submission)
         except Exception as exc:
             logger.error(
-                "submission %d: automatic submit failed: %s",
+                "submission %d: automatic submit failed, submit it by hand: %s",
                 submission.id,
                 redact(f"{type(exc).__name__}: {exc}"),
             )
             return
-        mark_submitted(self.conn, submission.id, now, by=f"api:{submission.program}")
+        try:
+            mark_submitted(self.conn, submission.id, now, by=f"api:{submission.program}")
+        except AlreadySubmitted:
+            pass  # the operator was faster
+        except sqlite3.Error:
+            logger.exception(
+                "submission %d was submitted automatically but not recorded; run"
+                " `clipper campaigns submit %d`",
+                submission.id,
+                submission.id,
+            )
 
     def _ping(self, submission: Submission, now: datetime) -> int:
         current = get_submission(self.conn, submission.id) or submission
+        pending = current.status == SubmissionStatus.PENDING
+        if pending and current.deadline_at is not None and current.overdue(now):
+            if current.overdue_alerted_at is not None:
+                return 0
+            # One message for a link first seen after its deadline (posted while the
+            # worker was down, or before this feature): the alert, not ping + alert.
+            also = {"notified_at": now, "reminded_at": now} if current.notified_at is None else {}
+            return self._send(
+                current, "overdue_alerted_at", self.alert, now, _missed_message(current), also
+            )
         if current.notified_at is None:
-            return self._send(current, "notified_at", self.notify, now, self._first(current, now))
-        if current.status != SubmissionStatus.PENDING or current.deadline_at is None:
-            return 0
-        if current.overdue(now):
-            if current.overdue_alerted_at is None:
-                text = (
-                    f"Campaign submission missed: {current.campaign_id} on {current.account_id}"
-                    f" ({current.platform}), deadline {_when(current.deadline_at)}. Link:"
-                    f" <{current.url}>. If you still submit it, record it with"
-                    f" `clipper campaigns submit {current.id}` (it will be flagged late)."
-                )
-                return self._send(current, "overdue_alerted_at", self.alert, now, text)
+            near = current.deadline_at is not None and now >= current.deadline_at - REMIND_BEFORE
+            also = {"reminded_at": now} if near else {}
+            return self._send(
+                current, "notified_at", self.notify, now, self._first(current, now), also
+            )
+        if not pending or current.deadline_at is None:
             return 0
         if current.reminded_at is None and now >= current.deadline_at - REMIND_BEFORE:
             text = (
@@ -469,27 +562,55 @@ class SubmissionPass:
         ).fetchone()
         return submission_message(submission, now, row[0] if row else None)
 
+    def _claim(self, submission_id: int, column: str, now: datetime) -> bool:
+        with transaction(self.conn):
+            cur = self.conn.execute(
+                f"UPDATE campaign_submissions SET {column} = ?, updated_at = ?"  # noqa: S608 - our column names
+                f" WHERE id = ? AND {column} IS NULL",
+                (to_iso(now), to_iso(now), submission_id),
+            )
+        return cur.rowcount == 1
+
+    def _release(self, submission_id: int, column: str, now: datetime) -> None:
+        with transaction(self.conn):
+            self.conn.execute(
+                f"UPDATE campaign_submissions SET {column} = NULL"  # noqa: S608 - our column names
+                f" WHERE id = ? AND {column} = ?",
+                (submission_id, to_iso(now)),
+            )
+
     def _send(
-        self, submission: Submission, column: str, send: Notify, now: datetime, text: str
+        self,
+        submission: Submission,
+        column: str,
+        send: Notify,
+        now: datetime,
+        text: str,
+        also: Mapping[str, datetime] | None = None,
     ) -> int:
-        key = (submission.id, column)
-        retry = self._retry.get(key)
-        if retry is not None and now < retry.at:
+        key = id(send)
+        backoff = self._backoff.get(key)
+        if key in self._down or (backoff is not None and now < backoff.at):
             return 0
+        if not self._claim(submission.id, column, now):
+            return 0  # another worker sent it
         try:
             send(text)
         except Exception as exc:
-            delay = min(retry.delay * 2, RETRY_MAX) if retry else RETRY_FIRST
-            self._retry[key] = _Retry(at=now + delay, delay=delay)
+            self._release(submission.id, column, now)
+            delay = min(backoff.delay * 2, RETRY_MAX) if backoff else RETRY_FIRST
+            self._backoff[key] = _Backoff(at=now + delay, delay=delay)
+            self._down.add(key)
             logger.warning(
-                "submission %d: %s ping failed (%s); retry in %ds",
+                "submission %d: %s message failed (%s); webhook retried in %ds",
                 submission.id,
                 column,
                 redact(str(exc)),
                 int(delay.total_seconds()),
             )
             return 0
-        self._retry.pop(key, None)
-        with transaction(self.conn):
-            _set(self.conn, submission.id, now, **{column: now})
+        self._backoff.pop(key, None)
+        if also:
+            with transaction(self.conn):
+                _set(self.conn, submission.id, now, **also)
         return 1

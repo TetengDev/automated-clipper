@@ -474,6 +474,11 @@ MIXED_SCRIPT = [
     "#sp〇ns〇red",  # ideographic number zero: looks like #sponsored
     "#ソウル한국",  # Katakana and Hangul are not one writing system
     "#ひㄅ",  # Hiragana and Bopomofo
+    "#adʹ",  # modifier prime: looks like #ad'
+    "#adː",  # modifier colon
+    "#fypˈ",  # modifier stress mark
+    "#ad〱",  # kana repeat mark with no kana
+    "#fypー",  # prolonged sound mark with no kana
 ]
 SINGLE_SCRIPT = [
     "#Москва",  # Russian

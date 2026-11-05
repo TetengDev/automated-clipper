@@ -19,13 +19,27 @@ Each pass (the worker runs one per poll, see `clipper.jobs.worker.Worker.posting
 
 If recording a successful upload fails (DB error), the post stays `uploading` and step 1
 resolves it later through `lookup`; it is never re-published blindly.
+
+CLP-105:
+
+* Heartbeat. While `publish` runs, a background thread re-stamps the post's `claimed_at`
+  every `heartbeat_seconds` (on its own connection from `connect`), so a slow but live
+  upload is never taken for a crashed one. It stops when the upload ends, when the post is
+  no longer this worker's, or after `MAX_UPLOAD`, so a publish that hangs for ever still
+  goes stale and reaches a human. Without `connect` there is no heartbeat.
+* `recover(dead_worker_id)` (from `run-worker --recover-id`) hands the dead worker's
+  `uploading` posts to the next stale pass at once.
+* The worker runs this stage on a thread of its own (`Worker.run_forever`), so it needs
+  a connection of its own too.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Callable, Mapping
+import threading
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -45,9 +59,21 @@ from clipper.posting.models import (
 from clipper.redact import redact
 
 STALE_UPLOAD = timedelta(minutes=30)
+HEARTBEAT = timedelta(minutes=1)
+"""How often a running upload re-stamps its claim; well inside `STALE_UPLOAD`."""
+RECOVER_QUIET = HEARTBEAT * 5
+"""`recover` only releases uploads whose claim has not been re-stamped for this long, so
+naming a live worker by mistake never hands its upload over. Five beats leave room for a
+few minutes of clock skew between hosts (NTP is assumed)."""
+HEARTBEAT_BUSY_MS = 2_000
+"""The heartbeat's busy timeout: a missed beat is harmless, a stalled result write is not."""
+MAX_UPLOAD = timedelta(hours=4)
+"""The heartbeat stops after this long, so a publish that never returns goes stale."""
 BACKOFF_BASE = timedelta(minutes=5)
 UNRESOLVED = "uploading state unresolved"
 DEFAULT_BATCH = 10
+MAX_STALE_PER_PASS = DEFAULT_BATCH
+"""Stale posts resolved per pass at most; the rest wait for the next pass."""
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +94,35 @@ class PostingStage:
     clock: Clock = utcnow
     alert: Alert = log_alert
     batch: int = DEFAULT_BATCH
+    connect: Callable[[], sqlite3.Connection] | None = None
+    """Opens a DB connection for the upload heartbeat thread (None: no heartbeat)."""
+    heartbeat_seconds: float = HEARTBEAT.total_seconds()
+    stop: threading.Event | None = None
+    """Set on shutdown: the pass finishes the upload in hand but claims no new post."""
     _warned: set[str] = field(default_factory=set, init=False, repr=False)
+
+    def recover(self, dead_worker_id: str) -> int:
+        """Hand a known-dead worker's `uploading` posts to the next stale pass now. Posts
+        whose claim was re-stamped within `RECOVER_QUIET` are left alone: their worker is
+        alive (its heartbeat still runs), whatever the operator believes."""
+        released, shortened = repo.release_uploads(
+            self.conn,
+            dead_worker_id,
+            self.clock(),
+            quiet_for=RECOVER_QUIET,
+            stale_after=STALE_UPLOAD,
+        )
+        logger.info("released %d uploading post(s) claimed by %s", released, dead_worker_id)
+        if shortened:
+            logger.warning(
+                "%d uploading post(s) of %s beat within %s: not released; they go stale in %s"
+                " unless that worker is alive",
+                shortened,
+                dead_worker_id,
+                RECOVER_QUIET,
+                RECOVER_QUIET,
+            )
+        return released
 
     def run_once(self) -> int:
         """One posting pass; returns how many posts it acted on."""
@@ -77,6 +131,8 @@ class PostingStage:
         # One post at a time (claim, publish, record), so a post never sits claimed while
         # others upload and cannot go stale before it is even tried.
         for _ in range(self.batch):
+            if self.stop is not None and self.stop.is_set():
+                break
             due = repo.claim_due(
                 self.conn,
                 self.clock(),
@@ -107,13 +163,60 @@ class PostingStage:
             if path is None:
                 raise FileNotFoundError("rendered video is missing")
             metadata = repo.metadata_for(self.conn, post)
-            result = publisher.publish(post, path, metadata)
+            with self._heartbeat(post):
+                result = publisher.publish(post, path, metadata)
         except Exception as exc:
             self._failed_attempt(post, _describe(exc))
             return
         # Outside the try: if this write fails the post stays `uploading` and the stale
         # pass resolves it through `lookup` instead of uploading it again.
         self._posted(post, result)
+
+    @contextmanager
+    def _heartbeat(self, post: Post) -> Iterator[None]:
+        """Keep `post`'s claim fresh while the body (an upload or a lookup) runs."""
+        if self.connect is None:
+            yield
+            return
+        done = threading.Event()
+        beat = threading.Thread(
+            target=self._beat, args=(post, done), name=f"heartbeat-post-{post.id}", daemon=True
+        )
+        beat.start()
+        try:
+            yield
+        finally:
+            done.set()
+            beat.join()
+
+    def _beat(self, post: Post, done: threading.Event) -> None:
+        assert self.connect is not None
+        started = self.clock()
+        conn: sqlite3.Connection | None = None
+        try:
+            while not done.wait(self.heartbeat_seconds):
+                now = self.clock()
+                if now - started > MAX_UPLOAD:
+                    logger.error(
+                        "%s: upload still running after %s; heartbeat stopped",
+                        _label(post),
+                        MAX_UPLOAD,
+                    )
+                    return
+                try:
+                    if conn is None:
+                        conn = self.connect()
+                        # The factory may use the default 30s; a beat may simply be missed.
+                        conn.execute(f"PRAGMA busy_timeout={HEARTBEAT_BUSY_MS:d}")
+                    if not repo.touch_claim(conn, post.id, self.worker_id, now):
+                        logger.warning("%s: no longer ours; heartbeat stopped", _label(post))
+                        return
+                except (sqlite3.Error, OSError) as exc:
+                    # Retried next beat; the upload itself carries on regardless.
+                    logger.warning("%s: heartbeat failed: %s", _label(post), exc)
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _already_live(self, post: Post, publisher: Publisher) -> bool:
         """Before re-publishing after a failed attempt, ask `lookup` (when there is one)
@@ -123,7 +226,8 @@ class PostingStage:
         if not callable(lookup):
             return False
         try:
-            found = lookup(post.idempotency_key)
+            with self._heartbeat(post):
+                found = lookup(post.idempotency_key)
         except Exception as exc:
             self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
             return True
@@ -137,30 +241,42 @@ class PostingStage:
         """Resolve posts a crashed (or very slow) worker left `uploading`. Never re-publish:
         only a `lookup` that finds the upload records it as posted; anything else is
         `post_failed` for a human to check, since the upload may still be in flight."""
-        stale = repo.claim_stale(
-            self.conn,
-            self.clock(),
-            self.worker_id,
-            older_than=STALE_UPLOAD,
-            platforms=self.publishers.keys(),
-        )
-        for post in stale:
-            lookup = getattr(self.publishers[post.platform], "lookup", None)
-            if not callable(lookup):
-                logger.error("%s: crashed mid-upload and cannot be checked", _label(post))
-                self._give_up(post, UNRESOLVED)
-                continue
-            try:
+        handled = 0
+        # One at a time, like due posts: one waiting behind a slow lookup is not claimed.
+        for _ in range(MAX_STALE_PER_PASS):
+            if self.stop is not None and self.stop.is_set():
+                break
+            stale = repo.claim_stale(
+                self.conn,
+                self.clock(),
+                self.worker_id,
+                older_than=STALE_UPLOAD,
+                platforms=self.publishers.keys(),
+                limit=1,
+            )
+            if not stale:
+                break
+            self._resolve_stale(stale[0])
+            handled += 1
+        return handled
+
+    def _resolve_stale(self, post: Post) -> None:
+        lookup = getattr(self.publishers[post.platform], "lookup", None)
+        if not callable(lookup):
+            logger.error("%s: crashed mid-upload and cannot be checked", _label(post))
+            self._give_up(post, UNRESOLVED)
+            return
+        try:
+            with self._heartbeat(post):  # a slow lookup must not let the claim go stale
                 found = lookup(post.idempotency_key)
-            except Exception as exc:
-                self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
-                continue
-            if found is not None:
-                logger.info("%s: upload from a crashed worker found; recorded", _label(post))
-                self._posted(post, found)
-            else:
-                self._give_up(post, f"{UNRESOLVED}: not found on the platform")
-        return len(stale)
+        except Exception as exc:
+            self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
+            return
+        if found is not None:
+            logger.info("%s: upload from a crashed worker found; recorded", _label(post))
+            self._posted(post, found)
+        else:
+            self._give_up(post, f"{UNRESOLVED}: not found on the platform")
 
     # --- outcomes ----------------------------------------------------------------------
 
@@ -213,9 +329,17 @@ class PostingStage:
         self._alert(failed, error)
 
     def _alert(self, post: Post, error: str) -> None:
+        if error.startswith(UNRESOLVED):
+            # The upload may still be in flight or live: a blind requeue could post twice.
+            advice = (
+                "The upload may have gone through: check the platform before you requeue"
+                f" with `clipper posts retry {post.id}`."
+            )
+        else:
+            advice = f"Requeue with `clipper posts retry {post.id}`."
         message = (
             f"{_label(post)} of clip {post.clip_id} is post_failed after"
-            f" {post.attempts} attempt(s): {error}. Requeue with `clipper posts retry {post.id}`."
+            f" {post.attempts} attempt(s): {error}. {advice}"
         )
         self._send(message, post)
 

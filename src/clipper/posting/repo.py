@@ -306,9 +306,11 @@ def claim_stale(
     *,
     older_than: timedelta,
     platforms: Collection[str],
+    limit: int | None = None,
 ) -> list[Post]:
     """Take over posts on `platforms` left `uploading` longer than `older_than` (a crashed
-    worker). Only platforms this worker publishes to: it must be able to `lookup` them."""
+    worker). Only platforms this worker publishes to: it must be able to `lookup` them.
+    `limit` takes over at most that many, so the rest do not sit claimed meanwhile."""
     wanted = sorted(platforms)
     if not wanted:
         return []
@@ -319,8 +321,10 @@ def claim_stale(
         rows = conn.execute(
             sql, (str(PostStatus.UPLOADING), to_iso(now - older_than), *wanted)
         ).fetchall()
-        taken = []
+        taken: list[Post] = []
         for row in rows:
+            if limit is not None and len(taken) >= limit:
+                break
             post = Post.from_row(row)
             cur = conn.execute(
                 "UPDATE posts SET worker_id = ?, claimed_at = ?, updated_at = ?"
@@ -346,6 +350,77 @@ def claim_stale(
                 )
                 taken.append(recovered)
         return taken
+
+
+def touch_claim(conn: sqlite3.Connection, post_id: int, worker_id: str, now: datetime) -> bool:
+    """Heartbeat (CLP-105): re-stamp `claimed_at` of a post this worker is uploading, so the
+    stale pass never takes over a live upload. False once the post is no longer this
+    worker's upload (finished, or taken over). No audit row: it runs every minute."""
+    cur = conn.execute(
+        "UPDATE posts SET claimed_at = ?, updated_at = ?"
+        " WHERE id = ? AND status = ? AND worker_id = ?",
+        (to_iso(now), to_iso(now), post_id, str(PostStatus.UPLOADING), worker_id),
+    )
+    return cur.rowcount == 1
+
+
+def release_uploads(
+    conn: sqlite3.Connection,
+    dead_worker_id: str,
+    now: datetime,
+    *,
+    quiet_for: timedelta,
+    stale_after: timedelta,
+) -> tuple[int, int]:
+    """Operator recovery of a known-dead worker (`run-worker --recover-id`). Returns
+    (released, shortened).
+
+    Claims not re-stamped for `quiet_for` are released (`claimed_at` cleared), so the next
+    stale pass resolves them through `lookup` at once. A claim re-stamped more recently may
+    belong to a live worker named by mistake, so it is only shortened: set to go stale
+    `quiet_for` from `now` instead of `stale_after` from its last beat. A live worker's
+    next heartbeat re-stamps it, so its upload is never handed over; a dead one's goes
+    stale minutes after the restart. Each change is compare-and-swap on `claimed_at`.
+    The protection relies on the heartbeat: a worker run without one looks quiet."""
+    quiet_since = to_iso(now - quiet_for)
+    shortened_to = to_iso(now - stale_after + quiet_for)
+    released = shortened = 0
+    with transaction(conn):
+        rows = conn.execute(
+            "SELECT * FROM posts WHERE status = ? AND worker_id = ? AND claimed_at IS NOT NULL",
+            (str(PostStatus.UPLOADING), dead_worker_id),
+        ).fetchall()
+        for row in rows:
+            quiet = row["claimed_at"] <= quiet_since
+            cur = conn.execute(
+                "UPDATE posts SET claimed_at = ?, updated_at = ?"
+                " WHERE id = ? AND status = ? AND worker_id = ? AND claimed_at IS ?",
+                (
+                    None if quiet else shortened_to,
+                    to_iso(now),
+                    row["id"],
+                    str(PostStatus.UPLOADING),
+                    dead_worker_id,
+                    row["claimed_at"],
+                ),
+            )
+            if cur.rowcount != 1:
+                continue
+            post = Post.from_row(row)
+            if quiet:
+                released += 1
+                _audit(conn, post, "post_released", now, worker_id=dead_worker_id)
+            else:
+                shortened += 1
+                _audit(
+                    conn,
+                    post,
+                    "post_release_deferred",
+                    now,
+                    worker_id=dead_worker_id,
+                    claimed_at=shortened_to,
+                )
+    return released, shortened
 
 
 def mark_posted(

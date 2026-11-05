@@ -344,10 +344,15 @@ def summary(campaign: Campaign) -> str:
     """One line for `clipper check-config`."""
     parts = [f"{campaign.id} {campaign.program} {campaign.creator}"]
     parts.append(",".join(campaign.platforms))
-    if campaign.min_duration_s is not None or campaign.max_duration_s is not None:
-        low = f"{campaign.min_duration_s:g}" if campaign.min_duration_s is not None else "0"
-        high = f"{campaign.max_duration_s:g}" if campaign.max_duration_s is not None else "-"
-        parts.append(f"{low}-{high} s")
+    low, high = campaign.min_duration_s, campaign.max_duration_s
+    if low is not None and high is not None:
+        parts.append(f"{low:g}-{high:g} s")
+    elif low is not None:
+        parts.append(f"at least {low:g} s")
+    elif high is not None:
+        parts.append(f"at most {high:g} s")
+    if "ai_content" in campaign.forbidden:
+        parts.append("no AI content")
     if campaign.required_hashtags:
         parts.append(" ".join(campaign.required_hashtags))
     if campaign.submit_within_minutes:

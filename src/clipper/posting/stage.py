@@ -186,8 +186,12 @@ class PostingStage:
     def _publish(self, post: Post) -> None:
         publisher = self.publishers[post.platform]
         # Lookup first: an earlier attempt that went live is recorded whatever the caps.
-        earlier = post.attempts > 0 or repo.had_failed_attempt(self.conn, post)
-        if earlier and self._already_live(post, publisher):
+        # After a human's retry (attempts reset, an earlier failure in the audit) a broken
+        # lookup does not block the upload: the retry is the override the alert asks for.
+        requeued = post.attempts == 0 and repo.had_failed_attempt(self.conn, post)
+        if (post.attempts > 0 or requeued) and self._already_live(
+            post, publisher, strict=not requeued
+        ):
             return
         if self._held_by_caps(post):
             return
@@ -251,10 +255,12 @@ class PostingStage:
             if conn is not None:
                 conn.close()
 
-    def _already_live(self, post: Post, publisher: Publisher) -> bool:
+    def _already_live(self, post: Post, publisher: Publisher, *, strict: bool = True) -> bool:
         """Before re-publishing after a failed attempt, ask `lookup` (when there is one)
         whether the earlier attempt went through after all, e.g. it timed out reading the
-        response. True when the post was recorded as posted or handed to a human."""
+        response. True when the post was recorded as posted or handed to a human. A lookup
+        that fails hands the post to a human, unless not `strict` (a human already
+        requeued it): then it is logged and the upload goes ahead."""
         lookup = getattr(publisher, "lookup", None)
         if not callable(lookup):
             return False
@@ -262,6 +268,11 @@ class PostingStage:
             with self._heartbeat(post):
                 found = lookup(post.idempotency_key)
         except Exception as exc:
+            if not strict:
+                logger.warning(
+                    "%s: lookup failed: %s; uploading as requeued", _label(post), _describe(exc)
+                )
+                return False
             self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
             return True
         if found is None:

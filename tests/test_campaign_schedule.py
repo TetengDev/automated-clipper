@@ -4,6 +4,7 @@ reason; a clean post is scheduled with the metadata the pre-flight checked."""
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,18 +13,27 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from clipper.campaigns import Campaign
+from clipper.campaigns import Campaign, PostingConfig
 from clipper.cli import app
 from clipper.edl import parse_edl
 from clipper.posting import repo
 from clipper.posting.models import OPEN_STATUSES, InvalidPostTransition, PostStatus
-from clipper.posting.scheduler import publish_problem, recheck_held, schedule_for_clip
-from clipper.posting.stage import PostingStage
+from clipper.posting.scheduler import (
+    publish_guard,
+    publish_problem,
+    recheck_held,
+    schedule_for_clip,
+)
+from clipper.posting.stage import PostingStage, allow_all
 from posting_support import FakeAccount, FakePublisher
 from review_support import Env, login, make_env
 
 NOW = datetime(2027, 1, 15, 8, 0, tzinfo=UTC)  # review_support.WALL_START
 TAGS = ["#giveaway", "#island", "#challenge"]
+
+
+def NOT_SENSITIVE(_creator: str) -> bool:  # noqa: N802 - a constant-like rule
+    return False
 
 
 @pytest.fixture
@@ -192,6 +202,7 @@ def test_held_post_is_never_published(env: Env) -> None:
         "w1",
         media_root=env.media_root,
         clock=lambda: NOW + timedelta(days=30),
+        guard=allow_all,
     )
 
     stage.run_once()
@@ -230,6 +241,7 @@ def test_posting_stage_publishes_the_stored_metadata(env: Env) -> None:
         "w1",
         media_root=env.media_root,
         clock=lambda: post.scheduled_at + timedelta(minutes=1),
+        guard=allow_all,
     )
 
     stage.run_once()
@@ -253,6 +265,7 @@ def test_recheck_schedules_held_posts_that_now_pass(env: Env) -> None:
         {"vyro_mrbeast": campaign()},
         NOW,
         media_root=env.media_root,
+        is_sensitive=NOT_SENSITIVE,
     )
 
     [released] = result.released
@@ -272,6 +285,7 @@ def test_recheck_keeps_failing_posts_held_with_the_new_reason(env: Env) -> None:
         {"vyro_mrbeast": campaign(min_duration_s=15)},
         NOW,
         media_root=env.media_root,
+        is_sensitive=NOT_SENSITIVE,
     )
 
     [still] = result.still_held
@@ -282,7 +296,9 @@ def test_recheck_keeps_failing_posts_held_with_the_new_reason(env: Env) -> None:
 def test_recheck_leaves_posts_of_a_removed_account_held(env: Env) -> None:
     [held] = schedule(env, rendered_clip(env, seconds=12))
 
-    result = recheck_held(env.conn, [], {}, NOW, media_root=env.media_root)
+    result = recheck_held(
+        env.conn, [], {}, NOW, media_root=env.media_root, is_sensitive=NOT_SENSITIVE
+    )
 
     assert result.released == []
     [still] = result.still_held
@@ -301,6 +317,7 @@ def test_recheck_keeps_a_post_held_when_the_account_no_longer_posts_the_creator(
         {"vyro_mrbeast": campaign()},
         NOW,
         media_root=env.media_root,
+        is_sensitive=NOT_SENSITIVE,
     )
 
     [still] = result.still_held
@@ -330,7 +347,12 @@ def test_recheck_without_a_free_slot_says_so(env: Env) -> None:
         schedule(env, rendered_clip(env), full, vyro_mrbeast=campaign())
 
     result = recheck_held(
-        env.conn, [full], {"vyro_mrbeast": campaign()}, NOW, media_root=env.media_root
+        env.conn,
+        [full],
+        {"vyro_mrbeast": campaign()},
+        NOW,
+        media_root=env.media_root,
+        is_sensitive=NOT_SENSITIVE,
     )
 
     [still] = result.still_held
@@ -340,7 +362,14 @@ def test_recheck_without_a_free_slot_says_so(env: Env) -> None:
 def test_recheck_releases_with_the_campaign_that_applies_now(env: Env) -> None:
     [held] = schedule(env, rendered_clip(env), vyro_mrbeast=campaign(brief_verified=False))
 
-    result = recheck_held(env.conn, [account(campaign=None)], {}, NOW, media_root=env.media_root)
+    result = recheck_held(
+        env.conn,
+        [account(campaign=None)],
+        {},
+        NOW,
+        media_root=env.media_root,
+        is_sensitive=NOT_SENSITIVE,
+    )
 
     [released] = result.released
     assert released.id == held.id and released.campaign_id is None
@@ -361,7 +390,12 @@ def test_recheck_uses_the_clips_current_version(env: Env) -> None:
     env.conn.execute("UPDATE clips SET current_version = 2 WHERE id = ?", (clip_id,))
 
     result = recheck_held(
-        env.conn, [account()], {"vyro_mrbeast": campaign()}, NOW, media_root=env.media_root
+        env.conn,
+        [account()],
+        {"vyro_mrbeast": campaign()},
+        NOW,
+        media_root=env.media_root,
+        is_sensitive=NOT_SENSITIVE,
     )
 
     [released] = result.released
@@ -617,3 +651,75 @@ def test_check_config_fails_on_a_market_that_cannot_meet_the_audience(tmp_path: 
 
     assert result.exit_code == 1
     assert "tt_main" in result.output and "market US" in result.output
+
+
+def test_a_stage_with_publishers_needs_an_explicit_guard(env: Env) -> None:
+    # Fail closed: leaving the guard out would publish without the campaign check.
+    with pytest.raises(ValueError, match="guard"):
+        PostingStage(env.conn, {"tiktok": FakePublisher()}, "w1")
+
+
+def test_recheck_needs_an_explicit_sensitivity_rule(env: Env) -> None:
+    with pytest.raises(TypeError):
+        recheck_held(env.conn, [], {}, NOW)  # type: ignore[call-arg]
+
+
+def test_released_post_starts_with_a_fresh_attempt_count(env: Env) -> None:
+    [held] = schedule(env, rendered_clip(env), vyro_mrbeast=campaign(brief_verified=False))
+    env.conn.execute("UPDATE posts SET attempts = 2 WHERE id = ?", (held.id,))
+
+    result = recheck_held(
+        env.conn,
+        [account()],
+        {"vyro_mrbeast": campaign()},
+        NOW,
+        media_root=env.media_root,
+        is_sensitive=NOT_SENSITIVE,
+    )
+
+    [released] = result.released
+    assert released.attempts == 0
+
+
+def test_reapproving_a_clip_with_held_posts_says_how_to_release_them(env: Env) -> None:
+    client = logged_in(env, accounts=[account()], campaigns={"vyro_mrbeast": campaign()})
+    clip_id = rendered_clip(env, seconds=12, status="pending_review")
+    headers = {"X-CSRF-Token": client.csrf, "HX-Request": "true"}  # type: ignore[attr-defined]
+    client.post(f"/clip/{clip_id}/approve", data={"version": "1"}, headers=headers)
+    client.get("/queue")  # consume the first flash
+    env.conn.execute("UPDATE clips SET status = 'pending_review' WHERE id = ?", (clip_id,))
+
+    client.post(f"/clip/{clip_id}/approve", data={"version": "1"}, headers=headers)
+
+    assert "clipper posts recheck" in client.get("/queue").text
+
+
+# --- config reload ----------------------------------------------------------------------
+
+
+def test_posting_config_reloads_when_a_file_changes(tmp_path: Path) -> None:
+    config = write_configs(tmp_path, verified=False)
+    live = PostingConfig(config)
+    _, first = live.current()
+    assert not first["vyro_mrbeast"].brief_verified
+
+    campaigns_file = tmp_path / "campaigns.yaml"
+    campaigns_file.write_text(CAMPAIGNS.format(verified="true"))
+    stamp = campaigns_file.stat().st_mtime_ns + 1_000_000_000
+    os.utime(campaigns_file, ns=(stamp, stamp))
+    _, second = live.current()
+
+    assert second["vyro_mrbeast"].brief_verified
+
+
+def test_posting_config_error_holds_rather_than_publishing(env: Env, tmp_path: Path) -> None:
+    config = write_configs(tmp_path, verified=True)
+    [post] = schedule(env, rendered_clip(env))
+    guard = publish_guard(env.conn, PostingConfig(config), env.media_root)
+    (tmp_path / "campaigns.yaml").write_text("campaigns: [oops")
+    stamp = (tmp_path / "campaigns.yaml").stat().st_mtime_ns + 1_000_000_000
+    os.utime(tmp_path / "campaigns.yaml", ns=(stamp, stamp))
+
+    reason = guard(post)
+
+    assert reason is not None and "config" in reason

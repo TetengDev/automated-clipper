@@ -209,7 +209,7 @@ def test_disclosure_like_tags_are_rejected_in_variants(tag):
     assert clean_hashtags(["#mrbeast", tag]) == ["#mrbeast"]
 
 
-@pytest.mark.parametrize("tag", ["#adventure", "#address", "#paidoff", "#partners", "#giftwrap"])
+@pytest.mark.parametrize("tag", ["#adventure", "#address", "#paidoff", "#giftwrap"])
 def test_ordinary_tags_that_share_a_prefix_are_kept(tag):
     assert variant(hashtags=["#mrbeast", tag, "#island"]).hashtags[1] == tag
 
@@ -315,11 +315,26 @@ def test_review_spoken_dots_and_line_breaks_are_not_links(text):
         "#partnerships",
         "#advertising",
         "#promoted",
-        "#promotion",
         "#ambassador",
         "#brandambassador",
         "#affiliate",
-        "#collaboration",
+        "#affiliatelink",
+        "#collabwith",
+        "#paidpost",
+        "#paidcollab",
+        "#paidcontent",
+        "#partners",
+        "#partnerwith",
+        "#promos",
+        "#promocode",
+        "#sponser",
+        "#sponserd",
+        "#spons",
+        "#branddeal",
+        "#brand_deal",
+        "#adsponsor",
+        "#pr",
+        "#prgift",
     ],
 )
 def test_review_disclosure_variants_are_rejected(tag):
@@ -327,7 +342,22 @@ def test_review_disclosure_variants_are_rejected(tag):
         variant(hashtags=["#mrbeast", tag, "#island"])
 
 
-@pytest.mark.parametrize("tag", ["#giftedkids", "#a1", "#adventure2024", "#promqueen"])
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "#giftedkids",
+        "#a1",
+        "#adventure2024",
+        "#promqueen",
+        "#sp500",
+        "#collaboration",
+        "#promotion",
+        "#affiliatemarketing",
+        "#paidoff",
+        "#partnersincrime",
+        "#product",
+    ],
+)
 def test_review_ordinary_tags_stay_usable(tag):
     assert variant(hashtags=["#mrbeast", tag, "#island"]).hashtags[1] == tag
 
@@ -377,7 +407,44 @@ def test_review_an_allowed_mention_matches_case_and_fullwidth_forms():
     assert preflight(post("thanks @MRBEAST"), "tiktok", 35.0, brief) == []
 
 
-@pytest.mark.parametrize("unit", ["a-", "a.", "a1.", "a ", "a[", "a d0t "])
+@pytest.mark.parametrize(
+    "text", ["visit .evil.com", "wait...prize.com", "-evil.com", "see (evil.com)"]
+)
+def test_review_a_domain_after_a_dot_or_bracket_is_flagged(text):
+    assert links_or_mentions(text), text
+
+
+@pytest.mark.parametrize("handle", ["@vyro.official", "@vyro.1", "@vyro._x", "@vyro.a", "@vyro-x"])
+def test_review_a_longer_handle_is_not_an_allowed_mention(handle):
+    brief = Brief(name="vyro", allowed_mentions=["vyro"])
+    problems = preflight(post(f"follow {handle} now"), "tiktok", 35.0, brief)
+    assert any(handle in p for p in problems), handle
+    assert preflight(post("follow @vyro. now"), "tiktok", 35.0, brief) == []
+
+
+def test_review_a_dotted_handle_can_be_allowed():
+    brief = Brief(name="vyro", allowed_mentions=["@vyro.official"])
+    assert preflight(post("follow @vyro.official"), "tiktok", 35.0, brief) == []
+
+
+@pytest.mark.parametrize("text", ["https://vyr̸o.app", "vyr̸o.app", "https://v᪰yro.app"])
+def test_review_a_combining_mark_inside_an_allowed_host_is_not_allowed(text):
+    brief = Brief(name="vyro", allowed_links=["vyro.app"])
+    problems = preflight(post(text), "tiktok", 35.0, brief)
+    assert any("links or mentions" in p for p in problems), text
+
+
+def test_review_an_allowed_host_with_a_file_path_passes():
+    brief = Brief(name="vyro", allowed_links=["https://vyro.app/download.html"])
+    assert preflight(post("get https://vyro.app/download.html"), "tiktok", 35.0, brief) == []
+    assert preflight(post("ｖyro.app"), "tiktok", 35.0, brief) == []
+    assert any(
+        "links or mentions" in p
+        for p in preflight(post("https://vyro.app/go/evil.com"), "tiktok", 35.0, brief)
+    )
+
+
+@pytest.mark.parametrize("unit", ["a-", "a.", "a1.", "a ", "a[", "a d0t ", "...a", "@a."])
 def test_review_link_detection_is_linear_on_long_hostile_text(unit):
     text = unit * 10_000
     start = time.perf_counter()

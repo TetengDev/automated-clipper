@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from clipper.config import AppConfig
 from clipper.jobs.models import TERMINAL, Clock, Job, JobStatus, utcnow
@@ -50,6 +50,8 @@ from clipper.redact import redact
 
 DEFAULT_MEDIA_ROOT = Path("data/media")
 DEFAULT_POLL_SECONDS = 5.0
+INTERRUPT_JOIN_SECONDS = 10.0
+"""How long an interrupted loop waits for the posting thread before giving up on it."""
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +59,17 @@ logger = logging.getLogger(__name__)
 class PeriodicPass(Protocol):
     """Work the loop runs once per poll besides the job stages (CLP-92's posting stage).
 
-    It runs on its own thread, so it must not share the worker's connection. It may also
-    implement `recover(dead_worker_id: str) -> int`, which `Worker.recover` calls.
+    It runs on its own thread, so it must not share the worker's connection.
     """
 
     def run_once(self) -> int: ...
+
+
+@runtime_checkable
+class RecoverablePass(PeriodicPass, Protocol):
+    """A periodic pass that can also release a dead worker's claims (`Worker.recover`)."""
+
+    def recover(self, dead_worker_id: str) -> int: ...
 
 
 def default_worker_id() -> str:
@@ -80,6 +88,12 @@ class Worker:
     posting: PeriodicPass | None = None
     """Posting pass (`clipper.posting.stage.PostingStage`), run once per poll on its own
     thread by `run_forever`."""
+    _posting_thread: threading.Thread | None = field(default=None, init=False, repr=False)
+
+    @property
+    def posting_running(self) -> bool:
+        """Whether the posting thread is still running (its connection is in use)."""
+        return self._posting_thread is not None and self._posting_thread.is_alive()
 
     def recover(self, dead_worker_id: str) -> int:
         """Release claims of a worker known to be dead, without waiting for lease expiry.
@@ -87,9 +101,8 @@ class Worker:
         uploads too (its own count is logged)."""
         released = release_claims(self.conn, dead_worker_id, self.clock())
         logger.info("released %d job(s) claimed by %s", released, dead_worker_id)
-        recover_posts = getattr(self.posting, "recover", None)
-        if callable(recover_posts):
-            recover_posts(dead_worker_id)
+        if isinstance(self.posting, RecoverablePass):
+            self.posting.recover(dead_worker_id)
         return released
 
     def run_once(self) -> bool:
@@ -176,17 +189,10 @@ class Worker:
         """
         unhandled = [s.value for s in JobStatus if s not in self.stages and s not in TERMINAL]
         logger.info("worker %s started; not handling: %s", self.worker_id, ", ".join(unhandled))
-        posting: threading.Thread | None = None
-        if self.posting is not None:
-            posting = threading.Thread(
-                target=self._posting_loop,
-                args=(self.posting, stop_event, poll_seconds),
-                name="posting",
-                daemon=True,  # an interrupted process must not hang on an upload
-            )
-            posting.start()
+        self._start_posting(stop_event, poll_seconds)
         try:
             while not stop_event.is_set():
+                self._check_posting(stop_event, poll_seconds)
                 try:
                     busy = self.run_once()
                 except Exception:
@@ -195,10 +201,35 @@ class Worker:
                 if not busy:
                     stop_event.wait(poll_seconds)
         except BaseException:
-            stop_event.set()  # interrupted: let the posting thread wind down, do not wait
+            # Interrupted: stop the posting thread, but wait only briefly for it.
+            stop_event.set()
+            if self._posting_thread is not None:
+                self._posting_thread.join(INTERRUPT_JOIN_SECONDS)
             raise
-        if posting is not None:
-            posting.join()
+        if self._posting_thread is not None:
+            if self._posting_thread.is_alive():
+                logger.info("waiting for the posting pass to finish its upload")
+            self._posting_thread.join()
+
+    def _start_posting(self, stop_event: threading.Event, poll_seconds: float) -> None:
+        if self.posting is None:
+            return
+        self._posting_thread = threading.Thread(
+            target=self._posting_loop,
+            args=(self.posting, stop_event, poll_seconds),
+            name="posting",
+            daemon=True,  # an interrupted process must not hang on an upload
+        )
+        self._posting_thread.start()
+
+    def _check_posting(self, stop_event: threading.Event, poll_seconds: float) -> None:
+        """Restart the posting thread if something it did not catch killed it."""
+        if self._posting_thread is None or self._posting_thread.is_alive():
+            return
+        if stop_event.is_set():
+            return
+        logger.error("posting thread died; restarting it")
+        self._start_posting(stop_event, poll_seconds)
 
     @staticmethod
     def _posting_loop(

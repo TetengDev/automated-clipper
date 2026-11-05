@@ -280,6 +280,8 @@ def run_worker(
     once: Annotated[bool, typer.Option(help="Run one stage of one job, then exit.")] = False,
 ) -> None:
     """Process queued jobs through the clip pipeline."""
+    if recover_id is not None and not recover_id.isprintable():
+        _fail("run-worker: --recover-id must not contain control characters")
     app_ctx = _app(ctx)
     try:
         cfg = load_config(app_ctx.config_path)
@@ -303,6 +305,7 @@ def run_worker(
     except (sqlite3.Error, OSError) as exc:
         conn.close()
         _fail(f"cannot open database {db_path}: {exc}")
+    stop = threading.Event()
     # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
     worker.posting = PostingStage(
         conn=posting_conn,
@@ -310,6 +313,7 @@ def run_worker(
         worker_id=worker.worker_id,
         media_root=media_dir,
         connect=lambda: connect(db_path),
+        stop=stop,
     )
     try:
         if recover_id:
@@ -318,13 +322,15 @@ def run_worker(
             if not worker.run_once():
                 typer.echo("no due jobs")
             return
-        stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         worker.run_forever(stop, poll_seconds=poll_seconds)
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
     finally:
-        posting_conn.close()
+        # A posting thread that outlived an interrupt may still be using its connection;
+        # leave that one to process exit rather than close it under the thread.
+        if not worker.posting_running:
+            posting_conn.close()
         conn.close()
 
 

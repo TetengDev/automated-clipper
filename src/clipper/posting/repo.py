@@ -360,22 +360,33 @@ def touch_claim(conn: sqlite3.Connection, post_id: int, worker_id: str, now: dat
     return cur.rowcount == 1
 
 
-def release_uploads(conn: sqlite3.Connection, dead_worker_id: str, now: datetime) -> int:
+def release_uploads(
+    conn: sqlite3.Connection, dead_worker_id: str, now: datetime, *, quiet_for: timedelta
+) -> int:
     """Operator recovery of a known-dead worker (`run-worker --recover-id`): clear the
     `claimed_at` of its `uploading` posts so the next stale pass resolves them through
-    `lookup` at once instead of after `STALE_UPLOAD`. The worker id stays, so a worker
-    wrongly reported dead can still record its result or re-stamp the claim."""
+    `lookup` at once instead of after `STALE_UPLOAD`.
+
+    Only claims not re-stamped for `quiet_for` are released: a live worker's heartbeat
+    keeps its claims fresh, so naming it by mistake never hands its upload to another
+    worker. Once released, the stale pass takes the post over at once."""
     with transaction(conn):
         rows = conn.execute(
-            "SELECT * FROM posts WHERE status = ? AND worker_id = ? AND claimed_at IS NOT NULL",
-            (str(PostStatus.UPLOADING), dead_worker_id),
+            "SELECT * FROM posts WHERE status = ? AND worker_id = ? AND claimed_at <= ?",
+            (str(PostStatus.UPLOADING), dead_worker_id, to_iso(now - quiet_for)),
         ).fetchall()
         released = 0
         for row in rows:
             cur = conn.execute(
                 "UPDATE posts SET claimed_at = NULL, updated_at = ?"
-                " WHERE id = ? AND status = ? AND worker_id = ?",
-                (to_iso(now), row["id"], str(PostStatus.UPLOADING), dead_worker_id),
+                " WHERE id = ? AND status = ? AND worker_id = ? AND claimed_at IS ?",
+                (
+                    to_iso(now),
+                    row["id"],
+                    str(PostStatus.UPLOADING),
+                    dead_worker_id,
+                    row["claimed_at"],
+                ),
             )
             if cur.rowcount == 1:
                 released += 1

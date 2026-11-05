@@ -61,6 +61,11 @@ from clipper.redact import redact
 STALE_UPLOAD = timedelta(minutes=30)
 HEARTBEAT = timedelta(minutes=1)
 """How often a running upload re-stamps its claim; well inside `STALE_UPLOAD`."""
+RECOVER_QUIET = HEARTBEAT * 3
+"""`recover` only releases uploads whose claim has not been re-stamped for this long, so
+naming a live worker by mistake never hands its upload over."""
+HEARTBEAT_BUSY_MS = 2_000
+"""The heartbeat's busy timeout: a missed beat is harmless, a stalled result write is not."""
 MAX_UPLOAD = timedelta(hours=4)
 """The heartbeat stops after this long, so a publish that never returns goes stale."""
 BACKOFF_BASE = timedelta(minutes=5)
@@ -89,11 +94,17 @@ class PostingStage:
     connect: Callable[[], sqlite3.Connection] | None = None
     """Opens a DB connection for the upload heartbeat thread (None: no heartbeat)."""
     heartbeat_seconds: float = HEARTBEAT.total_seconds()
+    stop: threading.Event | None = None
+    """Set on shutdown: the pass finishes the upload in hand but claims no new post."""
     _warned: set[str] = field(default_factory=set, init=False, repr=False)
 
     def recover(self, dead_worker_id: str) -> int:
-        """Hand a known-dead worker's `uploading` posts to the next stale pass now."""
-        released = repo.release_uploads(self.conn, dead_worker_id, self.clock())
+        """Hand a known-dead worker's `uploading` posts to the next stale pass now. Posts
+        whose claim was re-stamped within `RECOVER_QUIET` are left alone: their worker is
+        alive (its heartbeat still runs), whatever the operator believes."""
+        released = repo.release_uploads(
+            self.conn, dead_worker_id, self.clock(), quiet_for=RECOVER_QUIET
+        )
         logger.info("released %d uploading post(s) claimed by %s", released, dead_worker_id)
         return released
 
@@ -104,6 +115,8 @@ class PostingStage:
         # One post at a time (claim, publish, record), so a post never sits claimed while
         # others upload and cannot go stale before it is even tried.
         for _ in range(self.batch):
+            if self.stop is not None and self.stop.is_set():
+                break
             due = repo.claim_due(
                 self.conn,
                 self.clock(),
@@ -145,7 +158,7 @@ class PostingStage:
 
     @contextmanager
     def _heartbeat(self, post: Post) -> Iterator[None]:
-        """Keep `post`'s claim fresh while the body (the upload) runs."""
+        """Keep `post`'s claim fresh while the body (an upload or a lookup) runs."""
         if self.connect is None:
             yield
             return
@@ -163,11 +176,7 @@ class PostingStage:
     def _beat(self, post: Post, done: threading.Event) -> None:
         assert self.connect is not None
         started = self.clock()
-        try:
-            conn = self.connect()
-        except Exception:
-            logger.exception("%s: heartbeat cannot open the database", _label(post))
-            return
+        conn: sqlite3.Connection | None = None
         try:
             while not done.wait(self.heartbeat_seconds):
                 now = self.clock()
@@ -179,13 +188,18 @@ class PostingStage:
                     )
                     return
                 try:
+                    if conn is None:
+                        conn = self.connect()
+                        conn.execute(f"PRAGMA busy_timeout={HEARTBEAT_BUSY_MS:d}")
                     if not repo.touch_claim(conn, post.id, self.worker_id, now):
                         logger.warning("%s: no longer ours; heartbeat stopped", _label(post))
                         return
-                except sqlite3.Error as exc:
+                except (sqlite3.Error, OSError) as exc:
+                    # Retried next beat; the upload itself carries on regardless.
                     logger.warning("%s: heartbeat failed: %s", _label(post), exc)
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def _already_live(self, post: Post, publisher: Publisher) -> bool:
         """Before re-publishing after a failed attempt, ask `lookup` (when there is one)
@@ -195,7 +209,8 @@ class PostingStage:
         if not callable(lookup):
             return False
         try:
-            found = lookup(post.idempotency_key)
+            with self._heartbeat(post):
+                found = lookup(post.idempotency_key)
         except Exception as exc:
             self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
             return True
@@ -223,7 +238,9 @@ class PostingStage:
                 self._give_up(post, UNRESOLVED)
                 continue
             try:
-                found = lookup(post.idempotency_key)
+                # Lookups run one after another: keep the later ones' claims fresh too.
+                with self._heartbeat(post):
+                    found = lookup(post.idempotency_key)
             except Exception as exc:
                 self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
                 continue
@@ -285,9 +302,17 @@ class PostingStage:
         self._alert(failed, error)
 
     def _alert(self, post: Post, error: str) -> None:
+        if error.startswith(UNRESOLVED):
+            # The upload may still be in flight or live: a blind requeue could post twice.
+            advice = (
+                "The upload may have gone through: check the platform before you requeue"
+                f" with `clipper posts retry {post.id}`."
+            )
+        else:
+            advice = f"Requeue with `clipper posts retry {post.id}`."
         message = (
             f"{_label(post)} of clip {post.clip_id} is post_failed after"
-            f" {post.attempts} attempt(s): {error}. Requeue with `clipper posts retry {post.id}`."
+            f" {post.attempts} attempt(s): {error}. {advice}"
         )
         self._send(message, post)
 

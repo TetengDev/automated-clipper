@@ -126,12 +126,16 @@ class PostingStage:
     def _already_live(self, post: Post, publisher: Publisher) -> bool:
         """Before re-publishing after a failed attempt, ask `lookup` (when there is one)
         whether the earlier attempt went through after all, e.g. it timed out reading the
-        response. True when the post was recorded as posted or handed to a human."""
+        response. True when the post was recorded as posted, deferred (the lookup cannot
+        check right now) or handed to a human."""
         lookup = getattr(publisher, "lookup", None)
         if not callable(lookup):
             return False
         try:
             found = lookup(post.idempotency_key)
+        except PublishDeferred as exc:
+            self._deferred(post, exc)
+            return True
         except Exception as exc:
             self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
             return True
@@ -222,8 +226,9 @@ class PostingStage:
             repo.defer(self.conn, post, self.worker_id, reason, until, now)
         except PostConflict as exc:
             logger.warning("%s: deferral not recorded: %s", _label(post), exc)
-            return
-        logger.warning("%s: deferred to %s: %s", _label(post), until.isoformat(), reason)
+        else:
+            logger.warning("%s: deferred to %s: %s", _label(post), until.isoformat(), reason)
+        # The publisher sends each alert once, so it goes out even if the row changed.
         if deferral.alert:
             self._send(redact(deferral.alert), post)
 

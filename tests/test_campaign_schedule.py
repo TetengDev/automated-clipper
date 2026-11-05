@@ -17,7 +17,7 @@ from clipper.cli import app
 from clipper.edl import parse_edl
 from clipper.posting import repo
 from clipper.posting.models import OPEN_STATUSES, InvalidPostTransition, PostStatus
-from clipper.posting.scheduler import recheck_held, schedule_for_clip
+from clipper.posting.scheduler import publish_problem, recheck_held, schedule_for_clip
 from clipper.posting.stage import PostingStage
 from posting_support import FakeAccount, FakePublisher
 from review_support import Env, login, make_env
@@ -285,7 +285,216 @@ def test_recheck_leaves_posts_of_a_removed_account_held(env: Env) -> None:
     result = recheck_held(env.conn, [], {}, NOW, media_root=env.media_root)
 
     assert result.released == []
-    assert [p.id for p in result.still_held] == [held.id]
+    [still] = result.still_held
+    assert still.id == held.id
+    assert still.error == "account tt_main is no longer configured"
+
+
+def test_recheck_keeps_a_post_held_when_the_account_no_longer_posts_the_creator(
+    env: Env,
+) -> None:
+    schedule(env, rendered_clip(env), vyro_mrbeast=campaign(brief_verified=False))
+
+    result = recheck_held(
+        env.conn,
+        [account(creators=["Kai Cenat"])],
+        {"vyro_mrbeast": campaign()},
+        NOW,
+        media_root=env.media_root,
+    )
+
+    [still] = result.still_held
+    assert still.error == "account tt_main no longer posts MrBeast"
+
+
+def test_recheck_never_releases_a_sensitive_creator(env: Env) -> None:
+    schedule(env, rendered_clip(env), vyro_mrbeast=campaign(brief_verified=False))
+
+    result = recheck_held(
+        env.conn,
+        [account()],
+        {"vyro_mrbeast": campaign()},
+        NOW,
+        media_root=env.media_root,
+        is_sensitive=lambda creator: creator == "MrBeast",
+    )
+
+    [still] = result.still_held
+    assert still.error is not None and "sensitive" in still.error
+
+
+def test_recheck_without_a_free_slot_says_so(env: Env) -> None:
+    schedule(env, rendered_clip(env), vyro_mrbeast=campaign(brief_verified=False))
+    full = account(posts_per_day=1, min_gap_minutes=0)
+    for _ in range(8):  # fill today and the next 7 days
+        schedule(env, rendered_clip(env), full, vyro_mrbeast=campaign())
+
+    result = recheck_held(
+        env.conn, [full], {"vyro_mrbeast": campaign()}, NOW, media_root=env.media_root
+    )
+
+    [still] = result.still_held
+    assert still.error is not None and "no free slot" in still.error
+
+
+def test_recheck_releases_with_the_campaign_that_applies_now(env: Env) -> None:
+    [held] = schedule(env, rendered_clip(env), vyro_mrbeast=campaign(brief_verified=False))
+
+    result = recheck_held(env.conn, [account(campaign=None)], {}, NOW, media_root=env.media_root)
+
+    [released] = result.released
+    assert released.id == held.id and released.campaign_id is None
+    assert "#mrbeast" not in stored_metadata(env, held.id)["hashtags"]
+
+
+def test_recheck_uses_the_clips_current_version(env: Env) -> None:
+    clip_id = rendered_clip(env, seconds=12)
+    [held] = schedule(env, clip_id)
+    # The reviewer re-cut the clip: version 2, long enough, approved again.
+    env.conn.execute(
+        "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption, hashtags,"
+        " video_path, sensitive, created_at)"
+        " SELECT clip_id, 2, start_s, start_s + 30, title, caption, hashtags, video_path,"
+        " sensitive, created_at FROM clip_versions WHERE clip_id = ? AND version = 1",
+        (clip_id,),
+    )
+    env.conn.execute("UPDATE clips SET current_version = 2 WHERE id = ?", (clip_id,))
+
+    result = recheck_held(
+        env.conn, [account()], {"vyro_mrbeast": campaign()}, NOW, media_root=env.media_root
+    )
+
+    [released] = result.released
+    assert released.id == held.id and released.clip_version == 2
+
+
+def test_violation_is_held_even_when_the_account_has_no_free_slot(env: Env) -> None:
+    full = account(posts_per_day=1, min_gap_minutes=0)
+    for _ in range(8):
+        schedule(env, rendered_clip(env), full)
+
+    [post] = schedule(env, rendered_clip(env, seconds=12), full)
+
+    assert post.status == PostStatus.HELD
+    assert post.error is not None and "under the brief's 20 s" in post.error
+
+
+def test_forbidden_keyword_is_held_at_scheduling(env: Env) -> None:
+    brief = campaign(forbidden_keywords=["giveaway"])
+
+    [post] = schedule(env, rendered_clip(env), vyro_mrbeast=brief)
+
+    assert post.status == PostStatus.HELD
+    assert post.error is not None and "forbidden keyword 'giveaway'" in post.error
+
+
+def test_held_post_keeps_its_file_reserved_on_the_platform(env: Env) -> None:
+    # Intended: a held post can be released later, so the same file never goes to a
+    # second account on the platform meanwhile (CLP-92's one-file rule).
+    other = account(id="tt_other", campaign=None)
+
+    posts = schedule(env, rendered_clip(env, seconds=12), account(), other)
+
+    assert [(p.account_id, p.status) for p in posts] == [("tt_main", PostStatus.HELD)]
+
+
+# --- publish-time pre-flight ----------------------------------------------------------------
+
+
+def stage(env: Env, publisher: FakePublisher, accounts: list[FakeAccount], **briefs: Campaign):
+    found = {a.id: a for a in accounts}
+
+    def guard(post):  # type: ignore[no-untyped-def]
+        return publish_problem(env.conn, post, found, briefs, NOW, media_root=env.media_root)
+
+    return PostingStage(
+        env.conn,
+        {"tiktok": publisher},
+        "w1",
+        media_root=env.media_root,
+        clock=lambda: NOW + timedelta(days=30),
+        guard=guard,
+    )
+
+
+def test_publish_holds_a_post_whose_campaign_was_disabled_after_scheduling(env: Env) -> None:
+    [post] = schedule(env, rendered_clip(env))
+    publisher = FakePublisher()
+
+    stage(env, publisher, [account()], vyro_mrbeast=campaign(enabled=False)).run_once()
+
+    assert publisher.calls == []
+    found = repo.get_post(env.conn, post.id)
+    assert found is not None and found.status == PostStatus.HELD
+    assert found.error is not None and "disabled" in found.error
+
+
+def test_publish_holds_a_post_rescheduled_past_the_campaign_end(env: Env) -> None:
+    ends = NOW + timedelta(days=2)
+    [post] = schedule(env, rendered_clip(env), vyro_mrbeast=campaign(ends_at=ends))
+    repo.reschedule(env.conn, post.id, NOW + timedelta(days=5), NOW)
+    publisher = FakePublisher()
+
+    guard_now = NOW + timedelta(days=5)
+    found_accounts = {"tt_main": account()}
+    briefs = {"vyro_mrbeast": campaign(ends_at=ends)}
+    PostingStage(
+        env.conn,
+        {"tiktok": publisher},
+        "w1",
+        media_root=env.media_root,
+        clock=lambda: guard_now,
+        guard=lambda p: publish_problem(
+            env.conn, p, found_accounts, briefs, guard_now, media_root=env.media_root
+        ),
+    ).run_once()
+
+    assert publisher.calls == []
+    found = repo.get_post(env.conn, post.id)
+    assert found is not None and found.status == PostStatus.HELD
+    assert found.error is not None and "ended" in found.error
+
+
+def test_publish_holds_a_post_whose_account_changed_campaign(env: Env) -> None:
+    [post] = schedule(env, rendered_clip(env), account(campaign=None))
+    publisher = FakePublisher()
+
+    stage(env, publisher, [account()], vyro_mrbeast=campaign()).run_once()
+
+    assert publisher.calls == []
+    found = repo.get_post(env.conn, post.id)
+    assert found is not None and found.error is not None and "campaign changed" in found.error
+
+
+def test_publish_passes_a_compliant_post(env: Env) -> None:
+    schedule(env, rendered_clip(env))
+    publisher = FakePublisher()
+
+    stage(env, publisher, [account()], vyro_mrbeast=campaign()).run_once()
+
+    assert len(publisher.calls) == 1
+
+
+def test_a_failing_guard_holds_the_post(env: Env) -> None:
+    [post] = schedule(env, rendered_clip(env))
+    publisher = FakePublisher()
+
+    def broken(_post):  # type: ignore[no-untyped-def]
+        raise RuntimeError("db locked")
+
+    PostingStage(
+        env.conn,
+        {"tiktok": publisher},
+        "w1",
+        media_root=env.media_root,
+        clock=lambda: NOW + timedelta(days=30),
+        guard=broken,
+    ).run_once()
+
+    assert publisher.calls == []
+    found = repo.get_post(env.conn, post.id)
+    assert found is not None and found.status == PostStatus.HELD
+    assert found.error is not None and "publish pre-flight failed" in found.error
 
 
 # --- review app -----------------------------------------------------------------------------

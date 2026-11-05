@@ -438,3 +438,15 @@ def test_render_edl_never_reads_outside_the_media_root(tmp_path: Path) -> None:
 
     assert render_edl(media, "../job/outside.mp4") is None
     assert render_edl(media, None) is None
+
+
+def test_render_edl_survives_a_path_without_a_name(tmp_path: Path) -> None:
+    assert render_edl(tmp_path, ".") is None
+    assert render_edl(tmp_path, "dir/") is None
+
+
+def test_oversized_sidecar_is_not_parsed(tmp_path: Path) -> None:
+    stored = _sidecar(tmp_path, {"source": {"path": "a.mp4", "in_s": 0, "out_s": 5}})
+    (tmp_path / "job" / "clip_v1.json").write_text(" " * 1_000_001 + "{}")
+
+    assert render_edl(tmp_path, stored) is None

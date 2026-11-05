@@ -379,7 +379,19 @@ def test_campaign_over_the_instagram_cap_keeps_every_tag_and_preflight_blocks():
     assert any("at most 5" in p for p in preflight(meta, "instagram", 35.0))
 
 
-@pytest.mark.parametrize("tag", ["#\uff46\uff59\uff50", "#FyP", "#ad", "#Sponsored", "#partner"])
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "#\uff46\uff59\uff50",
+        "#FyP",
+        "#ad",
+        "#Sponsored",
+        "#partner",
+        "#ad\u02bc",  # a neutral apostrophe does not hide #ad (CLP-103)
+        "#fyp\u02bb",
+        "#\u02bead\u02bf",
+    ],
+)
 def test_lookalike_generic_and_disclosure_tags_are_rejected(tag):
     with pytest.raises(ValidationError):
         variant(hashtags=["#mrbeast", tag, "#island"])
@@ -479,6 +491,11 @@ MIXED_SCRIPT = [
     "#fypˈ",  # modifier stress mark
     "#ad〱",  # kana repeat mark with no kana
     "#fypー",  # prolonged sound mark with no kana
+    "#pr၀m၀一",  # a CJK character does not excuse a lookalike zero
+    "#sp〇ns〇red一",
+    # Cost of the rule above: the kanji zero next to Latin is rejected too, since it
+    # cannot be told apart from #sp〇ns〇red一.
+    "#iPhone二〇二四",
 ]
 SINGLE_SCRIPT = [
     "#Москва",  # Russian
@@ -493,10 +510,10 @@ SINGLE_SCRIPT = [
     "#пʼять",  # Ukrainian with the modifier-letter apostrophe
     "#ひ〱",  # Hiragana with the vertical kana repeat mark
     "#東京2024",  # digits belong to no script
-    "#iPhone二〇二四",  # 〇 is the ordinary kanji zero next to Han
+    "#東京〇",  # the kanji zero with no Latin letters
     "#Москва_2024",
 ]
-LATIN = ["#Pilipinas", "#niño", "#mañana2024", "#tara_na", "#mrbeast2", "#Hawaiʻi"]
+LATIN = ["#Pilipinas", "#niño", "#mañana2024", "#tara_na", "#mrbeast2", "#Hawaiʻi", "#Qurʾan"]
 
 
 @pytest.mark.parametrize("tag", MIXED_SCRIPT)

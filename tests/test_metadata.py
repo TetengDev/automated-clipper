@@ -493,6 +493,7 @@ SINGLE_SCRIPT = [
     "#пʼять",  # Ukrainian with the modifier-letter apostrophe
     "#ひ〱",  # Hiragana with the vertical kana repeat mark
     "#東京2024",  # digits belong to no script
+    "#iPhone二〇二四",  # 〇 is the ordinary kanji zero next to Han
     "#Москва_2024",
 ]
 LATIN = ["#Pilipinas", "#niño", "#mañana2024", "#tara_na", "#mrbeast2", "#Hawaiʻi"]

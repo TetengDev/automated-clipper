@@ -217,6 +217,10 @@ How it posts:
   posts are pushed back an hour at a time without counting attempts, and one alert goes
   out. Put a new refresh token in `.env` and restart the worker
   (`docker compose up -d worker`). Posting resumes on the next pass.
+- Posts for a YouTube account that is set to `enabled: false`, or that is no longer in
+  `accounts.yaml`, are also pushed back an hour at a time, with one alert. When no
+  YouTube account is enabled at all, the worker registers no YouTube publisher, and those
+  posts stay `scheduled`. Cancel them (`clipper posts cancel`) or enable the account again.
 
 ### One-time setup (the owner)
 
@@ -229,7 +233,10 @@ How it posts:
      verification.
    - Under *Data access*, add the scopes `https://www.googleapis.com/auth/youtube.upload`
      (upload) and `https://www.googleapis.com/auth/youtube.readonly` (the duplicate-upload
-     check lists the channel's recent uploads).
+     check lists the channel's recent uploads). `youtube.readonly` can read the whole
+     account, including private videos and playlists. It is the narrowest scope that lets
+     the worker list its own uploads, and without it a timed-out upload could be posted
+     twice.
    - Under *Audience*, click **Publish app** to move it from *Testing* to **In
      production**. A *Testing* app's refresh tokens expire after 7 days, and the accounts
      would then pause every week. A production app that is not yet verified still works
@@ -260,10 +267,18 @@ How it posts:
       CLIPPER_REFRESH_TOKEN_MRBEAST_CLIPS_YT=1//0g...
       ```
 
-   5. Under the gear icon, remove your client credentials from the Playground. Run
-      `clipper check-config`: the account should show `refresh_token=set`. Then restart
-      the worker.
-   An access token is not needed: the worker mints its own.
+   5. Under the gear icon, remove your client credentials from the Playground and close
+      the tab. The refresh token was on that page, so clear the browser history for it.
+   6. After the last account has its token, go back to the OAuth client and **delete the
+      Playground redirect URI**. Refresh tokens keep working without it. While it is
+      registered, anyone who gets hold of the client secret could use the Playground to
+      show this app's consent screen to a channel owner and collect a token. Add it again
+      only for the next re-authorisation.
+   7. Run `clipper check-config`: the account should show `refresh_token=set`. Then
+      restart the worker.
+
+   An access token is not needed: the worker mints its own. A changed OAuth client id or
+   secret also needs a worker restart.
 5. **Verification, in parallel.** In *Google Auth Platform → Verification centre*,
    submit the app for verification of the sensitive scopes above. You need the home page
    and privacy policy on a domain you verified in Search Console, a written reason for

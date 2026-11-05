@@ -72,7 +72,7 @@ MAX_UPLOAD = timedelta(hours=4)
 BACKOFF_BASE = timedelta(minutes=5)
 UNRESOLVED = "uploading state unresolved"
 DEFAULT_BATCH = 10
-MAX_STALE_PER_PASS = 50
+MAX_STALE_PER_PASS = DEFAULT_BATCH
 """Stale posts resolved per pass at most; the rest wait for the next pass."""
 
 logger = logging.getLogger(__name__)
@@ -244,6 +244,8 @@ class PostingStage:
         handled = 0
         # One at a time, like due posts: one waiting behind a slow lookup is not claimed.
         for _ in range(MAX_STALE_PER_PASS):
+            if self.stop is not None and self.stop.is_set():
+                break
             stale = repo.claim_stale(
                 self.conn,
                 self.clock(),

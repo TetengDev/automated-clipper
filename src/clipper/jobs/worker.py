@@ -101,6 +101,7 @@ class Worker:
     _posting_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _posting_restarts: int = field(default=0, init=False, repr=False)
     _posting_restart_at: float | None = field(default=None, init=False, repr=False)
+    _posting_started: float = field(default=0.0, init=False, repr=False)
 
     @property
     def posting_running(self) -> bool:
@@ -220,7 +221,7 @@ class Worker:
             raise
         if self._posting_thread is not None:
             if self._posting_thread.is_alive():
-                logger.info("waiting for the posting pass to finish its upload")
+                logger.info("waiting for the posting pass to stop")
             self._posting_thread.join()
 
     def _start_posting(self, stop_event: threading.Event, poll_seconds: float) -> None:
@@ -235,17 +236,21 @@ class Worker:
             daemon=True,  # an interrupted process must not hang on an upload
         )
         self._posting_thread.start()
+        self._posting_started = time.monotonic()
 
     def _check_posting(self, stop_event: threading.Event, poll_seconds: float) -> None:
         """Restart the posting thread if an exit it does not catch ended it, after a
         backoff that doubles per restart (capped), so a pass that keeps dying cannot spin."""
+        now = time.monotonic()
         if self._posting_thread is None or self._posting_thread.is_alive():
+            if self._posting_restarts and now - self._posting_started > MAX_RESTART_DELAY_SECONDS:
+                self._posting_restarts = 0  # healthy for a while: next death restarts fast
             return
         if stop_event.is_set():
             return
-        now = time.monotonic()
         if self._posting_restart_at is None:
-            delay = min(MAX_RESTART_DELAY_SECONDS, poll_seconds * 2**self._posting_restarts)
+            exponent = min(self._posting_restarts, 16)
+            delay = min(MAX_RESTART_DELAY_SECONDS, poll_seconds * 2**exponent)
             logger.error("posting thread died; restarting it in %.1fs", delay)
             self._posting_restart_at = now + delay
         if now < self._posting_restart_at:

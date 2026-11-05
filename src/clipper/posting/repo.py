@@ -380,7 +380,8 @@ def release_uploads(
     belong to a live worker named by mistake, so it is only shortened: set to go stale
     `quiet_for` from `now` instead of `stale_after` from its last beat. A live worker's
     next heartbeat re-stamps it, so its upload is never handed over; a dead one's goes
-    stale minutes after the restart. Each change is compare-and-swap on `claimed_at`."""
+    stale minutes after the restart. Each change is compare-and-swap on `claimed_at`.
+    The protection relies on the heartbeat: a worker run without one looks quiet."""
     quiet_since = to_iso(now - quiet_for)
     shortened_to = to_iso(now - stale_after + quiet_for)
     released = shortened = 0
@@ -391,8 +392,6 @@ def release_uploads(
         ).fetchall()
         for row in rows:
             quiet = row["claimed_at"] <= quiet_since
-            if not quiet and row["claimed_at"] <= shortened_to:
-                continue  # already due to go stale sooner than a shortening would make it
             cur = conn.execute(
                 "UPDATE posts SET claimed_at = ?, updated_at = ?"
                 " WHERE id = ? AND status = ? AND worker_id = ? AND claimed_at IS ?",

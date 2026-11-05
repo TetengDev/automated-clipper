@@ -15,7 +15,13 @@ import pytest
 from clipper.config import AppConfig
 from clipper.jobs import Worker
 from clipper.posting import repo
-from clipper.posting.models import MAX_ATTEMPTS, Post, PostStatus, PublishResult
+from clipper.posting.models import (
+    MAX_ATTEMPTS,
+    Post,
+    PostStatus,
+    PublishDeferred,
+    PublishResult,
+)
 from clipper.posting.stage import BACKOFF_BASE, STALE_UPLOAD, PostingStage
 from posting_support import FakePublisher, LookupPublisher
 from review_support import Env, make_env
@@ -551,3 +557,77 @@ def test_a_failing_alert_is_logged_not_raised(
 
     assert status(env, post.id) == PostStatus.POST_FAILED
     assert "alert failed" in caplog.text
+
+
+# --- deferral (CLP-93) -------------------------------------------------------------------
+
+
+@dataclass
+class DeferringPublisher:
+    """Defers every publish (a quota error or a paused account), optionally alerting."""
+
+    until: datetime
+    alert: str | None = None
+    calls: int = 0
+
+    def publish(self, post: Post, video_path: Path, metadata: object) -> PublishResult:
+        self.calls += 1
+        raise PublishDeferred("quotaExceeded: daily quota used up", self.until, alert=self.alert)
+
+
+def test_a_deferred_publish_reschedules_without_counting_an_attempt(env: Env, clock: Clock) -> None:
+    post = make_post(env, platform="youtube", account="yt_main")
+    until = T0 + timedelta(hours=7)
+    alerts: list[str] = []
+
+    stage(env, clock, {"youtube": DeferringPublisher(until)}, alert=alerts.append).run_once()
+
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None
+    assert deferred.status == PostStatus.SCHEDULED
+    assert deferred.attempts == 0
+    assert deferred.scheduled_at == until
+    assert deferred.worker_id is None and deferred.claimed_at is None
+    assert deferred.error is not None and "quotaExceeded" in deferred.error
+    assert alerts == []
+    actions = [r["action"] for r in env.reviews(post.clip_id)]
+    assert actions == ["post_scheduled", "post_uploading", "post_deferred"]
+
+
+def test_repeated_deferrals_never_fail_the_post(env: Env, clock: Clock) -> None:
+    post = make_post(env, platform="youtube", account="yt_main")
+    publisher = DeferringPublisher(T0)
+    posting = stage(env, clock, {"youtube": publisher}, alert=lambda _: None)
+
+    for _ in range(MAX_ATTEMPTS + 2):
+        publisher.until = clock.now + timedelta(hours=1)
+        posting.run_once()
+        clock.now = publisher.until
+
+    final = repo.get_post(env.conn, post.id)
+    assert final is not None
+    assert publisher.calls == MAX_ATTEMPTS + 2
+    assert final.status == PostStatus.SCHEDULED and final.attempts == 0
+
+
+def test_a_deferral_with_an_alert_sends_it(env: Env, clock: Clock) -> None:
+    make_post(env, platform="youtube", account="yt_main")
+    alerts: list[str] = []
+    publisher = DeferringPublisher(T0 + timedelta(hours=1), alert="yt_main paused: invalid_grant")
+
+    stage(env, clock, {"youtube": publisher}, alert=alerts.append).run_once()
+
+    assert alerts == ["yt_main paused: invalid_grant"]
+
+
+def test_a_deferral_into_the_past_still_moves_the_post_forward(env: Env, clock: Clock) -> None:
+    """A publisher bug must not make the stage spin on one post within a pass."""
+    post = make_post(env, platform="youtube", account="yt_main")
+    publisher = DeferringPublisher(T0 - timedelta(hours=1))
+
+    stage(env, clock, {"youtube": publisher}).run_once()
+
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None
+    assert deferred.scheduled_at > T0
+    assert publisher.calls == 1

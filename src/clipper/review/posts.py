@@ -8,7 +8,9 @@ Same auth and CSRF as the other review routes: the app-wide gate and `csrf_prote
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from typing import Annotated
+from zoneinfo import ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Form, HTTPException, Path, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -22,6 +24,7 @@ from clipper.posting.models import (
     parse_utc,
     reschedule_problem,
 )
+from clipper.posting.scheduler import slot_problems
 from clipper.review.app import flash, render, safe_next_path
 from clipper.review.routes import MAX_ID, ClipId, Conn, User, _action_error, _is_htmx, _now
 
@@ -106,6 +109,7 @@ def reschedule_post(
     problem = reschedule_problem(when, now)
     if problem:
         return _action_error(request, problem, 422)
+    broken = _broken_rules(request, conn, post_id, when)
     result = _apply(
         request,
         post_id,
@@ -114,6 +118,22 @@ def reschedule_post(
     )
     if isinstance(result, Response):
         return result
-    return _done(
-        request, next, f"Post {post_id} rescheduled to {when.strftime('%Y-%m-%d %H:%M')} UTC."
-    )
+    message = f"Post {post_id} rescheduled to {when.strftime('%Y-%m-%d %H:%M')} UTC."
+    if broken:
+        message += f" Breaks the account's rules: {'; '.join(broken)}."
+    return _done(request, next, message)
+
+
+def _broken_rules(request: Request, conn: Conn, post_id: int, when: datetime) -> list[str]:
+    """The account rules the new time breaks (CLP-106), flagged to the reviewer. The
+    reschedule still goes ahead: the reviewer chose the time on purpose."""
+    post = repo.get_post(conn, post_id)
+    accounts = {a.id: a for a in request.app.state.accounts}
+    account = accounts.get(post.account_id) if post is not None else None
+    if post is None or account is None:
+        return []
+    others = repo.account_post_times(conn, account.id, exclude_post_id=post.id)
+    try:
+        return slot_problems(account, others, when)
+    except (ValueError, ZoneInfoNotFoundError):
+        return []

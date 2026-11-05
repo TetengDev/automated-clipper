@@ -381,6 +381,13 @@ def load_accounts(path: Path, creators: AppConfig) -> AccountsConfig:
     return AccountsConfig(accounts=[_canonical(a, creators) for a in cfg.accounts])
 
 
+def accounts_by_id(config_path: Path, creators: AppConfig) -> dict[str, Account]:
+    """The posting accounts next to `config_path` (or `CLIPPER_ACCOUNTS`) by id, for the
+    posting stage and the posts CLI (CLP-106). No accounts file: none. Raises
+    ConfigError for an invalid one."""
+    return {a.id: a for a in load_accounts(accounts_path(config_path), creators).accounts}
+
+
 def _yaml_problem(exc: yaml.YAMLError) -> str:
     """The parser's problem and position, without PyYAML's quote of the offending line: a
     token pasted into the file by mistake must not end up in the terminal or CI logs."""

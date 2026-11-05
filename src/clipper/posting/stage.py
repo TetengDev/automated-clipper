@@ -31,6 +31,17 @@ CLP-105:
   `uploading` posts to the next stale pass at once.
 * The worker runs this stage on a thread of its own (`Worker.run_forever`), so it needs
   a connection of its own too.
+
+CLP-106 (with the accounts config, `accounts`):
+
+* A failed attempt retries in the account's next free slot at or after the backoff time
+  (`pick_slot`), so retries keep to its windows, gap, posts per day, warm-up and platform
+  cap. With no free slot within `MAX_DAYS_AHEAD` days the post is `post_failed` and alerts.
+* At claim time a due post that would take its account over that local day's limit (its
+  `daily_limit`; the platform cap alone for an account not in the config) is moved to the
+  account's next free slot from the next local day instead (audit `post_deferred`). Posts
+  posted that day and uploads in flight count.
+* Posts of an account missing from the config keep the plain backoff.
 """
 
 from __future__ import annotations
@@ -41,8 +52,9 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from clipper.clips import resolve_media_path
 from clipper.jobs.models import Clock, utcnow
@@ -55,6 +67,14 @@ from clipper.posting.models import (
     PostStatus,
     Publisher,
     PublishResult,
+)
+from clipper.posting.scheduler import (
+    MAX_DAYS_AHEAD,
+    PLATFORM_DAILY_CAPS,
+    AccountLike,
+    daily_limit,
+    day_bounds,
+    pick_slot,
 )
 from clipper.redact import redact
 
@@ -99,6 +119,8 @@ class PostingStage:
     heartbeat_seconds: float = HEARTBEAT.total_seconds()
     stop: threading.Event | None = None
     """Set on shutdown: the pass finishes the upload in hand but claims no new post."""
+    accounts: Mapping[str, AccountLike] = field(default_factory=dict)
+    """Posting accounts by id (CLP-91's config): their slot rules shape retries and caps."""
     _warned: set[str] = field(default_factory=set, init=False, repr=False)
 
     def recover(self, dead_worker_id: str) -> int:
@@ -156,6 +178,8 @@ class PostingStage:
 
     def _publish(self, post: Post) -> None:
         publisher = self.publishers[post.platform]
+        if self._defer_if_over_limit(post):
+            return
         if post.attempts > 0 and self._already_live(post, publisher):
             return
         try:
@@ -295,7 +319,65 @@ class PostingStage:
             return
         logger.info("%s: posted (%s)", _label(post), result.external_id)
 
+    def _defer_if_over_limit(self, post: Post) -> bool:
+        """Claim-time daily cap (CLP-106): a claimed post that would take its account over
+        today's limit goes back to `scheduled` in the account's next free slot from the
+        next local day, through the same `repo.defer` as a publisher's `PublishDeferred`
+        (CLP-93), without counting an attempt. True when it was deferred."""
+        account = self.accounts.get(post.account_id)
+        now = self.clock()
+        try:
+            timezone = account.timezone if account is not None else "UTC"
+            start, end = day_bounds(timezone, now)
+            if account is None:
+                limit = PLATFORM_DAILY_CAPS.get(post.platform)
+            else:
+                limit = daily_limit(account, now.astimezone(ZoneInfo(timezone)).date())
+            if limit is None:
+                return False
+            started = repo.started_between(
+                self.conn, post.account_id, start, end, exclude_post_id=post.id
+            )
+            if started < limit:
+                return False
+            until = end
+            if account is not None:
+                others = repo.account_post_times(self.conn, account.id, exclude_post_id=post.id)
+                until = pick_slot(account, others, end) or end
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            logger.error("account %s: invalid schedule config: %s", post.account_id, exc)
+            return False
+        reason = f"daily limit reached ({started} of {limit} upload(s) today)"
+        try:
+            repo.defer(self.conn, post, self.worker_id, reason, until, now)
+        except PostConflict as exc:
+            logger.warning("%s: deferral not recorded: %s", _label(post), exc)
+            return True
+        logger.warning("%s: %s; deferred to %s", _label(post), reason, until.isoformat())
+        return True
+
+    def _retry_slot(self, post: Post) -> tuple[datetime | None, bool]:
+        """(when to retry, give up?) for a failed attempt that is not the last one: the
+        account's next free slot at or after the backoff time."""
+        attempts = post.attempts + 1
+        if attempts >= MAX_ATTEMPTS:
+            return None, False
+        earliest = self.clock() + BACKOFF_BASE * 2**attempts
+        account = self.accounts.get(post.account_id)
+        if account is None:
+            return earliest, False
+        try:
+            others = repo.account_post_times(self.conn, account.id, exclude_post_id=post.id)
+            slot = pick_slot(account, others, earliest)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            logger.error("account %s: invalid schedule config: %s", account.id, exc)
+            return earliest, False
+        return slot, slot is None
+
     def _failed_attempt(self, post: Post, error: str) -> None:
+        retry_at, no_slot = self._retry_slot(post)
+        if no_slot:
+            error = f"{error}; no free slot for a retry in the next {MAX_DAYS_AHEAD} days"
         try:
             updated = repo.record_failure(
                 self.conn,
@@ -305,6 +387,8 @@ class PostingStage:
                 self.clock(),
                 max_attempts=MAX_ATTEMPTS,
                 backoff=BACKOFF_BASE,
+                retry_at=retry_at,
+                give_up=no_slot,
             )
         except PostConflict as exc:
             logger.warning("%s: failure not recorded: %s", _label(post), exc)

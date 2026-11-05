@@ -77,13 +77,44 @@ def list_posts(
     return [Post.from_row(r) for r in conn.execute(sql, [*params, limit])]
 
 
-def account_post_times(conn: sqlite3.Connection, account_id: str) -> list[datetime]:
-    """When the account's posts are (or were) scheduled; cancelled posts free their slot."""
+def account_post_times(
+    conn: sqlite3.Connection, account_id: str, *, exclude_post_id: int | None = None
+) -> list[datetime]:
+    """When the account's posts are (or were) scheduled; cancelled posts free their slot.
+    `exclude_post_id` leaves out the post being moved (CLP-106)."""
     rows = conn.execute(
-        f"SELECT * FROM posts WHERE account_id = ? AND {_COUNTED}",  # noqa: S608 - constant
-        (account_id,),
+        f"SELECT * FROM posts WHERE account_id = ? AND {_COUNTED} AND id IS NOT ?",  # noqa: S608 - constant
+        (account_id, exclude_post_id),
     )
     return [Post.from_row(r).scheduled_at for r in rows]
+
+
+def started_between(
+    conn: sqlite3.Connection,
+    account_id: str,
+    start: datetime,
+    end: datetime,
+    *,
+    exclude_post_id: int | None = None,
+) -> int:
+    """Uploads the account has made or has in flight in [start, end): posts posted then
+    and posts claimed for upload then (CLP-106's claim-time daily cap)."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM posts WHERE account_id = ? AND id IS NOT ? AND ("
+        " (status = ? AND posted_at >= ? AND posted_at < ?)"
+        " OR (status = ? AND claimed_at >= ? AND claimed_at < ?))",
+        (
+            account_id,
+            exclude_post_id,
+            str(PostStatus.POSTED),
+            to_iso(start),
+            to_iso(end),
+            str(PostStatus.UPLOADING),
+            to_iso(start),
+            to_iso(end),
+        ),
+    ).fetchone()
+    return int(row[0])
 
 
 def has_post(conn: sqlite3.Connection, clip_id: int, account_id: str) -> bool:
@@ -233,8 +264,15 @@ def reschedule(
     )
 
 
-def retry(conn: sqlite3.Connection, post_id: int, now: datetime, *, by: str | None = None) -> Post:
-    """Requeue a `post_failed` post now, with a fresh attempt count."""
+def retry(
+    conn: sqlite3.Connection,
+    post_id: int,
+    now: datetime,
+    *,
+    at: datetime | None = None,
+    by: str | None = None,
+) -> Post:
+    """Requeue a `post_failed` post at `at` (default now), with a fresh attempt count."""
     return _change(
         conn,
         post_id,
@@ -242,7 +280,7 @@ def retry(conn: sqlite3.Connection, post_id: int, now: datetime, *, by: str | No
         now,
         by=by,
         allowed_from=frozenset({PostStatus.POST_FAILED}),
-        scheduled_at=now,
+        scheduled_at=at or now,
         attempts=0,
         error=None,
     )
@@ -452,17 +490,20 @@ def record_failure(
     *,
     max_attempts: int,
     backoff: timedelta,
+    retry_at: datetime | None = None,
+    give_up: bool = False,
 ) -> Post:
-    """Count a failed attempt: back off (`now + backoff * 2**attempts`) or, at
-    `max_attempts`, give up with `post_failed`."""
+    """Count a failed attempt: retry at `retry_at` (CLP-106: the account's next free slot)
+    or else `now + backoff * 2**attempts`; at `max_attempts`, or with `give_up` (no free
+    slot), give up with `post_failed`."""
     with transaction(conn):
         current = _require(conn, post.id)
         attempts = current.attempts + 1
-        if attempts >= max_attempts:
+        if give_up or attempts >= max_attempts:
             target, fields = PostStatus.POST_FAILED, {}
         else:
             target = PostStatus.SCHEDULED
-            fields = {"scheduled_at": now + backoff * 2**attempts}
+            fields = {"scheduled_at": retry_at or now + backoff * 2**attempts}
         _update(
             conn,
             current,
@@ -486,6 +527,34 @@ def record_failure(
             scheduled_at=to_iso(updated.scheduled_at),
         )
     return updated
+
+
+def defer(
+    conn: sqlite3.Connection,
+    post: Post,
+    worker_id: str,
+    reason: str,
+    until: datetime,
+    now: datetime,
+) -> Post:
+    """Put a claimed post back to `scheduled` at `until` without counting an attempt
+    (CLP-93: quota, upload limit or a paused account; CLP-106: the account's day is
+    full). Audited as `post_deferred`. Same as CLP-93's (PR #51)."""
+    with transaction(conn):
+        _update(
+            conn,
+            post,
+            PostStatus.SCHEDULED,
+            now,
+            owner=worker_id,
+            scheduled_at=until,
+            error=reason,
+            worker_id=None,
+            claimed_at=None,
+        )
+        deferred = _require(conn, post.id)
+        _audit(conn, deferred, "post_deferred", now, error=reason, scheduled_at=to_iso(until))
+    return deferred
 
 
 def mark_failed(

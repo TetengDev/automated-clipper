@@ -234,3 +234,39 @@ def test_small_body_passes_through() -> None:
     sent = asyncio.run(_call([b"12345", b"67890"], [(b"content-length", b"10")]))
 
     assert sent[0]["status"] == 200
+
+
+def test_non_http_scopes_pass_through() -> None:
+    from clipper.review.app import _BodySizeLimit
+
+    seen: list[str] = []
+
+    async def inner(scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+        seen.append(scope["type"])
+
+    async def noop(*_args: object) -> None:
+        return None
+
+    limiter = _BodySizeLimit(inner, max_bytes=1)
+    asyncio.run(limiter({"type": "lifespan"}, noop, noop))  # type: ignore[arg-type]
+
+    assert seen == ["lifespan"]
+
+
+def test_overflow_after_the_response_started_is_reraised() -> None:
+    """Too late to answer 413: the error propagates so the server drops the connection."""
+    from clipper.review.app import _BodySizeLimit, _BodyTooLarge
+
+    async def inner(scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await receive()
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"x" * 11, "more_body": False}
+
+    async def send(_message: Message) -> None:
+        return None
+
+    scope = {"type": "http", "method": "POST", "path": "/x", "headers": []}
+    with pytest.raises(_BodyTooLarge):
+        asyncio.run(_BodySizeLimit(inner, max_bytes=10)(scope, receive, send))

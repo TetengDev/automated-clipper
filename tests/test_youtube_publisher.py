@@ -592,10 +592,17 @@ def test_missing_refresh_token_pauses_with_an_alert(
     assert "CLIPPER_REFRESH_TOKEN_YT_MAIN" in caught.value.alert
 
 
+@pytest.mark.parametrize(
+    "client",
+    [
+        OAuthClient(client_id="", client_secret=None),
+        OAuthClient(client_id="123.apps.googleusercontent.com", client_secret=SecretStr("")),
+    ],
+)
 def test_missing_oauth_client_pauses_with_an_alert(
-    clock: Clock, video: Path, google: respx.MockRouter
+    clock: Clock, video: Path, google: respx.MockRouter, client: OAuthClient
 ) -> None:
-    yt = publisher(clock, client=OAuthClient(client_id="", client_secret=None))
+    yt = publisher(clock, client=client)
     with pytest.raises(PublishDeferred) as caught:
         yt.publish(make_post(), video, META)
     assert caught.value.alert is not None
@@ -746,6 +753,7 @@ accounts:
     market: US
     timezone: America/New_York
     creators: [MrBeast]
+    licence: "LIC-TEST-001"
 """
 
 

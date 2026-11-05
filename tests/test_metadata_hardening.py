@@ -444,9 +444,15 @@ def test_review_an_allowed_host_with_a_file_path_passes():
     )
 
 
-@pytest.mark.parametrize("unit", ["a-", "a.", "a1.", "a ", "a[", "a d0t ", "...a", "@a."])
-def test_review_link_detection_is_linear_on_long_hostile_text(unit):
-    text = unit * 10_000
+@pytest.mark.parametrize(
+    ("head", "unit"),
+    [
+        *(("", u) for u in ["a-", "a.", "a1.", "a ", "a[", "a d0t ", "...a", "@a.", "a-.", "-.a"]),
+        ("@", ".-"),
+    ],
+)
+def test_review_link_detection_is_linear_on_long_hostile_text(head, unit):
+    text = head + unit * 10_000
     start = time.perf_counter()
     links_or_mentions(text)
     assert time.perf_counter() - start < 0.5
@@ -465,3 +471,21 @@ def test_review_truncate_words_with_a_space_right_at_the_limit():
     text = EMOJI * 4 + " " + EMOJI * 4  # 8 units, a space, 8 units
     assert truncate_words(text, 8, utf16_len) == EMOJI * 4
     assert truncate_words(text, 0, utf16_len) == ""
+
+
+@pytest.mark.parametrize(
+    ("title", "caption"),
+    [
+        ("get it at https://vyro.app", "mirror https://vyr\u0338o.app"),
+        ("T", "get vyro.app or vyr\u0336o.app"),
+        ("T", "follow @vyro and @vyr\u0338o"),
+    ],
+)
+def test_review_one_clean_copy_does_not_approve_a_lookalike(title, caption):
+    brief = Brief(name="vyro", allowed_links=["vyro.app"], allowed_mentions=["vyro"])
+    problems = preflight(post(caption, title=title), "tiktok", 35.0, brief)
+    assert any("links or mentions" in p for p in problems)
+
+
+def test_review_x_hyphen_dot_domain_is_flagged():
+    assert links_or_mentions("x-.evil.com")

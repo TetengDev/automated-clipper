@@ -3,6 +3,7 @@ an alert, and never double-post after a crash mid-upload."""
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from collections.abc import Iterator
@@ -15,8 +16,16 @@ import pytest
 from clipper.config import AppConfig
 from clipper.jobs import Worker
 from clipper.posting import repo
-from clipper.posting.models import MAX_ATTEMPTS, Post, PostStatus, PublishResult
-from clipper.posting.stage import BACKOFF_BASE, STALE_UPLOAD, PostingStage
+from clipper.posting.models import (
+    MAX_ATTEMPTS,
+    Post,
+    PostConflict,
+    PostStatus,
+    PublishDeferred,
+    PublishRejected,
+    PublishResult,
+)
+from clipper.posting.stage import BACKOFF_BASE, MIN_DEFER, STALE_UPLOAD, PostingStage
 from posting_support import FakePublisher, LookupPublisher
 from review_support import Env, make_env
 
@@ -108,9 +117,10 @@ def test_due_post_is_published_and_recorded(env: Env, clock: Clock) -> None:
     assert sent.id == post.id and sent.status == PostStatus.UPLOADING
     assert path == (env.media_root / post.video_path).resolve()
     assert meta.title == "Chair falls"
-    assert meta.caption == "He did not see it coming"
+    # The platform's variant (CLP-96), with the hashtag line, as CLP-94 wired it up.
+    assert meta.caption == "He did not see it coming\n\n#funny #fail"
     assert meta.hashtags == ["#funny", "#fail"]
-    assert meta.flags == {}
+    assert meta.flags == {"is_aigc": False, "brand_content_toggle": False}
     done = repo.get_post(env.conn, post.id)
     assert done is not None
     assert done.status == PostStatus.POSTED
@@ -551,3 +561,314 @@ def test_a_failing_alert_is_logged_not_raised(
 
     assert status(env, post.id) == PostStatus.POST_FAILED
     assert "alert failed" in caplog.text
+
+
+# --- deferral (CLP-93) -------------------------------------------------------------------
+
+
+@dataclass
+class DeferringPublisher:
+    """Defers every publish (a quota error or a paused account), optionally alerting."""
+
+    until: datetime
+    alert: str | None = None
+    calls: int = 0
+
+    def publish(self, post: Post, video_path: Path, metadata: object) -> PublishResult:
+        self.calls += 1
+        raise PublishDeferred("quotaExceeded: daily quota used up", self.until, alert=self.alert)
+
+
+def test_a_deferred_publish_reschedules_without_counting_an_attempt(env: Env, clock: Clock) -> None:
+    post = make_post(env, platform="youtube", account="yt_main")
+    until = T0 + timedelta(hours=7)
+    alerts: list[str] = []
+
+    stage(env, clock, {"youtube": DeferringPublisher(until)}, alert=alerts.append).run_once()
+
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None
+    assert deferred.status == PostStatus.SCHEDULED
+    assert deferred.attempts == 0
+    assert deferred.scheduled_at == until
+    assert deferred.worker_id is None and deferred.claimed_at is None
+    assert deferred.error is not None and "quotaExceeded" in deferred.error
+    assert alerts == []
+    actions = [r["action"] for r in env.reviews(post.clip_id)]
+    assert actions == ["post_scheduled", "post_uploading", "post_deferred"]
+
+
+def test_repeated_deferrals_never_fail_the_post(env: Env, clock: Clock) -> None:
+    post = make_post(env, platform="youtube", account="yt_main")
+    publisher = DeferringPublisher(T0)
+    posting = stage(env, clock, {"youtube": publisher}, alert=lambda _: None)
+
+    for _ in range(MAX_ATTEMPTS + 2):
+        publisher.until = clock.now + timedelta(hours=1)
+        posting.run_once()
+        clock.now = publisher.until
+
+    final = repo.get_post(env.conn, post.id)
+    assert final is not None
+    assert publisher.calls == MAX_ATTEMPTS + 2
+    assert final.status == PostStatus.SCHEDULED and final.attempts == 0
+
+
+def test_a_deferral_with_an_alert_sends_it(env: Env, clock: Clock) -> None:
+    make_post(env, platform="youtube", account="yt_main")
+    alerts: list[str] = []
+    publisher = DeferringPublisher(T0 + timedelta(hours=1), alert="yt_main paused: invalid_grant")
+
+    stage(env, clock, {"youtube": publisher}, alert=alerts.append).run_once()
+
+    assert alerts == ["yt_main paused: invalid_grant"]
+
+
+def test_a_deferral_into_the_past_still_moves_the_post_forward(env: Env, clock: Clock) -> None:
+    """A publisher bug must not make the stage spin on one post within a pass."""
+    post = make_post(env, platform="youtube", account="yt_main")
+    publisher = DeferringPublisher(T0 - timedelta(hours=1))
+
+    stage(env, clock, {"youtube": publisher}).run_once()
+
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None
+    assert deferred.scheduled_at > T0
+    assert publisher.calls == 1
+
+
+class DeferringLookup(LookupPublisher):
+    """`lookup` cannot check right now (paused account, quota) and says so."""
+
+    def lookup(self, idempotency_key: str) -> PublishResult | None:
+        self.lookups.append(idempotency_key)
+        raise PublishDeferred("account paused", T0 + timedelta(hours=1))
+
+
+def test_a_deferring_lookup_before_a_retry_defers_without_republishing(
+    env: Env, clock: Clock
+) -> None:
+    post = make_post(env, platform="youtube", account="yt_main")
+    env.conn.execute("UPDATE posts SET attempts = 1 WHERE id = ?", (post.id,))
+    publisher = DeferringLookup()
+
+    stage(env, clock, {"youtube": publisher}, alert=lambda _: None).run_once()
+
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None
+    assert publisher.calls == [] and publisher.lookups == [post.idempotency_key]
+    assert deferred.status == PostStatus.SCHEDULED
+    assert deferred.attempts == 1
+    assert deferred.scheduled_at == T0 + timedelta(hours=1)
+
+
+class AlertingDeferLookup(LookupPublisher):
+    def lookup(self, idempotency_key: str) -> PublishResult | None:
+        raise PublishDeferred("account paused", T0 + timedelta(hours=1), alert="yt_main paused")
+
+
+def test_a_stale_upload_whose_lookup_defers_fails_safely_and_keeps_the_alert(
+    env: Env, clock: Clock
+) -> None:
+    post = make_post(env, platform="youtube", account="yt_main")
+    stuck(env, post, T0 - STALE_UPLOAD - timedelta(minutes=1))
+    alerts: list[str] = []
+    publisher = AlertingDeferLookup()
+
+    stage(env, clock, {"youtube": publisher}, alert=alerts.append).run_once()
+
+    assert publisher.calls == []
+    assert status(env, post.id) == PostStatus.POST_FAILED
+    assert "yt_main paused" in alerts
+    assert len(alerts) == 2
+
+
+def test_a_deferral_alert_is_sent_even_if_the_deferral_cannot_be_recorded(
+    env: Env, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_post(env, platform="youtube", account="yt_main")
+    alerts: list[str] = []
+
+    def conflict(*args: object, **kwargs: object) -> Post:
+        raise PostConflict("changed meanwhile")
+
+    monkeypatch.setattr(repo, "defer", conflict)
+    publisher = DeferringPublisher(T0 + timedelta(hours=1), alert="yt_main paused")
+
+    stage(env, clock, {"youtube": publisher}, alert=alerts.append).run_once()
+
+    assert alerts == ["yt_main paused"]
+
+
+# --- CLP-94: deferral, lead time, platform metadata --------------------------------------
+
+
+@dataclass
+class Deferring:
+    """A publisher that cannot publish now (an expired token, a rate limit)."""
+
+    until: datetime
+    calls: int = 0
+
+    def publish(self, *_: object) -> PublishResult:
+        self.calls += 1
+        raise PublishDeferred("token expired for account tt_main", until=self.until)
+
+
+def test_deferred_post_goes_back_to_scheduled_without_an_attempt(env: Env, clock: Clock) -> None:
+    post = make_post(env)
+    alerts: list[str] = []
+    publisher = Deferring(T0 + timedelta(hours=1))
+
+    stage(env, clock, {"tiktok": publisher}, alert=alerts.append).run_once()
+
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None
+    assert deferred.status == PostStatus.SCHEDULED
+    assert deferred.attempts == 0
+    assert deferred.scheduled_at == T0 + timedelta(hours=1)
+    assert deferred.worker_id is None and deferred.claimed_at is None
+    assert deferred.error == "token expired for account tt_main"
+    assert alerts == []  # the publisher alerts (once per account), not the stage per post
+    assert [r["action"] for r in env.reviews(post.clip_id)][-1] == "post_deferred"
+
+
+def test_deferral_into_the_past_is_clamped_to_just_after_now(env: Env, clock: Clock) -> None:
+    post = make_post(env)
+
+    stage(env, clock, {"tiktok": Deferring(T0 - timedelta(hours=1))}).run_once()
+
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None and deferred.scheduled_at == T0 + MIN_DEFER
+
+
+def test_a_deferred_post_is_not_retried_in_the_same_pass(env: Env, clock: Clock) -> None:
+    make_post(env)
+    publisher = Deferring(T0)
+
+    stage(env, clock, {"tiktok": publisher}).run_once()
+
+    assert publisher.calls == 1
+
+
+def test_lookup_that_defers_does_not_fail_the_post(env: Env, clock: Clock) -> None:
+    post = make_post(env)
+    env.conn.execute("UPDATE posts SET attempts = 1 WHERE id = ?", (post.id,))
+
+    @dataclass
+    class DeferringLookup(FakePublisher):
+        def lookup(self, _: str) -> PublishResult | None:
+            raise PublishDeferred("token expired", until=T0 + timedelta(hours=1))
+
+    publisher = DeferringLookup()
+    stage(env, clock, {"tiktok": publisher}).run_once()
+
+    assert publisher.calls == []
+    updated = repo.get_post(env.conn, post.id)
+    assert updated is not None and updated.status == PostStatus.SCHEDULED
+    assert updated.attempts == 1
+
+
+@dataclass
+class EarlyPublisher(FakePublisher):
+    lead_time: timedelta = timedelta(minutes=30)
+
+
+def test_lead_time_claims_a_first_attempt_early(env: Env, clock: Clock) -> None:
+    early = make_post(env, platform="facebook", account="fb_main", at=T0 + timedelta(minutes=30))
+    later = make_post(env, platform="facebook", account="fb_main", at=T0 + timedelta(minutes=31))
+    publisher = EarlyPublisher()
+
+    assert stage(env, clock, {"facebook": publisher}).run_once() == 1
+
+    assert [sent.id for sent, *_ in publisher.calls] == [early.id]
+    assert status(env, later.id) == PostStatus.SCHEDULED
+
+
+def test_lead_time_does_not_skip_a_retry_backoff(env: Env, clock: Clock) -> None:
+    post = make_post(env, platform="facebook", account="fb_main", at=T0 + timedelta(minutes=10))
+    env.conn.execute("UPDATE posts SET attempts = 1 WHERE id = ?", (post.id,))
+    publisher = EarlyPublisher()
+
+    assert stage(env, clock, {"facebook": publisher}).run_once() == 0
+    assert publisher.calls == []
+
+
+def test_lead_time_of_one_platform_does_not_apply_to_another(env: Env, clock: Clock) -> None:
+    make_post(env, platform="tiktok", at=T0 + timedelta(minutes=5))
+    tiktok, facebook = FakePublisher(), EarlyPublisher()
+
+    stage(env, clock, {"tiktok": tiktok, "facebook": facebook}).run_once()
+
+    assert tiktok.calls == []
+
+
+def test_metadata_is_the_platform_variant(env: Env, clock: Clock) -> None:
+    post = make_post(env, platform="instagram", account="ig_main")
+    tags = ["#one", "#two", "#three", "#four", "#five", "#six"]
+    env.conn.execute(
+        "UPDATE clip_versions SET hashtags = ? WHERE clip_id = ?", (json.dumps(tags), post.clip_id)
+    )
+    publisher = FakePublisher()
+
+    stage(env, clock, {"instagram": publisher}).run_once()
+
+    [(_, _, meta)] = publisher.calls
+    assert meta.hashtags == tags[:5]
+    assert meta.caption == "He did not see it coming\n\n" + " ".join(tags[:5])
+    assert meta.flags == {"is_ai_generated": False, "paid_partnership": False}
+
+
+@dataclass
+class Rejecting(FakePublisher):
+    def publish(self, post: Post, *_: object) -> PublishResult:
+        self.calls.append((post, Path(), None))  # type: ignore[arg-type]
+        raise PublishRejected("instagram: 6 hashtags, at most 5 hashtags allowed")
+
+
+def test_rejected_post_fails_at_once_with_an_alert(env: Env, clock: Clock) -> None:
+    post = make_post(env)
+    alerts: list[str] = []
+
+    stage(env, clock, {"tiktok": Rejecting()}, alert=alerts.append).run_once()
+
+    failed = repo.get_post(env.conn, post.id)
+    assert failed is not None and failed.status == PostStatus.POST_FAILED
+    assert failed.error is not None and "6 hashtags" in failed.error
+    assert len(alerts) == 1
+
+
+def test_a_failed_early_attempt_is_not_retried_before_its_slot(env: Env, clock: Clock) -> None:
+    slot = T0 + timedelta(minutes=30)
+    post = make_post(env, platform="facebook", account="fb_main", at=slot)
+    publisher = EarlyPublisher(fail=1)
+
+    stage(env, clock, {"facebook": publisher}).run_once()
+
+    retried = repo.get_post(env.conn, post.id)
+    assert retried is not None and retried.status == PostStatus.SCHEDULED
+    assert retried.attempts == 1 and retried.scheduled_at == slot
+    clock.now = slot - timedelta(minutes=1)
+    stage(env, clock, {"facebook": publisher}).run_once()
+    assert len(publisher.calls) == 1  # not before the slot
+    clock.now = slot
+    stage(env, clock, {"facebook": publisher}).run_once()
+    assert len(publisher.calls) == 2
+
+
+def test_a_deferral_clears_the_lead_time(env: Env, clock: Clock) -> None:
+    post = make_post(env, platform="facebook", account="fb_main", at=T0 + timedelta(minutes=20))
+
+    @dataclass
+    class EarlyDeferring(EarlyPublisher):
+        def publish(self, sent: Post, *_: object) -> PublishResult:
+            self.calls.append((sent, Path(), None))  # type: ignore[arg-type]
+            raise PublishDeferred("rate limit", until=T0)
+
+    publisher = EarlyDeferring()
+    stage(env, clock, {"facebook": publisher}).run_once()
+
+    assert len(publisher.calls) == 1
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None
+    assert deferred.scheduled_at == T0 + MIN_DEFER + publisher.lead_time

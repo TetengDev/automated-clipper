@@ -331,6 +331,9 @@ class Secrets(BaseSettings):
     youtube_api_key: SecretStr | None = None
     twitch_client_id: SecretStr | None = None
     twitch_client_secret: SecretStr | None = None
+    # The Google OAuth client the YouTube publisher refreshes account tokens with (CLP-93).
+    youtube_oauth_client_id: SecretStr | None = None
+    youtube_oauth_client_secret: SecretStr | None = None
     anthropic_api_key: SecretStr | None = None
     claude_code_oauth_token: SecretStr | None = None
     groq_api_key: SecretStr | None = None

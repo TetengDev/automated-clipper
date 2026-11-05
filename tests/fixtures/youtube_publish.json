@@ -1,0 +1,160 @@
+{
+  "_comment": "Response bodies in the shape the Google OAuth token endpoint and YouTube Data API v3 return (docs: developers.google.com/youtube/v3/docs/videos/insert, /guides/using_resumable_upload_protocol, /docs/errors; developers.google.com/identity/protocols/oauth2/web-server#offline). Ids and tokens are made up. Used by tests/test_youtube_publisher.py; no test calls Google.",
+  "token": {
+    "access_token": "ya29.a0-recorded-access-token",
+    "expires_in": 3599,
+    "scope": "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly",
+    "token_type": "Bearer"
+  },
+  "token_invalid_grant": {
+    "error": "invalid_grant",
+    "error_description": "Token has been expired or revoked."
+  },
+  "token_invalid_client": {
+    "error": "invalid_client",
+    "error_description": "The OAuth client was not found."
+  },
+  "video_inserted": {
+    "kind": "youtube#video",
+    "etag": "x4Gq3w0Yx1b2Zc3Vd4Ue5Tf6Sg7",
+    "id": "Ks-_Mh1QhMc",
+    "snippet": {
+      "publishedAt": "2027-01-15T01:00:03Z",
+      "channelId": "UCrecordedChannel000000",
+      "title": "Chair falls",
+      "description": "He did not see it coming\n\n#funny #fail",
+      "tags": ["clipper-0123456789abcdef0123456789abcdef"],
+      "categoryId": "24",
+      "liveBroadcastContent": "none"
+    },
+    "status": {
+      "uploadStatus": "uploaded",
+      "privacyStatus": "private",
+      "publishAt": "2027-01-15T03:00:00Z",
+      "license": "youtube",
+      "embeddable": true,
+      "publicStatsViewable": true,
+      "selfDeclaredMadeForKids": false,
+      "containsSyntheticMedia": false
+    }
+  },
+  "error_quota_exceeded": {
+    "error": {
+      "code": 403,
+      "message": "The request cannot be completed because you have exceeded your <a href=\"/youtube/v3/getting-started#quota\">quota</a>.",
+      "errors": [
+        {
+          "message": "The request cannot be completed because you have exceeded your <a href=\"/youtube/v3/getting-started#quota\">quota</a>.",
+          "domain": "youtube.quota",
+          "reason": "quotaExceeded"
+        }
+      ]
+    }
+  },
+  "error_upload_limit_exceeded": {
+    "error": {
+      "code": 400,
+      "message": "The user has exceeded the number of videos they may upload.",
+      "errors": [
+        {
+          "message": "The user has exceeded the number of videos they may upload.",
+          "domain": "youtube.video",
+          "reason": "uploadLimitExceeded"
+        }
+      ]
+    }
+  },
+  "error_rate_limit_exceeded": {
+    "error": {
+      "code": 403,
+      "message": "The request cannot be completed because you have exceeded your rate limit.",
+      "errors": [
+        {
+          "message": "The request cannot be completed because you have exceeded your rate limit.",
+          "domain": "youtube.quota",
+          "reason": "rateLimitExceeded"
+        }
+      ]
+    }
+  },
+  "error_invalid_title": {
+    "error": {
+      "code": 400,
+      "message": "The request metadata specifies an invalid video title.",
+      "errors": [
+        {
+          "message": "The request metadata specifies an invalid video title.",
+          "domain": "youtube.video",
+          "reason": "invalidTitle"
+        }
+      ]
+    }
+  },
+  "error_unauthorized": {
+    "error": {
+      "code": 401,
+      "message": "Request had invalid authentication credentials.",
+      "errors": [
+        {
+          "message": "Invalid Credentials",
+          "domain": "global",
+          "reason": "authError",
+          "location": "Authorization",
+          "locationType": "header"
+        }
+      ],
+      "status": "UNAUTHENTICATED"
+    }
+  },
+  "channels_mine": {
+    "kind": "youtube#channelListResponse",
+    "etag": "c1",
+    "pageInfo": {"totalResults": 1, "resultsPerPage": 5},
+    "items": [
+      {
+        "kind": "youtube#channel",
+        "etag": "c2",
+        "id": "UCrecordedChannel000000",
+        "contentDetails": {"relatedPlaylists": {"likes": "", "uploads": "UUrecordedChannel000000"}}
+      }
+    ]
+  },
+  "playlist_items": {
+    "kind": "youtube#playlistItemListResponse",
+    "etag": "p1",
+    "pageInfo": {"totalResults": 2, "resultsPerPage": 50},
+    "items": [
+      {
+        "kind": "youtube#playlistItem",
+        "etag": "p2",
+        "id": "UExp1",
+        "contentDetails": {"videoId": "Ks-_Mh1QhMc", "videoPublishedAt": "2027-01-15T03:00:00Z"}
+      },
+      {
+        "kind": "youtube#playlistItem",
+        "etag": "p3",
+        "id": "UExp2",
+        "contentDetails": {"videoId": "Older000001"}
+      }
+    ]
+  },
+  "videos_list": {
+    "kind": "youtube#videoListResponse",
+    "etag": "v1",
+    "pageInfo": {"totalResults": 2, "resultsPerPage": 2},
+    "items": [
+      {
+        "kind": "youtube#video",
+        "etag": "v2",
+        "id": "Ks-_Mh1QhMc",
+        "snippet": {"title": "Chair falls", "tags": ["clipper-0123456789abcdef0123456789abcdef"]}
+      },
+      {
+        "kind": "youtube#video",
+        "etag": "v3",
+        "id": "Older000001",
+        "snippet": {"title": "Older clip"}
+      }
+    ]
+  }
+}

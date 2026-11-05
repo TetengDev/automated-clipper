@@ -41,6 +41,8 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "YOUTUBE_API_KEY",
         "TWITCH_CLIENT_ID",
         "TWITCH_CLIENT_SECRET",
+        "YOUTUBE_OAUTH_CLIENT_ID",
+        "YOUTUBE_OAUTH_CLIENT_SECRET",
         "ANTHROPIC_API_KEY",
         "GROQ_API_KEY",
         "DISCORD_WEBHOOK_URL",

@@ -111,11 +111,14 @@ class Post:
     @property
     def safe_url(self) -> str | None:
         """The post's URL if it is plain https (it comes from a platform API), else None,
-        so a template never links a `javascript:` or other odd scheme."""
-        if not self.url:
+        so a template never links a `javascript:` or other odd scheme. A backslash,
+        userinfo or port is refused too: browsers may resolve those to another host."""
+        if not self.url or "\\" in self.url:
             return None
         parts = urlsplit(self.url)
-        return self.url if parts.scheme == "https" and parts.netloc else None
+        if parts.scheme != "https" or not parts.hostname or parts.netloc != parts.hostname:
+            return None
+        return self.url
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Post:
@@ -158,6 +161,28 @@ class PublishResult:
     url: str | None = None
 
 
+class PublishRejected(Exception):  # noqa: N818 - an outcome, not an error
+    """Raised by `Publisher.publish` when the post can never go out as it is: a disclosure
+    the platform API cannot set, a caption over the platform's limits (CLP-94). The
+    posting stage marks it `post_failed` and alerts at once, without retrying."""
+
+
+class PublishDeferred(Exception):  # noqa: N818 - an outcome, not an error
+    """Raised by `Publisher.publish` when the post cannot go out now for a reason that is
+    not the post's fault: a platform quota or upload limit, or a paused account (CLP-93).
+
+    The posting stage moves the post back to `scheduled` at `until` without counting an
+    attempt, and sends `alert` (when set) to a human. `reason` is stored as the post's
+    error and must not contain secrets.
+    """
+
+    def __init__(self, reason: str, until: datetime, *, alert: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.until = until
+        self.alert = alert
+
+
 @runtime_checkable
 class Publisher(Protocol):
     """A platform publisher (CLP-93/94/95), registered per platform in the posting stage.
@@ -170,6 +195,17 @@ class Publisher(Protocol):
     post a crashed worker left `uploading`, so an upload that did go through is recorded
     instead of posted twice. Without `lookup` a crashed upload becomes `post_failed`
     ("uploading state unresolved") for a human to check.
+
+    `publish` may raise `PublishDeferred` to reschedule the post without counting an
+    attempt (quota, upload limit, paused account).
+
+    Also optional, read with getattr (CLP-94):
+
+    * `publish` may raise `PublishRejected`: the post is `post_failed` at once (no retry).
+    * `lead_time: timedelta`: a post's first attempt is claimed this long before its
+      `scheduled_at`, for a platform that publishes natively at a given time (Facebook's
+      `scheduled_publish_time`). Retries still wait for their backoff, and never come
+      before the slot.
     """
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult: ...

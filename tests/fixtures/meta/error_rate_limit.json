@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "(#613) Calls to this api have exceeded the rate limit.",
+    "type": "OAuthException",
+    "code": 613,
+    "fbtrace_id": "AbCdEfGh456"
+  }
+}

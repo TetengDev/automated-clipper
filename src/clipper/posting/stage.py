@@ -14,8 +14,15 @@ Each pass (the worker runs one per poll, see `clipper.jobs.worker.Worker.posting
    (`now + BACKOFF_BASE * 2**attempts`); the `MAX_ATTEMPTS`th failure is `post_failed`
    and raises an alert. A successful upload whose result cannot be recorded because the
    post changed meanwhile alerts too (a possible duplicate).
+   A publisher that raises `PublishDeferred` (a quota or upload limit, a paused account;
+   CLP-93) puts the post back to `scheduled` at the given time without counting an
+   attempt, and its alert, if any, goes to a human.
 3. Due posts on a platform with no publisher stay `scheduled`; that is logged once per
    platform per worker run.
+
+A publisher that raises `PublishRejected` (CLP-94) gets the post `post_failed` at once,
+with an alert. A publisher with a `lead_time` gets its posts' first attempts that long
+before `scheduled_at` (Facebook schedules natively).
 
 If recording a successful upload fails (DB error), the post stays `uploading` and step 1
 resolves it later through `lookup`; it is never re-published blindly.
@@ -39,13 +46,16 @@ from clipper.posting.models import (
     Post,
     PostConflict,
     PostStatus,
+    PublishDeferred,
     Publisher,
+    PublishRejected,
     PublishResult,
 )
 from clipper.redact import redact
 
 STALE_UPLOAD = timedelta(minutes=30)
 BACKOFF_BASE = timedelta(minutes=5)
+MIN_DEFER = timedelta(minutes=5)
 UNRESOLVED = "uploading state unresolved"
 DEFAULT_BATCH = 10
 
@@ -74,6 +84,7 @@ class PostingStage:
         """One posting pass; returns how many posts it acted on."""
         handled = self._recover_stale()
         self._warn_unpublishable()
+        early = {p: lead for p, pub in self.publishers.items() if (lead := _lead_time(pub))}
         # One post at a time (claim, publish, record), so a post never sits claimed while
         # others upload and cannot go stale before it is even tried.
         for _ in range(self.batch):
@@ -83,6 +94,7 @@ class PostingStage:
                 self.worker_id,
                 platforms=self.publishers.keys(),
                 limit=1,
+                early=early,
             )
             if not due:
                 break
@@ -108,6 +120,12 @@ class PostingStage:
                 raise FileNotFoundError("rendered video is missing")
             metadata = repo.metadata_for(self.conn, post)
             result = publisher.publish(post, path, metadata)
+        except PublishDeferred as exc:
+            self._deferred(post, exc)
+            return
+        except PublishRejected as exc:
+            self._give_up(post, f"rejected: {_describe(exc)}")
+            return
         except Exception as exc:
             self._failed_attempt(post, _describe(exc))
             return
@@ -118,12 +136,16 @@ class PostingStage:
     def _already_live(self, post: Post, publisher: Publisher) -> bool:
         """Before re-publishing after a failed attempt, ask `lookup` (when there is one)
         whether the earlier attempt went through after all, e.g. it timed out reading the
-        response. True when the post was recorded as posted or handed to a human."""
+        response. True when the post was recorded as posted, deferred (the lookup cannot
+        check right now) or handed to a human."""
         lookup = getattr(publisher, "lookup", None)
         if not callable(lookup):
             return False
         try:
             found = lookup(post.idempotency_key)
+        except PublishDeferred as exc:
+            self._deferred(post, exc)
+            return True
         except Exception as exc:
             self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
             return True
@@ -153,6 +175,11 @@ class PostingStage:
             try:
                 found = lookup(post.idempotency_key)
             except Exception as exc:
+                # Never deferred: a deferred post with no attempts would be re-published
+                # without a lookup. A human checks it; the publisher's alert still goes out.
+                alert = exc.alert if isinstance(exc, PublishDeferred) else None
+                if alert:
+                    self._send(redact(alert), post)
                 self._give_up(post, f"{UNRESOLVED}: lookup failed: {_describe(exc)}")
                 continue
             if found is not None:
@@ -204,6 +231,24 @@ class PostingStage:
                 updated.scheduled_at.isoformat(),
             )
 
+    def _deferred(self, post: Post, deferral: PublishDeferred) -> None:
+        """Reschedule without counting an attempt (CLP-93). Never earlier than
+        `MIN_DEFER` from now, so a bad `until` cannot make a pass spin on one post."""
+        now = self.clock()
+        # Past the publisher's lead time too, or a first attempt is due again at once.
+        lead = _lead_time(self.publishers[post.platform]) or timedelta(0)
+        until = max(deferral.until, now + MIN_DEFER + lead)
+        reason = redact(deferral.reason)
+        try:
+            repo.defer(self.conn, post, self.worker_id, reason, until, now)
+        except PostConflict as exc:
+            logger.warning("%s: deferral not recorded: %s", _label(post), exc)
+        else:
+            logger.warning("%s: deferred to %s: %s", _label(post), until.isoformat(), reason)
+        # The publisher sends each alert once, so it goes out even if the row changed.
+        if deferral.alert:
+            self._send(redact(deferral.alert), post)
+
     def _give_up(self, post: Post, error: str) -> None:
         try:
             failed = repo.mark_failed(self.conn, post, self.worker_id, error, self.clock())
@@ -224,6 +269,11 @@ class PostingStage:
             self.alert(message)
         except Exception:
             logger.exception("%s: alert failed", _label(post))
+
+
+def _lead_time(publisher: Publisher) -> timedelta | None:
+    lead = getattr(publisher, "lead_time", None)
+    return lead if isinstance(lead, timedelta) and lead > timedelta(0) else None
 
 
 def _describe(exc: Exception) -> str:

@@ -13,13 +13,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from datetime import datetime, timedelta
 from typing import Any
 
 from clipper.clips import get_version
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
+from clipper.metadata import build_post_metadata
 from clipper.posting.models import (
     InvalidPostTransition,
     Post,
@@ -280,8 +281,13 @@ def claim_due(
     *,
     platforms: Collection[str],
     limit: int = 10,
+    early: Mapping[str, timedelta] | None = None,
 ) -> list[Post]:
     """Atomically move due `scheduled` posts on `platforms` to `uploading` for this worker.
+
+    `early` maps a platform to a lead time: its posts that were never attempted are due
+    that long before `scheduled_at` (CLP-94: Facebook schedules natively). Retries are
+    due at their backoff time as on every other platform.
 
     BEGIN IMMEDIATE holds the write lock from the read to the update, so two workers can
     never claim the same post.
@@ -290,11 +296,17 @@ def claim_due(
     if not wanted:
         return []
     marks = ", ".join("?" for _ in wanted)
+    due = ["scheduled_at <= ?"]
+    params: list[Any] = [to_iso(now)]
+    for platform, lead in sorted((early or {}).items()):
+        if platform in wanted and lead > timedelta(0):
+            due.append("(platform = ? AND attempts = 0 AND scheduled_at <= ?)")
+            params += [platform, to_iso(now + lead)]
     with transaction(conn):
         rows = conn.execute(
-            f"SELECT * FROM posts WHERE status = ? AND scheduled_at <= ? AND platform IN ({marks})"  # noqa: S608 - placeholders only
-            " ORDER BY scheduled_at, id LIMIT ?",
-            (str(PostStatus.SCHEDULED), to_iso(now), *wanted, limit),
+            f"SELECT * FROM posts WHERE status = ? AND platform IN ({marks})"  # noqa: S608 - placeholders only
+            f" AND ({' OR '.join(due)}) ORDER BY scheduled_at, id LIMIT ?",
+            (str(PostStatus.SCHEDULED), *wanted, *params, limit),
         ).fetchall()
         return [_claim(conn, Post.from_row(r), worker_id, now) for r in rows]
 
@@ -387,7 +399,9 @@ def record_failure(
             target, fields = PostStatus.POST_FAILED, {}
         else:
             target = PostStatus.SCHEDULED
-            fields = {"scheduled_at": now + backoff * 2**attempts}
+            # Never before the slot: a first attempt claimed early (a publisher lead time)
+            # must not be retried, and so published, ahead of the time it was given.
+            fields = {"scheduled_at": max(now + backoff * 2**attempts, current.scheduled_at)}
         _update(
             conn,
             current,
@@ -413,6 +427,33 @@ def record_failure(
     return updated
 
 
+def defer(
+    conn: sqlite3.Connection,
+    post: Post,
+    worker_id: str,
+    reason: str,
+    until: datetime,
+    now: datetime,
+) -> Post:
+    """Put a claimed post back to `scheduled` at `until` without counting an attempt
+    (CLP-93: quota, upload limit or a paused account). Audited as `post_deferred`."""
+    with transaction(conn):
+        _update(
+            conn,
+            post,
+            PostStatus.SCHEDULED,
+            now,
+            owner=worker_id,
+            scheduled_at=until,
+            error=reason,
+            worker_id=None,
+            claimed_at=None,
+        )
+        deferred = _require(conn, post.id)
+        _audit(conn, deferred, "post_deferred", now, error=reason, scheduled_at=to_iso(until))
+    return deferred
+
+
 def mark_failed(
     conn: sqlite3.Connection, post: Post, worker_id: str, error: str, now: datetime
 ) -> Post:
@@ -434,12 +475,21 @@ def mark_failed(
 
 
 def metadata_for(conn: sqlite3.Connection, post: Post) -> PostMetadata:
-    """Title, caption and hashtags of the clip version the post was scheduled with."""
+    """The post's platform variant (CLP-96) of the clip version it was scheduled with: its
+    title, its caption ending with the hashtag line, its hashtags (within the platform's
+    cap, at most 5 on Instagram) and the disclosure flags (CLP-94, part of CLP-111).
+    Campaign tags, the paid-partnership flag (CLP-97) and the EDL's AI flag are not wired
+    in yet; the Meta publishers refuse campaign accounts meanwhile."""
     version = get_version(conn, post.clip_id, post.clip_version)
     if version is None:
         raise LookupError(f"clip {post.clip_id} v{post.clip_version}")
+    if post.platform not in version.variants:
+        return PostMetadata(
+            title=version.title or "",
+            caption=version.caption or "",
+            hashtags=list(version.hashtags),
+        )
+    built = build_post_metadata(version.variants, post.platform)
     return PostMetadata(
-        title=version.title or "",
-        caption=version.caption or "",
-        hashtags=list(version.hashtags),
+        title=built.title, caption=built.caption, hashtags=built.hashtags, flags=built.flags
     )

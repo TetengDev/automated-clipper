@@ -44,26 +44,46 @@ PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
 GENERIC_HASHTAGS = frozenset({"#fyp", "#foryou", "#foryoupage", "#viral", "#trending", "#fy"})
 """Reach tags that say nothing about the clip; rejected in variants, flagged in pre-flight."""
 DISCLOSURE_HASHTAGS = frozenset(
-    {"#ad", "#ads", "#paid", "#partner", "#promo", "#gifted", "#spon", "#sp"}
+    {
+        "#ad",
+        "#ads",
+        "#paid",
+        "#partner",
+        "#partners",
+        "#promo",
+        "#promos",
+        "#gifted",
+        "#spon",
+        "#collab",
+        "#affiliate",
+        "#pr",
+    }
 )
 DISCLOSURE_PREFIXES = (
-    "#sponsor",
+    "#spons",  # sponsored, and the misspelt sponser / sponserd
     "#paidpartner",
     "#paidpromo",
     "#paidad",
+    "#paidpost",
+    "#paidcollab",
+    "#paidcontent",
     "#brandpartner",
     "#brandambassador",
+    "#branddeal",
     "#ambassador",
-    "#affiliate",
+    "#affiliatelink",
     "#partnered",
     "#partnership",
+    "#partnerwith",
     "#adpartner",
     "#adpost",
+    "#adspons",
     "#advert",
     "#promoted",
-    "#promotion",
-    "#collab",
+    "#promocode",
+    "#collabwith",
     "#giftedby",
+    "#prgift",
 )
 """Tags that read as a paid-partnership disclosure, exactly or by prefix (`#sponsoredpost`),
 compared without underscores, trailing digits or digit lookalikes (`#sp0nsored_2024`): only
@@ -72,9 +92,10 @@ _LOOKALIKE_DIGITS = str.maketrans("013457", "oieast")
 _TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online|store|live|click"
 _SPOKEN_TLDS = "com|net|org|io|ly|gg|co|xyz|link|tv|app|info|biz|click"
 """After a spoken "dot": only TLDs that are not everyday words ("polka dot shop")."""
-# A name starts a token: never mid-word or right after a dot or hyphen, so each run of text
-# is scanned once (no quadratic backtracking on "a-a-a-..." or "a.a.a...").
-_NAME = r"(?<![\w.-])[\w-]+"
+# A name starts a token: never mid-word or right after a hyphen or a dot that follows a
+# word character, so each run of text is scanned once (no quadratic backtracking on
+# "a-a-a-..." or "a.a.a...").
+_NAME = r"(?<![\w-])(?<!\w\.)[\w-]+"
 LINK_OR_MENTION = re.compile(
     # A URL ends before quotes, brackets and trailing punctuation.
     r"(?i:(?<![\w./:-])(?:https?://|www\.)[\w\-.~:/?#@!$&*+,;=%]*[\w\-/#=~%&+])"
@@ -89,7 +110,8 @@ LINK_OR_MENTION = re.compile(
     + rf"|(?i:{_NAME}[ \t]+dot[ \t]+(?:{_SPOKEN_TLDS})\b)"
     # An IPv4 address.
     + r"|(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)"
-    + r"|(?<![\w@])@\w+"
+    # A whole handle: dots and hyphens are part of it ("@vyro.official").
+    + r"|(?<![\w@])@[\w.-]*\w"
 )
 """A link, a bare or obfuscated domain, an IP or an @mention: the transcript is untrusted, so
 text like this in a post is flagged for the reviewer and in pre-flight. Matched on a copy of
@@ -102,6 +124,8 @@ _INVISIBLE = re.compile(
 _IDNA_DOTS = str.maketrans({"\u3002": ".", "\uff61": ".", "\ufe12": ".", "\u2024": "."})
 _HOST = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
 _INLINE_TAG = re.compile(r"#\w+")
+_LINK_IN_PATH = re.compile(rf"(?i:www\.|https?:|[\w-]\.(?:{_TLDS})\b)")
+"""Another link inside an allowed URL's path; a file name ("download.html") is fine."""
 HASHTAG = re.compile(r"^#\w{1,50}$")
 
 
@@ -226,7 +250,7 @@ def _link_host(link: str) -> str | None:
     tail = unquote(f"{parts.path} {parts.query} {parts.fragment}")
     if parts.username is not None or port is not None or not _HOST.fullmatch(host):
         return None
-    if "@" in tail or "://" in tail or links_or_mentions(tail):
+    if "@" in tail or "://" in tail or _LINK_IN_PATH.search(tail):
         return None
     return host
 
@@ -493,7 +517,7 @@ class Brief(BaseModel):
     @field_validator("allowed_mentions", mode="after")
     @classmethod
     def _check_mentions(cls, value: list[str]) -> list[str]:
-        if any(not re.fullmatch(r"\w+", _handle(v)) for v in value):
+        if any(not re.fullmatch(r"[\w.-]*\w", _handle(v)) for v in value):
             raise ValueError("an allowed mention must be one @handle")
         return value
 
@@ -554,7 +578,10 @@ def preflight(
     if platform == "youtube" and _ANGLE.search(metadata.title + metadata.caption):
         problems.append("youtube: title or description contains < or >")
     found = links_or_mentions(f"{metadata.title}\n{metadata.caption}")
-    found = [f for f in found if not (brief and brief.allows(f))]
+    # An allowed match must appear as typed (up to NFKC): a combining mark inside a host
+    # is stripped for matching but would still be posted, to a different IDN host.
+    typed = _fold(f"{metadata.title}\n{metadata.caption}")
+    found = [f for f in found if not (brief and brief.allows(f) and _fold(f) in typed)]
     if found:
         problems.append(f"{platform}: links or mentions to check: {', '.join(found)}")
     inline = inline_disclosure_tags(f"{metadata.title}\n{metadata.caption}", metadata.hashtags)

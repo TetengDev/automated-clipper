@@ -682,13 +682,178 @@ def test_lookup_returns_none_when_no_upload_has_the_tag(
     assert publisher(clock).lookup("f" * 32) is None
 
 
-def test_lookup_skips_a_paused_account(clock: Clock, google: respx.MockRouter) -> None:
+def test_lookup_on_a_paused_account_never_says_not_found(
+    clock: Clock, google: respx.MockRouter
+) -> None:
+    """The upload may exist on the paused channel: the stage must not treat the post as
+    never uploaded, so lookup defers instead of returning None."""
     google.post(TOKEN_URL).mock(
         return_value=httpx.Response(400, json=FIXTURES["token_invalid_grant"])
     )
     channels, _, _ = mock_lookup(google)
-    assert publisher(clock).lookup(KEY) is None
+    with pytest.raises(PublishDeferred):
+        publisher(clock).lookup(KEY)
     assert channels.call_count == 0
+
+
+def test_lookup_finds_the_upload_on_a_healthy_account_even_if_another_is_paused(
+    clock: Clock, google: respx.MockRouter
+) -> None:
+    def grant(request: httpx.Request) -> httpx.Response:
+        form = dict(httpx.QueryParams(request.content.decode()))
+        if form["refresh_token"] == REFRESH:
+            return httpx.Response(400, json=FIXTURES["token_invalid_grant"])
+        return httpx.Response(200, json=FIXTURES["token"])
+
+    google.post(TOKEN_URL).mock(side_effect=grant)
+    mock_lookup(google)
+    yt = publisher(
+        clock, accounts=("yt_main", "yt_other"), tokens=Tokens(yt_other="1//other-token")
+    )
+    found = yt.lookup(KEY)
+    assert found is not None and found.external_id == "Ks-_Mh1QhMc"
+
+
+def test_lookup_retries_a_server_error(clock: Clock, google: respx.MockRouter) -> None:
+    ok_token(google)
+    channels, _, _ = mock_lookup(google)
+    channels.side_effect = [
+        httpx.Response(503),
+        httpx.Response(200, json=FIXTURES["channels_mine"]),
+    ]
+    sleeps: list[float] = []
+    found = publisher(clock, sleeps=sleeps).lookup(KEY)
+    assert found is not None
+    assert len(sleeps) == 1
+
+
+def test_lookup_out_of_quota_defers(clock: Clock, google: respx.MockRouter) -> None:
+    ok_token(google)
+    google.get(f"{API_URL}/channels").mock(
+        return_value=httpx.Response(403, json=FIXTURES["error_quota_exceeded"])
+    )
+    with pytest.raises(PublishDeferred) as caught:
+        publisher(clock).lookup(KEY)
+    assert caught.value.until == next_quota_reset(T0)
+
+
+# --- review fixes -------------------------------------------------------------------------
+
+
+def test_a_post_for_a_disabled_or_unknown_account_is_deferred_not_failed(
+    clock: Clock, video: Path, google: respx.MockRouter
+) -> None:
+    yt = publisher(clock)
+    with pytest.raises(PublishDeferred) as first:
+        yt.publish(make_post(account="yt_off"), video, META)
+    assert first.value.alert is not None and "yt_off" in first.value.alert
+    with pytest.raises(PublishDeferred) as second:
+        yt.publish(make_post(account="yt_off"), video, META)
+    assert second.value.alert is None
+
+
+def test_a_308_without_progress_counts_as_a_failure(
+    clock: Clock, video: Path, google: respx.MockRouter
+) -> None:
+    ok_token(google)
+    ok_session(google)
+    route = google.put(SESSION).mock(return_value=httpx.Response(308))
+    with pytest.raises(RuntimeError, match="no progress"):
+        publisher(clock).publish(make_post(), video, META)
+    assert route.call_count <= 2 * 6
+
+
+def test_a_308_claiming_more_bytes_than_the_file_is_refused(
+    clock: Clock, video: Path, google: respx.MockRouter
+) -> None:
+    ok_token(google)
+    ok_session(google)
+    google.put(SESSION).mock(return_value=httpx.Response(308, headers={"Range": "bytes=0-99999"}))
+    with pytest.raises(RuntimeError, match="Range"):
+        publisher(clock).publish(make_post(), video, META)
+
+
+def test_all_bytes_received_without_a_final_response_asks_for_the_status(
+    clock: Clock, video: Path, google: respx.MockRouter
+) -> None:
+    ok_token(google)
+    ok_session(google)
+    size = video.stat().st_size
+    route = google.put(SESSION).mock(
+        side_effect=[
+            httpx.Response(308, headers={"Range": f"bytes=0-{size - 1}"}),
+            httpx.Response(201, json=FIXTURES["video_inserted"]),
+        ]
+    )
+    assert publisher(clock).publish(make_post(), video, META).external_id == "Ks-_Mh1QhMc"
+    assert route.calls.last.request.headers["Content-Range"] == f"bytes */{size}"
+
+
+def test_a_non_object_upload_response_is_refused(
+    clock: Clock, video: Path, google: respx.MockRouter
+) -> None:
+    ok_token(google)
+    ok_session(google)
+    google.put(SESSION).mock(return_value=httpx.Response(201, json=["not", "a", "video"]))
+    with pytest.raises(RuntimeError, match="unexpected"):
+        publisher(clock).publish(make_post(), video, META)
+
+
+@pytest.mark.parametrize("expires_in", [0, -5, 10**30])
+def test_token_lifetime_from_google_is_bounded(
+    clock: Clock, video: Path, google: respx.MockRouter, expires_in: int
+) -> None:
+    token = ok_token(google, body={**FIXTURES["token"], "expires_in": expires_in})
+    ok_session(google)
+    ok_upload(google)
+    yt = publisher(clock)
+    yt.publish(make_post(), video, META)
+    clock.now += timedelta(minutes=1)
+    yt.publish(make_post(), video, META)
+    assert token.call_count == 1
+    clock.now += timedelta(days=2)
+    yt.publish(make_post(), video, META)
+    assert token.call_count == 2
+
+
+def test_credentials_are_not_reread_for_every_chunk(
+    clock: Clock, tmp_path: Path, google: respx.MockRouter
+) -> None:
+    video = tmp_path / "big.mp4"
+    video.write_bytes(b"x" * (CHUNK * 3))
+    reads: list[str] = []
+
+    def source(account_id: str) -> SecretStr | None:
+        reads.append(account_id)
+        return SecretStr(REFRESH)
+
+    ok_token(google)
+    ok_session(google)
+
+    def server(request: httpx.Request) -> httpx.Response:
+        end = int(request.headers["Content-Range"].split("-")[1].split("/")[0])
+        if end + 1 == CHUNK * 3:
+            return httpx.Response(201, json=FIXTURES["video_inserted"])
+        return httpx.Response(308, headers={"Range": f"bytes=0-{end}"})
+
+    google.put(SESSION).mock(side_effect=server)
+    yt = YouTubePublisher(
+        account_ids=("yt_main",),
+        client=OAuthClient(client_id="c.apps.googleusercontent.com", client_secret=SecretStr("s")),
+        refresh_token=source,
+        http=httpx.Client(),
+        clock=clock,
+        sleep=lambda _: None,
+        chunk_size=CHUNK,
+    )
+    yt.publish(make_post(), video, META)
+    assert len(reads) == 1
+
+
+def test_close_closes_the_publishers_own_http_client() -> None:
+    yt = YouTubePublisher(account_ids=("yt_main",), client=OAuthClient("c", SecretStr("s")))
+    yt.close()
+    assert yt.http.is_closed
 
 
 def test_lookup_errors_propagate(clock: Clock, google: respx.MockRouter) -> None:

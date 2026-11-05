@@ -18,6 +18,7 @@ from clipper.posting import repo
 from clipper.posting.models import (
     MAX_ATTEMPTS,
     Post,
+    PostConflict,
     PostStatus,
     PublishDeferred,
     PublishResult,
@@ -631,3 +632,45 @@ def test_a_deferral_into_the_past_still_moves_the_post_forward(env: Env, clock: 
     assert deferred is not None
     assert deferred.scheduled_at > T0
     assert publisher.calls == 1
+
+
+class DeferringLookup(LookupPublisher):
+    """`lookup` cannot check right now (paused account, quota) and says so."""
+
+    def lookup(self, idempotency_key: str) -> PublishResult | None:
+        self.lookups.append(idempotency_key)
+        raise PublishDeferred("account paused", T0 + timedelta(hours=1))
+
+
+def test_a_deferring_lookup_before_a_retry_defers_without_republishing(
+    env: Env, clock: Clock
+) -> None:
+    post = make_post(env, platform="youtube", account="yt_main")
+    env.conn.execute("UPDATE posts SET attempts = 1 WHERE id = ?", (post.id,))
+    publisher = DeferringLookup()
+
+    stage(env, clock, {"youtube": publisher}, alert=lambda _: None).run_once()
+
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None
+    assert publisher.calls == [] and publisher.lookups == [post.idempotency_key]
+    assert deferred.status == PostStatus.SCHEDULED
+    assert deferred.attempts == 1
+    assert deferred.scheduled_at == T0 + timedelta(hours=1)
+
+
+def test_a_deferral_alert_is_sent_even_if_the_deferral_cannot_be_recorded(
+    env: Env, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_post(env, platform="youtube", account="yt_main")
+    alerts: list[str] = []
+
+    def conflict(*args: object, **kwargs: object) -> Post:
+        raise PostConflict("changed meanwhile")
+
+    monkeypatch.setattr(repo, "defer", conflict)
+    publisher = DeferringPublisher(T0 + timedelta(hours=1), alert="yt_main paused")
+
+    stage(env, clock, {"youtube": publisher}, alert=alerts.append).run_once()
+
+    assert alerts == ["yt_main paused"]

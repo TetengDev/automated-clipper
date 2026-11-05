@@ -270,11 +270,16 @@ def test_a_program_with_a_submitter_is_submitted_automatically(env: Env) -> None
     calls: list[str] = []
 
     def whop(submission: object) -> None:
-        calls.append(getattr(submission, "url"))
+        calls.append(submission.url)
 
     now = [POSTED + timedelta(seconds=5)]
     SubmissionPass(
-        env.conn, CAMPAIGNS, Recorder(), Recorder(), clock=lambda: now[0], submitters={"reach": whop}
+        env.conn,
+        CAMPAIGNS,
+        Recorder(),
+        Recorder(),
+        clock=lambda: now[0],
+        submitters={"reach": whop},
     ).run_once()
 
     [submission] = list_submissions(env.conn)

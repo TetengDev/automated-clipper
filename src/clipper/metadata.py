@@ -25,7 +25,7 @@ import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import (
     BaseModel,
@@ -44,42 +44,64 @@ PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
 GENERIC_HASHTAGS = frozenset({"#fyp", "#foryou", "#foryoupage", "#viral", "#trending", "#fy"})
 """Reach tags that say nothing about the clip; rejected in variants, flagged in pre-flight."""
 DISCLOSURE_HASHTAGS = frozenset(
-    {
-        "#ad",
-        "#ads",
-        "#advert",
-        "#advertisement",
-        "#sponsored",
-        "#paid",
-        "#paidad",
-        "#partner",
-        "#partnership",
-        "#promo",
-        "#collab",
-        "#gifted",
-        "#adpartner",
-    }
+    {"#ad", "#ads", "#paid", "#partner", "#promo", "#gifted", "#spon", "#sp"}
 )
-DISCLOSURE_PREFIXES = ("#sponsor", "#paidpartner", "#paidpromo", "#brandpartner", "#gifted")
-"""Tags that read as a paid-partnership disclosure (exactly, or starting with a prefix, so
-`#sponsoredpost` too): only a campaign may add them (as campaign tags at scheduling), never
-the model or a variant."""
-_TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online|store|live"
+DISCLOSURE_PREFIXES = (
+    "#sponsor",
+    "#paidpartner",
+    "#paidpromo",
+    "#paidad",
+    "#brandpartner",
+    "#brandambassador",
+    "#ambassador",
+    "#affiliate",
+    "#partnered",
+    "#partnership",
+    "#adpartner",
+    "#adpost",
+    "#advert",
+    "#promoted",
+    "#promotion",
+    "#collab",
+    "#giftedby",
+)
+"""Tags that read as a paid-partnership disclosure, exactly or by prefix (`#sponsoredpost`),
+compared without underscores, trailing digits or digit lookalikes (`#sp0nsored_2024`): only
+a campaign may add them (as campaign tags at scheduling), never the model or a variant."""
+_LOOKALIKE_DIGITS = str.maketrans("013457", "oieast")
+_TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online|store|live|click"
+_SPOKEN_TLDS = "com|net|org|io|ly|gg|co|xyz|link|tv|app|info|biz|click"
+"""After a spoken "dot": only TLDs that are not everyday words ("polka dot shop")."""
+# A name starts a token: never mid-word or right after a dot or hyphen, so each run of text
+# is scanned once (no quadratic backtracking on "a-a-a-..." or "a.a.a...").
+_NAME = r"(?<![\w.-])[\w-]+"
 LINK_OR_MENTION = re.compile(
-    r"(?i:\b(?:https?://|www\.)\S+)"
-    # A domain: "name.tld" with no space around the dot. Any lowercase TLD of 2-24 letters,
-    # or a common TLD in any case, so a sentence break ("the store. Me and") is not one.
-    r"|\b[\w-]+(?:\.[\w-]+)*\.(?:[a-z]{2,24}|(?i:" + _TLDS + r"))\b"
-    # An obfuscated dot: "name[.]com", "name(dot)com", "name [dot] info".
-    r"|(?i:\b[\w-]+\s*[\[(]\s*(?:\.|dot|d0t)\s*[\])]\s*[a-z]{2,24}\b)"
+    # A URL ends before quotes, brackets and trailing punctuation.
+    r"(?i:(?<![\w./:-])(?:https?://|www\.)[\w\-.~:/?#@!$&*+,;=%]*[\w\-/#=~%&+])"
+    # A domain: "name.tld" with no space around the dot. Any TLD of 2-24 letters in one
+    # case, or a common TLD in any case, so a sentence break ("the store. Me") is not one.
+    + rf"|{_NAME}(?:\.[\w-]+)*\.(?:[a-z]{{2,24}}|[A-Z]{{2,24}}|(?i:{_TLDS}))\b"
+    # An obfuscated dot: "name[.]com", "name(dot)com", "name [d0t] info", "name . com".
+    + rf"|(?i:{_NAME}[ \t]*[\[(][ \t]*(?:\.|dot|d0t)[ \t]*[\])][ \t]*[a-z]{{2,24}}\b)"
+    + rf"|(?i:{_NAME}[ \t]+\.[ \t]+(?:{_SPOKEN_TLDS})\b)"
     # Spelled out: "name d0t anything", or "name dot com" with a common TLD.
-    r"|(?i:\b[\w-]+\s+d0t\s+[a-z]{2,24}\b)"
-    r"|(?i:\b[\w-]+\s+dot\s+(?:" + _TLDS + r")\b)"
-    r"|(?<![\w@])@\w+"
+    + rf"|(?i:{_NAME}[ \t]+d0t[ \t]+[a-z]{{2,24}}\b)"
+    + rf"|(?i:{_NAME}[ \t]+dot[ \t]+(?:{_SPOKEN_TLDS})\b)"
+    # An IPv4 address.
+    + r"|(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)"
+    + r"|(?<![\w@])@\w+"
 )
-"""A link, a bare or obfuscated domain or an @mention: the transcript is untrusted, so text
-like this in a post is flagged for the reviewer and in pre-flight. Matched on NFKC text, so
-a fullwidth dot or @ is caught too."""
+"""A link, a bare or obfuscated domain, an IP or an @mention: the transcript is untrusted, so
+text like this in a post is flagged for the reviewer and in pre-flight. Matched on a copy of
+the text that is NFKC-normalized, without invisible or combining characters, and with every
+dot IDNA treats as one turned into ".", so `scam\u200c．com` is caught too."""
+_INVISIBLE = re.compile(
+    "[\u034f\u115f\u1160\u180b-\u180f\u3164\ufe00-\ufe0f\uffa0"
+    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
+)
+_IDNA_DOTS = str.maketrans({"\u3002": ".", "\uff61": ".", "\ufe12": ".", "\u2024": "."})
+_HOST = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
+_INLINE_TAG = re.compile(r"#\w+")
 HASHTAG = re.compile(r"^#\w{1,50}$")
 
 
@@ -112,7 +134,7 @@ class PlatformLimits:
 
 
 PLATFORM_LIMITS: Mapping[str, PlatformLimits] = {
-    # TikTok counts its limits in UTF-16 units (an emoji is usually two).
+    # TikTok counts its limits in UTF-16 units: an emoji is usually two.
     "tiktok": PlatformLimits(
         title_max=100,
         caption_max=2200,
@@ -120,7 +142,7 @@ PLATFORM_LIMITS: Mapping[str, PlatformLimits] = {
         min_seconds=3,
         max_seconds=600,
         length=utf16_len,
-        unit="UTF-16 units (an emoji counts as two)",
+        unit="UTF-16 units",
     ),
     "instagram": PlatformLimits(
         title_max=100, caption_max=2200, post_hashtags_max=5, min_seconds=3, max_seconds=180
@@ -172,25 +194,49 @@ def is_generic(tag: str) -> bool:
 
 
 def is_disclosure(tag: str) -> bool:
-    folded = _fold(tag)
-    return folded in DISCLOSURE_HASHTAGS or folded.startswith(DISCLOSURE_PREFIXES)
+    key = _fold(tag).replace("_", "").rstrip("0123456789").translate(_LOOKALIKE_DIGITS)
+    return key in DISCLOSURE_HASHTAGS or key.startswith(DISCLOSURE_PREFIXES)
+
+
+def _match_text(text: str) -> str:
+    """The copy of `text` that links, mentions and inline tags are matched on."""
+    text = _INVISIBLE.sub("", unicodedata.normalize("NFKC", text))
+    text = "".join(c for c in text if unicodedata.category(c) not in {"Cf", "Mn", "Me"})
+    return text.translate(_IDNA_DOTS)
 
 
 def links_or_mentions(text: str) -> list[str]:
-    """Links, domains and @mentions in `text` (compatibility-normalized), in order."""
-    return [m.group(0) for m in LINK_OR_MENTION.finditer(unicodedata.normalize("NFKC", text))]
+    """Links, domains, IPs and @mentions in `text`, in order (as matched, normalized)."""
+    return [m.group(0) for m in LINK_OR_MENTION.finditer(_match_text(text))]
 
 
-def _link_host(link: str) -> str:
-    """The host a link or bare domain points at, folded and without `www.`; an obfuscated
-    domain ("name[.]com") keeps its brackets, so it never equals an allowed host."""
-    text = _fold(link.strip())
-    rest = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text)
+def _link_host(link: str) -> str | None:
+    """The host a plain link or bare domain points at (folded, without `www.` or a trailing
+    dot), or None when it is obfuscated or carries more than a host and a harmless path:
+    userinfo, a port, a backslash, or another link or mention inside it."""
+    rest = re.sub(r"^https?://", "", _fold(link.strip()))
+    if "\\" in rest:
+        return None
     try:
-        host = urlsplit(f"//{rest}").hostname or ""
+        parts = urlsplit(f"//{rest}")
+        port = parts.port
     except ValueError:
-        return text
-    return host.removeprefix("www.")
+        return None
+    host = (parts.hostname or "").rstrip(".").removeprefix("www.")
+    tail = unquote(f"{parts.path} {parts.query} {parts.fragment}")
+    if parts.username is not None or port is not None or not _HOST.fullmatch(host):
+        return None
+    if "@" in tail or "://" in tail or links_or_mentions(tail):
+        return None
+    return host
+
+
+def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
+    """Disclosure-like hashtags written into `text` itself, other than `allowed` ones."""
+    ok = {_fold(t) for t in allowed}
+    return [
+        t for t in _INLINE_TAG.findall(_match_text(text)) if is_disclosure(t) and _fold(t) not in ok
+    ]
 
 
 def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -> list[str]:
@@ -444,19 +490,31 @@ class Brief(BaseModel):
     allowed_links: list[str] = Field(default_factory=list)
     """Hosts the campaign asks for ("vyro.app", subdomains not included)."""
 
-    @field_validator("allowed_mentions", "allowed_links", mode="after")
+    @field_validator("allowed_mentions", mode="after")
     @classmethod
-    def _no_blank_entries(cls, value: list[str]) -> list[str]:
-        if any(not v.strip() for v in value):
-            raise ValueError("allowed mentions and links cannot be blank")
+    def _check_mentions(cls, value: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"\w+", _handle(v)) for v in value):
+            raise ValueError("an allowed mention must be one @handle")
+        return value
+
+    @field_validator("allowed_links", mode="after")
+    @classmethod
+    def _check_links(cls, value: list[str]) -> list[str]:
+        for link in value:
+            if _link_host(link) is None:
+                raise ValueError(f"allowed link {link!r} is not a plain host")
         return value
 
     def allows(self, found: str) -> bool:
         """Whether a link or mention from `links_or_mentions` is one the brief asks for."""
         if found.startswith("@"):
-            mentions = {_fold("@" + m.strip().lstrip("@")) for m in self.allowed_mentions}
-            return _fold(found) in mentions
-        return _link_host(found) in {_link_host(link) for link in self.allowed_links}
+            return _handle(found) in {_handle(m) for m in self.allowed_mentions}
+        host = _link_host(found)
+        return host is not None and host in {_link_host(link) for link in self.allowed_links}
+
+
+def _handle(mention: str) -> str:
+    return _fold(mention).strip().removeprefix("@")
 
 
 def _mentions(text: str, keyword: str) -> bool:
@@ -499,6 +557,9 @@ def preflight(
     found = [f for f in found if not (brief and brief.allows(f))]
     if found:
         problems.append(f"{platform}: links or mentions to check: {', '.join(found)}")
+    inline = inline_disclosure_tags(f"{metadata.title}\n{metadata.caption}", metadata.hashtags)
+    if inline:
+        problems.append(f"{platform}: disclosure-like tags in the text: {' '.join(inline)}")
     if limits.length(metadata.title) > limits.title_max:
         problems.append(f"{platform}: title is longer than {limits.title_max} {limits.unit}")
     if limits.length(metadata.caption) > limits.caption_max:

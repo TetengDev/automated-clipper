@@ -659,6 +659,27 @@ def test_a_deferring_lookup_before_a_retry_defers_without_republishing(
     assert deferred.scheduled_at == T0 + timedelta(hours=1)
 
 
+class AlertingDeferLookup(LookupPublisher):
+    def lookup(self, idempotency_key: str) -> PublishResult | None:
+        raise PublishDeferred("account paused", T0 + timedelta(hours=1), alert="yt_main paused")
+
+
+def test_a_stale_upload_whose_lookup_defers_fails_safely_and_keeps_the_alert(
+    env: Env, clock: Clock
+) -> None:
+    post = make_post(env, platform="youtube", account="yt_main")
+    stuck(env, post, T0 - STALE_UPLOAD - timedelta(minutes=1))
+    alerts: list[str] = []
+    publisher = AlertingDeferLookup()
+
+    stage(env, clock, {"youtube": publisher}, alert=alerts.append).run_once()
+
+    assert publisher.calls == []
+    assert status(env, post.id) == PostStatus.POST_FAILED
+    assert "yt_main paused" in alerts
+    assert len(alerts) == 2
+
+
 def test_a_deferral_alert_is_sent_even_if_the_deferral_cannot_be_recorded(
     env: Env, clock: Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:

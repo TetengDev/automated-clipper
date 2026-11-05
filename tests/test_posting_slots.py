@@ -990,3 +990,24 @@ def test_the_attempt_count_uses_an_index(env: Env) -> None:
     ).fetchall()
 
     assert any("clip_reviews_action_time" in str(tuple(row)) for row in plan)
+
+
+def test_a_retried_post_whose_lookup_fails_is_still_uploaded(env: Env, clock: Clock) -> None:
+    # The human's retry is the override the alert asks for ("check the platform before you
+    # requeue"): a broken lookup must not send the post straight back to post_failed.
+    from posting_support import LookupPublisher
+
+    class BrokenLookup(LookupPublisher):
+        def lookup(self, idempotency_key: str) -> PublishResult | None:
+            raise RuntimeError("lookup endpoint down")
+
+    post = make_post(env, account="ghost")
+    for minutes in range(MAX_ATTEMPTS):
+        post = fail_attempt(env, post, T0 - timedelta(hours=2, minutes=-minutes))
+    repo.retry(env.conn, post.id, T0)
+    publisher = BrokenLookup()
+
+    stage(env, clock, publisher).run_once()
+
+    assert [sent.id for sent, _, _ in publisher.calls] == [post.id]
+    assert get(env, post).status == PostStatus.POSTED

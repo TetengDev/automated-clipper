@@ -468,6 +468,12 @@ MIXED_SCRIPT = [
     "#οnline",  # Greek omicron
     "#Мαма",  # Cyrillic and Greek together
     "#ｆyр",  # fullwidth Latin folds to Latin, still mixed with Cyrillic
+    "#pr၀m၀",  # Myanmar zero: looks like #promo
+    "#pr߀m߀",  # NKo zero
+    "#prom০",  # Bengali zero
+    "#sp〇ns〇red",  # ideographic number zero: looks like #sponsored
+    "#ソウル한국",  # Katakana and Hangul are not one writing system
+    "#ひㄅ",  # Hiragana and Bopomofo
 ]
 SINGLE_SCRIPT = [
     "#Москва",  # Russian
@@ -479,14 +485,23 @@ SINGLE_SCRIPT = [
     "#東京タワー",  # Japanese: Han and Katakana
     "#iPhone買った",  # Japanese with Latin: Latin, Han, Hiragana
     "#BTS콘서트",  # Korean with Latin: Latin and Hangul
+    "#пʼять",  # Ukrainian with the modifier-letter apostrophe
+    "#ひ〱",  # Hiragana with the vertical kana repeat mark
+    "#東京2024",  # digits belong to no script
+    "#Москва_2024",
 ]
-LATIN = ["#Pilipinas", "#niño", "#mañana2024", "#tara_na", "#mrbeast2"]
+LATIN = ["#Pilipinas", "#niño", "#mañana2024", "#tara_na", "#mrbeast2", "#Hawaiʻi"]
 
 
 @pytest.mark.parametrize("tag", MIXED_SCRIPT)
 def test_mixed_script_hashtags_are_rejected_in_a_variant(tag):
     with pytest.raises(ValidationError, match="mixes scripts"):
         variant(hashtags=["#mrbeast", tag, "#island"])
+
+
+def test_mixed_script_error_names_the_scripts():
+    with pytest.raises(ValidationError, match="CYRILLIC, LATIN"):
+        variant(hashtags=["#mrbeast", "#fyр", "#island"])
 
 
 @pytest.mark.parametrize("tag", MIXED_SCRIPT)

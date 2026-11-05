@@ -23,7 +23,9 @@
 
 Tokens are held as `SecretStr` or not at all (only a hash identifies the credentials),
 travel only in the Authorization header or the token request body, go only to Google's
-fixed hosts, and never appear in errors, logs or repr.
+fixed hosts, and never appear in errors, logs or repr. The plain values do sit in
+httpx's frames while a request runs, so no error reporter that captures local variables
+(Sentry `include_local_variables`, rich `show_locals`) may be enabled in the worker.
 """
 
 from __future__ import annotations
@@ -413,7 +415,9 @@ class YouTubePublisher:
             self._call_tokens = None
         if skipped:
             reason = f"YouTube lookup could not check paused account(s) {', '.join(skipped)}"
-            raise PublishDeferred(reason, self.clock() + PAUSE_RECHECK)
+            alerts = [a for a in map(self._pause_alert, skipped) if a]
+            alert = "\n".join(alerts) or None
+            raise PublishDeferred(reason, self.clock() + PAUSE_RECHECK, alert=alert)
         return None
 
     def _unknown_account(self, account_id: str) -> PublishDeferred:
@@ -458,16 +462,21 @@ class YouTubePublisher:
 
     def _paused_deferral(self, paused: _Paused) -> PublishDeferred:
         pause = self._paused[paused.account_id]
-        alert = None
-        if not pause.alerted:
-            pause.alerted = True
-            alert = (
-                f"YouTube account {paused.account_id} is paused: {pause.why}. Its posts are"
-                " deferred, not failed. Fix it as described in docs/DEPLOYMENT.md"
-                " (YouTube publishing); posting resumes once new credentials are in place."
-            )
         reason = f"YouTube account {paused.account_id} paused: {pause.why}"
+        alert = self._pause_alert(paused.account_id)
         return PublishDeferred(reason, self.clock() + PAUSE_RECHECK, alert=alert)
+
+    def _pause_alert(self, account_id: str) -> str | None:
+        """The alert for a pause, the first time it is asked for; then None."""
+        pause = self._paused.get(account_id)
+        if pause is None or pause.alerted:
+            return None
+        pause.alerted = True
+        return (
+            f"YouTube account {account_id} is paused: {pause.why}. Its posts are"
+            " deferred, not failed. Fix it as described in docs/DEPLOYMENT.md"
+            " (YouTube publishing); posting resumes once new credentials are in place."
+        )
 
     def _access_token(self, account_id: str, *, force: bool = False) -> str:
         fingerprint, refresh = self._fingerprint(account_id)
@@ -595,13 +604,18 @@ class YouTubePublisher:
                         return _video_body(response)
                     if response.status_code == 308:
                         received = _received(response, size)
-                        if querying:
+                        if querying and received < size:
                             offset, resync = received, False
                             continue
-                        if received > offset:
+                        if not querying and received > offset:
                             offset, failures = received, 0
                             continue
-                        last_problem = "no progress"
+                        # A chunk the server did not take, or every byte in but no video.
+                        last_problem = (
+                            "all bytes received but no final response"
+                            if querying
+                            else "no progress"
+                        )
                     elif response.status_code == 404:
                         raise YouTubeError("YouTube upload session expired (HTTP 404)", status=404)
                     elif response.status_code not in RETRYABLE_STATUS:

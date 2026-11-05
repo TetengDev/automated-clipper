@@ -3,6 +3,7 @@ disclosure-tag detection (CLP-107)."""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -266,3 +267,134 @@ def test_brief_allow_lists_reject_blank_entries():
         Brief(name="b", allowed_mentions=["  "])
     with pytest.raises(ValidationError):
         Brief(name="b", allowed_links=[""])
+
+
+# --- review fixes (CLP-102/107 review) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "visit scam‌.com",  # zero-width non-joiner (kept by strip_control)
+        "visit scam‍.com",
+        "follow @‍scammer",
+        "visit scam​.com",  # zero-width space in a PostMetadata built by hand
+        "scam。com",  # ideographic full stop
+        "scam｡com",  # halfwidth ideographic full stop
+        "SCAM.CLICK",
+        "scam . com",
+        "go to 10.0.0.1 now",
+        "the end (.)com",
+    ],
+)
+def test_review_more_hidden_links_are_flagged(text):
+    assert links_or_mentions(text), text
+    assert any("links or mentions" in p for p in preflight(post(text), "tiktok", 35.0))
+
+
+@pytest.mark.parametrize(
+    "text", ["a red dot live", "polka dot shop", "the end (.)\nnext", "Mr.Beast and Hi there"]
+)
+def test_review_spoken_dots_and_line_breaks_are_not_links(text):
+    assert links_or_mentions(text) == []
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "#paid_partnership",
+        "#sponsored_post",
+        "#gifted_by",
+        "#paid_ad",
+        "#brand_partner",
+        "#ad_",
+        "#ad2024",
+        "#sp0nsored",
+        "#adpartnership",
+        "#partnered",
+        "#partnerships",
+        "#advertising",
+        "#promoted",
+        "#promotion",
+        "#ambassador",
+        "#brandambassador",
+        "#affiliate",
+        "#collaboration",
+    ],
+)
+def test_review_disclosure_variants_are_rejected(tag):
+    with pytest.raises(ValidationError, match="disclosure"):
+        variant(hashtags=["#mrbeast", tag, "#island"])
+
+
+@pytest.mark.parametrize("tag", ["#giftedkids", "#a1", "#adventure2024", "#promqueen"])
+def test_review_ordinary_tags_stay_usable(tag):
+    assert variant(hashtags=["#mrbeast", tag, "#island"]).hashtags[1] == tag
+
+
+def test_review_inline_disclosure_tags_in_the_text_are_flagged_by_preflight():
+    meta = build_post_metadata(variants(caption="great clip #paidpartnership"), "tiktok")
+    assert any("disclosure" in p for p in preflight(meta, "tiktok", 35.0))
+    titled = build_post_metadata(variants(title="t #Sponsored"), "tiktok")
+    assert any("disclosure" in p for p in preflight(titled, "tiktok", 35.0))
+    # A campaign's own disclosure tag on the hashtag line is still fine.
+    campaign = build_post_metadata(variants(), "tiktok", campaign_tags=["#ad"])
+    assert preflight(campaign, "tiktok", 35.0) == []
+
+
+@pytest.mark.parametrize(
+    "text", ["Get it at https://vyro.app.", "(https://vyro.app/x)", "at https://vyro.app, now"]
+)
+def test_review_an_allowed_link_with_punctuation_around_it_passes(text):
+    brief = Brief(name="vyro", allowed_links=["vyro.app"])
+    assert preflight(post(text), "tiktok", 35.0, brief) == [], text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://evil.com\\@vyro.app",
+        "https://evil.com@vyro.app",
+        "https://vyro.app:8080/x",
+        "https://vyro.app/)https://evil.com",
+        "https://vyro.app/<https://evil.com",
+        'https://vyro.app/"evil.com',
+        "https://vyro.app/”https://evil.com",
+        "https://vyro.app/、evil.click",
+        "https://vyro.app/@scammer",
+        "https://vyro.app/?next=https://evil.com",
+        "https://vyro.app。evil.com",
+    ],
+)
+def test_review_an_allowed_host_does_not_carry_another_link(text):
+    brief = Brief(name="vyro", allowed_links=["vyro.app"])
+    problems = preflight(post(text), "tiktok", 35.0, brief)
+    assert any("links or mentions" in p for p in problems), text
+
+
+def test_review_an_allowed_mention_matches_case_and_fullwidth_forms():
+    brief = Brief(name="vyro", allowed_mentions=["＠MrBeast"])
+    assert preflight(post("thanks @MRBEAST"), "tiktok", 35.0, brief) == []
+
+
+@pytest.mark.parametrize("unit", ["a-", "a.", "a1.", "a ", "a[", "a d0t "])
+def test_review_link_detection_is_linear_on_long_hostile_text(unit):
+    text = unit * 10_000
+    start = time.perf_counter()
+    links_or_mentions(text)
+    assert time.perf_counter() - start < 0.5
+
+
+def test_review_tiktok_length_message_names_the_unit_once():
+    with pytest.raises(ValidationError) as err:
+        Variant.model_validate(
+            {"title": "T", "caption": EMOJI * 1200, "hashtags": TAGS},
+            context={"platform": "tiktok"},
+        )
+    assert "UTF-16 units (" in str(err.value) and ") (" not in str(err.value)
+
+
+def test_review_truncate_words_with_a_space_right_at_the_limit():
+    text = EMOJI * 4 + " " + EMOJI * 4  # 8 units, a space, 8 units
+    assert truncate_words(text, 8, utf16_len) == EMOJI * 4
+    assert truncate_words(text, 0, utf16_len) == ""

@@ -46,6 +46,7 @@ from clipper.export import DEFAULT_OUTPUT_DIR, ExportLocks, Runner, run_subproce
 from clipper.jobs.worker import DEFAULT_MEDIA_ROOT
 
 if TYPE_CHECKING:
+    from clipper.campaigns import Campaign
     from clipper.posting.scheduler import AccountLike
 
 PACKAGE_DIR = Path(__file__).parent
@@ -421,6 +422,7 @@ def create_app(
     export_runner: Runner = run_subprocess,
     config: AppConfig | None = None,
     accounts: Sequence[AccountLike] = (),
+    campaigns: Mapping[str, Campaign] | None = None,
 ) -> FastAPI:
     """Build the review app. All config is passed in so tests need no environment.
 
@@ -432,7 +434,8 @@ def create_app(
     `config` gives each creator's content type for the faces check (CLP-87); without it
     every creator is unknown, so every clip needs the check (fails closed).
     `accounts` are the posting accounts an approved clip is scheduled on (CLP-92); none
-    means approving schedules nothing.
+    means approving schedules nothing. `campaigns` (by id) are the briefs campaign
+    accounts' posts are checked against (CLP-97); a post that breaks one is held.
     """
     if not _BCRYPT_HASH.match(password_hash):
         raise ValueError("REVIEW_PASSWORD_HASH must be a bcrypt hash ($2b$...)")
@@ -460,6 +463,7 @@ def create_app(
     app.state.export_locks = ExportLocks()
     app.state.config = config or AppConfig()
     app.state.accounts = tuple(accounts)
+    app.state.campaigns = dict(campaigns or {})
     app.state.wall_clock = wall_clock
     app.state.login_throttle = throttle
     app.state.session_policy = policy

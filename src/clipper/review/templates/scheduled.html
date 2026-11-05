@@ -22,6 +22,17 @@
 <p class="muted">No failed posts.</p>
 {% endif %}
 
+<h2>Held by the campaign pre-flight</h2>
+{% if held %}
+<p class="muted">These posts break their campaign's brief and are never published. Fix the
+campaign config and run <code>clipper posts recheck</code>, or cancel the post.</p>
+<ul class="posts" id="held">
+  {% for post in held %}{% include "_post_row.html" %}{% endfor %}
+</ul>
+{% else %}
+<p class="muted">No held posts.</p>
+{% endif %}
+
 {% if posted %}
 <h2>Recently posted</h2>
 <ul class="posts" id="posted">

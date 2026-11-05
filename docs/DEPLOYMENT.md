@@ -187,6 +187,36 @@ To add an account:
 The tokens sit in `.env` like the other keys. Encrypting refresh tokens at rest is a
 planned follow-up.
 
+## Campaigns
+
+Paid clipping campaigns live in `config/campaigns.yaml` (or the file named by
+`CLIPPER_CAMPAIGNS`), one entry per campaign brief. An account joins one with
+`campaign: <id>` in `accounts.yaml`; only the campaign creator's clips count for it.
+
+1. Copy the rules from the live brief on the program's site: length, required hashtags,
+   forbidden elements and keywords, the audience rule, the submission deadline, the
+   payout terms and the end date. The shipped entries are placeholders from the epic's
+   research notes, marked `OWNER TODO`. Do not guess a rule the brief does not state.
+2. Set `brief_verified: true` only after that check. While it is false, every post for
+   the campaign is **held**.
+3. Run `clipper check-config`. It prints one line per campaign. It fails when an account
+   cannot be assigned to its campaign: the platform is not one the campaign takes, the
+   account does not post the campaign's creator, or the account's `market` is not one of
+   the audience rule's markets (a PH account cannot deliver a US audience).
+
+When a clip is approved, each campaign account's post goes through a pre-flight: the
+platform limits, the brief's length range, its required hashtags (added to the post
+automatically), its forbidden keywords, the paid-partnership toggle, the end date, and
+AI content when the brief forbids it. AI content is read from the render sidecar; a clip
+without one is held under an AI ban, because nothing shows it is free of AI. A post that
+fails is `held` with the reason on the review app's Scheduled page and in
+`clipper posts list`, and it is never published. Logos, negative framing and reposts
+cannot be seen by the pipeline: the reviewer checks them before approving.
+
+After fixing the config, `clipper posts recheck` runs the pre-flight again and schedules
+the held posts that now pass. Otherwise cancel them on the Scheduled page or with
+`clipper posts cancel <id>`.
+
 ## CI/CD
 
 - **`ci.yml`** runs on every PR and on pushes to main: ruff, pytest (unit and integration against fixtures), Docker build, and Playwright tests for the review app.

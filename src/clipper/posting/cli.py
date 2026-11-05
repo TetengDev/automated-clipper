@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
+from zoneinfo import ZoneInfoNotFoundError
 
 import typer
 
@@ -18,12 +19,14 @@ from clipper.posting import repo
 from clipper.posting.models import (
     OPEN_STATUSES,
     InvalidPostTransition,
+    NoFreeSlot,
     Post,
     PostStatus,
     parse_utc,
     reschedule_problem,
 )
 from clipper.posting.scheduler import MAX_DAYS_AHEAD, AccountLike, pick_slot, slot_problems
+from clipper.posting.stage import HISTORY
 
 app = typer.Typer(
     help="Scheduled posts: list, cancel, reschedule, retry.",
@@ -62,7 +65,8 @@ def _accounts(ctx: typer.Context) -> dict[str, AccountLike]:
     try:
         return dict(accounts_by_id(config_path, load_config(config_path)))
     except ConfigError as exc:
-        _fail(f"cannot load the accounts config: {exc}")
+        # It is checked against the creators config, so either file can be at fault.
+        _fail(f"cannot load the accounts config (checked against {config_path}): {exc}")
 
 
 def _get(conn: sqlite3.Connection, post_id: int) -> Post:
@@ -83,11 +87,28 @@ def _confirm_problems(problems: list[str], yes: bool) -> None:
         typer.confirm("Schedule it anyway?", abort=True)
 
 
-def _problems(conn: sqlite3.Connection, account: AccountLike | None, post: Post, when: datetime):
+def _problems(
+    conn: sqlite3.Connection, account: AccountLike | None, post: Post, when: datetime
+) -> list[str]:
     if account is None:
         return []
-    others = repo.account_post_times(conn, account.id, exclude_post_id=post.id)
-    return slot_problems(account, others, when)
+    others = repo.account_post_times(conn, account.id, exclude_post_id=post.id, since=_since())
+    try:
+        return slot_problems(account, others, when)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        return [f"cannot check the account's rules: {exc}"]
+
+
+def _since() -> datetime:
+    return utcnow() - HISTORY
+
+
+def _warn_unknown(accounts: dict[str, AccountLike], post: Post) -> None:
+    if accounts and post.account_id not in accounts:
+        typer.echo(
+            f"warning: account {strip_control(post.account_id)} is not in the accounts config;"
+            " its slot rules are not checked"
+        )
 
 
 def _line(post: Post) -> str:
@@ -165,7 +186,10 @@ def cancel_cmd(ctx: typer.Context, post_id: Annotated[int, typer.Argument(min=1)
     _act(ctx, post_id, "cancel", lambda c: repo.cancel(c, post_id, utcnow(), by=CLI_ACTOR))
 
 
-YES_HELP = "Do not ask when the time breaks the account's windows, gap or daily limit."
+YES_HELP = (
+    "Do not ask when the time breaks the account's windows, gap or daily limit"
+    " (needed in scripts: without a terminal the question is answered no)."
+)
 
 
 @app.command("reschedule")
@@ -182,6 +206,9 @@ def reschedule_cmd(
     conn = _open(ctx)
     try:
         post = _get(conn, post_id)
+        if post.status not in (PostStatus.SCHEDULED, PostStatus.POST_FAILED):
+            _fail(f"cannot reschedule post {post_id}: it is {post.status}")
+        _warn_unknown(accounts, post)
         _confirm_problems(_problems(conn, accounts.get(post.account_id), post, when), yes)
     finally:
         conn.close()
@@ -213,22 +240,29 @@ def retry_cmd(
         if post.status != PostStatus.POST_FAILED:
             _fail(f"cannot retry post {post_id}: it is {post.status}")
         account = accounts.get(post.account_id)
+        _warn_unknown(accounts, post)
         if when is not None:
             _confirm_problems(_problems(conn, account, post, when), yes)
-        elif account is None:
-            if accounts:
-                typer.echo(
-                    f"warning: account {strip_control(post.account_id)} is not in the accounts"
-                    " config; requeued now without its slot rules"
-                )
-        else:
-            others = repo.account_post_times(conn, account.id, exclude_post_id=post.id)
-            when = pick_slot(account, others, utcnow())
-            if when is None:
-                _fail(
-                    f"no free slot for account {account.id} in the next {MAX_DAYS_AHEAD} days;"
-                    " pass --at TIME to choose one"
-                )
     finally:
         conn.close()
-    _act(ctx, post_id, "retry", lambda c: repo.retry(c, post_id, utcnow(), at=when, by=CLI_ACTOR))
+    pick = None
+    if when is None and account is not None:
+        rules = account
+
+        def pick(c: sqlite3.Connection, p: Post) -> datetime | None:
+            # Inside the write transaction: a post scheduled meanwhile is seen.
+            taken = repo.account_post_times(c, rules.id, exclude_post_id=p.id, since=_since())
+            return pick_slot(rules, taken, utcnow())
+
+    try:
+        _act(
+            ctx,
+            post_id,
+            "retry",
+            lambda c: repo.retry(c, post_id, utcnow(), at=when, pick=pick, by=CLI_ACTOR),
+        )
+    except NoFreeSlot:
+        _fail(
+            f"no free slot for account {post.account_id} in the next {MAX_DAYS_AHEAD} days;"
+            " pass --at TIME to choose one"
+        )

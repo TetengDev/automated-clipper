@@ -13,15 +13,17 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
 from clipper.clips import get_version
 from clipper.db import transaction
-from clipper.jobs.models import to_iso
+from clipper.jobs.models import from_iso, to_iso
 from clipper.posting.models import (
     InvalidPostTransition,
+    NoFreeSlot,
     Post,
     PostConflict,
     PostMetadata,
@@ -31,6 +33,8 @@ from clipper.posting.models import (
 )
 
 LIST_LIMIT = 500
+UNRESOLVED_PREFIX = "uploading state unresolved"
+"""How the posting stage's unresolved-upload errors start (`stage.UNRESOLVED`)."""
 _COUNTED = "status != 'cancelled'"
 _REVIEWER_EDITABLE = frozenset({PostStatus.SCHEDULED, PostStatus.POST_FAILED})
 
@@ -78,43 +82,75 @@ def list_posts(
 
 
 def account_post_times(
-    conn: sqlite3.Connection, account_id: str, *, exclude_post_id: int | None = None
+    conn: sqlite3.Connection,
+    account_id: str,
+    *,
+    exclude_post_id: int | None = None,
+    since: datetime | None = None,
 ) -> list[datetime]:
     """When the account's posts are (or were) scheduled; cancelled posts free their slot.
-    `exclude_post_id` leaves out the post being moved (CLP-106)."""
+    `exclude_post_id` leaves out the post being moved and `since` skips older history,
+    which the slot picker never looks at (CLP-106; the `(account_id, scheduled_at)` index
+    keeps it cheap)."""
     rows = conn.execute(
-        f"SELECT * FROM posts WHERE account_id = ? AND {_COUNTED} AND id IS NOT ?",  # noqa: S608 - constant
-        (account_id, exclude_post_id),
+        f"SELECT * FROM posts WHERE account_id = ? AND {_COUNTED} AND id IS NOT ?"  # noqa: S608 - constant
+        " AND scheduled_at >= ?",
+        (account_id, exclude_post_id, to_iso(since) if since is not None else ""),
     )
     return [Post.from_row(r).scheduled_at for r in rows]
 
 
-def started_between(
+def uploads_between(
     conn: sqlite3.Connection,
     account_id: str,
     start: datetime,
     end: datetime,
     *,
     exclude_post_id: int | None = None,
+    per_attempt: bool = False,
 ) -> int:
-    """Uploads the account has made or has in flight in [start, end): posts posted then
-    and posts claimed for upload then (CLP-106's claim-time daily cap)."""
+    """Uploads the account made or started in [start, end), for the claim-time caps
+    (CLP-106). Counted: posts posted then (`posted_at`), posts claimed for upload then
+    (`claimed_at`), and posts whose failed attempt (or unresolved upload) was recorded then
+    (`updated_at`, with attempts or an "uploading state unresolved" error): a failed attempt
+    may have reached the platform, used quota or even gone live.
+
+    `per_attempt` counts API attempts instead of posts (each earlier failed attempt of a
+    post adds one), for the platform's API cap. A post's attempts are only seen in the
+    window of its last change, and a reschedule resets them; the count errs high."""
+    weight = "1 + attempts" if per_attempt else "1"
+    failed_weight = (
+        f"attempts + (CASE WHEN error LIKE '{UNRESOLVED_PREFIX}%' THEN 1 ELSE 0 END)"
+        if per_attempt
+        else "1"
+    )
     row = conn.execute(
-        "SELECT COUNT(*) FROM posts WHERE account_id = ? AND id IS NOT ? AND ("
-        " (status = ? AND posted_at >= ? AND posted_at < ?)"
-        " OR (status = ? AND claimed_at >= ? AND claimed_at < ?))",
-        (
-            account_id,
-            exclude_post_id,
-            str(PostStatus.POSTED),
-            to_iso(start),
-            to_iso(end),
-            str(PostStatus.UPLOADING),
-            to_iso(start),
-            to_iso(end),
-        ),
+        f"SELECT COALESCE(SUM(CASE"  # noqa: S608 - fixed fragments, values bound
+        f" WHEN status = 'posted' AND posted_at >= ? AND posted_at < ? THEN {weight}"
+        f" WHEN status = 'uploading' AND claimed_at >= ? AND claimed_at < ? THEN {weight}"
+        " WHEN status IN ('scheduled', 'post_failed') AND updated_at >= ? AND updated_at < ?"
+        f" AND (attempts > 0 OR error LIKE '{UNRESOLVED_PREFIX}%') THEN {failed_weight}"
+        " ELSE 0 END), 0) FROM posts WHERE account_id = ? AND id IS NOT ?",
+        (*[to_iso(start), to_iso(end)] * 3, account_id, exclude_post_id),
     ).fetchone()
     return int(row[0])
+
+
+def last_upload(
+    conn: sqlite3.Connection,
+    account_id: str,
+    since: datetime,
+    *,
+    exclude_post_id: int | None = None,
+) -> datetime | None:
+    """When the account's latest upload since `since` started (posted or in flight)."""
+    row = conn.execute(
+        "SELECT MAX(CASE WHEN status = 'posted' THEN posted_at ELSE claimed_at END)"
+        " FROM posts WHERE account_id = ? AND id IS NOT ? AND ("
+        " (status = 'posted' AND posted_at >= ?) OR (status = 'uploading' AND claimed_at >= ?))",
+        (account_id, exclude_post_id, to_iso(since), to_iso(since)),
+    ).fetchone()
+    return from_iso(row[0]) if row and row[0] else None
 
 
 def has_post(conn: sqlite3.Connection, clip_id: int, account_id: str) -> bool:
@@ -193,14 +229,18 @@ def _change(
     action: str | None = None,
     by: str | None = None,
     allowed_from: Collection[PostStatus] = _REVIEWER_EDITABLE,
+    computed: Callable[[sqlite3.Connection, Post], dict[str, Any]] | None = None,
     **fields: Any,
 ) -> Post:
     """A reviewer/CLI change: move a post to `target` and set `fields`, with an audit row.
-    Only posts in `allowed_from` change: never one a worker is uploading."""
+    Only posts in `allowed_from` change: never one a worker is uploading. `computed`
+    adds fields worked out inside the transaction (CLP-106: the next free slot)."""
     with transaction(conn):
         post = _require(conn, post_id)
         if post.status not in allowed_from or not can_transition(post.status, target):
             raise InvalidPostTransition(post_id, post.status, target)
+        if computed is not None:
+            fields = {**fields, **computed(conn, post)}
         _update(conn, post, target, now, **fields)
         updated = _require(conn, post_id)
         _audit(
@@ -270,9 +310,20 @@ def retry(
     now: datetime,
     *,
     at: datetime | None = None,
+    pick: Callable[[sqlite3.Connection, Post], datetime | None] | None = None,
     by: str | None = None,
 ) -> Post:
-    """Requeue a `post_failed` post at `at` (default now), with a fresh attempt count."""
+    """Requeue a `post_failed` post with a fresh attempt count: at `at`, else at the slot
+    `pick` chooses inside the write transaction (None raises NoFreeSlot), else now."""
+
+    def slot(c: sqlite3.Connection, post: Post) -> dict[str, Any]:
+        if at is not None or pick is None:
+            return {"scheduled_at": at or now}
+        chosen = pick(c, post)
+        if chosen is None:
+            raise NoFreeSlot(post.account_id)
+        return {"scheduled_at": chosen}
+
     return _change(
         conn,
         post_id,
@@ -280,7 +331,7 @@ def retry(
         now,
         by=by,
         allowed_from=frozenset({PostStatus.POST_FAILED}),
-        scheduled_at=at or now,
+        computed=slot,
         attempts=0,
         error=None,
     )
@@ -490,20 +541,25 @@ def record_failure(
     *,
     max_attempts: int,
     backoff: timedelta,
-    retry_at: datetime | None = None,
-    give_up: bool = False,
+    retry_at: Callable[[sqlite3.Connection, datetime], datetime | None] | None = None,
+    no_slot_note: str = "",
 ) -> Post:
-    """Count a failed attempt: retry at `retry_at` (CLP-106: the account's next free slot)
-    or else `now + backoff * 2**attempts`; at `max_attempts`, or with `give_up` (no free
-    slot), give up with `post_failed`."""
+    """Count a failed attempt: retry at `now + backoff * 2**attempts`, or at the slot
+    `retry_at(conn, that time)` picks inside this transaction (CLP-106: the account's next
+    free slot at or after it). At `max_attempts`, or when `retry_at` finds no slot (then
+    `no_slot_note` is added to the error), give up with `post_failed`."""
     with transaction(conn):
         current = _require(conn, post.id)
         attempts = current.attempts + 1
-        if give_up or attempts >= max_attempts:
-            target, fields = PostStatus.POST_FAILED, {}
-        else:
-            target = PostStatus.SCHEDULED
-            fields = {"scheduled_at": retry_at or now + backoff * 2**attempts}
+        target, fields = PostStatus.POST_FAILED, {}
+        if attempts < max_attempts:
+            when: datetime | None = now + backoff * 2**attempts
+            if retry_at is not None:
+                when = retry_at(conn, when)
+            if when is None:
+                error = f"{error}; {no_slot_note}" if no_slot_note else error
+            else:
+                target, fields = PostStatus.SCHEDULED, {"scheduled_at": when}
         _update(
             conn,
             current,
@@ -529,32 +585,65 @@ def record_failure(
     return updated
 
 
-def defer(
+@dataclass(frozen=True)
+class Deferral:
+    """Why a claimed post may not upload now, and when it may (None: no free slot, so the
+    post is given up for a human)."""
+
+    reason: str
+    until: datetime | None
+
+
+def defer_claimed(
     conn: sqlite3.Connection,
     post: Post,
     worker_id: str,
-    reason: str,
-    until: datetime,
     now: datetime,
-) -> Post:
-    """Put a claimed post back to `scheduled` at `until` without counting an attempt
-    (CLP-93: quota, upload limit or a paused account; CLP-106: the account's day is
-    full). Audited as `post_deferred`. Same as CLP-93's (PR #51)."""
+    decide: Callable[[sqlite3.Connection], Deferral | None],
+) -> Deferral | None:
+    """Claim-time caps (CLP-106): run `decide` and act on it in one write transaction, so
+    the count and the slot it picks are not stale. A deferral puts the claimed post back
+    to `scheduled` at `until` without counting an attempt (audit `post_deferred`, as for
+    CLP-93's `PublishDeferred`); with no `until` it is `post_failed`. None: go ahead."""
     with transaction(conn):
+        decision = decide(conn)
+        if decision is None:
+            return None
+        if decision.until is None:
+            _update(
+                conn,
+                post,
+                PostStatus.POST_FAILED,
+                now,
+                owner=worker_id,
+                error=decision.reason,
+                worker_id=None,
+                claimed_at=None,
+            )
+            failed = _require(conn, post.id)
+            _audit(conn, failed, _action(PostStatus.POST_FAILED), now, error=decision.reason)
+            return decision
         _update(
             conn,
             post,
             PostStatus.SCHEDULED,
             now,
             owner=worker_id,
-            scheduled_at=until,
-            error=reason,
+            scheduled_at=decision.until,
+            error=decision.reason,
             worker_id=None,
             claimed_at=None,
         )
         deferred = _require(conn, post.id)
-        _audit(conn, deferred, "post_deferred", now, error=reason, scheduled_at=to_iso(until))
-    return deferred
+        _audit(
+            conn,
+            deferred,
+            "post_deferred",
+            now,
+            error=decision.reason,
+            scheduled_at=to_iso(decision.until),
+        )
+    return decision
 
 
 def mark_failed(

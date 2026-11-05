@@ -25,6 +25,7 @@ from clipper.posting.models import (
     reschedule_problem,
 )
 from clipper.posting.scheduler import slot_problems
+from clipper.posting.stage import HISTORY
 from clipper.review.app import flash, render, safe_next_path
 from clipper.review.routes import MAX_ID, ClipId, Conn, User, _action_error, _is_htmx, _now
 
@@ -132,7 +133,8 @@ def _broken_rules(request: Request, conn: Conn, post_id: int, when: datetime) ->
     account = accounts.get(post.account_id) if post is not None else None
     if post is None or account is None:
         return []
-    others = repo.account_post_times(conn, account.id, exclude_post_id=post.id)
+    since = _now(request) - HISTORY
+    others = repo.account_post_times(conn, account.id, exclude_post_id=post.id, since=since)
     try:
         return slot_problems(account, others, when)
     except (ValueError, ZoneInfoNotFoundError):

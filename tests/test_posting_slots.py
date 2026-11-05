@@ -210,17 +210,33 @@ def test_backoff_retry_with_no_free_slot_gives_up_and_alerts(env: Env, clock: Cl
     assert len(alerts) == 1
 
 
-def test_a_warmup_day_with_no_allowance_defers_instead_of_publishing(
+def test_a_warmup_with_no_allowance_for_weeks_holds_the_post_for_a_human(
     env: Env, clock: Clock
 ) -> None:
-    account = FakeAccount(warmup_start=date(2027, 6, 1))
+    account = FakeAccount(warmup_start=date(2027, 6, 1))  # no slot within MAX_DAYS_AHEAD
+    due = make_post(env)
+    publisher = FakePublisher()
+    alerts: list[str] = []
+
+    stage(env, clock, publisher, account, alert=alerts.append).run_once()
+
+    assert publisher.calls == []
+    held = get(env, due)
+    assert held.status == PostStatus.POST_FAILED and held.attempts == 0
+    assert len(alerts) == 1
+
+
+def test_a_warmup_day_with_no_allowance_defers_to_the_first_allowed_day(
+    env: Env, clock: Clock
+) -> None:
+    account = FakeAccount(warmup_start=date(2027, 1, 17))
     due = make_post(env)
     publisher = FakePublisher()
 
     stage(env, clock, publisher, account).run_once()
 
     assert publisher.calls == []
-    assert get(env, due).scheduled_at > T0
+    assert get(env, due).scheduled_at == local(17, 9)
 
 
 def test_last_attempt_still_fails_without_looking_for_a_slot(env: Env, clock: Clock) -> None:

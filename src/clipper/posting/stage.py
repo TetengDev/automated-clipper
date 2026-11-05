@@ -37,10 +37,13 @@ CLP-106 (with the accounts config, `accounts`):
 * A failed attempt retries in the account's next free slot at or after the backoff time
   (`pick_slot`), so retries keep to its windows, gap, posts per day, warm-up and platform
   cap. With no free slot within `MAX_DAYS_AHEAD` days the post is `post_failed` and alerts.
-* At claim time a due post that would take its account over that local day's limit (its
-  `daily_limit`; the platform cap alone for an account not in the config) is moved to the
-  account's next free slot from the next local day instead (audit `post_deferred`). Posts
-  posted that day and uploads in flight count.
+* At claim time (after the lookup of an earlier attempt), in one write transaction:
+  a post that would take its account over its local day's `daily_limit` (the platform
+  cap on the UTC day for an account not in the config), over the platform cap in a
+  rolling 24 hours, or inside the minimum gap after its last upload, is deferred to the
+  account's next free slot (audit `post_deferred`, no attempt counted), or, with no free
+  slot, is `post_failed` and alerts. Posts posted, in flight, or with failed attempts in
+  the window count (`repo.uploads_between`).
 * Posts of an account missing from the config keep the plain backoff.
 """
 
@@ -90,9 +93,14 @@ HEARTBEAT_BUSY_MS = 2_000
 MAX_UPLOAD = timedelta(hours=4)
 """The heartbeat stops after this long, so a publish that never returns goes stale."""
 BACKOFF_BASE = timedelta(minutes=5)
-UNRESOLVED = "uploading state unresolved"
+UNRESOLVED = repo.UNRESOLVED_PREFIX
 DEFAULT_BATCH = 10
 MAX_STALE_PER_PASS = DEFAULT_BATCH
+ROLLING_DAY = timedelta(hours=24)
+ROLLING_RETRY = timedelta(hours=1)
+"""A post held by the rolling 24-hour platform cap is tried again this much later."""
+HISTORY = timedelta(days=2)
+"""Post history the slot picker needs (it only looks at today and later, local time)."""
 """Stale posts resolved per pass at most; the rest wait for the next pass."""
 
 logger = logging.getLogger(__name__)
@@ -178,9 +186,10 @@ class PostingStage:
 
     def _publish(self, post: Post) -> None:
         publisher = self.publishers[post.platform]
-        if self._defer_if_over_limit(post):
-            return
+        # Lookup first: an earlier attempt that went live is recorded whatever the caps.
         if post.attempts > 0 and self._already_live(post, publisher):
+            return
+        if self._held_by_caps(post):
             return
         try:
             path = resolve_media_path(self.media_root, post.video_path)
@@ -319,65 +328,126 @@ class PostingStage:
             return
         logger.info("%s: posted (%s)", _label(post), result.external_id)
 
-    def _defer_if_over_limit(self, post: Post) -> bool:
-        """Claim-time daily cap (CLP-106): a claimed post that would take its account over
-        today's limit goes back to `scheduled` in the account's next free slot from the
-        next local day, through the same `repo.defer` as a publisher's `PublishDeferred`
-        (CLP-93), without counting an attempt. True when it was deferred."""
-        account = self.accounts.get(post.account_id)
+    def _held_by_caps(self, post: Post) -> bool:
+        """Claim-time caps (CLP-106). True when the claimed post must not upload now: it
+        was deferred (no attempt counted) or, with no free slot, given up with an alert."""
         now = self.clock()
         try:
-            timezone = account.timezone if account is not None else "UTC"
-            start, end = day_bounds(timezone, now)
-            if account is None:
-                limit = PLATFORM_DAILY_CAPS.get(post.platform)
-            else:
-                limit = daily_limit(account, now.astimezone(ZoneInfo(timezone)).date())
-            if limit is None:
-                return False
-            started = repo.started_between(
-                self.conn, post.account_id, start, end, exclude_post_id=post.id
+            decision = repo.defer_claimed(
+                self.conn, post, self.worker_id, now, lambda c: self._cap_decision(c, post, now)
             )
-            if started < limit:
-                return False
-            until = end
-            if account is not None:
-                others = repo.account_post_times(self.conn, account.id, exclude_post_id=post.id)
-                until = pick_slot(account, others, end) or end
-        except (ValueError, ZoneInfoNotFoundError) as exc:
-            logger.error("account %s: invalid schedule config: %s", post.account_id, exc)
-            return False
-        reason = f"daily limit reached ({started} of {limit} upload(s) today)"
-        try:
-            repo.defer(self.conn, post, self.worker_id, reason, until, now)
         except PostConflict as exc:
             logger.warning("%s: deferral not recorded: %s", _label(post), exc)
             return True
-        logger.warning("%s: %s; deferred to %s", _label(post), reason, until.isoformat())
+        except sqlite3.Error as exc:
+            # Never upload unchecked, and never leave the post claimed (the stale pass
+            # would hand it to a human as an unresolved upload).
+            logger.error("%s: cap check failed: %s; retrying later", _label(post), exc)
+            hold = repo.Deferral(f"cap check failed: {exc}", now + BACKOFF_BASE)
+            try:
+                repo.defer_claimed(self.conn, post, self.worker_id, now, lambda _: hold)
+            except Exception:
+                logger.exception("%s: could not release the claim", _label(post))
+            return True
+        if decision is None:
+            return False
+        if decision.until is None:
+            failed = repo.get_post(self.conn, post.id) or post
+            self._alert(failed, decision.reason)
+        else:
+            logger.warning(
+                "%s: %s; deferred to %s", _label(post), decision.reason, decision.until.isoformat()
+            )
         return True
 
-    def _retry_slot(self, post: Post) -> tuple[datetime | None, bool]:
-        """(when to retry, give up?) for a failed attempt that is not the last one: the
-        account's next free slot at or after the backoff time."""
-        attempts = post.attempts + 1
-        if attempts >= MAX_ATTEMPTS:
-            return None, False
-        earliest = self.clock() + BACKOFF_BASE * 2**attempts
+    def _cap_decision(
+        self, conn: sqlite3.Connection, post: Post, now: datetime
+    ) -> repo.Deferral | None:
+        """Runs inside the claim-check transaction. In order: the account's daily limit
+        for its local day (`daily_limit`; the platform cap on the UTC day for an account
+        not in the config or with a broken one), the platform cap over a rolling 24 hours
+        (counted per API attempt), and the account's minimum gap after its last upload.
+        The claim-time count is the authority on caps; the slot picker only plans."""
         account = self.accounts.get(post.account_id)
-        if account is None:
-            return earliest, False
-        try:
-            others = repo.account_post_times(self.conn, account.id, exclude_post_id=post.id)
-            slot = pick_slot(account, others, earliest)
-        except (ValueError, ZoneInfoNotFoundError) as exc:
-            logger.error("account %s: invalid schedule config: %s", account.id, exc)
-            return earliest, False
-        return slot, slot is None
+        cap = PLATFORM_DAILY_CAPS.get(post.platform)
+        limit = cap
+        start, end = day_bounds("UTC", now)
+        if account is not None:
+            try:
+                start, end = day_bounds(account.timezone, now)
+                limit = daily_limit(account, start.astimezone(ZoneInfo(account.timezone)).date())
+            except (ValueError, ZoneInfoNotFoundError) as exc:
+                logger.error("account %s: invalid schedule config: %s", account.id, exc)
+                account, limit = None, cap
+                start, end = day_bounds("UTC", now)
+        others = post.id
+
+        def after(moment: datetime, *extra: datetime) -> datetime | None:
+            if account is None:
+                return moment
+            try:
+                taken = repo.account_post_times(
+                    conn, account.id, exclude_post_id=others, since=now - HISTORY
+                )
+                return pick_slot(account, [*taken, *extra], moment)
+            except (ValueError, ZoneInfoNotFoundError):
+                return moment
+
+        def held(reason: str, until: datetime | None) -> repo.Deferral:
+            if until is None:
+                reason = f"{reason}; no free slot in the next {MAX_DAYS_AHEAD} days"
+            return repo.Deferral(reason, until)
+
+        if limit is not None:
+            done = repo.uploads_between(conn, post.account_id, start, end, exclude_post_id=others)
+            if done >= limit:
+                return held(f"daily limit reached ({done} of {limit} upload(s) today)", after(end))
+        if cap is not None:
+            recent = repo.uploads_between(
+                conn,
+                post.account_id,
+                now - ROLLING_DAY,
+                now + timedelta(seconds=1),
+                exclude_post_id=others,
+                per_attempt=True,
+            )
+            if recent >= cap:
+                return held(
+                    f"{post.platform} cap reached ({recent} of {cap} upload(s) in 24 hours)",
+                    after(now + ROLLING_RETRY),
+                )
+        if account is not None and account.min_gap_minutes > 0:
+            gap = timedelta(minutes=account.min_gap_minutes)
+            last = repo.last_upload(conn, account.id, now - gap, exclude_post_id=others)
+            if last is not None and now - last < gap:
+                return held(
+                    f"within the {account.min_gap_minutes}-minute gap of the last upload",
+                    after(last + gap, last),
+                )
+        return None
+
+    def _retry_at(self, post: Post) -> Callable[[sqlite3.Connection, datetime], datetime | None]:
+        """For `record_failure`: inside its transaction, the account's next free slot at or
+        after the backoff time (the backoff time itself for an account not in the config
+        or with a broken one)."""
+        account = self.accounts.get(post.account_id)
+        now = self.clock()
+
+        def slot(conn: sqlite3.Connection, earliest: datetime) -> datetime | None:
+            if account is None:
+                return earliest
+            try:
+                taken = repo.account_post_times(
+                    conn, account.id, exclude_post_id=post.id, since=now - HISTORY
+                )
+                return pick_slot(account, taken, earliest)
+            except (ValueError, ZoneInfoNotFoundError) as exc:
+                logger.error("account %s: invalid schedule config: %s", account.id, exc)
+                return earliest
+
+        return slot
 
     def _failed_attempt(self, post: Post, error: str) -> None:
-        retry_at, no_slot = self._retry_slot(post)
-        if no_slot:
-            error = f"{error}; no free slot for a retry in the next {MAX_DAYS_AHEAD} days"
         try:
             updated = repo.record_failure(
                 self.conn,
@@ -387,14 +457,14 @@ class PostingStage:
                 self.clock(),
                 max_attempts=MAX_ATTEMPTS,
                 backoff=BACKOFF_BASE,
-                retry_at=retry_at,
-                give_up=no_slot,
+                retry_at=self._retry_at(post),
+                no_slot_note=f"no free slot for a retry in the next {MAX_DAYS_AHEAD} days",
             )
         except PostConflict as exc:
             logger.warning("%s: failure not recorded: %s", _label(post), exc)
             return
         if updated.status == PostStatus.POST_FAILED:
-            self._alert(updated, error)
+            self._alert(updated, updated.error or error)
         else:
             logger.warning(
                 "%s: attempt %d failed: %s; retry at %s",

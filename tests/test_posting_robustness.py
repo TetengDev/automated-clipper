@@ -19,7 +19,7 @@ from clipper.db import connect
 from clipper.jobs import Job, JobStatus, StageContext, StageDef, Worker, enqueue
 from clipper.posting import repo
 from clipper.posting.models import Post, PostStatus, PublishResult
-from clipper.posting.stage import MAX_UPLOAD, STALE_UPLOAD, PostingStage
+from clipper.posting.stage import MAX_UPLOAD, RECOVER_QUIET, STALE_UPLOAD, PostingStage
 from clipper.urls import SourceRef
 from posting_support import LookupPublisher
 from review_support import Env, make_env
@@ -367,7 +367,8 @@ def test_recover_never_releases_an_upload_that_is_still_heartbeating(
     env: Env, clock: Clock
 ) -> None:
     # An operator who names a live worker must not get its upload taken over: a claim
-    # re-stamped within the last three heartbeats is left alone.
+    # re-stamped within RECOVER_QUIET is not released, only set to go stale RECOVER_QUIET
+    # from now, which a live worker's next heartbeat undoes.
     post = make_post(env)
     uploading(env, post, "busy", T0 - timedelta(minutes=1))
     posting = stage(env, clock, LookupPublisher())
@@ -375,7 +376,29 @@ def test_recover_never_releases_an_upload_that_is_still_heartbeating(
     assert posting.recover("busy") == 0
     assert posting.run_once() == 0
     left = fresh(env, post.id)
-    assert left.worker_id == "busy" and left.claimed_at == T0 - timedelta(minutes=1)
+    assert left.worker_id == "busy" and left.status == PostStatus.UPLOADING
+    assert left.claimed_at == T0 - STALE_UPLOAD + RECOVER_QUIET
+    assert repo.touch_claim(env.conn, post.id, "busy", T0 + timedelta(minutes=1))
+    clock.now = T0 + RECOVER_QUIET
+    assert posting.run_once() == 0  # alive: re-stamped, so still not stale
+    assert fresh(env, post.id).worker_id == "busy"
+
+
+def test_recover_of_a_fresh_crash_resolves_it_after_recover_quiet(env: Env, clock: Clock) -> None:
+    # Restarted right after the crash: the last beat is recent, so the post is not released
+    # at once, but it goes stale RECOVER_QUIET later, not STALE_UPLOAD later.
+    post = make_post(env)
+    uploading(env, post, "dead", T0 - timedelta(seconds=30))
+    publisher = LookupPublisher(found={post.idempotency_key: PublishResult(external_id="e")})
+    posting = stage(env, clock, publisher)
+
+    posting.recover("dead")
+    clock.now = T0 + RECOVER_QUIET - timedelta(seconds=1)
+    assert posting.run_once() == 0
+    clock.now = T0 + RECOVER_QUIET
+
+    assert posting.run_once() == 1
+    assert fresh(env, post.id).status == PostStatus.POSTED
 
 
 def test_unresolved_upload_alert_says_to_check_the_platform_first(env: Env, clock: Clock) -> None:
@@ -550,3 +573,131 @@ def test_interrupt_waits_briefly_for_the_posting_pass(env: Env) -> None:
 
     assert stop.is_set()
     assert not worker.posting_running  # its connection is safe to close now
+
+
+class Fatal(BaseException):
+    """A BaseException that is neither an interrupt nor an exit."""
+
+
+def test_posting_loop_survives_a_base_exception(env: Env, caplog: pytest.LogCaptureFixture) -> None:
+    stop = threading.Event()
+    calls: list[int] = []
+
+    class Pass:
+        def run_once(self) -> int:
+            calls.append(1)
+            if len(calls) == 1:
+                raise Fatal
+            stop.set()
+            return 0
+
+    worker = Worker(conn=env.conn, config=AppConfig(), worker_id="w1", stages={}, posting=Pass())
+
+    worker.run_forever(stop, poll_seconds=0.01)
+
+    assert len(calls) == 2
+    assert "posting pass failed" in caplog.text
+
+
+def test_a_dead_posting_thread_is_restarted_after_a_backoff(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    stop = threading.Event()
+    calls: list[float] = []
+
+    class Pass:
+        def run_once(self) -> int:
+            calls.append(time.monotonic())
+            if len(calls) == 1:
+                raise SystemExit  # ends the thread (threading ignores SystemExit)
+            stop.set()
+            return 0
+
+    worker = Worker(conn=env.conn, config=AppConfig(), worker_id="w1", stages={}, posting=Pass())
+
+    worker.run_forever(stop, poll_seconds=0.05)
+
+    assert len(calls) == 2
+    assert calls[1] - calls[0] >= 0.05  # not restarted in a tight loop
+    assert "posting thread died" in caplog.text
+
+
+def test_recover_quiet_allows_for_clock_skew_between_hosts() -> None:
+    from clipper.posting.stage import HEARTBEAT, RECOVER_QUIET
+
+    assert RECOVER_QUIET >= HEARTBEAT * 5
+
+
+def test_worker_wires_its_stop_event_into_the_posting_stage(env: Env, clock: Clock) -> None:
+    stop = threading.Event()
+    posting = stage(env, clock, LookupPublisher())
+    worker = Worker(conn=env.conn, config=AppConfig(), worker_id="w1", stages={}, posting=posting)
+    stop.set()
+
+    worker.run_forever(stop, poll_seconds=0.01)
+
+    assert posting.stop is stop
+
+
+def test_an_interrupt_leaves_a_still_busy_posting_thread_running(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clipper.jobs import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "INTERRUPT_JOIN_SECONDS", 0.01)
+    stop = threading.Event()
+    in_pass = threading.Event()
+    release = threading.Event()
+
+    class Pass:
+        def run_once(self) -> int:
+            in_pass.set()
+            release.wait(WAIT)
+            return 0
+
+    def crash(job: Job, ctx: StageContext) -> None:
+        assert in_pass.wait(WAIT)
+        raise Crash
+
+    enqueue(env.conn, SourceRef("youtube", "dQw4w9WgXcQ"), datetime.now(UTC), creator="manual")
+    worker = Worker(
+        conn=env.conn,
+        config=AppConfig(),
+        worker_id="w1",
+        stages={JobStatus.DETECTED: StageDef(crash)},
+        media_root=env.media_root,
+        posting=Pass(),
+    )
+
+    with pytest.raises(Crash):
+        worker.run_forever(stop, poll_seconds=0.01)
+
+    assert worker.posting_running  # so the CLI must not close its connection
+    release.set()
+    assert wait_until(lambda: not worker.posting_running)
+
+
+def test_stale_posts_are_claimed_one_at_a_time(env: Env, clock: Clock) -> None:
+    # A post waiting behind a slow lookup is not claimed (and ageing) meanwhile.
+    first = make_post(env)
+    second = make_post(env, account="tt_alt")
+    uploading(env, first, "dead", T0 - timedelta(hours=2))
+    uploading(env, second, "dead", T0 - timedelta(hours=1))
+    seen: list[str | None] = []
+
+    @dataclass
+    class Watching(LookupPublisher):
+        def lookup(self, idempotency_key: str) -> PublishResult | None:
+            if idempotency_key == first.idempotency_key:
+                seen.append(fresh(env, second.id).worker_id)
+            return PublishResult(external_id=idempotency_key[:6])
+
+    stage(env, clock, Watching()).run_once()
+
+    assert seen == ["dead"]
+    assert fresh(env, second.id).status == PostStatus.POSTED
+
+
+def test_connect_accepts_a_shorter_busy_timeout(tmp_path: Path) -> None:
+    with closing(connect(tmp_path / "x.db", busy_timeout_ms=1500)) as conn:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 1500

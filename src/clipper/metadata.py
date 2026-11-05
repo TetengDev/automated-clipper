@@ -132,10 +132,13 @@ def is_disclosure(tag: str) -> bool:
 
 _SCRIPT_ALIASES = {"CJK": "HAN", "IDEOGRAPHIC": "HAN"}
 """First words of Unicode character names that do not spell the script."""
-_COMMON = frozenset({"KATAKANA-HIRAGANA", "MODIFIER", "VERTICAL"})
-"""Letters shared by more than one script: the prolonged sound mark ー, modifier letters
-such as the okina in #Hawaiʻi or the Ukrainian apostrophe ʼ, and the kana repeat mark 〱.
-Modifier letters that look like Latin letters (ʰ, ᵖ) fold to Latin under NFKC first."""
+_NEUTRAL = frozenset("ʻʼʽ")
+"""Apostrophe-like modifier letters written inside words of several scripts: the okina in
+#Hawaiʻi and the Ukrainian apostrophe ʼ. Every other modifier letter (prime, colon, stress
+mark) counts as a script of its own, so it cannot pad a Latin tag."""
+_KANA_MARKS = frozenset("ー〱〲〳〴〵")
+"""The prolonged sound mark ー and the kana repeat marks: part of a tag only next to kana."""
+_KANA = frozenset({"HIRAGANA", "KATAKANA"})
 _SCRIPT_MIXES = (
     frozenset({"LATIN", "HAN", "HIRAGANA", "KATAKANA"}),
     frozenset({"LATIN", "HAN", "BOPOMOFO"}),
@@ -145,28 +148,33 @@ _SCRIPT_MIXES = (
 "highly restrictive" profile (UTS #39)."""
 
 
-def _scripts(tag: str) -> set[str]:
-    """The scripts of the letters in `tag` after NFKC folding, read from the first word of
-    each letter's Unicode name (LATIN, CYRILLIC, GREEK, ...). Digits, `_` and combining
-    marks belong to no script."""
+def _scripts(folded: str) -> set[str]:
+    """The scripts of the letters in an NFKC-folded tag, read from the first word of each
+    letter's Unicode name (LATIN, CYRILLIC, GREEK, ...). Digits, `_` and combining marks
+    belong to no script."""
     scripts: set[str] = set()
-    for char in unicodedata.normalize("NFKC", tag):
-        if not unicodedata.category(char).startswith("L"):
+    kana_marks = False
+    for char in folded:
+        if char in _NEUTRAL or not unicodedata.category(char).startswith("L"):
+            continue
+        if char in _KANA_MARKS:
+            kana_marks = True
             continue
         word = unicodedata.name(char, "UNKNOWN").split(" ", 1)[0]
-        if word not in _COMMON:
-            scripts.add(_SCRIPT_ALIASES.get(word, word))
+        scripts.add(_SCRIPT_ALIASES.get(word, word))
+    if kana_marks and not scripts & _KANA:
+        scripts.add("KANA MARK")
     return scripts
 
 
 def _mixed_scripts(tag: str) -> list[str]:
     """The scripts `tag` mixes, sorted; empty when it is one writing system."""
-    scripts = _scripts(tag)
+    folded = unicodedata.normalize("NFKC", tag)
+    scripts = _scripts(folded)
     if len(scripts) > 1 and not any(scripts <= mix for mix in _SCRIPT_MIXES):
         return sorted(scripts)
     # A Latin tag with a lookalike zero from another script (#pr၀m၀, #sp〇ns〇red).
-    folded = unicodedata.normalize("NFKC", tag)
-    if "LATIN" in scripts and any(
+    if scripts == {"LATIN"} and any(
         not c.isascii() and unicodedata.category(c).startswith("N") for c in folded
     ):
         return ["LATIN", "non-ASCII digits"]
@@ -257,7 +265,7 @@ class Variant(BaseModel):
             if is_disclosure(tag):
                 raise ValueError(f"hashtag {tag} reads as a paid-partnership disclosure")
             if mixed := _mixed_scripts(tag):
-                raise ValueError(f"hashtag {tag!r} mixes scripts ({', '.join(mixed)})")
+                raise ValueError(f"hashtag {tag} mixes scripts ({', '.join(mixed)})")
         if len({_fold(t) for t in tags}) != len(tags):
             raise ValueError("duplicate hashtags")
         return tags

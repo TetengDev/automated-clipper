@@ -37,6 +37,7 @@ from clipper.urls import InvalidSourceURL, parse_source_url
 if TYPE_CHECKING:
     import httpx
 
+    from clipper.accounts import Account
     from clipper.posting.models import Publisher
     from clipper.resolve import Resolved
     from clipper.sources.youtube import MetadataProvider, YouTubeSource
@@ -321,6 +322,48 @@ def run_worker(
         conn.close()
 
 
+def _posting_accounts(config_path: Path, cfg: AppConfig) -> list[Account]:
+    """The accounts from accounts.yaml (CLP-91); none when the file is missing."""
+    from clipper.accounts import accounts_path, load_accounts
+
+    try:
+        return list(load_accounts(accounts_path(config_path), cfg).accounts)
+    except ConfigError as exc:
+        _fail(str(exc))
+
+
+@app.command("meta-tokens")
+def meta_tokens(ctx: typer.Context) -> None:
+    """Check the Facebook and Instagram account tokens: valid, and when they expire.
+
+    Exits 1 when a token is missing, invalid or expires within 7 days. Prints names and
+    dates only, never a token."""
+    from clipper.jobs.models import utcnow
+    from clipper.publish.meta import GraphClient, token_report
+
+    try:
+        cfg = load_config(_app(ctx).config_path)
+    except ConfigError as exc:
+        _fail(str(exc))
+    accounts = [
+        a
+        for a in _posting_accounts(_app(ctx).config_path, cfg)
+        if a.enabled and a.platform in ("facebook", "instagram")
+    ]
+    if not accounts:
+        typer.echo("no facebook or instagram accounts")
+        return
+    healthy = True
+    with _http_client() as http:
+        client = GraphClient(http)
+        for account in accounts:
+            ok, line = token_report(client, account.id, utcnow())
+            healthy = healthy and ok
+            typer.echo(f"{account.id} {account.platform}: {line}")
+    if not healthy:
+        raise typer.Exit(code=1)
+
+
 def _publishers(config_path: Path, cfg: AppConfig) -> dict[str, Publisher]:
     """Publishers for the platforms the accounts config posts to (CLP-93). An invalid
     accounts config turns posting off instead of stopping the clip pipeline."""
@@ -409,6 +452,7 @@ def run_review(
         config = load_config(_app(ctx).config_path)  # content types for the faces check
     except ConfigError as exc:
         _fail(f"run-review: {exc}")
+    accounts = _posting_accounts(_app(ctx).config_path, config)  # approve schedules on these
     try:
         secrets = Secrets()
         application = create_app(
@@ -420,6 +464,7 @@ def run_review(
             output_dir=output_dir.resolve(),
             rclone_remote=secrets.rclone_remote,
             config=config,
+            accounts=accounts,
         )
     except (MissingSecretError, ValidationError, ValueError) as exc:
         _fail(f"run-review: {exc}")

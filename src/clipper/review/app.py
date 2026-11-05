@@ -9,6 +9,9 @@ Security model (single reviewer, behind Caddy/HTTPS in production):
   routes should still declare `Depends(require_user)` so the requirement is explicit.
 - Every unsafe request (POST/PUT/PATCH/DELETE) must carry the session's CSRF token, as a
   `csrf_token` form field or an `X-CSRF-Token` header (`csrf_protect`, applied app-wide).
+- Every request body is capped at 256 KB (`_BodySizeLimit`, outside the session and auth
+  layers): an oversized `Content-Length` is 413 before the app runs, and a streamed body is
+  counted as it arrives, so no form is ever parsed past the cap.
 - Login attempts are throttled per client IP (the 6th failure inside a sliding minute gets
   429) with a global backstop of 30 attempts a minute. The client IP is only trustworthy
   when uvicorn trusts the proxy's X-Forwarded-For (`run-review --forwarded-allow-ips`).
@@ -33,7 +36,13 @@ from urllib.parse import quote, urlsplit
 
 import bcrypt
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.datastructures import Headers, MutableHeaders
@@ -60,11 +69,15 @@ LOGIN_MAX_ATTEMPTS = 5  # failures per client IP per window
 LOGIN_GLOBAL_MAX_ATTEMPTS = 30  # attempts across all IPs per window
 LOGIN_WINDOW_SECONDS = 60.0
 BCRYPT_MAX_BYTES = 72
+# Largest legitimate form (CLP-96 variants: every title and caption at its platform limit,
+# in 4-byte characters percent-encoded) is about 140 KB.
+MAX_REQUEST_BODY_BYTES = 256 * 1024
 CSRF_FORM_FIELD = "csrf_token"
 CSRF_HEADER = "X-CSRF-Token"
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _PUBLIC_PATHS = frozenset({"/login", "/healthz"})
 _BCRYPT_HASH = re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$")
+_CONTENT_LENGTH = re.compile(r"[0-9]+")
 _UNSAFE_NEXT_CHARS = re.compile(r"[\x00-\x20\x7f\\]")
 
 SECURITY_HEADERS = {
@@ -189,6 +202,70 @@ class _AuthGate:
             await _login_redirect(scope)(scope, receive, send)
             return
         await self.app(scope, receive, send)
+
+
+class _BodyTooLarge(HTTPException):
+    """Raised from the wrapped `receive` once a body passes the cap. An HTTPException, so
+    FastAPI's body parsing re-raises it as-is (any other error becomes a 400)."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=413, detail="Request body too large")
+
+
+class _BodySizeLimit:
+    """ASGI middleware: request bodies over `max_bytes` get 413 before anything parses them.
+
+    A declared `Content-Length` over the cap is refused without calling the app; a
+    malformed one is 400. The body is also counted as it streams in (chunked uploads, or a
+    `Content-Length` that understates it): past the cap, `receive` raises `_BodyTooLarge`,
+    which FastAPI turns into a 413, or this middleware does if it escapes the app.
+    """
+
+    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = Headers(scope=scope).get("content-length")
+        if declared is not None:
+            if not _CONTENT_LENGTH.fullmatch(declared):
+                await PlainTextResponse("Invalid Content-Length", 400)(scope, receive, send)
+                return
+            if int(declared) > self.max_bytes:
+                await _too_large()(scope, receive, send)
+                return
+
+        received = 0
+        started = False
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise _BodyTooLarge
+            return message
+
+        async def tracking_send(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except _BodyTooLarge:
+            if started:
+                raise
+            await _too_large()(scope, receive, send)
+
+
+def _too_large() -> Response:
+    return PlainTextResponse("Request body too large", 413, headers={"Connection": "close"})
 
 
 class _SecurityHeaders:
@@ -464,7 +541,7 @@ def create_app(
     app.state.login_throttle = throttle
     app.state.session_policy = policy
 
-    # Middleware: last added is outermost -> [security headers](session(gate(app))).
+    # Middleware: last added is outermost -> [security headers](body cap(session(gate(app)))).
     app.add_middleware(_AuthGate, policy=policy)
     app.add_middleware(
         SessionMiddleware,
@@ -474,6 +551,7 @@ def create_app(
         same_site="lax",
         https_only=secure_cookies,
     )
+    app.add_middleware(_BodySizeLimit, max_bytes=MAX_REQUEST_BODY_BYTES)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

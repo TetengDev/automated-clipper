@@ -92,10 +92,10 @@ _LOOKALIKE_DIGITS = str.maketrans("013457", "oieast")
 _TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online|store|live|click"
 _SPOKEN_TLDS = "com|net|org|io|ly|gg|co|xyz|link|tv|app|info|biz|click"
 """After a spoken "dot": only TLDs that are not everyday words ("polka dot shop")."""
-# A name starts a token: never mid-word or right after a hyphen or a dot that follows a
-# word character, so each run of text is scanned once (no quadratic backtracking on
+# A name starts a token: never mid-word or right after a hyphen, or a dot that follows a
+# word character or hyphen, so each run of text is scanned once (no quadratic backtracking on
 # "a-a-a-..." or "a.a.a...").
-_NAME = r"(?<![\w-])(?<!\w\.)[\w-]+"
+_NAME = r"(?<![\w-])(?<![\w-]\.)[\w-]+"
 LINK_OR_MENTION = re.compile(
     # A URL ends before quotes, brackets and trailing punctuation.
     r"(?i:(?<![\w./:-])(?:https?://|www\.)[\w\-.~:/?#@!$&*+,;=%]*[\w\-/#=~%&+])"
@@ -222,16 +222,36 @@ def is_disclosure(tag: str) -> bool:
     return key in DISCLOSURE_HASHTAGS or key.startswith(DISCLOSURE_PREFIXES)
 
 
+def _match_copy(text: str) -> tuple[str, list[int]]:
+    """The copy of `text` that links, mentions and inline tags are matched on, and for each
+    of its characters the index of the character of `text` it came from."""
+    chars: list[str] = []
+    origin: list[int] = []
+    for i, char in enumerate(text):
+        for c in unicodedata.normalize("NFKC", char):
+            if _INVISIBLE.match(c) or unicodedata.category(c) in {"Cf", "Mn", "Me"}:
+                continue
+            chars.append(c.translate(_IDNA_DOTS))
+            origin.append(i)
+    return "".join(chars), origin
+
+
 def _match_text(text: str) -> str:
-    """The copy of `text` that links, mentions and inline tags are matched on."""
-    text = _INVISIBLE.sub("", unicodedata.normalize("NFKC", text))
-    text = "".join(c for c in text if unicodedata.category(c) not in {"Cf", "Mn", "Me"})
-    return text.translate(_IDNA_DOTS)
+    return _match_copy(text)[0]
+
+
+def _link_matches(text: str) -> list[tuple[str, str]]:
+    """Each link or mention as matched, with the slice of `text` it was matched from."""
+    copy, origin = _match_copy(text)
+    return [
+        (m.group(0), text[origin[m.start()] : origin[m.end() - 1] + 1])
+        for m in LINK_OR_MENTION.finditer(copy)
+    ]
 
 
 def links_or_mentions(text: str) -> list[str]:
     """Links, domains, IPs and @mentions in `text`, in order (as matched, normalized)."""
-    return [m.group(0) for m in LINK_OR_MENTION.finditer(_match_text(text))]
+    return [found for found, _ in _link_matches(text)]
 
 
 def _link_host(link: str) -> str | None:
@@ -577,11 +597,13 @@ def preflight(
         problems.append("youtube: the title is empty")
     if platform == "youtube" and _ANGLE.search(metadata.title + metadata.caption):
         problems.append("youtube: title or description contains < or >")
-    found = links_or_mentions(f"{metadata.title}\n{metadata.caption}")
-    # An allowed match must appear as typed (up to NFKC): a combining mark inside a host
-    # is stripped for matching but would still be posted, to a different IDN host.
-    typed = _fold(f"{metadata.title}\n{metadata.caption}")
-    found = [f for f in found if not (brief and brief.allows(f) and _fold(f) in typed)]
+    # An allowed match must also read the same as typed (up to NFKC): a combining mark in a
+    # host is stripped for matching but would still be posted, to a different IDN host.
+    found = [
+        f
+        for f, typed in _link_matches(f"{metadata.title}\n{metadata.caption}")
+        if not (brief and brief.allows(f) and _fold(typed) == _fold(f))
+    ]
     if found:
         problems.append(f"{platform}: links or mentions to check: {', '.join(found)}")
     inline = inline_disclosure_tags(f"{metadata.title}\n{metadata.caption}", metadata.hashtags)

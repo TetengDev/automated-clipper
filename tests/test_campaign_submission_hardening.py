@@ -279,3 +279,52 @@ def test_a_stored_figure_that_overflows_never_breaks_the_rollup(env: Env) -> Non
 def test_a_webhook_url_httpx_cannot_send_to_is_refused_up_front() -> None:
     with httpx.Client() as http, pytest.raises(ValueError):
         DiscordWebhook("https://discord.com/api/webhooks/1/tok\x7fen", http)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://discord.com:99999/api/webhooks/1/t",
+        "https://discord.com:8443/api/webhooks/1/t",
+        "https://discord.com/api/webhooks/1/t ok",
+    ],
+)
+def test_a_webhook_url_that_would_fail_every_send_is_refused(url: str) -> None:
+    with httpx.Client() as http, pytest.raises(ValueError):
+        DiscordWebhook(url, http)
+
+
+def test_a_payout_with_fractions_of_a_cent_is_refused() -> None:
+    with pytest.raises(ValueError):
+        parse_payout("12.505")
+    assert str(parse_payout("12.500")) == "12.50"
+
+
+QUICK = {"quick": campaign(id="quick", submit_within_minutes=5)}
+
+
+def test_first_ping_and_reminder_stamp_are_claimed_together(env: Env) -> None:
+    posted_post(env, campaign_id="quick")
+    now = [POSTED + timedelta(seconds=5)]
+    other = Recorder()
+
+    class Racing(Recorder):
+        def __call__(self, text: str) -> None:
+            # Another worker polls while this one is sending the first ping.
+            SubmissionPass(env.conn, QUICK, other, other, clock=lambda: now[0]).run_once()
+            super().__call__(text)
+
+    racing = Racing()
+    SubmissionPass(env.conn, QUICK, racing, racing, clock=lambda: now[0]).run_once()
+
+    assert len(racing.messages) == 1 and other.messages == []
+
+
+def test_a_failed_send_releases_every_stamp_it_claimed(env: Env) -> None:
+    posted_post(env, campaign_id="quick")
+    down = Down()
+
+    SubmissionPass(env.conn, QUICK, down, down, clock=lambda: POSTED).run_once()  # type: ignore[arg-type]
+
+    [submission] = list_submissions(env.conn)
+    assert submission.notified_at is None and submission.reminded_at is None

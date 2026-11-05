@@ -60,7 +60,7 @@ def test_one_mb_form_post_is_413_before_it_is_parsed(
         data={"csrf_token": csrf, "version": "1", "tiktok_caption": "x" * ONE_MB},
     )
 
-    assert response.status_code == 413
+    assert_plain_413(response)
     assert form_calls == []
     assert env.reviews(clip_id) == []
 
@@ -112,7 +112,7 @@ def test_streamed_body_without_content_length_is_413(client: TestClient, env: En
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
 
-    assert response.status_code == 413
+    assert_plain_413(response)
     assert env.reviews(clip_id) == []
 
 
@@ -131,19 +131,77 @@ def test_streamed_body_to_a_route_without_form_params_is_413(client: TestClient)
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
 
+    assert_plain_413(response)
+
+
+def _padded_logout_form(csrf: str, size: int) -> bytes:
+    prefix = f"csrf_token={csrf}&pad=".encode()
+    return prefix + b"p" * (size - len(prefix))
+
+
+def test_body_at_the_limit_reaches_the_route(client: TestClient) -> None:
+    body = _padded_logout_form(login(client), MAX_REQUEST_BODY_BYTES)
+
+    response = client.post(
+        "/logout", content=body, headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+
+    assert response.status_code == 303  # parsed, CSRF checked, logged out
+
+
+def test_body_one_byte_over_the_limit_is_413(client: TestClient) -> None:
+    body = _padded_logout_form(login(client), MAX_REQUEST_BODY_BYTES + 1)
+
+    response = client.post(
+        "/logout", content=body, headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+
     assert response.status_code == 413
 
 
-def test_body_at_the_limit_is_accepted(client: TestClient) -> None:
-    prefix = b"password="
-    body = prefix + b"p" * (MAX_REQUEST_BODY_BYTES - len(prefix))
-    assert len(body) == MAX_REQUEST_BODY_BYTES
+def _stream(body: bytes, chunk: int = 16 * 1024) -> Iterator[bytes]:
+    for i in range(0, len(body), chunk):
+        yield body[i : i + chunk]
+
+
+def test_streamed_body_at_the_limit_reaches_the_route(client: TestClient) -> None:
+    body = _padded_logout_form(login(client), MAX_REQUEST_BODY_BYTES)
 
     response = client.post(
-        "/login", content=body, headers={"Content-Type": "application/x-www-form-urlencoded"}
+        "/logout",
+        content=_stream(body),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
 
-    assert response.status_code != 413
+    assert response.status_code == 303
+
+
+def test_streamed_body_one_byte_over_the_limit_is_413(client: TestClient) -> None:
+    body = _padded_logout_form(login(client), MAX_REQUEST_BODY_BYTES + 1)
+
+    response = client.post(
+        "/logout",
+        content=_stream(body),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    assert_plain_413(response)
+
+
+def assert_plain_413(response) -> None:  # type: ignore[no-untyped-def]
+    """Both 413 paths (declared length, streamed overflow) give the same closing response."""
+    assert response.status_code == 413
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.text == "Request body too large"
+    assert response.headers["connection"] == "close"
+    for name in SECURITY_HEADERS:
+        assert name in response.headers
+
+
+def test_huge_content_length_is_413_not_a_crash() -> None:
+    sent = asyncio.run(_call([b"ok"], [(b"content-length", b"9" * 5000)]))
+
+    assert sent[0]["status"] == 413
 
 
 def test_largest_legitimate_variants_form_fits_under_the_limit(
@@ -178,10 +236,12 @@ def test_normal_review_actions_are_unaffected(client: TestClient, env: Env) -> N
 # --- the middleware on its own: Content-Length cannot be used to sneak past -------------
 
 
-async def _call(body_chunks: list[bytes], headers: list[tuple[bytes, bytes]]) -> list[Message]:
+async def _call(
+    body_chunks: list[bytes], headers: list[tuple[bytes, bytes]], seen: list[int] | None = None
+) -> list[Message]:
     from clipper.review.app import _BodySizeLimit
 
-    seen: list[int] = []
+    seen = [] if seen is None else seen
 
     async def inner(scope, receive, send) -> None:  # type: ignore[no-untyped-def]
         while True:
@@ -218,9 +278,11 @@ def test_understated_content_length_is_still_counted() -> None:
 
 
 def test_overstated_content_length_is_413_without_reading() -> None:
-    sent = asyncio.run(_call([b"ok"], [(b"content-length", b"11")]))
+    seen: list[int] = []
+    sent = asyncio.run(_call([b"ok"], [(b"content-length", b"11")], seen))
 
     assert sent[0]["status"] == 413
+    assert seen == []  # the app never ran
 
 
 @pytest.mark.parametrize("value", [b"abc", b"-1", b"1e3", b"", b"\xd9\xa1"])

@@ -22,7 +22,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +55,14 @@ LINK_OR_MENTION = re.compile(
 """A link, a bare domain (also "name dot com") or an @mention: the transcript is untrusted,
 so text like this in a post is flagged for the reviewer and in pre-flight."""
 HASHTAG = re.compile(r"^#\w{1,50}$")
+
+
+def utf16_len(text: str) -> int:
+    """Length in UTF-16 code units, as TikTok counts it: a character outside the Basic
+    Multilingual Plane (most emoji) counts as two."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
 _ANGLE = re.compile(r"[<>]")
 """The YouTube Data API rejects titles and descriptions containing < or >."""
 
@@ -71,11 +79,22 @@ class PlatformLimits:
     hashtags_min: int = 3
     hashtags_max: int = 5
     """What the model may write per variant (3-5, keyword-first)."""
+    length: Callable[[str], int] = len
+    """How the platform counts `title_max` and `caption_max`: code points unless its
+    documentation says otherwise."""
+    unit: str = "characters"
 
 
 PLATFORM_LIMITS: Mapping[str, PlatformLimits] = {
+    # TikTok counts its limits in UTF-16 units (an emoji is usually two).
     "tiktok": PlatformLimits(
-        title_max=100, caption_max=2200, post_hashtags_max=10, min_seconds=3, max_seconds=600
+        title_max=100,
+        caption_max=2200,
+        post_hashtags_max=10,
+        min_seconds=3,
+        max_seconds=600,
+        length=utf16_len,
+        unit="UTF-16 units (an emoji counts as two)",
     ),
     "instagram": PlatformLimits(
         title_max=100, caption_max=2200, post_hashtags_max=5, min_seconds=3, max_seconds=180
@@ -151,14 +170,20 @@ def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -
     return out[:limit]
 
 
-def truncate_words(text: str, limit: int) -> str:
-    """`text` cut to at most `limit` characters at a word boundary (a hard cut when the
-    last space is in the first half)."""
-    if len(text) <= limit:
+def truncate_words(text: str, limit: int, length: Callable[[str], int] = len) -> str:
+    """`text` cut to at most `limit` units of `length` (characters by default) at a word
+    boundary (a hard cut when the last space is in the first half)."""
+    if length(text) <= limit:
         return text
-    cut = text[: limit + 1]
-    space = cut.rfind(" ")
-    head = cut[:space] if space > limit // 2 else text[:limit]
+    end = used = 0
+    for char in text:
+        used += length(char)
+        if used > limit:
+            break
+        end += 1
+    # A space right after the longest prefix that fits is a word boundary too.
+    space = end if text[end] == " " else text.rfind(" ", 0, end)
+    head = text[:space] if space > 0 and length(text[:space]) > limit // 2 else text[:end]
     return head.rstrip()
 
 
@@ -208,15 +233,15 @@ class Variant(BaseModel):
         limits = _limits(platform) if platform else None
         title_max = limits.title_max if limits else _TITLE_MAX
         caption_max = limits.caption_max if limits else _CAPTION_MAX
+        length, unit = (limits.length, limits.unit) if limits else (len, "characters")
         where = f"{platform} " if platform else ""
-        if len(self.title) > title_max:
-            raise ValueError(f"{where}title is longer than {title_max} characters")
+        if length(self.title) > title_max:
+            raise ValueError(f"{where}title is longer than {title_max} {unit}")
         # The posted caption is the body plus a blank line and the hashtag line.
         room = caption_room(platform, self.hashtags) if platform else caption_max
-        if len(self.caption) > room:
+        if length(self.caption) > room:
             raise ValueError(
-                f"{where}caption is longer than {room} characters"
-                f" ({caption_max} with the hashtag line)"
+                f"{where}caption is longer than {room} {unit} ({caption_max} with the hashtag line)"
             )
         if platform == "youtube" and _ANGLE.search(self.title + self.caption):
             raise ValueError("youtube title and description cannot contain < or >")
@@ -228,9 +253,11 @@ def _hashtag_line(tags: Sequence[str]) -> str:
 
 
 def caption_room(platform: str, tags: Sequence[str]) -> int:
-    """Characters left for the caption body once the hashtag line is appended."""
+    """Room left for the caption body once the hashtag line is appended, in the platform's
+    own units (UTF-16 units on TikTok, which is also what an HTML `maxlength` counts)."""
+    limits = _limits(platform)
     line = _hashtag_line(tags)
-    return _limits(platform).caption_max - (len(line) + 2 if line else 0)
+    return limits.caption_max - (limits.length(line) + 2 if line else 0)
 
 
 def _fit(platform: str, title: str, caption: str, tags: Sequence[object]) -> Variant:
@@ -241,8 +268,8 @@ def _fit(platform: str, title: str, caption: str, tags: Sequence[object]) -> Var
         title, caption = _ANGLE.sub("", title), _ANGLE.sub("", caption)
     return Variant.model_validate(
         {
-            "title": truncate_words(title, limits.title_max),
-            "caption": truncate_words(caption, caption_room(platform, hashtags)),
+            "title": truncate_words(title, limits.title_max, limits.length),
+            "caption": truncate_words(caption, caption_room(platform, hashtags), limits.length),
             "hashtags": hashtags,
         },
         context={"platform": platform},
@@ -414,10 +441,10 @@ def preflight(
     found = links_or_mentions(f"{metadata.title}\n{metadata.caption}")
     if found:
         problems.append(f"{platform}: links or mentions to check: {', '.join(found)}")
-    if len(metadata.title) > limits.title_max:
-        problems.append(f"{platform}: title is longer than {limits.title_max} characters")
-    if len(metadata.caption) > limits.caption_max:
-        problems.append(f"{platform}: caption is longer than {limits.caption_max} characters")
+    if limits.length(metadata.title) > limits.title_max:
+        problems.append(f"{platform}: title is longer than {limits.title_max} {limits.unit}")
+    if limits.length(metadata.caption) > limits.caption_max:
+        problems.append(f"{platform}: caption is longer than {limits.caption_max} {limits.unit}")
     if brief:
         present = {t.lower() for t in metadata.hashtags}
         for tag in brief.required_tags:

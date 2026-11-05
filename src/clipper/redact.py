@@ -21,6 +21,10 @@ _PATTERNS: tuple[tuple[re.Pattern[str], _Replacement], ...] = (
     (re.compile(r"(hooks\.slack\.com/services/)[\w/-]+"), rf"\1{MASK}"),
     (re.compile(r"(authorization['\"]?\s*[:=]\s*['\"]?)[^'\"\r\n]+", re.IGNORECASE), rf"\1{MASK}"),
     (re.compile(r"(\bbearer\s+)[\w.~+/=-]+", re.IGNORECASE), rf"\1{MASK}"),
+    (re.compile(r"(\boauth\s+)[\w.~+/=-]+", re.IGNORECASE), rf"\1{MASK}"),
+    # Meta (Facebook / Instagram Graph API) access tokens, e.g. echoed in
+    # "Malformed access token EAAB..." errors (CLP-94).
+    (re.compile(r"(?<![A-Za-z0-9])EAA[A-Za-z0-9]{20,}"), MASK),
     (re.compile(r"(?<![A-Za-z0-9])(?:sk-|gsk_)[\w-]{8,}"), MASK),
     # Bare Google OAuth values: access tokens, refresh tokens, client secrets (CLP-93).
     (re.compile(r"(?<![A-Za-z0-9])(?:ya29\.[\w.-]{16,}|1//[\w-]{16,}|GOCSPX-[\w-]{8,})"), MASK),

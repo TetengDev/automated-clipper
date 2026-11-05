@@ -14,7 +14,9 @@
   shortly before it expires, and refreshed once on a 401. A refresh token Google rejects
   (`invalid_grant`, e.g. revoked, or expired because the consent screen is in Testing)
   pauses that account: its posts are deferred, one alert goes out, and the pause lifts
-  as soon as a different refresh token (or OAuth client) is configured.
+  once a different refresh token is configured (a changed OAuth client in `Secrets`
+  takes a worker restart). A post for an account that is not an enabled YouTube account
+  is deferred too, with one alert, instead of failing.
 * `lookup(idempotency_key)` finds an earlier upload by the `clipper-<key>` tag every
   upload carries, among each account's latest uploads, so the posting stage never posts a
   video twice after a timeout or a crash.
@@ -72,6 +74,8 @@ RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
 HTTP_TIMEOUT = httpx.Timeout(60.0, connect=15.0)
 
 TOKEN_EXPIRY_MARGIN = timedelta(minutes=2)
+TOKEN_LIFETIME_BOUNDS = (300, 86400)
+"""Seconds; Google's `expires_in` is clamped into this range."""
 PAUSE_RECHECK = timedelta(hours=1)
 """How far a paused account's posts are pushed each time they come due."""
 REJECTED_GRANT_ERRORS = frozenset({"invalid_grant", "invalid_client", "unauthorized_client"})
@@ -82,6 +86,7 @@ DEFER_REASONS = frozenset({"quotaExceeded", "uploadLimitExceeded", "dailyLimitEx
 
 LOOKUP_DEPTH = 50
 """Latest uploads per account that `lookup` checks (one page of the uploads playlist)."""
+LOOKUP_RETRIES = 3
 
 _VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{6,64}")
 _IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -99,7 +104,8 @@ def _account_refresh_token(account_id: str) -> SecretStr | None:
 
 @dataclass(frozen=True)
 class OAuthClient:
-    """The owner's Google Cloud OAuth client (Desktop app type)."""
+    """The owner's Google Cloud OAuth client (Web application type, see
+    docs/DEPLOYMENT.md, "YouTube publishing")."""
 
     client_id: str
     client_secret: SecretStr | None
@@ -290,15 +296,23 @@ def _session_uri(response: httpx.Response) -> str:
     return location
 
 
-def _received(response: httpx.Response) -> int:
+def _received(response: httpx.Response, size: int) -> int:
     """Bytes the server has, from a 308's `Range: bytes=0-N` (none: nothing yet)."""
     header = response.headers.get("Range")
     if not header:
         return 0
     match = _RANGE.fullmatch(header.strip())
-    if not match:
+    if not match or int(match[1]) + 1 > size:
         raise YouTubeError("YouTube returned an unexpected upload Range")
     return int(match[1]) + 1
+
+
+def _quota_deferral(exc: YouTubeError, now: datetime) -> PublishDeferred | None:
+    limited = sorted(exc.reasons & DEFER_REASONS)
+    if not limited:
+        return None
+    reason = f"YouTube {limited[0]}: deferred to the next quota day"
+    return PublishDeferred(reason, next_quota_reset(now))
 
 
 # --- the publisher --------------------------------------------------------------------------
@@ -329,32 +343,40 @@ class YouTubePublisher:
         self.chunk_size = chunk_size
         self._tokens: dict[str, _AccessToken] = {}
         self._paused: dict[str, _Pause] = {}
+        self._unknown_alerted: set[str] = set()
+        # Refresh tokens read during one publish/lookup call, so `.env` is parsed once per
+        # call rather than once per request; None outside a call.
+        self._call_tokens: dict[str, SecretStr | None] | None = None
 
     def __repr__(self) -> str:
         return f"YouTubePublisher(account_ids={self.account_ids!r})"
+
+    def close(self) -> None:
+        self.http.close()
 
     # --- Publisher ---------------------------------------------------------------------
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult:
         if post.account_id not in self.account_ids:
-            raise ValueError(f"{post.account_id!r} is not a configured YouTube account")
+            raise self._unknown_account(post.account_id)
         resource = video_resource(post, metadata)
         size = video_path.stat().st_size
         if size == 0:
             raise ValueError("the rendered video is empty")
         deadline = self.clock() + UPLOAD_DEADLINE
+        self._call_tokens = {}
         try:
             session = self._start_session(post.account_id, resource, size)
             video = self._upload(post.account_id, session, video_path, size, deadline)
         except _Paused as paused:
             raise self._paused_deferral(paused) from None
         except YouTubeError as exc:
-            limited = sorted(exc.reasons & DEFER_REASONS)
-            if limited:
-                until = next_quota_reset(self.clock())
-                reason = f"YouTube {limited[0]}: deferred to the next quota day"
-                raise PublishDeferred(reason, until) from None
+            deferral = _quota_deferral(exc, self.clock())
+            if deferral is not None:
+                raise deferral from None
             raise
+        finally:
+            self._call_tokens = None
         video_id = _video_id(video)
         logger.info(
             "youtube %s: uploaded %s for %s", post.account_id, video_id, _rfc3339(post.scheduled_at)
@@ -363,24 +385,60 @@ class YouTubePublisher:
 
     def lookup(self, idempotency_key: str) -> PublishResult | None:
         """The upload tagged with this post's key on any configured account, or None.
-        Paused accounts are skipped (their posts are deferred before any re-upload)."""
+
+        A paused account cannot be checked: if nothing is found elsewhere, this raises
+        `PublishDeferred` rather than claim the upload does not exist. Quota errors defer
+        too; other errors propagate (the posting stage then hands the post to a human)."""
         tag = idempotency_tag(idempotency_key)
-        for account_id in self.account_ids:
-            try:
-                video_id = self._find_tagged(account_id, tag)
-            except _Paused as paused:
-                logger.warning(
-                    "youtube %s: lookup skipped, account paused: %s", account_id, paused.why
-                )
-                continue
-            if video_id is not None:
-                return PublishResult(external_id=video_id, url=shorts_url(video_id))
+        skipped: list[str] = []
+        self._call_tokens = {}
+        try:
+            for account_id in self.account_ids:
+                try:
+                    video_id = self._find_tagged(account_id, tag)
+                except _Paused as paused:
+                    logger.warning(
+                        "youtube %s: lookup skipped, account paused: %s", account_id, paused.why
+                    )
+                    skipped.append(account_id)
+                    continue
+                except YouTubeError as exc:
+                    deferral = _quota_deferral(exc, self.clock())
+                    if deferral is not None:
+                        raise deferral from None
+                    raise
+                if video_id is not None:
+                    return PublishResult(external_id=video_id, url=shorts_url(video_id))
+        finally:
+            self._call_tokens = None
+        if skipped:
+            reason = f"YouTube lookup could not check paused account(s) {', '.join(skipped)}"
+            raise PublishDeferred(reason, self.clock() + PAUSE_RECHECK)
         return None
+
+    def _unknown_account(self, account_id: str) -> PublishDeferred:
+        alert = None
+        if account_id not in self._unknown_alerted:
+            self._unknown_alerted.add(account_id)
+            alert = (
+                f"Posts for {account_id} are on YouTube but the account is not an enabled"
+                " YouTube account in accounts.yaml; they are deferred, not failed. Enable"
+                " the account or cancel its posts (`clipper posts cancel`)."
+            )
+        reason = f"{account_id} is not an enabled YouTube account"
+        return PublishDeferred(reason, self.clock() + PAUSE_RECHECK, alert=alert)
 
     # --- OAuth -------------------------------------------------------------------------
 
+    def _refresh_token_for(self, account_id: str) -> SecretStr | None:
+        if self._call_tokens is None:
+            return self.refresh_token(account_id)
+        if account_id not in self._call_tokens:
+            self._call_tokens[account_id] = self.refresh_token(account_id)
+        return self._call_tokens[account_id]
+
     def _fingerprint(self, account_id: str) -> tuple[str, SecretStr | None]:
-        refresh = self.refresh_token(account_id)
+        refresh = self._refresh_token_for(account_id)
         digest = hashlib.sha256()
         for part in (
             self.client.client_id,
@@ -439,15 +497,7 @@ class YouTubePublisher:
             and now < cached.expires
         ):
             return cached.value.get_secret_value()
-        response = self.http.post(
-            TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh.get_secret_value(),
-                "client_id": self.client.client_id,
-                "client_secret": secret.get_secret_value(),
-            },
-        )
+        response = self.http.post(TOKEN_URL, data=_grant(self.client.client_id, secret, refresh))
         if response.status_code in (400, 401):
             error = _error(response, "token refresh")
             rejected = sorted(error.reasons & REJECTED_GRANT_ERRORS)
@@ -461,10 +511,12 @@ class YouTubePublisher:
             body = response.json()
             value = body["access_token"]
             lifetime = int(body.get("expires_in", 3600))
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OverflowError):
             raise YouTubeError("YouTube token refresh returned an unexpected body") from None
         if not isinstance(value, str) or not value:
             raise YouTubeError("YouTube token refresh returned no access token")
+        low, high = TOKEN_LIFETIME_BOUNDS
+        lifetime = min(max(lifetime, low), high)
         expires = now + timedelta(seconds=lifetime) - TOKEN_EXPIRY_MARGIN
         self._tokens[account_id] = _AccessToken(fingerprint, SecretStr(value), expires)
         return value
@@ -503,17 +555,19 @@ class YouTubePublisher:
 
     def _upload(
         self, account_id: str, session: str, video_path: Path, size: int, deadline: datetime
-    ) -> Any:
-        """Send the file in chunks; after a 5xx or a dropped connection, ask the server how
-        much it has and resume from there, up to MAX_UPLOAD_RETRIES times in a row."""
+    ) -> dict[str, Any]:
+        """Send the file in chunks. After a 5xx, a dropped connection or a chunk the server
+        did not take, ask it how much it has and resume from there; MAX_UPLOAD_RETRIES
+        such failures in a row give up."""
         offset, failures, resync = 0, 0, False
         last_problem = ""
         with video_path.open("rb") as video:
             while True:
                 if self.clock() > deadline:
                     raise TimeoutError(f"YouTube upload did not finish within {UPLOAD_DEADLINE}")
+                querying = resync or offset >= size
                 try:
-                    if resync:
+                    if querying:
                         response = self._authorized(
                             account_id,
                             "PUT",
@@ -538,15 +592,22 @@ class YouTubePublisher:
                     last_problem = type(exc).__name__
                 else:
                     if response.status_code in (200, 201):
-                        return response.json()
+                        return _video_body(response)
                     if response.status_code == 308:
-                        offset, failures, resync = _received(response), 0, False
-                        continue
-                    if response.status_code == 404:
+                        received = _received(response, size)
+                        if querying:
+                            offset, resync = received, False
+                            continue
+                        if received > offset:
+                            offset, failures = received, 0
+                            continue
+                        last_problem = "no progress"
+                    elif response.status_code == 404:
                         raise YouTubeError("YouTube upload session expired (HTTP 404)", status=404)
-                    if response.status_code not in RETRYABLE_STATUS:
+                    elif response.status_code not in RETRYABLE_STATUS:
                         raise _error(response, "upload")
-                    last_problem = f"HTTP {response.status_code}"
+                    else:
+                        last_problem = f"HTTP {response.status_code}"
                 failures += 1
                 if failures > MAX_UPLOAD_RETRIES:
                     raise YouTubeError(
@@ -558,10 +619,24 @@ class YouTubePublisher:
     # --- lookup ------------------------------------------------------------------------
 
     def _get(self, account_id: str, path: str, params: dict[str, str]) -> dict[str, Any]:
-        response = self._authorized(account_id, "GET", f"{API_URL}/{path}", params=params)
+        """A read-only list call, retried on 5xx and dropped connections."""
+        url = f"{API_URL}/{path}"
+        for attempt in range(1, LOOKUP_RETRIES + 1):
+            try:
+                response = self._authorized(account_id, "GET", url, params=params)
+            except httpx.TransportError:
+                if attempt == LOOKUP_RETRIES:
+                    raise
+            else:
+                if response.status_code not in RETRYABLE_STATUS or attempt == LOOKUP_RETRIES:
+                    break
+            self.sleep(float(2**attempt))
         if response.status_code != 200:
             raise _error(response, f"{path}.list")
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError:
+            raise YouTubeError(f"YouTube {path}.list returned an unexpected body") from None
         return body if isinstance(body, dict) else {}
 
     def _find_tagged(self, account_id: str, tag: str) -> str | None:
@@ -596,3 +671,24 @@ class YouTubePublisher:
             if tag in tags:
                 return _video_id(item)
         return None
+
+
+def _grant(client_id: str, secret: SecretStr, refresh: SecretStr) -> dict[str, str]:
+    """The refresh-token grant body. Built here so the plain values live only in this
+    short call and the request, not in a long-lived frame."""
+    return {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh.get_secret_value(),
+        "client_id": client_id,
+        "client_secret": secret.get_secret_value(),
+    }
+
+
+def _video_body(response: httpx.Response) -> dict[str, Any]:
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise YouTubeError("YouTube returned an unexpected upload response")
+    return body

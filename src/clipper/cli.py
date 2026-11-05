@@ -294,9 +294,10 @@ def run_worker(
         media_root=media_dir,
     )
     # Platforms without a registered publisher keep their due posts scheduled.
+    publishers = _publishers(app_ctx.config_path, cfg)
     worker.posting = PostingStage(
         conn=conn,
-        publishers=_publishers(app_ctx.config_path, cfg),
+        publishers=publishers,
         worker_id=worker.worker_id,
         media_root=media_dir,
     )
@@ -313,6 +314,10 @@ def run_worker(
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
     finally:
+        for publisher in publishers.values():
+            close = getattr(publisher, "close", None)
+            if callable(close):
+                close()
         conn.close()
 
 

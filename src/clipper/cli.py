@@ -287,28 +287,20 @@ def _open_db(db_path: Path) -> sqlite3.Connection:
 
 
 def _publish_guard(
-    conn: sqlite3.Connection, config_path: Path, cfg: AppConfig, media_dir: Path
+    conn: sqlite3.Connection, config_path: Path, media_dir: Path
 ) -> Callable[[Post], str | None]:
-    """The campaign pre-flight the posting stage runs before each publish (CLP-97), with
-    the accounts and campaigns as they are when the worker starts."""
-    from clipper.accounts import accounts_path, load_accounts
-    from clipper.campaigns import campaigns_path, load_campaigns
-    from clipper.jobs.models import utcnow
-    from clipper.posting.scheduler import publish_problem
+    """The campaign pre-flight the posting stage runs before each publish (CLP-97). The
+    config is checked now (a bad one stops the worker) and reloaded whenever it changes."""
+    from clipper.campaigns import PostingConfig
+    from clipper.posting.scheduler import publish_guard
 
+    live = PostingConfig(config_path)
     try:
-        accounts = load_accounts(accounts_path(config_path), cfg)
-        campaigns = load_campaigns(campaigns_path(config_path), cfg, accounts).by_id()
+        live.current()
     except ConfigError as exc:
         conn.close()
         _fail(str(exc))
-    by_id = {a.id: a for a in accounts.accounts}
-    root = media_dir.resolve()
-
-    def guard(post: Post) -> str | None:
-        return publish_problem(conn, post, by_id, campaigns, utcnow(), media_root=root)
-
-    return guard
+    return publish_guard(conn, live, media_dir.resolve())
 
 
 @app.command("run-worker")
@@ -345,7 +337,7 @@ def run_worker(
         stages=build_stages(),
         media_root=media_dir,
     )
-    guard = _publish_guard(conn, app_ctx.config_path, cfg, media_dir)
+    guard = _publish_guard(conn, app_ctx.config_path, media_dir)
     # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
     worker.posting = PostingStage(
         conn=conn, publishers={}, worker_id=worker.worker_id, media_root=media_dir, guard=guard

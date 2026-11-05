@@ -29,8 +29,15 @@ from typing import Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from clipper import clips
-from clipper.campaigns import Campaign, campaign_for, campaign_preflight, render_edl
+from clipper.campaigns import (
+    Campaign,
+    PostingConfig,
+    campaign_for,
+    campaign_preflight,
+    render_edl,
+)
 from clipper.clips import ClipDetail, ClipStatus
+from clipper.config import ConfigError
 from clipper.db import transaction
 from clipper.metadata import build_post_metadata
 from clipper.pipeline.common import strip_control
@@ -335,10 +342,6 @@ SensitiveRule = Callable[[str], bool]
 """Whether a creator's clips are always sensitive (CLP-87), by creator name."""
 
 
-def _never_sensitive(_creator: str) -> bool:
-    return False
-
-
 def _ineligible(
     post: Post,
     clip: ClipDetail | None,
@@ -369,13 +372,14 @@ def recheck_held(
     now: datetime,
     *,
     media_root: Path | None = None,
-    is_sensitive: SensitiveRule = _never_sensitive,
+    is_sensitive: SensitiveRule,
 ) -> RecheckResult:
     """Run the pre-flight again on every held post with the current config and the clip's
     current version (a re-edited, re-approved clip is checked as it is now). A post that
     passes is scheduled in its account's next free slot; one that does not keeps its hold
     with the current reason. Each post is checked and released in one transaction, so the
-    slot cannot be taken meanwhile; a post cancelled meanwhile is skipped."""
+    slot cannot be taken meanwhile; a post cancelled meanwhile is skipped.
+    `is_sensitive` is required: a sensitive creator's clip is never released."""
     by_id = {a.id: a for a in accounts}
     released: list[Post] = []
     still: list[Post] = []
@@ -468,3 +472,22 @@ def publish_problem(
     edl = render_edl(media_root, post.video_path) if media_root else None
     problems = campaign_preflight(campaign, metadata, post.platform, version.duration_s, edl, now)
     return "; ".join(problems) if problems else None
+
+
+def publish_guard(
+    conn: sqlite3.Connection, config: PostingConfig, media_root: Path | None
+) -> Callable[[Post], str | None]:
+    """The posting stage's guard: `publish_problem` with the config as it is on disk now.
+    An invalid config holds the post rather than publishing it."""
+
+    def guard(post: Post) -> str | None:
+        try:
+            accounts, campaigns = config.current()
+        except ConfigError as exc:
+            first = str(exc).splitlines()[0] if str(exc) else "invalid"
+            return f"posting config is invalid ({first}); fix it and run `clipper posts recheck`"
+        return publish_problem(
+            conn, post, accounts, campaigns, datetime.now(UTC), media_root=media_root
+        )
+
+    return guard

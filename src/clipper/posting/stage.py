@@ -72,10 +72,19 @@ class PostingStage:
     clock: Clock = utcnow
     alert: Alert = log_alert
     guard: Guard | None = None
-    """The publish-time campaign pre-flight (CLP-97, `scheduler.publish_problem`): a reason
-    holds the claimed post instead of publishing it."""
+    """The publish-time campaign pre-flight (CLP-97, `scheduler.publish_guard`): a reason
+    holds the claimed post instead of publishing it. Required whenever there are
+    publishers (pass `allow_all` to opt out explicitly), so leaving it out never
+    publishes without the check."""
     batch: int = DEFAULT_BATCH
     _warned: set[str] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.publishers and self.guard is None:
+            raise ValueError(
+                "PostingStage with publishers needs a guard (scheduler.publish_guard, or"
+                " allow_all to publish without the campaign pre-flight)"
+            )
 
     def run_once(self) -> int:
         """One posting pass; returns how many posts it acted on."""
@@ -126,7 +135,7 @@ class PostingStage:
 
     def _held(self, post: Post) -> bool:
         """Run the guard; hold the post when it refuses (or fails: fail closed)."""
-        if self.guard is None:
+        if self.guard is None:  # no publishers, so nothing is ever claimed
             return False
         try:
             reason = self.guard(post)
@@ -251,6 +260,11 @@ class PostingStage:
             self.alert(message)
         except Exception:
             logger.exception("%s: alert failed", _label(post))
+
+
+def allow_all(_post: Post) -> str | None:
+    """A guard that never holds: only for stages that knowingly skip the pre-flight."""
+    return None
 
 
 def _describe(exc: Exception) -> str:

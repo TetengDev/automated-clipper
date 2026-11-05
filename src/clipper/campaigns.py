@@ -45,9 +45,11 @@ from clipper.accounts import (
     AccountsConfig,
     Platform,
     _yaml_problem,
+    accounts_path,
+    load_accounts,
 )
 from clipper.clips import resolve_media_path
-from clipper.config import AppConfig, ConfigError, _format_errors, _UniqueKeyLoader
+from clipper.config import AppConfig, ConfigError, _format_errors, _UniqueKeyLoader, load_config
 from clipper.edl import EDL, has_ai_elements, parse_edl
 from clipper.metadata import HASHTAG, Brief, PostMetadata, preflight
 
@@ -382,3 +384,34 @@ def campaign_for(
     if campaign is not None and campaign.creator.casefold() != creator.casefold():
         return None, None
     return campaign_id, campaign
+
+
+class PostingConfig:
+    """Accounts and campaigns as they are on disk now, for long-running processes (the
+    worker's publish-time pre-flight). Reloaded whenever creators.yaml, accounts.yaml or
+    campaigns.yaml changes (by mtime), so a campaign disabled or tightened without a
+    restart still holds its posts. `current` raises ConfigError for an invalid config;
+    callers fail closed."""
+
+    def __init__(self, creators_path: Path) -> None:
+        self._paths = (
+            creators_path,
+            accounts_path(creators_path),
+            campaigns_path(creators_path),
+        )
+        self._stamp: tuple[int, ...] | None = None
+        self._value: tuple[dict[str, Account], dict[str, Campaign]] = ({}, {})
+
+    def _mtimes(self) -> tuple[int, ...]:
+        return tuple(p.stat().st_mtime_ns if p.exists() else -1 for p in self._paths)
+
+    def current(self) -> tuple[dict[str, Account], dict[str, Campaign]]:
+        stamp = self._mtimes()
+        if stamp != self._stamp:
+            creators_path, accounts_file, campaigns_file = self._paths
+            creators = load_config(creators_path)
+            accounts = load_accounts(accounts_file, creators)
+            campaigns = load_campaigns(campaigns_file, creators, accounts)
+            self._value = ({a.id: a for a in accounts.accounts}, campaigns.by_id())
+            self._stamp = stamp
+        return self._value

@@ -213,10 +213,11 @@ fails is `held` with the reason on the review app's Scheduled page and in
 `clipper posts list`, and it is never published. Logos, negative framing and reposts
 cannot be seen by the pipeline: the reviewer checks them before approving.
 
-The worker runs the same check again just before it publishes, with the config it
-started with, so a campaign that was disabled, ended or tightened after scheduling (or a
-post rescheduled past the campaign's end) is held instead of posted. Restart the worker
-after changing `campaigns.yaml`. A held post keeps its file reserved on its platform, so
+The worker runs the same check again just before it publishes, with the config as it is
+on disk (reloaded when `creators.yaml`, `accounts.yaml` or `campaigns.yaml` changes), so a
+campaign that was disabled, ended or tightened after scheduling (or a post rescheduled
+past the campaign's end) is held instead of posted. If the config is invalid, due
+campaign posts are held until it is fixed. A held post keeps its file reserved on its platform, so
 no other account on that platform gets the same file meanwhile.
 
 After fixing the config, `clipper posts recheck` runs the pre-flight again, on the clip's

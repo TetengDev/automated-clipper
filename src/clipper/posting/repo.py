@@ -209,6 +209,7 @@ def release_held(
         now,
         scheduled_at=at,
         error=None,
+        attempts=0,
         metadata=_metadata_json(metadata),
         clip_version=clip_version,
         video_path=video_path,

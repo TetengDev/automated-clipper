@@ -40,6 +40,7 @@ from clipper.metadata import (
     fingerprint,
     links_or_mentions,
 )
+from clipper.posting import repo as post_repo
 from clipper.posting.models import PostStatus
 from clipper.posting.scheduler import schedule_for_clip
 from clipper.review.app import flash, get_db, render, require_user
@@ -301,6 +302,18 @@ def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.Clip
         return
     held = [p for p in created if p.status == PostStatus.HELD]
     scheduled = len(created) - len(held)
+    earlier = [
+        p
+        for p in post_repo.list_posts(conn, statuses=(PostStatus.HELD,), clip_id=clip.id)
+        if p not in held
+    ]
+    if earlier:
+        # Approving again does not re-check posts held before (one post per account).
+        flash(
+            request,
+            f"Clip {clip.id} has {len(earlier)} post(s) still held from before; run"
+            " `clipper posts recheck` to check them again.",
+        )
     if scheduled:
         flash(request, f"Scheduled {scheduled} post(s) for clip {clip.id}.")
     if held:

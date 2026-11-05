@@ -34,7 +34,7 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 - `GROQ_API_KEY`, only with `transcriber: groq` (transcription runs locally by default; see [Local transcription](#local-transcription))
 - `DISCORD_WEBHOOK_URL`, `DISCORD_ALERTS_WEBHOOK_URL`, `HEALTHCHECK_URL_*`
 - `REVIEW_PASSWORD_HASH`, `SESSION_SECRET`, `RCLONE_REMOTE`
-- `CLIPPER_ACCESS_TOKEN_<ACCOUNT_ID>` and `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>` for each posting account (see [Posting accounts](#posting-accounts))
+- `CLIPPER_ACCESS_TOKEN_<ACCOUNT_ID>` and `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>` for each posting account (see [Posting accounts](#posting-accounts)); for Facebook and Instagram accounts also `CLIPPER_META_ID_<ACCOUNT_ID>` (see [Meta publishing](#meta-publishing-facebook-page-reels-instagram-reels))
 - `YOUTUBE_OAUTH_CLIENT_ID`, `YOUTUBE_OAUTH_CLIENT_SECRET` for the YouTube publisher (see [YouTube publishing](#youtube-publishing))
 - the restic credentials
 
@@ -188,6 +188,11 @@ To add an account:
 The tokens sit in `.env` like the other keys. Encrypting refresh tokens at rest is a
 planned follow-up.
 
+Approving a clip in the review app schedules it on every enabled account whose `creators`
+include the clip's creator. A post on a platform that has no publisher yet waits as
+`scheduled` (the worker logs it once). Until its publisher ships, set `enabled: false` on
+such an account, or its posts go out late, all together, when the publisher arrives.
+
 ## YouTube publishing
 
 The worker posts to YouTube itself, through the free YouTube Data API v3
@@ -300,6 +305,141 @@ token and the client secret are local variables inside httpx.
 
 To revoke access, remove the app at <https://myaccount.google.com/permissions> for that
 Google account. Its account then pauses on the next post, with an alert.
+
+## Meta publishing (Facebook Page Reels, Instagram Reels)
+
+The worker publishes `facebook` and `instagram` posts through the Graph API
+(`src/clipper/publish/`), using your own Meta app. There is no third-party service and no
+cost.
+
+- **Facebook**: the Reel is uploaded about 25 minutes before its slot and scheduled with
+  `scheduled_publish_time`, so Facebook publishes it on time. A slot less than 11
+  minutes away (a late worker, a retry) is published at once. The post is marked
+  `posted` when Facebook accepts the Reel, before it goes live. Clips outside 3–90 s are
+  never scheduled to Facebook; the scheduler logs why.
+- **Instagram**: Instagram has no API scheduling, so the worker publishes at the slot. It
+  creates a `REELS` container, uploads the file with the resumable upload, polls
+  `status_code` until `FINISHED`, then calls `media_publish`. An `ERROR` or `EXPIRED`
+  container fails the attempt, which is retried with backoff. Captions with more than 5
+  hashtags or more than 2,200 characters are refused at once (`post_failed`, with an
+  alert, no retry).
+- **Time limit**: a publish gives up after 15 minutes. A Facebook retry never comes
+  before the post's slot.
+- **Disclosure**: the AI flag goes to `is_ai_generated` on both platforms. The
+  paid-partnership flag goes to `is_paid_partnership` on Instagram. The Facebook Reels
+  API has no plain paid-partnership toggle, so a Facebook post that needs one is refused
+  (`post_failed`, with an alert) and must be posted by hand.
+  - **Campaign accounts fail closed.** The campaign brief and its paid-partnership flag
+    are not wired into the post metadata yet
+    ([CLP-97](https://linear.app/tengdev/issue/CLP-97)), so every post on an account
+    with `campaign:` set is refused, and must be posted by hand.
+  - **AI flag.** It comes from the clip's EDL. The pipeline makes no AI elements today,
+    so it is always off; wiring the EDL into posting is a follow-up.
+- **Rate limits**: before each Instagram publish the worker reads
+  `content_publishing_limit`. Within 2 posts of the 24-hour limit (50), the post is
+  deferred by an hour. A Graph rate-limit error (codes 4, 9, 17, 32, 613, 80001, 80002)
+  holds every post of that account for an hour. A deferral never counts as a failed
+  attempt. A deferred post keeps no record of its original slot, so a long pause
+  releases its backlog together; this is a known follow-up.
+- **Permission errors and blocks** (codes 10, 200-299, 368) pause the account like an
+  invalid token, with one alert a day, instead of retrying into an enforcement.
+- **No public media URL**: the clip bytes go straight to `rupload.facebook.com`. The
+  media directory is never served publicly, and no signed URL is created. Instagram's
+  `video_url` option (Meta fetches a public HTTPS URL) is not used, because it would need
+  the media directory, or a signed link to it, on the internet.
+
+### Owner setup (once)
+
+1. **Accounts.** Use a Facebook Page and an Instagram professional account (Business
+   or Creator) linked to that Page (Meta Business Suite > Settings > Linked accounts).
+2. **Meta app.** At [developers.facebook.com](https://developers.facebook.com/apps),
+   create an app of type *Business* and add the *Facebook Login for Business* and
+   *Instagram* (API setup with Facebook login) products. Give your own Facebook user the
+   app's admin role. While the app only manages Pages and accounts that you administer,
+   Standard Access works without App Review. Submit App Review for the permissions
+   below only if other people's accounts are to be added later.
+3. **Permissions.** `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`,
+   `business_management` (for Pages owned by a Business portfolio), `instagram_basic` and
+   `instagram_content_publish`.
+4. **Long-lived Page token.**
+   1. In the [Graph API Explorer](https://developers.facebook.com/tools/explorer), choose
+      your app, add the permissions above and click *Generate Access Token*. This gives a
+      short-lived user token.
+   2. Exchange it for a long-lived user token (about 60 days). Run this on your own
+      machine, never on the server or in CI. The secrets are read from the keyboard
+      and passed to curl on stdin, so they appear in neither the shell history nor
+      `ps`:
+
+      ```sh
+      read -rs 'APP_SECRET?App secret: '; echo        # bash: read -rsp 'App secret: ' APP_SECRET
+      read -rs 'SHORT_TOKEN?Short-lived token: '; echo
+      printf 'url = "https://graph.facebook.com/v26.0/oauth/access_token"\nget\n'\
+      'data = "grant_type=fb_exchange_token"\ndata = "client_id=<APP_ID>"\n'\
+      'data = "client_secret=%s"\ndata = "fb_exchange_token=%s"\n' \
+        "$APP_SECRET" "$SHORT_TOKEN" | curl -sS --config -
+      unset APP_SECRET SHORT_TOKEN
+      ```
+
+      Afterwards, clear the terminal scrollback. Discard the long-lived user token once
+      you have the Page token in step 4.3: nothing stores it.
+
+   3. With the long-lived user token, call `GET /v26.0/me/accounts`. The `access_token`
+      next to your Page is a Page token that **does not expire**. Its `id` is the Page id.
+   4. With that Page token, call `GET /v26.0/<PAGE_ID>?fields=instagram_business_account`
+      to get the Instagram user id.
+   5. Check the token in the [Access Token Debugger](https://developers.facebook.com/tools/debug/accesstoken).
+      It should show *Expires: Never* and your scopes.
+5. **Secrets** in `/srv/clipper/.env`. One Page token serves both platforms. For the
+   accounts `mrbeast_clips_fb` (facebook) and `mrbeast_clips_ig` (instagram):
+
+   ```sh
+   CLIPPER_ACCESS_TOKEN_MRBEAST_CLIPS_FB=<PAGE_TOKEN>
+   CLIPPER_META_ID_MRBEAST_CLIPS_FB=<PAGE_ID>
+   CLIPPER_ACCESS_TOKEN_MRBEAST_CLIPS_IG=<PAGE_TOKEN>
+   CLIPPER_META_ID_MRBEAST_CLIPS_IG=<IG_USER_ID>
+   ```
+
+   The app secret is used only for the exchange in step 4.2. Do not store it on the
+   server. Keep `.env` at mode 600, owned by the user the containers run as.
+
+   Without the app secret on the server, *Require App Secret* (`appsecret_proof`) cannot
+   be turned on. A leaked Page token therefore works from anywhere and does not expire.
+   To revoke it, remove the app from the Page (Page settings > Business integrations),
+   or change your Facebook password. Then repeat step 4.
+6. Run `clipper meta-tokens`. It prints, for each Facebook and Instagram account, whether
+   its token is valid and when it, or its data access, expires. It never prints a token.
+   It exits 1 when a token is missing, invalid, or expires within 7 days, so it can run
+   from cron or a healthcheck.
+
+### Token expiry
+
+The Page token itself never expires. It stops working when you change your Facebook
+password, remove the app, lose the Page role, or revoke a permission. Data access also
+lapses after 90 days unless it is renewed: open the app again with Facebook Login, or
+repeat step 4. The worker checks each account's token with `/debug_token` every 6 hours
+while it publishes:
+
+- **Within 7 days of expiry**, it alerts once a day.
+- **If the token is invalid, expired or missing**, or a call returns OAuthException 190,
+  publishing to that account **stops cleanly**. No upload is started, and the account's
+  posts stay `scheduled`, deferred by an hour at a time without counting attempts. One
+  alert a day names the account. After you put a new token in `.env`, publishing resumes
+  on the next attempt, with no restart and no `clipper posts retry`.
+
+### Running a first live post (owner)
+
+No live post was made in development, because there are no credentials there. To make
+the first one:
+
+1. Do the setup above, then add a `facebook` account and an `instagram` account to
+   `config/accounts.yaml` (`posts_per_day: 1` and a `warmup_start` are a good start).
+   Run `clipper check-config` and `clipper meta-tokens`.
+2. Approve one clip of 3–90 s in the review app, and check the *Scheduled* page.
+3. Run the worker. About 25 minutes before the Facebook slot, the Reel shows as
+   scheduled in Meta Business Suite (Content > Scheduled). At the Instagram slot, the
+   Reel is published. Both posts turn `posted`, with their links, on the clip page.
+4. If something fails, `clipper posts list` shows the error, and the alert log
+   (`ALERT:`) explains it.
 
 ## CI/CD
 

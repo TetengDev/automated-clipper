@@ -19,6 +19,7 @@ from clipper.campaigns import (
     campaigns_path,
     load_campaigns,
     render_edl,
+    unconfigured_campaigns,
 )
 from clipper.config import AppConfig, ConfigError, load_config
 from clipper.edl import parse_edl
@@ -150,11 +151,17 @@ def test_missing_campaigns_file_is_empty_when_no_account_names_one(
     assert cfg.campaigns == []
 
 
-def test_missing_campaigns_file_with_an_account_campaign_is_an_error(
+def test_missing_campaigns_file_with_an_account_campaign_is_a_warning(
     tmp_path: Path, creators: AppConfig
 ) -> None:
-    with pytest.raises(ConfigError, match="mrbeast_clips_tt.*vyro_mrbeast"):
-        load_campaigns(tmp_path / "nope.yaml", creators, _accounts(tmp_path, creators))
+    # Not configured yet: loading works, the posts are held as an unknown campaign, and
+    # check-config says so.
+    accounts = _accounts(tmp_path, creators)
+    cfg = load_campaigns(tmp_path / "nope.yaml", creators, accounts)
+
+    assert cfg.campaigns == []
+    [warning] = unconfigured_campaigns(accounts, cfg)
+    assert "mrbeast_clips_tt" in warning and "vyro_mrbeast" in warning and "held" in warning
 
 
 def test_campaigns_path_defaults_next_to_creators_and_honours_the_env(tmp_path: Path) -> None:

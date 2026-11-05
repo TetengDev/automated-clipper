@@ -294,6 +294,10 @@ How it posts:
    "locked" notice, pause posting to YouTube (`enabled: false` on the account) until
    verification or the API audit is done.
 
+Never enable an error reporter that records local variables in the worker (Sentry's
+`include_local_variables`, rich's `show_locals`). While a token request runs, the refresh
+token and the client secret are local variables inside httpx.
+
 To revoke access, remove the app at <https://myaccount.google.com/permissions> for that
 Google account. Its account then pauses on the next post, with an alert.
 

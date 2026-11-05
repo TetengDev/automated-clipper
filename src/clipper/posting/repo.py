@@ -180,40 +180,83 @@ def insert_post(
     return post
 
 
+def held_posts(conn: sqlite3.Connection) -> list[Post]:
+    """Every held post, oldest first (no list limit: recheck must see them all)."""
+    rows = conn.execute(
+        "SELECT * FROM posts WHERE status = ? ORDER BY id", (str(PostStatus.HELD),)
+    ).fetchall()
+    return [Post.from_row(r) for r in rows]
+
+
 def release_held(
     conn: sqlite3.Connection,
-    post_id: int,
+    post: Post,
     at: datetime,
-    metadata: PostMetadata,
     now: datetime,
+    *,
+    metadata: PostMetadata,
+    clip_version: int,
+    video_path: str,
+    campaign_id: str | None,
 ) -> Post:
-    """A held post passed the pre-flight again: schedule it at `at` with `metadata`."""
-    return _change(
+    """A held post passed the pre-flight again: schedule it at `at` with what was checked
+    (the clip's current version and file, the campaign that now applies). The caller
+    holds the transaction, so the slot it picked cannot be taken meanwhile."""
+    _update(
         conn,
-        post_id,
+        post,
         PostStatus.SCHEDULED,
         now,
-        action="post_released",
-        allowed_from=frozenset({PostStatus.HELD}),
         scheduled_at=at,
         error=None,
         metadata=_metadata_json(metadata),
+        clip_version=clip_version,
+        video_path=video_path,
+        campaign_id=campaign_id,
     )
+    released = _require(conn, post.id)
+    _audit(
+        conn,
+        released,
+        "post_released",
+        now,
+        previous=str(post.status),
+        scheduled_at=to_iso(at),
+        campaign_id=campaign_id,
+    )
+    return released
 
 
-def update_hold(conn: sqlite3.Connection, post_id: int, reason: str, now: datetime) -> Post:
-    """A held post still fails the pre-flight: record the current reason (audited only
-    when it changed)."""
-    with transaction(conn):
-        post = _require(conn, post_id)
-        if post.status != PostStatus.HELD:
-            raise InvalidPostTransition(post_id, post.status, PostStatus.HELD)
-        if post.error == reason:
-            return post
-        _update(conn, post, PostStatus.HELD, now, error=reason)
-        updated = _require(conn, post_id)
-        _audit(conn, updated, _action(PostStatus.HELD), now, reason=reason)
+def update_hold(conn: sqlite3.Connection, post: Post, reason: str, now: datetime) -> Post:
+    """A held post still cannot go out: record the current reason (audited only when it
+    changed). The caller holds the transaction."""
+    if post.error == reason:
+        return post
+    _update(conn, post, PostStatus.HELD, now, error=reason)
+    updated = _require(conn, post.id)
+    _audit(conn, updated, _action(PostStatus.HELD), now, reason=reason)
     return updated
+
+
+def hold_claimed(
+    conn: sqlite3.Connection, post: Post, worker_id: str, reason: str, now: datetime
+) -> Post:
+    """The publish-time pre-flight refused a post this worker claimed: hold it instead of
+    publishing (CLP-97)."""
+    with transaction(conn):
+        _update(
+            conn,
+            post,
+            PostStatus.HELD,
+            now,
+            owner=worker_id,
+            error=reason,
+            worker_id=None,
+            claimed_at=None,
+        )
+        held = _require(conn, post.id)
+        _audit(conn, held, _action(PostStatus.HELD), now, reason=reason, worker_id=worker_id)
+    return held
 
 
 def _change(

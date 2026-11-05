@@ -21,11 +21,11 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import yaml
 from pydantic import (
@@ -34,6 +34,7 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -78,6 +79,8 @@ class AudienceRule(BaseModel):
         for market in value:
             if not isinstance(market, str) or not _MARKET.fullmatch(market):
                 raise ValueError(f"markets: {market!r} is not a 2-letter country code like US")
+        if len(set(value)) != len(value):
+            raise ValueError("markets: duplicate market")
         return value
 
 
@@ -98,7 +101,7 @@ class Campaign(BaseModel):
 
     id: str = Field(pattern=ACCOUNT_ID_PATTERN, max_length=64)
     program: Program
-    creator: str
+    creator: str = Field(min_length=1)
     """A name from creators.yaml; only that creator's clips count for the campaign."""
     platforms: list[Platform] = Field(min_length=1)
     brief_verified: bool = False
@@ -118,11 +121,11 @@ class Campaign(BaseModel):
     paid_partnership: bool = False
     enabled: bool = True
 
-    @field_validator("platforms")
+    @field_validator("platforms", "forbidden")
     @classmethod
-    def _distinct_platforms(cls, value: list[str]) -> list[str]:
+    def _distinct(cls, value: list[str], info: ValidationInfo) -> list[str]:
         if len(set(value)) != len(value):
-            raise ValueError("duplicate platform")
+            raise ValueError(f"duplicate {info.field_name.rstrip('s')}")
         return value
 
     @field_validator("required_hashtags", mode="before")
@@ -140,7 +143,7 @@ class Campaign(BaseModel):
     def _keywords(cls, value: list[str]) -> list[str]:
         if any(not k.strip() for k in value):
             raise ValueError("forbidden_keywords must not be empty strings")
-        return value
+        return list(dict.fromkeys(k.strip() for k in value))
 
     @model_validator(mode="after")
     def _duration_range(self) -> Campaign:
@@ -167,7 +170,7 @@ class Campaign(BaseModel):
 class CampaignsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    campaigns: list[Campaign] = []
+    campaigns: list[Campaign] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _unique(self) -> CampaignsConfig:
@@ -281,13 +284,15 @@ def render_edl(media_root: Path, video_path: str | None) -> EDL | None:
     outside `media_root`, or not a valid EDL: callers treat None as "unknown"."""
     if not video_path:
         return None
-    sidecar = resolve_media_path(media_root, str(Path(video_path).with_suffix(".json")))
-    if sidecar is None:
-        return None
     try:
-        if sidecar.stat().st_size > MAX_SIDECAR_BYTES:
+        sidecar = resolve_media_path(media_root, str(Path(video_path).with_suffix(".json")))
+        if sidecar is None:
             return None
-        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        with sidecar.open("rb") as fh:  # one bounded read: no stat-then-read race
+            raw = fh.read(MAX_SIDECAR_BYTES + 1)
+        if len(raw) > MAX_SIDECAR_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8"))
         edl = data.get("edl") if isinstance(data, dict) else None
         return parse_edl(edl) if isinstance(edl, dict) else None
     except (OSError, UnicodeError, ValueError):  # ValidationError is a ValueError
@@ -356,19 +361,19 @@ def summary(campaign: Campaign) -> str:
     return f"{line} ({'; '.join(flags)})" if flags else line
 
 
+class HasCampaign(Protocol):
+    campaign: str | None
+
+
 def campaign_for(
-    account: object, creator: str, campaigns: Mapping[str, Campaign]
+    account: HasCampaign, creator: str, campaigns: Mapping[str, Campaign]
 ) -> tuple[str | None, Campaign | None]:
     """The account's campaign id (None: no campaign applies) and the campaign (None when
     the id is unknown). A campaign applies only to its own creator's clips."""
-    campaign_id = getattr(account, "campaign", None)
+    campaign_id = account.campaign
     if not campaign_id:
         return None, None
     campaign = campaigns.get(campaign_id)
     if campaign is not None and campaign.creator.casefold() != creator.casefold():
         return None, None
     return campaign_id, campaign
-
-
-def tags_of(campaign: Campaign | None) -> Sequence[str]:
-    return campaign.required_hashtags if campaign else ()

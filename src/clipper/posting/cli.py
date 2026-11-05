@@ -152,7 +152,7 @@ def recheck_cmd(
     """Re-run the campaign pre-flight on held posts; schedule the ones that now pass."""
     from clipper.accounts import accounts_path, load_accounts
     from clipper.campaigns import campaigns_path, load_campaigns
-    from clipper.config import ConfigError, load_config
+    from clipper.config import ConfigError, always_sensitive, load_config
     from clipper.posting.scheduler import recheck_held
 
     config_path: Path = ctx.find_root().obj.config_path
@@ -162,6 +162,13 @@ def recheck_cmd(
         campaigns = load_campaigns(campaigns_path(config_path), creators, accounts)
     except ConfigError as exc:
         _fail(str(exc))
+
+    def is_sensitive(creator: str) -> bool:
+        try:
+            return always_sensitive(creators.creator(creator))
+        except KeyError:
+            return True  # an unknown creator fails closed, as in the review app
+
     conn = _open(ctx)
     try:
         result = recheck_held(
@@ -170,6 +177,7 @@ def recheck_cmd(
             campaigns.by_id(),
             utcnow(),
             media_root=media_dir.resolve(),
+            is_sensitive=is_sensitive,
         )
     finally:
         conn.close()

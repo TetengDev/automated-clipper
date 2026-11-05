@@ -14,6 +14,8 @@ Each pass (the worker runs one per poll, see `clipper.jobs.worker.Worker.posting
    (`now + BACKOFF_BASE * 2**attempts`); the `MAX_ATTEMPTS`th failure is `post_failed`
    and raises an alert. A successful upload whose result cannot be recorded because the
    post changed meanwhile alerts too (a possible duplicate).
+   Before publishing, the `guard` (the campaign pre-flight, CLP-97) runs again with the
+   current config: a post it refuses, or a guard that fails, is `held` instead.
 3. Due posts on a platform with no publisher stay `scheduled`; that is logged once per
    platform per worker run.
 
@@ -33,6 +35,7 @@ from pathlib import Path
 from clipper.clips import resolve_media_path
 from clipper.jobs.models import Clock, utcnow
 from clipper.jobs.worker import DEFAULT_MEDIA_ROOT
+from clipper.pipeline.common import strip_control
 from clipper.posting import repo
 from clipper.posting.models import (
     MAX_ATTEMPTS,
@@ -52,6 +55,7 @@ DEFAULT_BATCH = 10
 logger = logging.getLogger(__name__)
 
 Alert = Callable[[str], None]
+Guard = Callable[[Post], "str | None"]
 
 
 def log_alert(message: str) -> None:
@@ -67,6 +71,9 @@ class PostingStage:
     media_root: Path = DEFAULT_MEDIA_ROOT
     clock: Clock = utcnow
     alert: Alert = log_alert
+    guard: Guard | None = None
+    """The publish-time campaign pre-flight (CLP-97, `scheduler.publish_problem`): a reason
+    holds the claimed post instead of publishing it."""
     batch: int = DEFAULT_BATCH
     _warned: set[str] = field(default_factory=set, init=False, repr=False)
 
@@ -102,6 +109,8 @@ class PostingStage:
         publisher = self.publishers[post.platform]
         if post.attempts > 0 and self._already_live(post, publisher):
             return
+        if self._held(post):
+            return
         try:
             path = resolve_media_path(self.media_root, post.video_path)
             if path is None:
@@ -114,6 +123,24 @@ class PostingStage:
         # Outside the try: if this write fails the post stays `uploading` and the stale
         # pass resolves it through `lookup` instead of uploading it again.
         self._posted(post, result)
+
+    def _held(self, post: Post) -> bool:
+        """Run the guard; hold the post when it refuses (or fails: fail closed)."""
+        if self.guard is None:
+            return False
+        try:
+            reason = self.guard(post)
+        except Exception as exc:
+            reason = f"publish pre-flight failed: {_describe(exc)}"
+        if reason is None:
+            return False
+        try:
+            repo.hold_claimed(self.conn, post, self.worker_id, reason, self.clock())
+        except PostConflict as exc:
+            logger.warning("%s: hold not recorded: %s", _label(post), exc)
+            return True
+        logger.warning("%s: held by pre-flight: %s", _label(post), strip_control(reason))
+        return True
 
     def _already_live(self, post: Post, publisher: Publisher) -> bool:
         """Before re-publishing after a failed attempt, ask `lookup` (when there is one)

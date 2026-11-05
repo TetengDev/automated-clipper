@@ -9,6 +9,7 @@ import re
 import signal
 import sqlite3
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, NoReturn
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     import httpx
 
     from clipper.accounts import AccountsConfig
+    from clipper.posting.models import Post
     from clipper.resolve import Resolved
     from clipper.sources.youtube import MetadataProvider, YouTubeSource
 
@@ -284,6 +286,31 @@ def _open_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _publish_guard(
+    conn: sqlite3.Connection, config_path: Path, cfg: AppConfig, media_dir: Path
+) -> Callable[[Post], str | None]:
+    """The campaign pre-flight the posting stage runs before each publish (CLP-97), with
+    the accounts and campaigns as they are when the worker starts."""
+    from clipper.accounts import accounts_path, load_accounts
+    from clipper.campaigns import campaigns_path, load_campaigns
+    from clipper.jobs.models import utcnow
+    from clipper.posting.scheduler import publish_problem
+
+    try:
+        accounts = load_accounts(accounts_path(config_path), cfg)
+        campaigns = load_campaigns(campaigns_path(config_path), cfg, accounts).by_id()
+    except ConfigError as exc:
+        conn.close()
+        _fail(str(exc))
+    by_id = {a.id: a for a in accounts.accounts}
+    root = media_dir.resolve()
+
+    def guard(post: Post) -> str | None:
+        return publish_problem(conn, post, by_id, campaigns, utcnow(), media_root=root)
+
+    return guard
+
+
 @app.command("run-worker")
 def run_worker(
     ctx: typer.Context,
@@ -318,9 +345,10 @@ def run_worker(
         stages=build_stages(),
         media_root=media_dir,
     )
+    guard = _publish_guard(conn, app_ctx.config_path, cfg, media_dir)
     # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
     worker.posting = PostingStage(
-        conn=conn, publishers={}, worker_id=worker.worker_id, media_root=media_dir
+        conn=conn, publishers={}, worker_id=worker.worker_id, media_root=media_dir, guard=guard
     )
     try:
         if recover_id:

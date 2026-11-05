@@ -21,7 +21,7 @@ import logging
 import math
 import re
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -33,8 +33,9 @@ from clipper.campaigns import Campaign, campaign_for, campaign_preflight, render
 from clipper.clips import ClipDetail, ClipStatus
 from clipper.db import transaction
 from clipper.metadata import build_post_metadata
+from clipper.pipeline.common import strip_control
 from clipper.posting import repo
-from clipper.posting.models import Post, PostMetadata, PostStatus
+from clipper.posting.models import Post, PostConflict, PostMetadata, PostStatus
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class AccountLike(Protocol):
     warmup_start: date | None
     warmup_days: int  # default 14
     enabled: bool
+    campaign: str | None  # campaign id from campaigns.yaml (CLP-97), or None
 
 
 def parse_windows(windows: Sequence[str]) -> list[tuple[time, time]]:
@@ -177,7 +179,7 @@ def pick_slot(account: AccountLike, existing: Sequence[datetime], now: datetime)
 
 @dataclass(frozen=True)
 class _Plan:
-    """What one account would post for a clip, and why the brief refuses it (if it does)."""
+    """What one account would post for a clip, and why it may not (if it may not)."""
 
     campaign_id: str | None
     metadata: PostMetadata
@@ -216,6 +218,11 @@ def _plan(
     return _Plan(campaign_id, metadata, problems)
 
 
+def _log_text(text: str | None) -> str:
+    """Hold reasons quote clip text (LLM output over an untrusted transcript)."""
+    return strip_control(text or "")
+
+
 def schedule_for_clip(
     conn: sqlite3.Connection,
     clip_id: int,
@@ -232,12 +239,14 @@ def schedule_for_clip(
     it is, so calling this again is safe. Nothing is scheduled for a sensitive clip (its
     stored flag, or `sensitive=True` from the creator's rule), a clip that is not approved
     or exported, or one without a rendered video. An account is skipped when the same file
-    is already scheduled or posted on its platform, or when it has no free slot.
+    is already scheduled, posted or held on its platform, or when it has no free slot.
 
     A post for a campaign account (`campaigns` by id) whose clip or metadata breaks the
-    brief is created `held` with the reasons in `error` and takes no slot. `media_root`
-    locates the render sidecar, which says whether the clip has AI elements; without it the
-    AI status is unknown, which holds the post under a brief that forbids AI content.
+    brief is created `held` with the reasons in `error`, with or without a free slot. A
+    held post takes no slot (its `scheduled_at` is only the time it was held) but keeps
+    its file reserved on the platform, so it can be released later. `media_root` locates
+    the render sidecar, which says whether the clip has AI elements; without it the AI
+    status is unknown, which holds the post under a brief that forbids AI content.
     """
     clip = clips.get_clip(conn, clip_id)
     if clip is None or clip.status not in SCHEDULABLE:
@@ -271,7 +280,8 @@ def schedule_for_clip(
             except (ValueError, ZoneInfoNotFoundError) as exc:
                 logger.error("account %s: invalid schedule config: %s", account.id, exc)
                 continue
-            if slot is None:
+            plan = _plan(clip, account, briefs, media_root, slot or now)
+            if slot is None and plan.reason is None:
                 logger.warning(
                     "clip %d: no slot for account %s in the next %d days",
                     clip_id,
@@ -279,7 +289,6 @@ def schedule_for_clip(
                     MAX_DAYS_AHEAD,
                 )
                 continue
-            plan = _plan(clip, account, briefs, media_root, slot)
             created.append(
                 repo.insert_post(
                     conn,
@@ -287,7 +296,8 @@ def schedule_for_clip(
                     clip_version=clip.current_version,
                     account_id=account.id,
                     platform=account.platform,
-                    scheduled_at=now if plan.reason else slot,
+                    # A held post has no slot: this is only when it was held.
+                    scheduled_at=slot if slot is not None and plan.reason is None else now,
                     video_path=video_path,
                     now=now,
                     campaign_id=plan.campaign_id,
@@ -298,7 +308,11 @@ def schedule_for_clip(
     for post in created:
         if post.status == PostStatus.HELD:
             logger.warning(
-                "clip %d held on %s (%s): %s", clip_id, post.account_id, post.platform, post.error
+                "clip %d held on %s (%s): %s",
+                clip_id,
+                post.account_id,
+                post.platform,
+                _log_text(post.error),
             )
             continue
         logger.info(
@@ -317,6 +331,37 @@ class RecheckResult:
     still_held: list[Post] = field(default_factory=list)
 
 
+SensitiveRule = Callable[[str], bool]
+"""Whether a creator's clips are always sensitive (CLP-87), by creator name."""
+
+
+def _never_sensitive(_creator: str) -> bool:
+    return False
+
+
+def _ineligible(
+    post: Post,
+    clip: ClipDetail | None,
+    account: AccountLike | None,
+    is_sensitive: SensitiveRule,
+) -> str | None:
+    """Why a held post cannot be released whatever the brief says, or None. The same
+    rules as `schedule_for_clip`."""
+    if account is None:
+        return f"account {post.account_id} is no longer configured"
+    if not account.enabled:
+        return f"account {account.id} is disabled"
+    if clip is None or clip.status not in SCHEDULABLE:
+        return f"clip {post.clip_id} is no longer approved"
+    if clip.creator not in account.creators:
+        return f"account {account.id} no longer posts {clip.creator}"
+    if clip.current.sensitive or is_sensitive(clip.creator):
+        return f"clip {clip.id} is sensitive and is never auto-posted"
+    if not clip.current.video_path:
+        return f"clip {clip.id} has no rendered video"
+    return None
+
+
 def recheck_held(
     conn: sqlite3.Connection,
     accounts: Sequence[AccountLike],
@@ -324,37 +369,102 @@ def recheck_held(
     now: datetime,
     *,
     media_root: Path | None = None,
+    is_sensitive: SensitiveRule = _never_sensitive,
 ) -> RecheckResult:
-    """Run the pre-flight again on every held post with the current config. A post that
-    now passes is scheduled in its account's next free slot; one that still fails keeps
-    its hold with the current reason. A post whose account is gone or disabled, or whose
-    clip is no longer schedulable, stays held."""
+    """Run the pre-flight again on every held post with the current config and the clip's
+    current version (a re-edited, re-approved clip is checked as it is now). A post that
+    passes is scheduled in its account's next free slot; one that does not keeps its hold
+    with the current reason. Each post is checked and released in one transaction, so the
+    slot cannot be taken meanwhile; a post cancelled meanwhile is skipped."""
     by_id = {a.id: a for a in accounts}
     released: list[Post] = []
     still: list[Post] = []
-    for post in repo.list_posts(conn, statuses=(PostStatus.HELD,)):
-        account = by_id.get(post.account_id)
-        clip = clips.get_clip(conn, post.clip_id)
-        if (
-            account is None
-            or not account.enabled
-            or clip is None
-            or clip.status not in SCHEDULABLE
-            or clip.current_version != post.clip_version
-        ):
-            still.append(post)
-            continue
+    for held in repo.held_posts(conn):
         try:
-            slot = pick_slot(account, repo.account_post_times(conn, account.id), now)
-        except (ValueError, ZoneInfoNotFoundError) as exc:
-            logger.error("account %s: invalid schedule config: %s", account.id, exc)
-            still.append(post)
+            with transaction(conn):
+                post = repo.get_post(conn, held.id)
+                if post is None or post.status != PostStatus.HELD:
+                    continue  # cancelled (or released) meanwhile
+                outcome = _recheck_one(conn, post, by_id, campaigns, now, media_root, is_sensitive)
+        except (PostConflict, ValueError, ZoneInfoNotFoundError) as exc:
+            logger.error("post %d: recheck failed: %s", held.id, _log_text(str(exc)))
+            still.append(held)
             continue
-        plan = _plan(clip, account, campaigns, media_root, slot or now)
-        if plan.reason:
-            still.append(repo.update_hold(conn, post.id, plan.reason, now))
-        elif slot is None:
-            still.append(post)
-        else:
-            released.append(repo.release_held(conn, post.id, slot, plan.metadata, now))
+        (released if outcome.status == PostStatus.SCHEDULED else still).append(outcome)
     return RecheckResult(released=released, still_held=still)
+
+
+def _recheck_one(
+    conn: sqlite3.Connection,
+    post: Post,
+    accounts: Mapping[str, AccountLike],
+    campaigns: Mapping[str, Campaign],
+    now: datetime,
+    media_root: Path | None,
+    is_sensitive: SensitiveRule,
+) -> Post:
+    account = accounts.get(post.account_id)
+    clip = clips.get_clip(conn, post.clip_id)
+    blocked = _ineligible(post, clip, account, is_sensitive)
+    if blocked is not None:
+        return repo.update_hold(conn, post, blocked, now)
+    assert clip is not None and account is not None and clip.current.video_path
+    video_path = clip.current.video_path
+    if video_path != post.video_path and repo.file_on_platform(conn, post.platform, video_path):
+        reason = f"clip {clip.id}'s current file is already scheduled on {post.platform}"
+        return repo.update_hold(conn, post, reason, now)
+    slot = pick_slot(account, repo.account_post_times(conn, account.id), now)
+    plan = _plan(clip, account, campaigns, media_root, slot or now)
+    if plan.reason is not None:
+        return repo.update_hold(conn, post, plan.reason, now)
+    if slot is None:
+        reason = f"no free slot for account {account.id} in the next {MAX_DAYS_AHEAD} days"
+        return repo.update_hold(conn, post, reason, now)
+    return repo.release_held(
+        conn,
+        post,
+        slot,
+        now,
+        metadata=plan.metadata,
+        clip_version=clip.current_version,
+        video_path=video_path,
+        campaign_id=plan.campaign_id,
+    )
+
+
+def publish_problem(
+    conn: sqlite3.Connection,
+    post: Post,
+    accounts: Mapping[str, AccountLike],
+    campaigns: Mapping[str, Campaign],
+    now: datetime,
+    *,
+    media_root: Path | None = None,
+) -> str | None:
+    """The publish-time pre-flight (CLP-97): why a claimed post must not go out now, or
+    None. The config may have changed since scheduling (campaign disabled or ended, brief
+    tightened, the account moved to another campaign) and a reschedule may have moved the
+    post past the campaign's end, so the brief is checked again with the stored metadata.
+    Fails closed: an account no longer configured, or a post whose campaign differs from
+    the one its account has now (including one scheduled before CLP-97), is held."""
+    account = accounts.get(post.account_id)
+    if account is None:
+        return f"account {post.account_id} is no longer configured"
+    version = clips.get_version(conn, post.clip_id, post.clip_version)
+    clip = clips.get_clip(conn, post.clip_id)
+    if version is None or clip is None:
+        return f"clip {post.clip_id} v{post.clip_version} is missing"
+    campaign_id, campaign = campaign_for(account, clip.creator, campaigns)
+    if campaign_id != post.campaign_id:
+        return (
+            f"campaign changed since scheduling ({post.campaign_id or 'none'} ->"
+            f" {campaign_id or 'none'}); run `clipper posts recheck` or cancel the post"
+        )
+    if campaign_id is None:
+        return None
+    if campaign is None:
+        return f"account {account.id}: unknown campaign {campaign_id!r}"
+    metadata = repo.metadata_for(conn, post)
+    edl = render_edl(media_root, post.video_path) if media_root else None
+    problems = campaign_preflight(campaign, metadata, post.platform, version.duration_s, edl, now)
+    return "; ".join(problems) if problems else None

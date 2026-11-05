@@ -37,9 +37,10 @@ POST_TRANSITIONS: dict[PostStatus, frozenset[PostStatus]] = {
     PostStatus.SCHEDULED: frozenset(
         {PostStatus.UPLOADING, PostStatus.CANCELLED, PostStatus.SCHEDULED}
     ),
-    # uploading -> scheduled is a retry after a failed attempt (with backoff).
+    # uploading -> scheduled is a retry after a failed attempt (with backoff);
+    # uploading -> held is the publish-time campaign pre-flight refusing it (CLP-97).
     PostStatus.UPLOADING: frozenset(
-        {PostStatus.POSTED, PostStatus.SCHEDULED, PostStatus.POST_FAILED}
+        {PostStatus.POSTED, PostStatus.SCHEDULED, PostStatus.POST_FAILED, PostStatus.HELD}
     ),
     PostStatus.POST_FAILED: frozenset({PostStatus.SCHEDULED, PostStatus.CANCELLED}),
     PostStatus.POSTED: frozenset(),

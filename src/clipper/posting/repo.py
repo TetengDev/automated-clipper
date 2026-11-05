@@ -348,6 +348,41 @@ def claim_stale(
         return taken
 
 
+def touch_claim(conn: sqlite3.Connection, post_id: int, worker_id: str, now: datetime) -> bool:
+    """Heartbeat (CLP-105): re-stamp `claimed_at` of a post this worker is uploading, so the
+    stale pass never takes over a live upload. False once the post is no longer this
+    worker's upload (finished, or taken over). No audit row: it runs every minute."""
+    cur = conn.execute(
+        "UPDATE posts SET claimed_at = ?, updated_at = ?"
+        " WHERE id = ? AND status = ? AND worker_id = ?",
+        (to_iso(now), to_iso(now), post_id, str(PostStatus.UPLOADING), worker_id),
+    )
+    return cur.rowcount == 1
+
+
+def release_uploads(conn: sqlite3.Connection, dead_worker_id: str, now: datetime) -> int:
+    """Operator recovery of a known-dead worker (`run-worker --recover-id`): clear the
+    `claimed_at` of its `uploading` posts so the next stale pass resolves them through
+    `lookup` at once instead of after `STALE_UPLOAD`. The worker id stays, so a worker
+    wrongly reported dead can still record its result or re-stamp the claim."""
+    with transaction(conn):
+        rows = conn.execute(
+            "SELECT * FROM posts WHERE status = ? AND worker_id = ? AND claimed_at IS NOT NULL",
+            (str(PostStatus.UPLOADING), dead_worker_id),
+        ).fetchall()
+        released = 0
+        for row in rows:
+            cur = conn.execute(
+                "UPDATE posts SET claimed_at = NULL, updated_at = ?"
+                " WHERE id = ? AND status = ? AND worker_id = ?",
+                (to_iso(now), row["id"], str(PostStatus.UPLOADING), dead_worker_id),
+            )
+            if cur.rowcount == 1:
+                released += 1
+                _audit(conn, Post.from_row(row), "post_released", now, worker_id=dead_worker_id)
+        return released
+
+
 def mark_posted(
     conn: sqlite3.Connection, post: Post, worker_id: str, result: PublishResult, now: datetime
 ) -> Post:

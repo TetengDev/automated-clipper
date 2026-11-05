@@ -270,7 +270,9 @@ def run_worker(
     ] = None,
     recover_id: Annotated[
         str | None,
-        typer.Option(help="Release jobs claimed by this dead worker id before starting."),
+        typer.Option(
+            help="Release jobs and uploading posts claimed by this dead worker id before starting."
+        ),
     ] = None,
     poll_seconds: Annotated[float, typer.Option(min=0.1, help="Idle sleep.")] = (
         jobs.DEFAULT_POLL_SECONDS
@@ -292,9 +294,22 @@ def run_worker(
         stages=build_stages(),
         media_root=media_dir,
     )
+    # The posting pass runs on its own thread (CLP-105), so it gets its own connection;
+    # check_same_thread=False only because `recover` uses it here before that thread starts.
+    # Its upload heartbeat opens one more, per upload.
+    db_path = app_ctx.db_path
+    try:
+        posting_conn = connect(db_path, check_same_thread=False)
+    except (sqlite3.Error, OSError) as exc:
+        conn.close()
+        _fail(f"cannot open database {db_path}: {exc}")
     # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
     worker.posting = PostingStage(
-        conn=conn, publishers={}, worker_id=worker.worker_id, media_root=media_dir
+        conn=posting_conn,
+        publishers={},
+        worker_id=worker.worker_id,
+        media_root=media_dir,
+        connect=lambda: connect(db_path),
     )
     try:
         if recover_id:
@@ -309,6 +324,7 @@ def run_worker(
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
     finally:
+        posting_conn.close()
         conn.close()
 
 

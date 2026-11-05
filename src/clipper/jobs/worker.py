@@ -3,7 +3,11 @@
 The stage contract (what CLP-13..16 plug into) is documented in `clipper.jobs.stages`.
 
 Each worker process claims under a unique id, so a crashed worker's job becomes available
-again when its lease expires (or immediately via `run-worker --recover-id <dead id>`).
+again when its lease expires (or immediately via `run-worker --recover-id <dead id>`, which
+also hands the dead worker's `uploading` posts to the posting stage's stale pass).
+
+The posting pass (CLP-92) runs on a thread of its own (CLP-105), once per poll, so a long
+job stage never delays a due post. It must therefore use a DB connection of its own.
 """
 
 from __future__ import annotations
@@ -14,7 +18,6 @@ import os
 import socket
 import sqlite3
 import threading
-import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -52,7 +55,11 @@ logger = logging.getLogger(__name__)
 
 
 class PeriodicPass(Protocol):
-    """Work the loop runs once per poll besides the job stages (CLP-92's posting stage)."""
+    """Work the loop runs once per poll besides the job stages (CLP-92's posting stage).
+
+    It runs on its own thread, so it must not share the worker's connection. It may also
+    implement `recover(dead_worker_id: str) -> int`, which `Worker.recover` calls.
+    """
 
     def run_once(self) -> int: ...
 
@@ -71,12 +78,18 @@ class Worker:
     clock: Clock = utcnow
     lease: timedelta = DEFAULT_LEASE
     posting: PeriodicPass | None = None
-    """Posting pass (`clipper.posting.stage.PostingStage`), run at most once per poll."""
+    """Posting pass (`clipper.posting.stage.PostingStage`), run once per poll on its own
+    thread by `run_forever`."""
 
     def recover(self, dead_worker_id: str) -> int:
-        """Release claims of a worker known to be dead, without waiting for lease expiry."""
+        """Release claims of a worker known to be dead, without waiting for lease expiry.
+        Returns the number of jobs released; the posting pass releases the dead worker's
+        uploads too (its own count is logged)."""
         released = release_claims(self.conn, dead_worker_id, self.clock())
         logger.info("released %d job(s) claimed by %s", released, dead_worker_id)
+        recover_posts = getattr(self.posting, "recover", None)
+        if callable(recover_posts):
+            recover_posts(dead_worker_id)
         return released
 
     def run_once(self) -> bool:
@@ -154,27 +167,46 @@ class Worker:
     def run_forever(
         self, stop_event: threading.Event, poll_seconds: float = DEFAULT_POLL_SECONDS
     ) -> None:
-        """Loop until `stop_event` is set; a running stage always finishes first.
+        """Loop until `stop_event` is set; a running stage (and upload) always finishes first.
 
         Errors outside a stage (e.g. DB locked while recording an outcome) are logged and
         retried after `poll_seconds`; only BaseException (interrupt, exit) stops the loop.
+        The posting pass runs on its own thread, once per `poll_seconds`, and stops with
+        the loop.
         """
         unhandled = [s.value for s in JobStatus if s not in self.stages and s not in TERMINAL]
         logger.info("worker %s started; not handling: %s", self.worker_id, ", ".join(unhandled))
-        last_post_pass: float | None = None
-        while not stop_event.is_set():
-            if self.posting is not None and (
-                last_post_pass is None or time.monotonic() - last_post_pass >= poll_seconds
-            ):
-                last_post_pass = time.monotonic()
+        posting: threading.Thread | None = None
+        if self.posting is not None:
+            posting = threading.Thread(
+                target=self._posting_loop,
+                args=(self.posting, stop_event, poll_seconds),
+                name="posting",
+                daemon=True,  # an interrupted process must not hang on an upload
+            )
+            posting.start()
+        try:
+            while not stop_event.is_set():
                 try:
-                    self.posting.run_once()
+                    busy = self.run_once()
                 except Exception:
-                    logger.exception("posting pass failed; retrying next poll")
+                    logger.exception("worker loop error; retrying in %ss", poll_seconds)
+                    busy = False
+                if not busy:
+                    stop_event.wait(poll_seconds)
+        except BaseException:
+            stop_event.set()  # interrupted: let the posting thread wind down, do not wait
+            raise
+        if posting is not None:
+            posting.join()
+
+    @staticmethod
+    def _posting_loop(
+        posting: PeriodicPass, stop_event: threading.Event, poll_seconds: float
+    ) -> None:
+        while not stop_event.is_set():
             try:
-                busy = self.run_once()
+                posting.run_once()
             except Exception:
-                logger.exception("worker loop error; retrying in %ss", poll_seconds)
-                busy = False
-            if not busy:
-                stop_event.wait(poll_seconds)
+                logger.exception("posting pass failed; retrying next poll")
+            stop_event.wait(poll_seconds)

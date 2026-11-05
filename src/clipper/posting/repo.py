@@ -13,15 +13,17 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
 from clipper.clips import get_version
 from clipper.db import transaction
-from clipper.jobs.models import to_iso
+from clipper.jobs.models import from_iso, to_iso
 from clipper.posting.models import (
     InvalidPostTransition,
+    NoFreeSlot,
     Post,
     PostConflict,
     PostMetadata,
@@ -31,6 +33,8 @@ from clipper.posting.models import (
 )
 
 LIST_LIMIT = 500
+UNRESOLVED_PREFIX = "uploading state unresolved"
+"""How the posting stage's unresolved-upload errors start (`stage.UNRESOLVED`)."""
 _COUNTED = "status != 'cancelled'"
 _REVIEWER_EDITABLE = frozenset({PostStatus.SCHEDULED, PostStatus.POST_FAILED})
 
@@ -77,13 +81,106 @@ def list_posts(
     return [Post.from_row(r) for r in conn.execute(sql, [*params, limit])]
 
 
-def account_post_times(conn: sqlite3.Connection, account_id: str) -> list[datetime]:
-    """When the account's posts are (or were) scheduled; cancelled posts free their slot."""
+def account_post_times(
+    conn: sqlite3.Connection,
+    account_id: str,
+    *,
+    exclude_post_id: int | None = None,
+    since: datetime | None = None,
+) -> list[datetime]:
+    """When the account's posts are (or were) scheduled; cancelled posts free their slot.
+    `exclude_post_id` leaves out the post being moved and `since` skips older history,
+    which the slot picker never looks at (CLP-106; the `(account_id, scheduled_at)` index
+    keeps it cheap)."""
     rows = conn.execute(
-        f"SELECT * FROM posts WHERE account_id = ? AND {_COUNTED}",  # noqa: S608 - constant
-        (account_id,),
+        f"SELECT * FROM posts WHERE account_id = ? AND {_COUNTED} AND id IS NOT ?"  # noqa: S608 - constant
+        " AND scheduled_at >= ?",
+        (account_id, exclude_post_id, to_iso(since) if since is not None else ""),
     )
     return [Post.from_row(r).scheduled_at for r in rows]
+
+
+def uploads_between(
+    conn: sqlite3.Connection,
+    account_id: str,
+    start: datetime,
+    end: datetime,
+    *,
+    exclude_post_id: int | None = None,
+    per_attempt: bool = False,
+) -> int:
+    """Uploads the account made or started in [start, end), for the claim-time caps
+    (CLP-106): posts posted then (`posted_at`), posts claimed for upload then
+    (`claimed_at`), and failed attempts (or unresolved uploads) recorded then, from their
+    audit rows: a failed attempt may have reached the platform, used quota or even gone
+    live. Audit rows keep their time, so a later deferral, reschedule or retry neither
+    moves an attempt into another window nor erases it.
+
+    By default each other post counts once. `per_attempt` counts API attempts instead (for
+    the platform's API cap), including the excluded post's own failed attempts."""
+    window = (to_iso(start), to_iso(end))
+    live = conn.execute(
+        "SELECT id FROM posts WHERE account_id = ? AND id IS NOT ? AND updated_at >= ? AND ("
+        " (status = 'posted' AND posted_at >= ? AND posted_at < ?)"
+        " OR (status = 'uploading' AND claimed_at >= ? AND claimed_at < ?))",
+        (account_id, exclude_post_id, window[0], *window, *window),
+    ).fetchall()
+    failed = [
+        row[0]
+        for row in conn.execute(
+            "SELECT json_extract(payload, '$.post_id') FROM clip_reviews"
+            " WHERE action IN (?, ?) AND created_at >= ? AND created_at < ?"
+            " AND json_extract(payload, '$.account_id') = ?"
+            " AND (json_extract(payload, '$.attempts') IS NOT NULL"
+            " OR json_extract(payload, '$.error') LIKE ?)",
+            (
+                _action(PostStatus.SCHEDULED),
+                _action(PostStatus.POST_FAILED),
+                *window,
+                account_id,
+                f"{UNRESOLVED_PREFIX}%",
+            ),
+        )
+    ]
+    if per_attempt:
+        return len(live) + len(failed)
+    return len(({row[0] for row in live} | set(failed)) - {exclude_post_id})
+
+
+def had_failed_attempt(conn: sqlite3.Connection, post: Post) -> bool:
+    """Whether an upload attempt of this post ever failed (or was left unresolved), even
+    if a reviewer's retry or reschedule has since reset its attempt count."""
+    row = conn.execute(
+        "SELECT 1 FROM clip_reviews WHERE clip_id = ? AND action IN (?, ?)"
+        " AND json_extract(payload, '$.post_id') = ?"
+        " AND (json_extract(payload, '$.attempts') IS NOT NULL"
+        " OR json_extract(payload, '$.error') LIKE ?) LIMIT 1",
+        (
+            post.clip_id,
+            _action(PostStatus.SCHEDULED),
+            _action(PostStatus.POST_FAILED),
+            post.id,
+            f"{UNRESOLVED_PREFIX}%",
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def last_upload(
+    conn: sqlite3.Connection,
+    account_id: str,
+    since: datetime,
+    *,
+    exclude_post_id: int | None = None,
+) -> datetime | None:
+    """When the account's latest upload since `since` started (posted or in flight)."""
+    row = conn.execute(
+        "SELECT MAX(CASE WHEN status = 'posted' THEN posted_at ELSE claimed_at END)"
+        " FROM posts WHERE account_id = ? AND id IS NOT ? AND ("
+        " (status = 'posted' AND posted_at >= ?) OR (status = 'uploading' AND claimed_at >= ?))",
+        (account_id, exclude_post_id, to_iso(since), to_iso(since)),
+    ).fetchone()
+    return from_iso(row[0]) if row and row[0] else None
 
 
 def has_post(conn: sqlite3.Connection, clip_id: int, account_id: str) -> bool:
@@ -162,14 +259,18 @@ def _change(
     action: str | None = None,
     by: str | None = None,
     allowed_from: Collection[PostStatus] = _REVIEWER_EDITABLE,
+    computed: Callable[[sqlite3.Connection, Post], dict[str, Any]] | None = None,
     **fields: Any,
 ) -> Post:
     """A reviewer/CLI change: move a post to `target` and set `fields`, with an audit row.
-    Only posts in `allowed_from` change: never one a worker is uploading."""
+    Only posts in `allowed_from` change: never one a worker is uploading. `computed`
+    adds fields worked out inside the transaction (CLP-106: the next free slot)."""
     with transaction(conn):
         post = _require(conn, post_id)
         if post.status not in allowed_from or not can_transition(post.status, target):
             raise InvalidPostTransition(post_id, post.status, target)
+        if computed is not None:
+            fields = {**fields, **computed(conn, post)}
         _update(conn, post, target, now, **fields)
         updated = _require(conn, post_id)
         _audit(
@@ -233,8 +334,26 @@ def reschedule(
     )
 
 
-def retry(conn: sqlite3.Connection, post_id: int, now: datetime, *, by: str | None = None) -> Post:
-    """Requeue a `post_failed` post now, with a fresh attempt count."""
+def retry(
+    conn: sqlite3.Connection,
+    post_id: int,
+    now: datetime,
+    *,
+    at: datetime | None = None,
+    pick: Callable[[sqlite3.Connection, Post], datetime | None] | None = None,
+    by: str | None = None,
+) -> Post:
+    """Requeue a `post_failed` post with a fresh attempt count: at `at`, else at the slot
+    `pick` chooses inside the write transaction (None raises NoFreeSlot), else now."""
+
+    def slot(c: sqlite3.Connection, post: Post) -> dict[str, Any]:
+        if at is not None or pick is None:
+            return {"scheduled_at": at or now}
+        chosen = pick(c, post)
+        if chosen is None:
+            raise NoFreeSlot(post.account_id)
+        return {"scheduled_at": chosen}
+
     return _change(
         conn,
         post_id,
@@ -242,7 +361,7 @@ def retry(conn: sqlite3.Connection, post_id: int, now: datetime, *, by: str | No
         now,
         by=by,
         allowed_from=frozenset({PostStatus.POST_FAILED}),
-        scheduled_at=now,
+        computed=slot,
         attempts=0,
         error=None,
     )
@@ -306,9 +425,11 @@ def claim_stale(
     *,
     older_than: timedelta,
     platforms: Collection[str],
+    limit: int | None = None,
 ) -> list[Post]:
     """Take over posts on `platforms` left `uploading` longer than `older_than` (a crashed
-    worker). Only platforms this worker publishes to: it must be able to `lookup` them."""
+    worker). Only platforms this worker publishes to: it must be able to `lookup` them.
+    `limit` takes over at most that many, so the rest do not sit claimed meanwhile."""
     wanted = sorted(platforms)
     if not wanted:
         return []
@@ -319,8 +440,10 @@ def claim_stale(
         rows = conn.execute(
             sql, (str(PostStatus.UPLOADING), to_iso(now - older_than), *wanted)
         ).fetchall()
-        taken = []
+        taken: list[Post] = []
         for row in rows:
+            if limit is not None and len(taken) >= limit:
+                break
             post = Post.from_row(row)
             cur = conn.execute(
                 "UPDATE posts SET worker_id = ?, claimed_at = ?, updated_at = ?"
@@ -346,6 +469,77 @@ def claim_stale(
                 )
                 taken.append(recovered)
         return taken
+
+
+def touch_claim(conn: sqlite3.Connection, post_id: int, worker_id: str, now: datetime) -> bool:
+    """Heartbeat (CLP-105): re-stamp `claimed_at` of a post this worker is uploading, so the
+    stale pass never takes over a live upload. False once the post is no longer this
+    worker's upload (finished, or taken over). No audit row: it runs every minute."""
+    cur = conn.execute(
+        "UPDATE posts SET claimed_at = ?, updated_at = ?"
+        " WHERE id = ? AND status = ? AND worker_id = ?",
+        (to_iso(now), to_iso(now), post_id, str(PostStatus.UPLOADING), worker_id),
+    )
+    return cur.rowcount == 1
+
+
+def release_uploads(
+    conn: sqlite3.Connection,
+    dead_worker_id: str,
+    now: datetime,
+    *,
+    quiet_for: timedelta,
+    stale_after: timedelta,
+) -> tuple[int, int]:
+    """Operator recovery of a known-dead worker (`run-worker --recover-id`). Returns
+    (released, shortened).
+
+    Claims not re-stamped for `quiet_for` are released (`claimed_at` cleared), so the next
+    stale pass resolves them through `lookup` at once. A claim re-stamped more recently may
+    belong to a live worker named by mistake, so it is only shortened: set to go stale
+    `quiet_for` from `now` instead of `stale_after` from its last beat. A live worker's
+    next heartbeat re-stamps it, so its upload is never handed over; a dead one's goes
+    stale minutes after the restart. Each change is compare-and-swap on `claimed_at`.
+    The protection relies on the heartbeat: a worker run without one looks quiet."""
+    quiet_since = to_iso(now - quiet_for)
+    shortened_to = to_iso(now - stale_after + quiet_for)
+    released = shortened = 0
+    with transaction(conn):
+        rows = conn.execute(
+            "SELECT * FROM posts WHERE status = ? AND worker_id = ? AND claimed_at IS NOT NULL",
+            (str(PostStatus.UPLOADING), dead_worker_id),
+        ).fetchall()
+        for row in rows:
+            quiet = row["claimed_at"] <= quiet_since
+            cur = conn.execute(
+                "UPDATE posts SET claimed_at = ?, updated_at = ?"
+                " WHERE id = ? AND status = ? AND worker_id = ? AND claimed_at IS ?",
+                (
+                    None if quiet else shortened_to,
+                    to_iso(now),
+                    row["id"],
+                    str(PostStatus.UPLOADING),
+                    dead_worker_id,
+                    row["claimed_at"],
+                ),
+            )
+            if cur.rowcount != 1:
+                continue
+            post = Post.from_row(row)
+            if quiet:
+                released += 1
+                _audit(conn, post, "post_released", now, worker_id=dead_worker_id)
+            else:
+                shortened += 1
+                _audit(
+                    conn,
+                    post,
+                    "post_release_deferred",
+                    now,
+                    worker_id=dead_worker_id,
+                    claimed_at=shortened_to,
+                )
+    return released, shortened
 
 
 def mark_posted(
@@ -377,17 +571,25 @@ def record_failure(
     *,
     max_attempts: int,
     backoff: timedelta,
+    retry_at: Callable[[sqlite3.Connection, datetime], datetime | None] | None = None,
+    no_slot_note: str = "",
 ) -> Post:
-    """Count a failed attempt: back off (`now + backoff * 2**attempts`) or, at
-    `max_attempts`, give up with `post_failed`."""
+    """Count a failed attempt: retry at `now + backoff * 2**attempts`, or at the slot
+    `retry_at(conn, that time)` picks inside this transaction (CLP-106: the account's next
+    free slot at or after it). At `max_attempts`, or when `retry_at` finds no slot (then
+    `no_slot_note` is added to the error), give up with `post_failed`."""
     with transaction(conn):
         current = _require(conn, post.id)
         attempts = current.attempts + 1
-        if attempts >= max_attempts:
-            target, fields = PostStatus.POST_FAILED, {}
-        else:
-            target = PostStatus.SCHEDULED
-            fields = {"scheduled_at": now + backoff * 2**attempts}
+        target, fields = PostStatus.POST_FAILED, {}
+        if attempts < max_attempts:
+            when: datetime | None = now + backoff * 2**attempts
+            if retry_at is not None:
+                when = retry_at(conn, when)
+            if when is None:
+                error = f"{error}; {no_slot_note}" if no_slot_note else error
+            else:
+                target, fields = PostStatus.SCHEDULED, {"scheduled_at": when}
         _update(
             conn,
             current,
@@ -411,6 +613,67 @@ def record_failure(
             scheduled_at=to_iso(updated.scheduled_at),
         )
     return updated
+
+
+@dataclass(frozen=True)
+class Deferral:
+    """Why a claimed post may not upload now, and when it may (None: no free slot, so the
+    post is given up for a human)."""
+
+    reason: str
+    until: datetime | None
+
+
+def defer_claimed(
+    conn: sqlite3.Connection,
+    post: Post,
+    worker_id: str,
+    now: datetime,
+    decide: Callable[[sqlite3.Connection], Deferral | None],
+) -> Deferral | None:
+    """Claim-time caps (CLP-106): run `decide` and act on it in one write transaction, so
+    the count and the slot it picks are not stale. A deferral puts the claimed post back
+    to `scheduled` at `until` without counting an attempt (audit `post_deferred`, as for
+    CLP-93's `PublishDeferred`); with no `until` it is `post_failed`. None: go ahead."""
+    with transaction(conn):
+        decision = decide(conn)
+        if decision is None:
+            return None
+        if decision.until is None:
+            _update(
+                conn,
+                post,
+                PostStatus.POST_FAILED,
+                now,
+                owner=worker_id,
+                error=decision.reason,
+                worker_id=None,
+                claimed_at=None,
+            )
+            failed = _require(conn, post.id)
+            _audit(conn, failed, _action(PostStatus.POST_FAILED), now, error=decision.reason)
+            return decision
+        _update(
+            conn,
+            post,
+            PostStatus.SCHEDULED,
+            now,
+            owner=worker_id,
+            scheduled_at=decision.until,
+            error=decision.reason,
+            worker_id=None,
+            claimed_at=None,
+        )
+        deferred = _require(conn, post.id)
+        _audit(
+            conn,
+            deferred,
+            "post_deferred",
+            now,
+            error=decision.reason,
+            scheduled_at=to_iso(decision.until),
+        )
+    return decision
 
 
 def mark_failed(

@@ -81,6 +81,10 @@ class PostConflict(Exception):
     """The post changed under us (another worker or a reviewer); the result is dropped."""
 
 
+class NoFreeSlot(Exception):
+    """The account has no free slot within the scheduler's horizon (CLP-106)."""
+
+
 def can_transition(current: str, target: PostStatus) -> bool:
     try:
         return target in POST_TRANSITIONS[PostStatus(current)]

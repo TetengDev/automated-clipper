@@ -44,6 +44,9 @@ from clipper.redact import redact
         "https://bucket.s3.amazonaws.com/k X-Amz-Signature=SECRET",
         "secret: 'SECRET with spaces'",
         '{"password": "p SECRET w"}',
+        "google access ya29.a0AfSECRETSECRETSECRETSECRET leaked",
+        "refresh 1//0gSECRETSECRETSECRETSECRET leaked",
+        "client GOCSPX-SECRETSECRET1234 leaked",
     ],
 )
 def test_redacts_secrets(text: str) -> None:

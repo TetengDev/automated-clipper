@@ -35,6 +35,7 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 - `DISCORD_WEBHOOK_URL`, `DISCORD_ALERTS_WEBHOOK_URL`, `HEALTHCHECK_URL_*`
 - `REVIEW_PASSWORD_HASH`, `SESSION_SECRET`, `RCLONE_REMOTE`
 - `CLIPPER_ACCESS_TOKEN_<ACCOUNT_ID>` and `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>` for each posting account (see [Posting accounts](#posting-accounts))
+- `YOUTUBE_OAUTH_CLIENT_ID`, `YOUTUBE_OAUTH_CLIENT_SECRET` for the YouTube publisher (see [YouTube publishing](#youtube-publishing))
 - the restic credentials
 
 GitHub Actions secrets contain only the SSH key, host, and user.
@@ -186,6 +187,119 @@ To add an account:
 
 The tokens sit in `.env` like the other keys. Encrypting refresh tokens at rest is a
 planned follow-up.
+
+## YouTube publishing
+
+The worker posts to YouTube itself, through the free YouTube Data API v3
+(`src/clipper/posting/youtube.py`, [CLP-93](https://linear.app/tengdev/issue/CLP-93)). It
+registers the YouTube publisher when `accounts.yaml` has at least one enabled `youtube`
+account. If `accounts.yaml` is invalid, the worker logs `posting is off` and runs the
+rest of the pipeline. Only clips a reviewer approved are ever scheduled.
+
+How it posts:
+
+- Each due post is uploaded as `private` with `status.publishAt` set to the post's
+  scheduled time, so YouTube makes it public. A late retry has a `publishAt` in the past,
+  and YouTube publishes such a video right away. Vertical videos up to 3 minutes become
+  Shorts automatically.
+- The title is capped at 100 characters. The description is the caption plus up to 5
+  hashtags, within 5000 bytes. The category is 24 (Entertainment), the video is declared
+  not made for kids, and `containsSyntheticMedia` is set when the clip has an AI element.
+  Each upload carries a hidden `clipper-<idempotency key>` tag. After a timeout or a crash,
+  the worker uses that tag to find the earlier upload and records it instead of uploading
+  the video twice.
+- Quota: one upload costs 1 unit of the separate "Video Uploads" bucket, which allows 100
+  calls a day. A `quotaExceeded` or `uploadLimitExceeded` error moves the post to just
+  after the next quota reset (midnight Pacific time). It does not count as a failed attempt.
+- Tokens: the worker turns the account's refresh token into a short-lived access token
+  and refreshes it when it expires. If Google rejects the refresh token (`invalid_grant`,
+  for example because it was revoked) or the OAuth client, the account is **paused**. Its
+  posts are pushed back an hour at a time without counting attempts, and one alert goes
+  out. Put a new refresh token in `.env` and restart the worker
+  (`docker compose up -d worker`). Posting resumes on the next pass.
+- Posts for a YouTube account that is set to `enabled: false`, or that is no longer in
+  `accounts.yaml`, are also pushed back an hour at a time, with one alert. When no
+  YouTube account is enabled at all, the worker registers no YouTube publisher, and those
+  posts stay `scheduled`. Cancel them (`clipper posts cancel`) or enable the account again.
+
+### One-time setup (the owner)
+
+1. **Google Cloud project.** At <https://console.cloud.google.com>, create a project (for
+   example `clipper-publisher`). Under *APIs & Services → Library*, enable **YouTube Data
+   API v3**.
+2. **OAuth consent screen** (*Google Auth Platform → Branding / Audience / Data access*):
+   - User type **External**. Enter the app name, the support email, the developer contact
+     email, the home page and the **privacy policy URL**. You need both pages later for
+     verification.
+   - Under *Data access*, add the scopes `https://www.googleapis.com/auth/youtube.upload`
+     (upload) and `https://www.googleapis.com/auth/youtube.readonly` (the duplicate-upload
+     check lists the channel's recent uploads). `youtube.readonly` can read the whole
+     account, including private videos and playlists. It is the narrowest scope that lets
+     the worker list its own uploads, and without it a timed-out upload could be posted
+     twice.
+   - Under *Audience*, click **Publish app** to move it from *Testing* to **In
+     production**. A *Testing* app's refresh tokens expire after 7 days, and the accounts
+     would then pause every week. A production app that is not yet verified still works
+     for the owner: the consent screen shows "Google hasn't verified this app", and you
+     continue through *Advanced → Go to … (unsafe)*.
+3. **OAuth client.** Under *Clients → Create client*, pick type **Web application** and
+   add the authorised redirect URI `https://developers.google.com/oauthplayground`. Put
+   the client id and secret in `/srv/clipper/.env`:
+
+   ```sh
+   YOUTUBE_OAUTH_CLIENT_ID=1234567890-abc.apps.googleusercontent.com
+   YOUTUBE_OAUTH_CLIENT_SECRET=GOCSPX-...
+   ```
+
+4. **Refresh token, once per YouTube account.**
+   1. Open <https://developers.google.com/oauthplayground>. Under the gear icon, tick
+      **Use your own OAuth credentials** and paste the client id and secret. Tokens minted
+      with your own client do not expire the way the Playground's default client's do.
+   2. Under *Input your own scopes*, enter
+      `https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly`
+      and click **Authorize APIs**.
+   3. Sign in with the Google account that owns the channel. If it manages several
+      channels (brand accounts), pick the channel of this `accounts.yaml` entry.
+   4. Click **Exchange authorization code for tokens** and copy the **refresh token**.
+      Put it in `.env` under the account's id, for example for `mrbeast_clips_yt`:
+
+      ```sh
+      CLIPPER_REFRESH_TOKEN_MRBEAST_CLIPS_YT=1//0g...
+      ```
+
+   5. Under the gear icon, remove your client credentials from the Playground and close
+      the tab. The refresh token was on that page, so clear the browser history for it.
+   6. After the last account has its token, go back to the OAuth client and **delete the
+      Playground redirect URI**. Refresh tokens keep working without it. While it is
+      registered, anyone who gets hold of the client secret could use the Playground to
+      show this app's consent screen to a channel owner and collect a token. Add it again
+      only for the next re-authorisation.
+   7. Run `clipper check-config`: the account should show `refresh_token=set`. Then
+      restart the worker.
+
+   An access token is not needed: the worker mints its own. A changed OAuth client id or
+   secret also needs a worker restart.
+5. **Verification, in parallel.** In *Google Auth Platform → Verification centre*,
+   submit the app for verification of the sensitive scopes above. You need the home page
+   and privacy policy on a domain you verified in Search Console, a written reason for
+   each scope ("uploads the channel owner's approved clips; reads the channel's recent
+   uploads to avoid duplicates"), and an unlisted YouTube demo video. The video shows the
+   consent screen with the app name and the scopes, then an upload as it appears on the
+   channel. Until verification is done, the owner's own channels work as described in
+   step 2, but no more than 100 users can authorise the app.
+6. **First live upload: check it by hand.** The current `videos.insert` docs say videos
+   uploaded from unverified API projects are *not* restricted to private. Older revisions
+   said they were locked private. After the first scheduled post, check in YouTube Studio
+   that the video turns public at its `publishAt` time. If it stays private with a
+   "locked" notice, pause posting to YouTube (`enabled: false` on the account) until
+   verification or the API audit is done.
+
+Never enable an error reporter that records local variables in the worker (Sentry's
+`include_local_variables`, rich's `show_locals`). While a token request runs, the refresh
+token and the client secret are local variables inside httpx.
+
+To revoke access, remove the app at <https://myaccount.google.com/permissions> for that
+Google account. Its account then pauses on the next post, with an alert.
 
 ## CI/CD
 

@@ -206,7 +206,8 @@ class _AuthGate:
 
 class _BodyTooLarge(HTTPException):
     """Raised from the wrapped `receive` once a body passes the cap. An HTTPException, so
-    FastAPI's body parsing re-raises it as-is (any other error becomes a 400)."""
+    FastAPI's body parsing re-raises it as-is (any other error becomes a 400); the app's
+    handler for it answers with the same `_too_large()` response as the middleware."""
 
     def __init__(self) -> None:
         super().__init__(status_code=413, detail="Request body too large")
@@ -218,7 +219,8 @@ class _BodySizeLimit:
     A declared `Content-Length` over the cap is refused without calling the app; a
     malformed one is 400. The body is also counted as it streams in (chunked uploads, or a
     `Content-Length` that understates it): past the cap, `receive` raises `_BodyTooLarge`,
-    which FastAPI turns into a 413, or this middleware does if it escapes the app.
+    which the app's exception handler turns into a 413, or this middleware does if it
+    escapes the app. Every 413 closes the connection, so the rest of the body is not read.
     """
 
     def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
@@ -234,7 +236,8 @@ class _BodySizeLimit:
             if not _CONTENT_LENGTH.fullmatch(declared):
                 await PlainTextResponse("Invalid Content-Length", 400)(scope, receive, send)
                 return
-            if int(declared) > self.max_bytes:
+            # Length check first: int() refuses strings over 4300 digits.
+            if len(declared) > len(str(self.max_bytes)) or int(declared) > self.max_bytes:
                 await _too_large()(scope, receive, send)
                 return
 
@@ -554,6 +557,10 @@ def create_app(
     app.add_middleware(_BodySizeLimit, max_bytes=MAX_REQUEST_BODY_BYTES)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.exception_handler(_BodyTooLarge)
+    async def _body_too_large(_request: Request, _exc: _BodyTooLarge) -> Response:
+        return _too_large()
 
     @app.exception_handler(LoginRequired)
     async def _login_required(request: Request, _exc: LoginRequired) -> Response:

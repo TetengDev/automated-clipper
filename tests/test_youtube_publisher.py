@@ -691,9 +691,31 @@ def test_lookup_on_a_paused_account_never_says_not_found(
         return_value=httpx.Response(400, json=FIXTURES["token_invalid_grant"])
     )
     channels, _, _ = mock_lookup(google)
-    with pytest.raises(PublishDeferred):
-        publisher(clock).lookup(KEY)
+    yt = publisher(clock)
+    with pytest.raises(PublishDeferred) as first:
+        yt.lookup(KEY)
     assert channels.call_count == 0
+    # The pause alerts once, even when only retries (which look up first) hit it.
+    assert first.value.alert is not None and "yt_main" in first.value.alert
+    with pytest.raises(PublishDeferred) as second:
+        yt.lookup(KEY)
+    assert second.value.alert is None
+
+
+def test_a_server_that_has_every_byte_but_never_finishes_is_bounded(
+    clock: Clock, video: Path, google: respx.MockRouter
+) -> None:
+    ok_token(google)
+    ok_session(google)
+    size = video.stat().st_size
+    route = google.put(SESSION).mock(
+        return_value=httpx.Response(308, headers={"Range": f"bytes=0-{size - 1}"})
+    )
+    sleeps: list[float] = []
+    with pytest.raises(RuntimeError, match="no final response"):
+        publisher(clock, sleeps=sleeps).publish(make_post(), video, META)
+    assert route.call_count <= 7
+    assert len(sleeps) == 5
 
 
 def test_lookup_finds_the_upload_on_a_healthy_account_even_if_another_is_paused(

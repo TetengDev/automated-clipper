@@ -531,9 +531,11 @@ def create_app(
         flash(request, "Signed out.")
         return RedirectResponse("/login", status_code=303)
 
+    from clipper.review.campaigns import router as campaigns_router
     from clipper.review.posts import router as posts_router
     from clipper.review.routes import router  # imports this module's helpers
 
     app.include_router(router)
     app.include_router(posts_router)
+    app.include_router(campaigns_router)
     return app

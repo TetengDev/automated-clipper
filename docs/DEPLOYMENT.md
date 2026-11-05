@@ -225,6 +225,30 @@ current version, and schedules the held posts that now pass; the others keep a h
 the current reason. Otherwise cancel them on the Scheduled page or with
 `clipper posts cancel <id>`. Cancelling is final for that clip on that account.
 
+### Link submission
+
+Vyro, Reach and Whop pay only for links submitted on their sites, and Reach wants them
+within 30 minutes of posting. None of them documents a free submission API, so the
+submit itself is a manual step: the clipper never scrapes these sites or logs in to them.
+
+1. When a campaign post goes live, the worker records a submission and pings
+   `DISCORD_WEBHOOK_URL` with the link, the campaign, the deadline (posted time plus the
+   brief's `submit_within_minutes`) and the command to mark it done.
+2. Submit the link on the program's site.
+3. Mark it submitted on the review app's Campaigns page or with
+   `clipper campaigns submit <id>`. The submission time is recorded, and a submission
+   after the deadline is flagged late.
+
+The worker sends a reminder 10 minutes before the deadline. When the deadline passes
+without a submission, it sends one alert to `DISCORD_ALERTS_WEBHOOK_URL`, or to the ping
+webhook when no alerts webhook is set. Without either webhook, the messages go to the
+worker log. A failed send is retried with backoff.
+
+When a program reports approved views and the payout for a submission, record them with
+`clipper campaigns earnings <id> --views N --payout 12.50`. `clipper campaigns rpm` and
+the Campaigns page show RPM (payout per 1,000 approved views) per account and per
+campaign. `clipper campaigns list` lists every submission.
+
 ## CI/CD
 
 - **`ci.yml`** runs on every PR and on pushes to main: ruff, pytest (unit and integration against fixtures), Docker build, and Playwright tests for the review app.

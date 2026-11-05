@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -415,3 +415,24 @@ class PostingConfig:
             self._value = ({a.id: a for a in accounts.accounts}, campaigns.by_id())
             self._stamp = stamp
         return self._value
+
+
+class LiveCampaigns(Mapping[str, Campaign]):
+    """The campaigns of a `PostingConfig`, read afresh on every lookup, so the worker's
+    submission pass sees an edited campaigns.yaml without a restart. Raises ConfigError
+    while the config is invalid; the pass is skipped until it is fixed."""
+
+    def __init__(self, config: PostingConfig) -> None:
+        self._config = config
+
+    def _now(self) -> dict[str, Campaign]:
+        return self._config.current()[1]
+
+    def __getitem__(self, key: str) -> Campaign:
+        return self._now()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._now())
+
+    def __len__(self) -> int:
+        return len(self._now())

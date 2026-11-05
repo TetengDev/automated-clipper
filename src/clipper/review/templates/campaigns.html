@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}Campaigns · Clipper review{% endblock %}
+{% block content %}
+<h1>Campaign submissions <span class="muted count" id="pending-total">{{ pending | length }}</span></h1>
+<p class="muted">Times are UTC. Submit each link on the campaign program's site, then mark it
+submitted here or with <code>clipper campaigns submit &lt;id&gt;</code>.</p>
+
+<h2>To submit</h2>
+{% if pending %}
+<ul class="posts" id="pending">
+  {% for s in pending %}
+  <li class="post" id="submission-{{ s.id }}" data-status="{{ s.status }}">
+    <div class="post-meta">
+      <span class="badge {{ 'post-status-post_failed' if s.overdue(now) else 'post-status-scheduled' }}">
+        {{ "overdue" if s.overdue(now) else "pending" }}</span>
+      <strong>{{ s.campaign_id }}</strong> · {{ s.account_id }} · {{ s.platform }} ·
+      posted {{ s.posted_at.strftime("%Y-%m-%d %H:%M") }} UTC ·
+      {% if s.deadline_at %}deadline {{ s.deadline_at.strftime("%Y-%m-%d %H:%M") }} UTC
+        {% if not s.overdue(now) %}({{ s.minutes_left(now) }} min left){% endif %}
+      {% else %}no deadline{% endif %}
+    </div>
+    {% if s.safe_url %}<p><a href="{{ s.safe_url }}" target="_blank" rel="noopener noreferrer">{{ s.safe_url }}</a></p>{% endif %}
+    <div class="post-actions">
+      <form method="post" action="/campaigns/submissions/{{ s.id }}/submitted"
+            hx-post="/campaigns/submissions/{{ s.id }}/submitted" hx-target="#submission-error-{{ s.id }}"
+            hx-disabled-elt="find button" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit">Mark submitted</button>
+      </form>
+    </div>
+    <div id="submission-error-{{ s.id }}" aria-live="polite"></div>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">Nothing to submit.</p>
+{% endif %}
+
+<h2>RPM</h2>
+{% set groups = [("Account", rollup.by_account), ("Campaign", rollup.by_campaign)] %}
+{% for label, rows in groups %}
+{% if rows %}
+<table class="rpm" id="rpm-{{ label | lower }}">
+  <thead><tr><th>{{ label }}</th><th>Submissions</th><th>With earnings</th><th>Approved views</th><th>Payout</th><th>RPM</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+  <tr><td>{{ r.key }}</td><td>{{ r.submissions }}</td><td>{{ r.with_earnings }}</td>
+      <td>{{ "{:,}".format(r.views) }}</td><td>{{ r.payout }}</td><td>{{ r.rpm if r.rpm is not none else "-" }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% else %}{% endfor %}
+{% if not rollup.by_account %}<p class="muted">No submissions yet.</p>{% endif %}
+
+{% if submitted %}
+<h2>Recently submitted</h2>
+<ul class="posts" id="submitted">
+  {% for s in submitted %}
+  <li class="post" id="submission-{{ s.id }}" data-status="{{ s.status }}">
+    <div class="post-meta">
+      <span class="badge post-status-posted">submitted</span>
+      {% if s.late %}<span class="badge post-status-post_failed">late</span>{% endif %}
+      <strong>{{ s.campaign_id }}</strong> · {{ s.account_id }} · {{ s.platform }} ·
+      {{ s.submitted_at.strftime("%Y-%m-%d %H:%M") }} UTC by {{ s.submitted_by }}
+      {% if s.approved_views is not none %} · {{ "{:,}".format(s.approved_views) }} views, {{ s.payout }}{% endif %}
+      {% if s.safe_url %} · <a href="{{ s.safe_url }}" target="_blank" rel="noopener noreferrer">view post</a>{% endif %}
+    </div>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

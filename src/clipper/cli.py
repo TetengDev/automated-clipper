@@ -37,6 +37,7 @@ from clipper.urls import InvalidSourceURL, parse_source_url
 if TYPE_CHECKING:
     import httpx
 
+    from clipper.posting.models import Publisher
     from clipper.resolve import Resolved
     from clipper.sources.youtube import MetadataProvider, YouTubeSource
 
@@ -292,9 +293,12 @@ def run_worker(
         stages=build_stages(),
         media_root=media_dir,
     )
-    # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
+    # Platforms without a registered publisher keep their due posts scheduled.
     worker.posting = PostingStage(
-        conn=conn, publishers={}, worker_id=worker.worker_id, media_root=media_dir
+        conn=conn,
+        publishers=_publishers(app_ctx.config_path, cfg),
+        worker_id=worker.worker_id,
+        media_root=media_dir,
     )
     try:
         if recover_id:
@@ -310,6 +314,20 @@ def run_worker(
         raise typer.Exit(code=130) from None
     finally:
         conn.close()
+
+
+def _publishers(config_path: Path, cfg: AppConfig) -> dict[str, Publisher]:
+    """Publishers for the platforms the accounts config posts to (CLP-93). An invalid
+    accounts config turns posting off instead of stopping the clip pipeline."""
+    from clipper.accounts import accounts_path, load_accounts
+    from clipper.posting.publishers import build_publishers
+
+    try:
+        accounts = load_accounts(accounts_path(config_path), cfg)
+    except ConfigError as exc:
+        logging.getLogger(__name__).error("posting is off: %s", exc)
+        return {}
+    return build_publishers(accounts, Secrets())
 
 
 def _trusts_every_client(forwarded_allow_ips: str) -> bool:

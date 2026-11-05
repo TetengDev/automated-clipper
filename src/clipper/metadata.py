@@ -25,6 +25,7 @@ import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -42,18 +43,43 @@ from clipper.pipeline.common import strip_control
 PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
 GENERIC_HASHTAGS = frozenset({"#fyp", "#foryou", "#foryoupage", "#viral", "#trending", "#fy"})
 """Reach tags that say nothing about the clip; rejected in variants, flagged in pre-flight."""
-DISCLOSURE_HASHTAGS = frozenset({"#ad", "#ads", "#sponsored", "#paid", "#partner", "#promo"})
-"""Tags that read as a paid-partnership disclosure: only a campaign may add them (as campaign
-tags at scheduling), never the model or a variant."""
+DISCLOSURE_HASHTAGS = frozenset(
+    {
+        "#ad",
+        "#ads",
+        "#advert",
+        "#advertisement",
+        "#sponsored",
+        "#paid",
+        "#paidad",
+        "#partner",
+        "#partnership",
+        "#promo",
+        "#collab",
+        "#gifted",
+        "#adpartner",
+    }
+)
+DISCLOSURE_PREFIXES = ("#sponsor", "#paidpartner", "#paidpromo", "#brandpartner", "#gifted")
+"""Tags that read as a paid-partnership disclosure (exactly, or starting with a prefix, so
+`#sponsoredpost` too): only a campaign may add them (as campaign tags at scheduling), never
+the model or a variant."""
+_TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online|store|live"
 LINK_OR_MENTION = re.compile(
     r"(?i:\b(?:https?://|www\.)\S+)"
-    # A domain: "name.com" with no space around the dot, or spelled out "name dot com".
-    # Lowercase TLDs only, so a sentence break ("the store. Me and") is not a domain.
-    r"|\b[\w-]+(?:\.|\s+(?i:dot)\s+)(?:com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop)\b"
+    # A domain: "name.tld" with no space around the dot. Any lowercase TLD of 2-24 letters,
+    # or a common TLD in any case, so a sentence break ("the store. Me and") is not one.
+    r"|\b[\w-]+(?:\.[\w-]+)*\.(?:[a-z]{2,24}|(?i:" + _TLDS + r"))\b"
+    # An obfuscated dot: "name[.]com", "name(dot)com", "name [dot] info".
+    r"|(?i:\b[\w-]+\s*[\[(]\s*(?:\.|dot|d0t)\s*[\])]\s*[a-z]{2,24}\b)"
+    # Spelled out: "name d0t anything", or "name dot com" with a common TLD.
+    r"|(?i:\b[\w-]+\s+d0t\s+[a-z]{2,24}\b)"
+    r"|(?i:\b[\w-]+\s+dot\s+(?:" + _TLDS + r")\b)"
     r"|(?<![\w@])@\w+"
 )
-"""A link, a bare domain (also "name dot com") or an @mention: the transcript is untrusted,
-so text like this in a post is flagged for the reviewer and in pre-flight."""
+"""A link, a bare or obfuscated domain or an @mention: the transcript is untrusted, so text
+like this in a post is flagged for the reviewer and in pre-flight. Matched on NFKC text, so
+a fullwidth dot or @ is caught too."""
 HASHTAG = re.compile(r"^#\w{1,50}$")
 
 
@@ -146,12 +172,25 @@ def is_generic(tag: str) -> bool:
 
 
 def is_disclosure(tag: str) -> bool:
-    return _fold(tag) in DISCLOSURE_HASHTAGS
+    folded = _fold(tag)
+    return folded in DISCLOSURE_HASHTAGS or folded.startswith(DISCLOSURE_PREFIXES)
 
 
 def links_or_mentions(text: str) -> list[str]:
-    """Links, domains and @mentions in `text`, in order."""
-    return [m.group(0) for m in LINK_OR_MENTION.finditer(text)]
+    """Links, domains and @mentions in `text` (compatibility-normalized), in order."""
+    return [m.group(0) for m in LINK_OR_MENTION.finditer(unicodedata.normalize("NFKC", text))]
+
+
+def _link_host(link: str) -> str:
+    """The host a link or bare domain points at, folded and without `www.`; an obfuscated
+    domain ("name[.]com") keeps its brackets, so it never equals an allowed host."""
+    text = _fold(link.strip())
+    rest = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text)
+    try:
+        host = urlsplit(f"//{rest}").hostname or ""
+    except ValueError:
+        return text
+    return host.removeprefix("www.")
 
 
 def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -> list[str]:
@@ -400,6 +439,24 @@ class Brief(BaseModel):
     forbidden_keywords: list[str] = Field(default_factory=list)
     min_seconds: float | None = None
     paid_partnership: bool = False
+    allowed_mentions: list[str] = Field(default_factory=list)
+    """@handles the campaign asks for (a creator credit); pre-flight lets these through."""
+    allowed_links: list[str] = Field(default_factory=list)
+    """Hosts the campaign asks for ("vyro.app", subdomains not included)."""
+
+    @field_validator("allowed_mentions", "allowed_links", mode="after")
+    @classmethod
+    def _no_blank_entries(cls, value: list[str]) -> list[str]:
+        if any(not v.strip() for v in value):
+            raise ValueError("allowed mentions and links cannot be blank")
+        return value
+
+    def allows(self, found: str) -> bool:
+        """Whether a link or mention from `links_or_mentions` is one the brief asks for."""
+        if found.startswith("@"):
+            mentions = {_fold("@" + m.strip().lstrip("@")) for m in self.allowed_mentions}
+            return _fold(found) in mentions
+        return _link_host(found) in {_link_host(link) for link in self.allowed_links}
 
 
 def _mentions(text: str, keyword: str) -> bool:
@@ -439,6 +496,7 @@ def preflight(
     if platform == "youtube" and _ANGLE.search(metadata.title + metadata.caption):
         problems.append("youtube: title or description contains < or >")
     found = links_or_mentions(f"{metadata.title}\n{metadata.caption}")
+    found = [f for f in found if not (brief and brief.allows(f))]
     if found:
         problems.append(f"{platform}: links or mentions to check: {', '.join(found)}")
     if limits.length(metadata.title) > limits.title_max:

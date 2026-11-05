@@ -20,6 +20,10 @@ Each pass (the worker runs one per poll, see `clipper.jobs.worker.Worker.posting
 3. Due posts on a platform with no publisher stay `scheduled`; that is logged once per
    platform per worker run.
 
+A publisher that raises `PublishRejected` (CLP-94) gets the post `post_failed` at once,
+with an alert. A publisher with a `lead_time` gets its posts' first attempts that long
+before `scheduled_at` (Facebook schedules natively).
+
 If recording a successful upload fails (DB error), the post stays `uploading` and step 1
 resolves it later through `lookup`; it is never re-published blindly.
 """
@@ -44,6 +48,7 @@ from clipper.posting.models import (
     PostStatus,
     PublishDeferred,
     Publisher,
+    PublishRejected,
     PublishResult,
 )
 from clipper.redact import redact
@@ -79,6 +84,7 @@ class PostingStage:
         """One posting pass; returns how many posts it acted on."""
         handled = self._recover_stale()
         self._warn_unpublishable()
+        early = {p: lead for p, pub in self.publishers.items() if (lead := _lead_time(pub))}
         # One post at a time (claim, publish, record), so a post never sits claimed while
         # others upload and cannot go stale before it is even tried.
         for _ in range(self.batch):
@@ -88,6 +94,7 @@ class PostingStage:
                 self.worker_id,
                 platforms=self.publishers.keys(),
                 limit=1,
+                early=early,
             )
             if not due:
                 break
@@ -115,6 +122,9 @@ class PostingStage:
             result = publisher.publish(post, path, metadata)
         except PublishDeferred as exc:
             self._deferred(post, exc)
+            return
+        except PublishRejected as exc:
+            self._give_up(post, f"rejected: {_describe(exc)}")
             return
         except Exception as exc:
             self._failed_attempt(post, _describe(exc))
@@ -225,7 +235,9 @@ class PostingStage:
         """Reschedule without counting an attempt (CLP-93). Never earlier than
         `MIN_DEFER` from now, so a bad `until` cannot make a pass spin on one post."""
         now = self.clock()
-        until = max(deferral.until, now + MIN_DEFER)
+        # Past the publisher's lead time too, or a first attempt is due again at once.
+        lead = _lead_time(self.publishers[post.platform]) or timedelta(0)
+        until = max(deferral.until, now + MIN_DEFER + lead)
         reason = redact(deferral.reason)
         try:
             repo.defer(self.conn, post, self.worker_id, reason, until, now)
@@ -257,6 +269,11 @@ class PostingStage:
             self.alert(message)
         except Exception:
             logger.exception("%s: alert failed", _label(post))
+
+
+def _lead_time(publisher: Publisher) -> timedelta | None:
+    lead = getattr(publisher, "lead_time", None)
+    return lead if isinstance(lead, timedelta) and lead > timedelta(0) else None
 
 
 def _describe(exc: Exception) -> str:

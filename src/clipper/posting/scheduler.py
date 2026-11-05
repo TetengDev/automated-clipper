@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from clipper import clips
 from clipper.clips import ClipStatus
 from clipper.db import transaction
+from clipper.metadata import PLATFORM_LIMITS
 from clipper.posting import repo
 from clipper.posting.models import Post
 
@@ -167,6 +168,15 @@ def pick_slot(account: AccountLike, existing: Sequence[datetime], now: datetime)
     return None
 
 
+def length_problem(platform: str, seconds: float) -> str | None:
+    """Why a clip of `seconds` cannot be posted to `platform`, or None when it can (or the
+    platform has no known limits)."""
+    limits = PLATFORM_LIMITS.get(platform)
+    if limits is None or limits.min_seconds <= seconds <= limits.max_seconds:
+        return None
+    return f"{seconds:g} s is outside {platform}'s {limits.min_seconds:g}-{limits.max_seconds:g} s"
+
+
 def schedule_for_clip(
     conn: sqlite3.Connection,
     clip_id: int,
@@ -180,8 +190,10 @@ def schedule_for_clip(
     Returns the posts created; an approved clip already scheduled on an account is left as
     it is, so calling this again is safe. Nothing is scheduled for a sensitive clip (its
     stored flag, or `sensitive=True` from the creator's rule), a clip that is not approved
-    or exported, or one without a rendered video. An account is skipped when the same file
-    is already scheduled or posted on its platform, or when it has no free slot.
+    or exported, or one without a rendered video. An account is skipped when the clip's
+    length is outside its platform's limits (Facebook Reels: 3-90 s, CLP-94), when the
+    same file is already scheduled or posted on its platform, or when it has no free slot.
+    Each skip is logged with its reason.
     """
     clip = clips.get_clip(conn, clip_id)
     if clip is None or clip.status not in SCHEDULABLE:
@@ -200,6 +212,12 @@ def schedule_for_clip(
     with transaction(conn):
         for account in eligible:
             if repo.has_post(conn, clip_id, account.id):
+                continue
+            problem = length_problem(account.platform, clip.current.duration_s)
+            if problem is not None:
+                logger.warning(
+                    "clip %d: %s; not scheduled on account %s", clip_id, problem, account.id
+                )
                 continue
             if repo.file_on_platform(conn, account.platform, video_path):
                 logger.info(

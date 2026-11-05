@@ -18,6 +18,7 @@ import os
 import socket
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -52,6 +53,8 @@ DEFAULT_MEDIA_ROOT = Path("data/media")
 DEFAULT_POLL_SECONDS = 5.0
 INTERRUPT_JOIN_SECONDS = 10.0
 """How long an interrupted loop waits for the posting thread before giving up on it."""
+MAX_RESTART_DELAY_SECONDS = 300.0
+"""Cap of the backoff between restarts of a posting thread that keeps dying."""
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,13 @@ class RecoverablePass(PeriodicPass, Protocol):
     def recover(self, dead_worker_id: str) -> int: ...
 
 
+@runtime_checkable
+class StoppablePass(PeriodicPass, Protocol):
+    """A periodic pass that checks `stop` between items; `run_forever` wires it."""
+
+    stop: threading.Event | None
+
+
 def default_worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -89,6 +99,8 @@ class Worker:
     """Posting pass (`clipper.posting.stage.PostingStage`), run once per poll on its own
     thread by `run_forever`."""
     _posting_thread: threading.Thread | None = field(default=None, init=False, repr=False)
+    _posting_restarts: int = field(default=0, init=False, repr=False)
+    _posting_restart_at: float | None = field(default=None, init=False, repr=False)
 
     @property
     def posting_running(self) -> bool:
@@ -214,6 +226,8 @@ class Worker:
     def _start_posting(self, stop_event: threading.Event, poll_seconds: float) -> None:
         if self.posting is None:
             return
+        if isinstance(self.posting, StoppablePass) and self.posting.stop is None:
+            self.posting.stop = stop_event  # stop claiming new posts on shutdown
         self._posting_thread = threading.Thread(
             target=self._posting_loop,
             args=(self.posting, stop_event, poll_seconds),
@@ -223,12 +237,21 @@ class Worker:
         self._posting_thread.start()
 
     def _check_posting(self, stop_event: threading.Event, poll_seconds: float) -> None:
-        """Restart the posting thread if something it did not catch killed it."""
+        """Restart the posting thread if an exit it does not catch ended it, after a
+        backoff that doubles per restart (capped), so a pass that keeps dying cannot spin."""
         if self._posting_thread is None or self._posting_thread.is_alive():
             return
         if stop_event.is_set():
             return
-        logger.error("posting thread died; restarting it")
+        now = time.monotonic()
+        if self._posting_restart_at is None:
+            delay = min(MAX_RESTART_DELAY_SECONDS, poll_seconds * 2**self._posting_restarts)
+            logger.error("posting thread died; restarting it in %.1fs", delay)
+            self._posting_restart_at = now + delay
+        if now < self._posting_restart_at:
+            return
+        self._posting_restarts += 1
+        self._posting_restart_at = None
         self._start_posting(stop_event, poll_seconds)
 
     @staticmethod
@@ -238,6 +261,8 @@ class Worker:
         while not stop_event.is_set():
             try:
                 posting.run_once()
-            except Exception:
+            except (KeyboardInterrupt, SystemExit):
+                raise  # an exit request ends the thread; the job loop decides what next
+            except BaseException:
                 logger.exception("posting pass failed; retrying next poll")
             stop_event.wait(poll_seconds)

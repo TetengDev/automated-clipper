@@ -31,7 +31,7 @@ from clipper.export import DEFAULT_OUTPUT_DIR
 from clipper.monitor import CycleReport, FirstRun, YouTubeMonitor
 from clipper.pipeline import build_stages
 from clipper.posting.cli import app as posts_app
-from clipper.posting.stage import PostingStage
+from clipper.posting.stage import HEARTBEAT_BUSY_MS, PostingStage
 from clipper.urls import InvalidSourceURL, parse_source_url
 
 if TYPE_CHECKING:
@@ -312,7 +312,7 @@ def run_worker(
         publishers={},
         worker_id=worker.worker_id,
         media_root=media_dir,
-        connect=lambda: connect(db_path),
+        connect=lambda: connect(db_path, busy_timeout_ms=HEARTBEAT_BUSY_MS),
         stop=stop,
     )
     try:

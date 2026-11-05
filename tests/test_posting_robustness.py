@@ -344,7 +344,10 @@ def test_release_uploads_counts_only_the_dead_workers_uploads(env: Env) -> None:
     env.conn.execute("UPDATE posts SET worker_id = 'dead' WHERE id = ?", (scheduled.id,))
 
     later = T0 + timedelta(minutes=10)
-    assert repo.release_uploads(env.conn, "dead", later, quiet_for=timedelta(minutes=3)) == 1
+    released = repo.release_uploads(
+        env.conn, "dead", later, quiet_for=timedelta(minutes=3), stale_after=STALE_UPLOAD
+    )
+    assert released == (1, 0)
     assert fresh(env, dead.id).claimed_at is None
     assert fresh(env, other.id).claimed_at == T0
     assert fresh(env, scheduled.id).status == PostStatus.SCHEDULED
@@ -355,7 +358,9 @@ def test_released_upload_is_not_retaken_once_its_worker_heartbeats(env: Env, clo
     # before any stale pass ran, so nobody takes the upload over.
     post = make_post(env)
     [claimed] = repo.claim_due(env.conn, T0, "w1", platforms={"tiktok"})
-    repo.release_uploads(env.conn, "w1", T0 + timedelta(minutes=10), quiet_for=timedelta(0))
+    repo.release_uploads(
+        env.conn, "w1", T0 + timedelta(minutes=10), quiet_for=timedelta(0), stale_after=STALE_UPLOAD
+    )
 
     assert repo.touch_claim(env.conn, claimed.id, "w1", T0 + timedelta(minutes=11))
     rival = stage(env, clock, LookupPublisher(), worker_id="w2")
@@ -599,6 +604,8 @@ def test_posting_loop_survives_a_base_exception(env: Env, caplog: pytest.LogCapt
     assert "posting pass failed" in caplog.text
 
 
+# pytest reports the SystemExit that ends the thread; plain threading ignores it.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_a_dead_posting_thread_is_restarted_after_a_backoff(
     env: Env, caplog: pytest.LogCaptureFixture
 ) -> None:

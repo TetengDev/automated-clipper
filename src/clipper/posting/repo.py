@@ -110,30 +110,60 @@ def uploads_between(
     per_attempt: bool = False,
 ) -> int:
     """Uploads the account made or started in [start, end), for the claim-time caps
-    (CLP-106). Counted: posts posted then (`posted_at`), posts claimed for upload then
-    (`claimed_at`), and posts whose failed attempt (or unresolved upload) was recorded then
-    (`updated_at`, with attempts or an "uploading state unresolved" error): a failed attempt
-    may have reached the platform, used quota or even gone live.
+    (CLP-106): posts posted then (`posted_at`), posts claimed for upload then
+    (`claimed_at`), and failed attempts (or unresolved uploads) recorded then, from their
+    audit rows: a failed attempt may have reached the platform, used quota or even gone
+    live. Audit rows keep their time, so a later deferral, reschedule or retry neither
+    moves an attempt into another window nor erases it.
 
-    `per_attempt` counts API attempts instead of posts (each earlier failed attempt of a
-    post adds one), for the platform's API cap. A post's attempts are only seen in the
-    window of its last change, and a reschedule resets them; the count errs high."""
-    weight = "1 + attempts" if per_attempt else "1"
-    failed_weight = (
-        f"attempts + (CASE WHEN error LIKE '{UNRESOLVED_PREFIX}%' THEN 1 ELSE 0 END)"
-        if per_attempt
-        else "1"
-    )
+    By default each other post counts once. `per_attempt` counts API attempts instead (for
+    the platform's API cap), including the excluded post's own failed attempts."""
+    window = (to_iso(start), to_iso(end))
+    live = conn.execute(
+        "SELECT id FROM posts WHERE account_id = ? AND id IS NOT ? AND updated_at >= ? AND ("
+        " (status = 'posted' AND posted_at >= ? AND posted_at < ?)"
+        " OR (status = 'uploading' AND claimed_at >= ? AND claimed_at < ?))",
+        (account_id, exclude_post_id, window[0], *window, *window),
+    ).fetchall()
+    failed = [
+        row[0]
+        for row in conn.execute(
+            "SELECT json_extract(payload, '$.post_id') FROM clip_reviews"
+            " WHERE action IN (?, ?) AND created_at >= ? AND created_at < ?"
+            " AND json_extract(payload, '$.account_id') = ?"
+            " AND (json_extract(payload, '$.attempts') IS NOT NULL"
+            " OR json_extract(payload, '$.error') LIKE ?)",
+            (
+                _action(PostStatus.SCHEDULED),
+                _action(PostStatus.POST_FAILED),
+                *window,
+                account_id,
+                f"{UNRESOLVED_PREFIX}%",
+            ),
+        )
+    ]
+    if per_attempt:
+        return len(live) + len(failed)
+    return len(({row[0] for row in live} | set(failed)) - {exclude_post_id})
+
+
+def had_failed_attempt(conn: sqlite3.Connection, post: Post) -> bool:
+    """Whether an upload attempt of this post ever failed (or was left unresolved), even
+    if a reviewer's retry or reschedule has since reset its attempt count."""
     row = conn.execute(
-        f"SELECT COALESCE(SUM(CASE"  # noqa: S608 - fixed fragments, values bound
-        f" WHEN status = 'posted' AND posted_at >= ? AND posted_at < ? THEN {weight}"
-        f" WHEN status = 'uploading' AND claimed_at >= ? AND claimed_at < ? THEN {weight}"
-        " WHEN status IN ('scheduled', 'post_failed') AND updated_at >= ? AND updated_at < ?"
-        f" AND (attempts > 0 OR error LIKE '{UNRESOLVED_PREFIX}%') THEN {failed_weight}"
-        " ELSE 0 END), 0) FROM posts WHERE account_id = ? AND id IS NOT ?",
-        (*[to_iso(start), to_iso(end)] * 3, account_id, exclude_post_id),
+        "SELECT 1 FROM clip_reviews WHERE clip_id = ? AND action IN (?, ?)"
+        " AND json_extract(payload, '$.post_id') = ?"
+        " AND (json_extract(payload, '$.attempts') IS NOT NULL"
+        " OR json_extract(payload, '$.error') LIKE ?) LIMIT 1",
+        (
+            post.clip_id,
+            _action(PostStatus.SCHEDULED),
+            _action(PostStatus.POST_FAILED),
+            post.id,
+            f"{UNRESOLVED_PREFIX}%",
+        ),
     ).fetchone()
-    return int(row[0])
+    return row is not None
 
 
 def last_upload(

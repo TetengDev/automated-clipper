@@ -72,6 +72,7 @@ from clipper.posting.models import (
     PublishResult,
 )
 from clipper.posting.scheduler import (
+    HISTORY,
     MAX_DAYS_AHEAD,
     PLATFORM_DAILY_CAPS,
     AccountLike,
@@ -96,12 +97,10 @@ BACKOFF_BASE = timedelta(minutes=5)
 UNRESOLVED = repo.UNRESOLVED_PREFIX
 DEFAULT_BATCH = 10
 MAX_STALE_PER_PASS = DEFAULT_BATCH
+"""Stale posts resolved per pass at most; the rest wait for the next pass."""
 ROLLING_DAY = timedelta(hours=24)
 ROLLING_RETRY = timedelta(hours=1)
 """A post held by the rolling 24-hour platform cap is tried again this much later."""
-HISTORY = timedelta(days=2)
-"""Post history the slot picker needs (it only looks at today and later, local time)."""
-"""Stale posts resolved per pass at most; the rest wait for the next pass."""
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +186,8 @@ class PostingStage:
     def _publish(self, post: Post) -> None:
         publisher = self.publishers[post.platform]
         # Lookup first: an earlier attempt that went live is recorded whatever the caps.
-        if post.attempts > 0 and self._already_live(post, publisher):
+        earlier = post.attempts > 0 or repo.had_failed_attempt(self.conn, post)
+        if earlier and self._already_live(post, publisher):
             return
         if self._held_by_caps(post):
             return
@@ -339,11 +339,11 @@ class PostingStage:
         except PostConflict as exc:
             logger.warning("%s: deferral not recorded: %s", _label(post), exc)
             return True
-        except sqlite3.Error as exc:
+        except Exception as exc:
             # Never upload unchecked, and never leave the post claimed (the stale pass
             # would hand it to a human as an unresolved upload).
-            logger.error("%s: cap check failed: %s; retrying later", _label(post), exc)
-            hold = repo.Deferral(f"cap check failed: {exc}", now + BACKOFF_BASE)
+            logger.error("%s: cap check failed: %s; retrying later", _label(post), _describe(exc))
+            hold = repo.Deferral(f"cap check failed: {_describe(exc)}", now + BACKOFF_BASE)
             try:
                 repo.defer_claimed(self.conn, post, self.worker_id, now, lambda _: hold)
             except Exception:

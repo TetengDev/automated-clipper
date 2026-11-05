@@ -45,6 +45,8 @@ PLATFORM_DAILY_CAPS: dict[str, int] = {
 }
 MAX_DAYS_AHEAD = 7
 """Today plus this many days are searched for a free slot."""
+HISTORY = timedelta(days=2)
+"""Post history the slot picker needs (it only looks at today and later, local time)."""
 
 SCHEDULABLE = (ClipStatus.APPROVED, ClipStatus.EXPORTED)
 _WINDOW = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")

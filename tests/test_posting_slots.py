@@ -82,9 +82,9 @@ def make_post(
         now=T0 - timedelta(days=1),
     )
     if status is not None:
-        env.conn.execute(
-            "UPDATE posts SET status = ?, posted_at = ? WHERE id = ?",
-            (status, to_iso(posted_at) if posted_at else None, post.id),
+        env.conn.execute(  # as the stage writes it: updated when it was posted
+            "UPDATE posts SET status = ?, posted_at = ?, updated_at = ? WHERE id = ?",
+            (status, to_iso(posted_at) if posted_at else None, to_iso(posted_at or T0), post.id),
         )
     return post
 
@@ -267,8 +267,9 @@ def test_claim_counts_uploads_in_flight_toward_the_limit(env: Env, clock: Clock)
     account = FakeAccount(posts_per_day=1, min_gap_minutes=0)
     busy = make_post(env, at=local(15, 8))
     env.conn.execute(
-        "UPDATE posts SET status = 'uploading', worker_id = 'w2', claimed_at = ? WHERE id = ?",
-        (to_iso(T0), busy.id),
+        "UPDATE posts SET status = 'uploading', worker_id = 'w2', claimed_at = ?, updated_at = ?"
+        " WHERE id = ?",
+        (to_iso(T0), to_iso(T0), busy.id),
     )
     due = make_post(env)
     publisher = FakePublisher()

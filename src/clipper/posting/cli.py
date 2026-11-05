@@ -25,8 +25,13 @@ from clipper.posting.models import (
     parse_utc,
     reschedule_problem,
 )
-from clipper.posting.scheduler import MAX_DAYS_AHEAD, AccountLike, pick_slot, slot_problems
-from clipper.posting.stage import HISTORY
+from clipper.posting.scheduler import (
+    HISTORY,
+    MAX_DAYS_AHEAD,
+    AccountLike,
+    pick_slot,
+    slot_problems,
+)
 
 app = typer.Typer(
     help="Scheduled posts: list, cancel, reschedule, retry.",
@@ -97,6 +102,10 @@ def _problems(
         return slot_problems(account, others, when)
     except (ValueError, ZoneInfoNotFoundError) as exc:
         return [f"cannot check the account's rules: {exc}"]
+
+
+class _BrokenRules(Exception):
+    """The account's slot rules could not be applied (a bad timezone or window)."""
 
 
 def _since() -> datetime:
@@ -252,7 +261,10 @@ def retry_cmd(
         def pick(c: sqlite3.Connection, p: Post) -> datetime | None:
             # Inside the write transaction: a post scheduled meanwhile is seen.
             taken = repo.account_post_times(c, rules.id, exclude_post_id=p.id, since=_since())
-            return pick_slot(rules, taken, utcnow())
+            try:
+                return pick_slot(rules, taken, utcnow())
+            except (ValueError, ZoneInfoNotFoundError) as exc:
+                raise _BrokenRules(str(exc)) from exc
 
     try:
         _act(
@@ -265,4 +277,9 @@ def retry_cmd(
         _fail(
             f"no free slot for account {post.account_id} in the next {MAX_DAYS_AHEAD} days;"
             " pass --at TIME to choose one"
+        )
+    except _BrokenRules as exc:
+        _fail(
+            f"cannot check account {strip_control(post.account_id)}'s rules:"
+            f" {strip_control(str(exc))}; pass --at TIME to choose one"
         )

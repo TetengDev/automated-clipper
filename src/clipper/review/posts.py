@@ -24,8 +24,7 @@ from clipper.posting.models import (
     parse_utc,
     reschedule_problem,
 )
-from clipper.posting.scheduler import slot_problems
-from clipper.posting.stage import HISTORY
+from clipper.posting.scheduler import HISTORY, slot_problems
 from clipper.review.app import flash, render, safe_next_path
 from clipper.review.routes import MAX_ID, ClipId, Conn, User, _action_error, _is_htmx, _now
 

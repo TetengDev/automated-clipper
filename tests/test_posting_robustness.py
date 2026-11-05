@@ -708,3 +708,22 @@ def test_stale_posts_are_claimed_one_at_a_time(env: Env, clock: Clock) -> None:
 def test_connect_accepts_a_shorter_busy_timeout(tmp_path: Path) -> None:
     with closing(connect(tmp_path / "x.db", busy_timeout_ms=1500)) as conn:
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 1500
+
+
+def test_a_stopping_pass_resolves_no_more_stale_posts(env: Env, clock: Clock) -> None:
+    first = make_post(env)
+    second = make_post(env, account="tt_alt")
+    uploading(env, first, "dead", T0 - timedelta(hours=2))
+    uploading(env, second, "dead", T0 - timedelta(hours=1))
+    stop = threading.Event()
+
+    @dataclass
+    class StopOnLookup(LookupPublisher):
+        def lookup(self, idempotency_key: str) -> PublishResult | None:
+            stop.set()
+            return PublishResult(external_id="e")
+
+    stage(env, clock, StopOnLookup(), stop=stop).run_once()
+
+    assert fresh(env, first.id).status == PostStatus.POSTED
+    assert fresh(env, second.id).worker_id == "dead"  # left for the next worker

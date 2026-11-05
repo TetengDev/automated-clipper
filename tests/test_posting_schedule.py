@@ -277,6 +277,36 @@ def test_an_account_with_a_bad_timezone_is_skipped(
     assert "tt_bad" in caplog.text
 
 
+def test_a_clip_over_90_s_is_not_scheduled_to_facebook(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    fb = FakeAccount(id="fb_main", platform="facebook")
+    ig = FakeAccount(id="ig_main", platform="instagram")
+    clip_id = approved_clip(env, start_s=0.0, end_s=95.0, duration_s=91.0)
+
+    created = schedule_for_clip(env.conn, clip_id, [fb, ig], NOW)
+
+    assert [p.account_id for p in created] == ["ig_main"]
+    assert "fb_main" in caplog.text and "91 s" in caplog.text and "3-90 s" in caplog.text
+
+
+def test_a_90_s_clip_is_scheduled_to_facebook(env: Env) -> None:
+    fb = FakeAccount(id="fb_main", platform="facebook")
+    clip_id = approved_clip(env, start_s=0.0, end_s=95.0, duration_s=90.0)
+
+    assert [p.account_id for p in schedule_for_clip(env.conn, clip_id, [fb], NOW)] == ["fb_main"]
+
+
+def test_a_clip_under_3_s_is_not_scheduled_to_instagram(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    ig = FakeAccount(id="ig_main", platform="instagram")
+    clip_id = approved_clip(env, start_s=0.0, end_s=2.5)
+
+    assert schedule_for_clip(env.conn, clip_id, [ig], NOW) == []
+    assert "ig_main" in caplog.text
+
+
 def test_scheduling_writes_an_audit_row(env: Env) -> None:
     clip_id = approved_clip(env)
 

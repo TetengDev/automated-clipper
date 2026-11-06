@@ -134,6 +134,7 @@ def test_post_statuses_and_transitions() -> None:
         "posted",
         "post_failed",
         "cancelled",
+        "held",
     ]
     assert POST_TRANSITIONS[PostStatus.POSTED] == frozenset()
     assert POST_TRANSITIONS[PostStatus.CANCELLED] == frozenset()

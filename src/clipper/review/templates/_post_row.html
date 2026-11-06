@@ -3,8 +3,10 @@
   <div class="post-meta">
     <span class="badge post-status-{{ post.status }}">{{ post.status | replace("_", " ") }}</span>
     <strong>{{ post.account_id }}</strong> · {{ post.platform }} ·
+    {% if post.campaign_id %}campaign {{ post.campaign_id }} ·{% endif %}
     <a href="/clip/{{ post.clip_id }}">clip {{ post.clip_id }}</a> v{{ post.clip_version }} ·
     {% if post.posted_at %}posted {{ post.posted_at.strftime("%Y-%m-%d %H:%M") }} UTC
+    {% elif post.status == "held" %}not scheduled
     {% else %}<time datetime="{{ post.scheduled_at.isoformat() }}">{{ post.scheduled_at.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% endif %}
     {% if post.attempts %} · {{ post.attempts }} attempt(s){% endif %}
     {% if post.safe_url %} · <a href="{{ post.safe_url }}" target="_blank" rel="noopener noreferrer">view post</a>{% endif %}
@@ -24,6 +26,16 @@
                value="{{ post.scheduled_at.strftime('%Y-%m-%dT%H:%M') }}"></label>
       <button type="submit">{{ "Retry at" if post.status == "post_failed" else "Reschedule" }}</button>
     </form>
+    <form method="post" action="/posts/{{ post.id }}/cancel" hx-post="/posts/{{ post.id }}/cancel"
+          hx-target="#post-error-{{ post.id }}" hx-disabled-elt="find button" class="inline-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="{{ next }}">
+      <button type="submit" class="danger">Cancel post</button>
+    </form>
+  </div>
+  <div id="post-error-{{ post.id }}" aria-live="polite"></div>
+  {% elif post.status == "held" %}
+  <div class="post-actions">
     <form method="post" action="/posts/{{ post.id }}/cancel" hx-post="/posts/{{ post.id }}/cancel"
           hx-target="#post-error-{{ post.id }}" hx-disabled-elt="find button" class="inline-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

@@ -9,6 +9,7 @@ import re
 import signal
 import sqlite3
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, NoReturn
@@ -37,6 +38,8 @@ from clipper.urls import InvalidSourceURL, parse_source_url
 if TYPE_CHECKING:
     import httpx
 
+    from clipper.accounts import AccountsConfig
+    from clipper.posting.models import Post
     from clipper.resolve import Resolved
     from clipper.sources.youtube import MetadataProvider, YouTubeSource
 
@@ -103,10 +106,33 @@ def check_config(ctx: typer.Context) -> None:
     for creator in cfg.creators:
         platforms = [p for p in ("youtube", "twitch") if getattr(creator, p) is not None]
         typer.echo(f"  - {creator.name} [{creator.region}] {', '.join(platforms)}")
-    _check_accounts(_app(ctx).config_path, cfg)
+    accounts = _check_accounts(_app(ctx).config_path, cfg)
+    _check_campaigns(_app(ctx).config_path, cfg, accounts)
 
 
-def _check_accounts(config_path: Path, cfg: AppConfig) -> None:
+def _check_campaigns(config_path: Path, cfg: AppConfig, accounts: AccountsConfig) -> None:
+    """Campaigns summary for check-config (CLP-97), with the audience policy guard."""
+    from clipper.campaigns import (
+        campaigns_path,
+        load_campaigns,
+        summary,
+        unconfigured_campaigns,
+    )
+
+    path = campaigns_path(config_path)
+    try:
+        campaigns = load_campaigns(path, cfg, accounts)
+    except ConfigError as exc:
+        _fail(str(exc))
+    found = "" if path.exists() else f" ({path} not found)"
+    typer.echo(f"ok: {len(campaigns.campaigns)} campaigns{found}")
+    for campaign in campaigns.campaigns:
+        typer.echo(f"  - {summary(campaign)}")
+    for warning in unconfigured_campaigns(accounts, campaigns):
+        typer.echo(f"warning: {warning}", err=True)
+
+
+def _check_accounts(config_path: Path, cfg: AppConfig) -> AccountsConfig:
     """Accounts summary for check-config (CLP-91): token status only, never values."""
     from clipper.accounts import (
         account_tokens,
@@ -130,7 +156,9 @@ def _check_accounts(config_path: Path, cfg: AppConfig) -> None:
             f"  - {a.id}{state} {a.platform} {a.handle} [{a.market}] {a.posts_per_day}/day "
             f"windows {', '.join(a.windows)} {a.timezone}; "
             f"tokens: {token_status(account_tokens(a.id, env))}"
+            + (f"; campaign {a.campaign}" if a.campaign else "")
         )
+    return accounts
 
 
 @app.command("migrate")
@@ -258,6 +286,23 @@ def _open_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _publish_guard(
+    conn: sqlite3.Connection, config_path: Path, media_dir: Path
+) -> Callable[[Post], str | None]:
+    """The campaign pre-flight the posting stage runs before each publish (CLP-97). The
+    config is checked now (a bad one stops the worker) and reloaded whenever it changes."""
+    from clipper.campaigns import PostingConfig
+    from clipper.posting.scheduler import publish_guard
+
+    live = PostingConfig(config_path)
+    try:
+        live.current()
+    except ConfigError as exc:
+        conn.close()
+        _fail(str(exc))
+    return publish_guard(conn, live, media_dir.resolve())
+
+
 @app.command("run-worker")
 def run_worker(
     ctx: typer.Context,
@@ -292,9 +337,10 @@ def run_worker(
         stages=build_stages(),
         media_root=media_dir,
     )
+    guard = _publish_guard(conn, app_ctx.config_path, media_dir)
     # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
     worker.posting = PostingStage(
-        conn=conn, publishers={}, worker_id=worker.worker_id, media_root=media_dir
+        conn=conn, publishers={}, worker_id=worker.worker_id, media_root=media_dir, guard=guard
     )
     try:
         if recover_id:

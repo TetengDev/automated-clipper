@@ -1,4 +1,5 @@
-"""`clipper posts`: list, cancel, reschedule and retry scheduled posts (CLP-92)."""
+"""`clipper posts`: list, cancel, reschedule and retry scheduled posts (CLP-92), and
+recheck posts held by the campaign pre-flight (CLP-97)."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import typer
 
 from clipper.db import MigrationError, connect, migrate
 from clipper.jobs.models import to_iso, utcnow
+from clipper.jobs.worker import DEFAULT_MEDIA_ROOT
 from clipper.pipeline.common import strip_control
 from clipper.posting import repo
 from clipper.posting.models import (
@@ -138,6 +140,50 @@ def reschedule_cmd(
         "reschedule",
         lambda c: repo.reschedule(c, post_id, when, utcnow(), by=CLI_ACTOR),
     )
+
+
+@app.command("recheck")
+def recheck_cmd(
+    ctx: typer.Context,
+    media_dir: Annotated[
+        Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Rendered clips and sidecars.")
+    ] = DEFAULT_MEDIA_ROOT,
+) -> None:
+    """Re-run the campaign pre-flight on held posts; schedule the ones that now pass."""
+    from clipper.accounts import accounts_path, load_accounts
+    from clipper.campaigns import campaigns_path, load_campaigns
+    from clipper.config import ConfigError, always_sensitive, load_config
+    from clipper.posting.scheduler import recheck_held
+
+    config_path: Path = ctx.find_root().obj.config_path
+    try:
+        creators = load_config(config_path)
+        accounts = load_accounts(accounts_path(config_path), creators)
+        campaigns = load_campaigns(campaigns_path(config_path), creators, accounts)
+    except ConfigError as exc:
+        _fail(str(exc))
+
+    def is_sensitive(creator: str) -> bool:
+        try:
+            return always_sensitive(creators.creator(creator))
+        except KeyError:
+            return True  # an unknown creator fails closed, as in the review app
+
+    conn = _open(ctx)
+    try:
+        result = recheck_held(
+            conn,
+            accounts.accounts,
+            campaigns.by_id(),
+            utcnow(),
+            media_root=media_dir.resolve(),
+            is_sensitive=is_sensitive,
+        )
+    finally:
+        conn.close()
+    for post in [*result.released, *result.still_held]:
+        typer.echo(_line(post))
+    typer.echo(f"{len(result.released)} released, {len(result.still_held)} still held")
 
 
 @app.command("retry")

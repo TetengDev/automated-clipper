@@ -1,7 +1,8 @@
 """Post states, the Post row model, and the publisher contract (CLP-92).
 
-Platform publishers (CLP-93/94/95) implement `Publisher`; per-platform metadata variants
-(CLP-96) will build `PostMetadata`. Until then it comes from the clip version.
+Platform publishers (CLP-93/94/95) implement `Publisher`. `PostMetadata` is built at
+scheduling from the clip's per-platform variant (CLP-96) plus its campaign's tags, and
+stored on the post (CLP-97); posts scheduled before that fall back to the clip version.
 """
 
 from __future__ import annotations
@@ -26,6 +27,9 @@ class PostStatus(StrEnum):
     POSTED = "posted"
     POST_FAILED = "post_failed"
     CANCELLED = "cancelled"
+    HELD = "held"
+    """Broke its campaign's brief at scheduling (CLP-97); the reason is in `error`. Never
+    published: `clipper posts recheck` schedules it once it passes, or it is cancelled."""
 
 
 POST_TRANSITIONS: dict[PostStatus, frozenset[PostStatus]] = {
@@ -33,16 +37,24 @@ POST_TRANSITIONS: dict[PostStatus, frozenset[PostStatus]] = {
     PostStatus.SCHEDULED: frozenset(
         {PostStatus.UPLOADING, PostStatus.CANCELLED, PostStatus.SCHEDULED}
     ),
-    # uploading -> scheduled is a retry after a failed attempt (with backoff).
+    # uploading -> scheduled is a retry after a failed attempt (with backoff);
+    # uploading -> held is the publish-time campaign pre-flight refusing it (CLP-97).
     PostStatus.UPLOADING: frozenset(
-        {PostStatus.POSTED, PostStatus.SCHEDULED, PostStatus.POST_FAILED}
+        {PostStatus.POSTED, PostStatus.SCHEDULED, PostStatus.POST_FAILED, PostStatus.HELD}
     ),
     PostStatus.POST_FAILED: frozenset({PostStatus.SCHEDULED, PostStatus.CANCELLED}),
     PostStatus.POSTED: frozenset(),
     PostStatus.CANCELLED: frozenset(),
+    # held -> scheduled only through the pre-flight recheck (`scheduler.recheck_held`).
+    PostStatus.HELD: frozenset({PostStatus.SCHEDULED, PostStatus.CANCELLED}),
 }
 
-OPEN_STATUSES = (PostStatus.SCHEDULED, PostStatus.UPLOADING, PostStatus.POST_FAILED)
+OPEN_STATUSES = (
+    PostStatus.SCHEDULED,
+    PostStatus.UPLOADING,
+    PostStatus.POST_FAILED,
+    PostStatus.HELD,
+)
 """What `clipper posts list` shows by default."""
 
 RESCHEDULE_HORIZON = timedelta(days=366)
@@ -107,6 +119,7 @@ class Post:
     worker_id: str | None = None
     claimed_at: datetime | None = None
     created_at: str = ""
+    campaign_id: str | None = None
 
     @property
     def safe_url(self) -> str | None:
@@ -139,12 +152,14 @@ class Post:
             worker_id=row["worker_id"],
             claimed_at=from_iso(row["claimed_at"]),
             created_at=row["created_at"],
+            campaign_id=row["campaign_id"],
         )
 
 
 @dataclass(frozen=True)
 class PostMetadata:
-    """What a publisher posts with the video. CLP-96 builds it from per-platform variants."""
+    """What a publisher posts with the video: built from the clip's per-platform variant
+    (CLP-96) with the campaign's tags at scheduling (CLP-97), and stored on the post."""
 
     title: str
     caption: str

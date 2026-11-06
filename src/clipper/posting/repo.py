@@ -3,7 +3,7 @@
 Every status change runs inside BEGIN IMMEDIATE, is conditional on the current status
 (and, for a worker's own claim, on its worker id), and writes an audit row to
 `clip_reviews` (action `post_scheduled`, `post_uploading`, `post_posted`, `post_failed`,
-`post_cancelled` or `post_rescheduled`), next to the clip's review
+`post_cancelled`, `post_rescheduled`, `post_held` or `post_released`), next to the clip's review
 history. Functions that change state open their own transaction, except `insert_post`,
 which callers wrap (see `scheduler.schedule_for_clip`).
 """
@@ -14,6 +14,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Collection, Iterable
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -32,7 +33,11 @@ from clipper.posting.models import (
 
 LIST_LIMIT = 500
 _COUNTED = "status != 'cancelled'"
+"""Posts that hold their file on the platform (`posts_one_file_per_platform`)."""
+_TAKES_SLOT = "status NOT IN ('cancelled', 'held')"
+"""Posts that use one of the account's slots: a held post has none until it is released."""
 _REVIEWER_EDITABLE = frozenset({PostStatus.SCHEDULED, PostStatus.POST_FAILED})
+_CANCELLABLE = _REVIEWER_EDITABLE | {PostStatus.HELD}
 
 
 def _action(status: PostStatus) -> str:
@@ -78,9 +83,10 @@ def list_posts(
 
 
 def account_post_times(conn: sqlite3.Connection, account_id: str) -> list[datetime]:
-    """When the account's posts are (or were) scheduled; cancelled posts free their slot."""
+    """When the account's posts are (or were) scheduled; cancelled and held posts take no
+    slot."""
     rows = conn.execute(
-        f"SELECT * FROM posts WHERE account_id = ? AND {_COUNTED}",  # noqa: S608 - constant
+        f"SELECT * FROM posts WHERE account_id = ? AND {_TAKES_SLOT}",  # noqa: S608 - constant
         (account_id,),
     )
     return [Post.from_row(r).scheduled_at for r in rows]
@@ -118,6 +124,10 @@ def _audit(
     )
 
 
+def _metadata_json(metadata: PostMetadata | None) -> str | None:
+    return None if metadata is None else json.dumps(asdict(metadata), ensure_ascii=False)
+
+
 def insert_post(
     conn: sqlite3.Connection,
     *,
@@ -128,29 +138,126 @@ def insert_post(
     scheduled_at: datetime,
     video_path: str,
     now: datetime,
+    campaign_id: str | None = None,
+    metadata: PostMetadata | None = None,
+    held: str | None = None,
 ) -> Post:
-    """Create a `scheduled` post (and its audit row) with a fresh idempotency key."""
+    """Create a `scheduled` post (and its audit row) with a fresh idempotency key; or a
+    `held` one when `held` gives the reason (CLP-97). `metadata` is what it is published
+    with."""
     stamp = to_iso(now)
+    status = PostStatus.HELD if held else PostStatus.SCHEDULED
     cur = conn.execute(
         "INSERT INTO posts (clip_id, clip_version, account_id, platform, status, scheduled_at,"
-        " idempotency_key, video_path, created_at, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " idempotency_key, video_path, created_at, updated_at, campaign_id, metadata, error)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             clip_id,
             clip_version,
             account_id,
             platform,
-            str(PostStatus.SCHEDULED),
+            str(status),
             to_iso(scheduled_at),
             uuid.uuid4().hex,
             video_path,
             stamp,
             stamp,
+            campaign_id,
+            _metadata_json(metadata),
+            held,
         ),
     )
     post = _require(conn, int(cur.lastrowid or 0))
-    _audit(conn, post, _action(PostStatus.SCHEDULED), now, scheduled_at=to_iso(scheduled_at))
+    _audit(
+        conn,
+        post,
+        _action(status),
+        now,
+        scheduled_at=None if held else to_iso(scheduled_at),
+        campaign_id=campaign_id,
+        reason=held,
+    )
     return post
+
+
+def held_posts(conn: sqlite3.Connection) -> list[Post]:
+    """Every held post, oldest first (no list limit: recheck must see them all)."""
+    rows = conn.execute(
+        "SELECT * FROM posts WHERE status = ? ORDER BY id", (str(PostStatus.HELD),)
+    ).fetchall()
+    return [Post.from_row(r) for r in rows]
+
+
+def release_held(
+    conn: sqlite3.Connection,
+    post: Post,
+    at: datetime,
+    now: datetime,
+    *,
+    metadata: PostMetadata,
+    clip_version: int,
+    video_path: str,
+    campaign_id: str | None,
+) -> Post:
+    """A held post passed the pre-flight again: schedule it at `at` with what was checked
+    (the clip's current version and file, the campaign that now applies). The caller
+    holds the transaction, so the slot it picked cannot be taken meanwhile."""
+    _update(
+        conn,
+        post,
+        PostStatus.SCHEDULED,
+        now,
+        scheduled_at=at,
+        error=None,
+        attempts=0,
+        metadata=_metadata_json(metadata),
+        clip_version=clip_version,
+        video_path=video_path,
+        campaign_id=campaign_id,
+    )
+    released = _require(conn, post.id)
+    _audit(
+        conn,
+        released,
+        "post_released",
+        now,
+        previous=str(post.status),
+        scheduled_at=to_iso(at),
+        campaign_id=campaign_id,
+    )
+    return released
+
+
+def update_hold(conn: sqlite3.Connection, post: Post, reason: str, now: datetime) -> Post:
+    """A held post still cannot go out: record the current reason (audited only when it
+    changed). The caller holds the transaction."""
+    if post.error == reason:
+        return post
+    _update(conn, post, PostStatus.HELD, now, error=reason)
+    updated = _require(conn, post.id)
+    _audit(conn, updated, _action(PostStatus.HELD), now, reason=reason)
+    return updated
+
+
+def hold_claimed(
+    conn: sqlite3.Connection, post: Post, worker_id: str, reason: str, now: datetime
+) -> Post:
+    """The publish-time pre-flight refused a post this worker claimed: hold it instead of
+    publishing (CLP-97)."""
+    with transaction(conn):
+        _update(
+            conn,
+            post,
+            PostStatus.HELD,
+            now,
+            owner=worker_id,
+            error=reason,
+            worker_id=None,
+            claimed_at=None,
+        )
+        held = _require(conn, post.id)
+        _audit(conn, held, _action(PostStatus.HELD), now, reason=reason, worker_id=worker_id)
+    return held
 
 
 def _change(
@@ -213,7 +320,7 @@ def _update(
 
 
 def cancel(conn: sqlite3.Connection, post_id: int, now: datetime, *, by: str | None = None) -> Post:
-    return _change(conn, post_id, PostStatus.CANCELLED, now, by=by)
+    return _change(conn, post_id, PostStatus.CANCELLED, now, by=by, allowed_from=_CANCELLABLE)
 
 
 def reschedule(
@@ -434,7 +541,13 @@ def mark_failed(
 
 
 def metadata_for(conn: sqlite3.Connection, post: Post) -> PostMetadata:
-    """Title, caption and hashtags of the clip version the post was scheduled with."""
+    """What the post is published with: the metadata stored at scheduling (the clip's
+    platform variant, campaign tags and flags, as the pre-flight checked them). Posts
+    scheduled before CLP-97 fall back to the clip version's single title and caption."""
+    row = conn.execute("SELECT metadata FROM posts WHERE id = ?", (post.id,)).fetchone()
+    stored = _stored_metadata(row["metadata"] if row else None)
+    if stored is not None:
+        return stored
     version = get_version(conn, post.clip_id, post.clip_version)
     if version is None:
         raise LookupError(f"clip {post.clip_id} v{post.clip_version}")
@@ -443,3 +556,23 @@ def metadata_for(conn: sqlite3.Connection, post: Post) -> PostMetadata:
         caption=version.caption or "",
         hashtags=list(version.hashtags),
     )
+
+
+def _stored_metadata(raw: str | None) -> PostMetadata | None:
+    if not raw:
+        return None
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("stored post metadata is not an object")
+    title, caption = data.get("title"), data.get("caption")
+    hashtags, flags = data.get("hashtags"), data.get("flags")
+    if not (
+        isinstance(title, str)
+        and isinstance(caption, str)
+        and isinstance(hashtags, list)
+        and all(isinstance(t, str) for t in hashtags)
+        and isinstance(flags, dict)
+        and all(isinstance(k, str) and isinstance(v, bool) for k, v in flags.items())
+    ):
+        raise ValueError("stored post metadata is malformed")
+    return PostMetadata(title=title, caption=caption, hashtags=hashtags, flags=flags)

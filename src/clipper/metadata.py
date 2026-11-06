@@ -208,9 +208,19 @@ def normalize_hashtag(raw: str) -> str:
     return tag if tag.startswith("#") else f"#{tag}"
 
 
+_NEUTRAL = frozenset("ʻʼʽʾʿ")
+"""Apostrophe-like modifier letters written inside words of several scripts: the okina in
+#Hawaiʻi, the Ukrainian apostrophe ʼ and the half rings of Arabic transliteration (#Qurʾan).
+They belong to no script, and `_fold` drops them, so `#adʼ` is still `#ad`. Every other
+modifier letter (prime, colon, stress mark) counts as a script of its own, so it cannot pad
+a Latin tag."""
+_DROP_NEUTRAL = dict.fromkeys(map(ord, _NEUTRAL))
+
+
 def _fold(tag: str) -> str:
-    """Compatibility-folded and case-folded, so fullwidth `#ｆｙｐ` matches `#fyp`."""
-    return unicodedata.normalize("NFKC", tag).casefold()
+    """Compatibility-folded and case-folded without the neutral apostrophes, so fullwidth
+    `#ｆｙｐ` and `#fypʻ` match `#fyp`."""
+    return unicodedata.normalize("NFKC", tag).casefold().translate(_DROP_NEUTRAL)
 
 
 def is_generic(tag: str) -> bool:
@@ -249,6 +259,63 @@ def _link_matches(text: str) -> list[tuple[str, str]]:
     ]
 
 
+_SCRIPT_ALIASES = {"CJK": "HAN", "IDEOGRAPHIC": "HAN"}
+"""First words of Unicode character names that do not spell the script."""
+_KANA_MARKS = frozenset("ー〱〲〳〴〵")
+"""The prolonged sound mark ー and the kana repeat marks: part of a tag only next to kana."""
+_KANA = frozenset({"HIRAGANA", "KATAKANA"})
+_SCRIPT_MIXES = (
+    frozenset({"LATIN", "HAN", "HIRAGANA", "KATAKANA"}),
+    frozenset({"LATIN", "HAN", "BOPOMOFO"}),
+    frozenset({"LATIN", "HAN", "HANGUL"}),
+)
+"""Script sets that are one writing system (Japanese, Chinese, Korean), as in the Unicode
+"highly restrictive" profile (UTS #39)."""
+
+
+def _scripts(folded: str) -> set[str]:
+    """The scripts of the letters in an NFKC-folded tag, read from the first word of each
+    letter's Unicode name (LATIN, CYRILLIC, GREEK, ...). Digits, `_` and combining marks
+    belong to no script."""
+    scripts: set[str] = set()
+    kana_marks = False
+    for char in folded:
+        if char in _NEUTRAL or not unicodedata.category(char).startswith("L"):
+            continue
+        if char in _KANA_MARKS:
+            kana_marks = True
+            continue
+        word = unicodedata.name(char, "UNKNOWN").split(" ", 1)[0]
+        scripts.add(_SCRIPT_ALIASES.get(word, word))
+    if kana_marks and not scripts & _KANA:
+        scripts.add("KANA MARK")
+    return scripts
+
+
+def _mixed_scripts(tag: str) -> list[str]:
+    """The scripts `tag` mixes, sorted; empty when it is one writing system."""
+    folded = unicodedata.normalize("NFKC", tag)
+    scripts = _scripts(folded)
+    if len(scripts) > 1 and not any(scripts <= mix for mix in _SCRIPT_MIXES):
+        return sorted(scripts)
+    # A Latin tag with a lookalike zero from another script (#pr၀m၀, #sp〇ns〇red). An
+    # allowed CJK letter does not excuse it (#sp〇ns〇red一), so #iPhone二〇二四 is rejected too.
+    if "LATIN" in scripts and any(
+        not c.isascii() and unicodedata.category(c).startswith("N") for c in folded
+    ):
+        return ["LATIN", "non-ASCII digits"]
+    return []
+
+
+def is_mixed_script(tag: str) -> bool:
+    """True when the letters come from more than one script, as in `#fyр` with a Cyrillic
+    р, or a Latin tag holds a digit from another script: a mixed-script lookalike of a
+    generic, disclosure or campaign tag. Japanese, Chinese and Korean mixed with Latin are
+    one writing system each. A lookalike written wholly in one script (all-Cyrillic `#аԁ`)
+    is not caught here."""
+    return bool(_mixed_scripts(tag))
+
+
 def links_or_mentions(text: str) -> list[str]:
     """Links, domains, IPs and @mentions in `text`, in order (as matched, normalized)."""
     return [found for found, _ in _link_matches(text)]
@@ -284,7 +351,8 @@ def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
 
 
 def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -> list[str]:
-    """Lenient: malformed, generic and repeated tags are dropped, the rest cut to `limit`."""
+    """Lenient: malformed, generic, mixed-script and repeated tags are dropped, the rest cut
+    to `limit`."""
     out: list[str] = []
     seen: set[str] = set()
     for raw in tags:
@@ -292,7 +360,12 @@ def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -
             continue
         tag = normalize_hashtag(raw)
         key = _fold(tag)
-        usable = HASHTAG.fullmatch(tag) and not is_generic(tag) and not is_disclosure(tag)
+        usable = (
+            HASHTAG.fullmatch(tag)
+            and not is_generic(tag)
+            and not is_disclosure(tag)
+            and not is_mixed_script(tag)
+        )
         if usable and key not in seen:
             seen.add(key)
             out.append(tag)
@@ -319,9 +392,9 @@ def truncate_words(text: str, limit: int, length: Callable[[str], int] = len) ->
 class Variant(BaseModel):
     """One platform's title, caption (without the hashtag line) and hashtags.
 
-    Strict: generic, malformed, repeated or more than 5 hashtags are errors. Validate with
-    `context={"platform": ...}` to apply that platform's title and caption limits; without
-    it the loosest limits apply."""
+    Strict: generic, malformed, mixed-script, repeated or more than 5 hashtags are errors.
+    Validate with `context={"platform": ...}` to apply that platform's title and caption
+    limits; without it the loosest limits apply."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -352,6 +425,8 @@ class Variant(BaseModel):
                 raise ValueError(f"generic hashtag {tag} says nothing about the clip")
             if is_disclosure(tag):
                 raise ValueError(f"hashtag {tag} reads as a paid-partnership disclosure")
+            if mixed := _mixed_scripts(tag):
+                raise ValueError(f"hashtag {tag} mixes scripts ({', '.join(mixed)})")
         if len({_fold(t) for t in tags}) != len(tags):
             raise ValueError("duplicate hashtags")
         return tags

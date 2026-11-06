@@ -21,6 +21,19 @@ MAX_ATTEMPTS = 3
 """Failed publish attempts before a post is `post_failed` (and alerts)."""
 
 
+_URL_UNSAFE = frozenset("<>`\\\"'")
+
+
+def plain_https(url: str | None) -> str | None:
+    """`url` if it is a plain https URL, else None. No whitespace, control characters or
+    markup characters either: the URL is linked in templates and quoted in Discord
+    messages and logs, where a newline or `>` could forge text."""
+    if not url or any(c.isspace() or not c.isprintable() or c in _URL_UNSAFE for c in url):
+        return None
+    parts = urlsplit(url)
+    return url if parts.scheme == "https" and parts.netloc else None
+
+
 class PostStatus(StrEnum):
     SCHEDULED = "scheduled"
     UPLOADING = "uploading"
@@ -125,10 +138,7 @@ class Post:
     def safe_url(self) -> str | None:
         """The post's URL if it is plain https (it comes from a platform API), else None,
         so a template never links a `javascript:` or other odd scheme."""
-        if not self.url:
-            return None
-        parts = urlsplit(self.url)
-        return self.url if parts.scheme == "https" and parts.netloc else None
+        return plain_https(self.url)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Post:

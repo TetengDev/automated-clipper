@@ -25,7 +25,7 @@ dependencies = [
     "tenacity>=9.0",
     "typer>=0.12",
     "uvicorn>=0.54.0",
-    "yt-dlp>=2026.10.21",
+    "yt-dlp[default,pin-deno]>=2026.10.21",  # + yt-dlp-ejs and Deno (pinned by yt-dlp)
 ]
 
 [project.scripts]
@@ -55,6 +55,9 @@ override-dependencies = [
     "opencv-python; sys_platform == 'never'",
     "opencv-contrib-python; sys_platform == 'never'",
 ]
+# The deno sdist downloads its binary at build time, outside uv.lock's hashes. Wheels only:
+# a platform without one fails the install instead of fetching an unpinned binary.
+no-build-package = ["deno"]
 
 [tool.ruff]
 line-length = 100

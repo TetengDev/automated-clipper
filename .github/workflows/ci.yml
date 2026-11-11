@@ -112,6 +112,12 @@ jobs:
           $run -v "$PWD/config:/app/config:ro" clipper:ci --config /app/config/creators.yaml check-config
           $run -v "$smoke:/app/data" clipper:ci --db /app/data/state.db migrate
           $run --entrypoint yt-dlp clipper:ci --version
+          # Deno (YouTube challenges) must run on the read-only rootfs with nothing on stderr:
+          # yt-dlp counts any Deno stderr (cache dir warning, update notice) as a failed solve.
+          deno_out="$(echo 'console.log(1)' | $run -i --read-only --tmpfs /tmp --user 10001:10001 \
+            --entrypoint deno clipper:ci run --ext=js --no-prompt --no-remote --no-npm \
+            --cached-only --no-config - 2>&1)"
+          [ "$deno_out" = 1 ] || { echo "deno smoke failed: $deno_out" >&2; exit 1; }
           $run --entrypoint ffmpeg clipper:ci -version
           $run --entrypoint node clipper:ci --version
           # `remotion versions` fails when any package differs from what Remotion pins. The

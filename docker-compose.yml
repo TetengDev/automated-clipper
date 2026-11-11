@@ -52,7 +52,9 @@ services:
   monitor:
     <<: [*clipper, *after-migrate]
     command: ["run-monitor"]
-    mem_limit: 512m
+    # Each yt-dlp probe runs Deno for YouTube's challenges: ~320 MB RSS on top of yt-dlp's
+    # ~100 MB (CLP-127). At 512m a probe thrashed from 2 s to 12 s.
+    mem_limit: 1g
     cpus: 1
 
   worker:

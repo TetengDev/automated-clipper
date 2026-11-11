@@ -59,6 +59,46 @@ The select stage asks Claude for highlights in one of two ways (`selector` in
   - Check your plan's terms before running this unattended on a server.
 - **`api`**: the paid Messages API with `ANTHROPIC_API_KEY`, capped by `daily_llm_usd_cap`.
 
+## yt-dlp
+
+yt-dlp needs a JavaScript runtime to solve YouTube's player challenges; without one it
+falls back to a client that is deprecated and misses formats. The dependency is
+`yt-dlp[default,pin-deno]`, so `uv sync` (and the image) installs:
+
+- `yt-dlp-ejs`, the challenge solver scripts.
+- Deno, from the `deno` wheel that the Deno organisation publishes on PyPI. It lands in the
+  venv's `bin/` (`/opt/venv/bin/deno` in the image), which yt-dlp searches before `PATH`.
+  Nothing extra to install on macOS or the server.
+
+yt-dlp pins the exact version of both, so `uv lock --upgrade-package yt-dlp` moves all three
+together. That matters for Deno: its V8 runs JavaScript downloaded from YouTube, so it should
+not fall behind on security fixes.
+
+yt-dlp counts any Deno stderr output as a failed solve. In the image, `DENO_DIR=/tmp/deno`
+puts Deno's cache on the tmpfs (the root filesystem is read-only; Deno 2.9.8 tolerates an
+unwritable cache silently, but a later version might warn) and `DENO_NO_UPDATE_CHECK=1`
+stops the update check and its notice. CI runs Deno in the read-only container and fails
+on any stderr. Both names are on the child-process allowlist in
+`pipeline/ytdlp.py`; no other `DENO_*` variable reaches yt-dlp or Deno.
+
+Optional settings in `.env`:
+
+- `CLIPPER_YTDLP_COOKIES`: path to a `cookies.txt` for members-only or age-gated videos
+  (see `allow_gated_content`).
+- `CLIPPER_YTDLP_PROXY`: proxy URL for every yt-dlp call. Its password is masked in logs.
+
+Security: yt-dlp runs Deno with no `--allow-*` flags, so the challenge script gets no file,
+network, environment or subprocess access; `--no-prompt` turns a permission request into an
+error, `--no-config` ignores config files, and `--no-remote --no-npm --cached-only` stop it
+from fetching code. yt-dlp puts the proxy URL, credentials included, in Deno's
+`HTTP(S)_PROXY`; without `--allow-env` the script cannot read it. The residual risk is a V8 escape running as uid 10001, the same as
+ffmpeg decoding untrusted media ([CLP-71](https://linear.app/tengdev/issue/CLP-71)).
+
+Downloads failing with "Requested format is not available" across many videos usually means
+the runtime is broken: run yt-dlp with `-v` and look for `Solving JS challenges using deno`.
+The slow test `CLIPPER_SLOW_TESTS=1 uv run pytest -k real_probe` checks this against a live
+video.
+
 ## Local transcription
 
 The worker transcribes with faster-whisper on CPU (`transcriber: local`, the default).

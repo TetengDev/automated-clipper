@@ -50,7 +50,13 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    CLIPPER_RENDER_DIR=/app/render
+    CLIPPER_RENDER_DIR=/app/render \
+    # Deno (yt-dlp[pin-deno] wheel, /opt/venv/bin/deno) solves YouTube's player challenges.
+    # yt-dlp counts any Deno stderr as a failed solve, so: cache on the tmpfs (the rootfs is
+    # read-only; Deno 2.9.8 tolerates that silently, later versions might warn), and no
+    # update check notice.
+    DENO_DIR=/tmp/deno \
+    DENO_NO_UPDATE_CHECK=1
 
 WORKDIR /app
 

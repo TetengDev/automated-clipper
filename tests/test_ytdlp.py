@@ -1,5 +1,9 @@
+import importlib.metadata
 import json
+import os
 import sys
+import sysconfig
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -199,6 +203,34 @@ def test_run_command_adds_extra_env(monkeypatch: pytest.MonkeyPatch) -> None:
     out = run_command([sys.executable, "-c", code], 30, env={"MALLOC_ARENA_MAX": "2"}).stdout
     env = json.loads(out)
     assert env["MALLOC_ARENA_MAX"] == "2" and "ANTHROPIC_API_KEY" not in env
+
+
+def test_run_command_passes_deno_settings_but_not_deno_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # yt-dlp starts Deno with its own environment, which is the one we hand it.
+    monkeypatch.setenv("DENO_DIR", "/tmp/deno")
+    monkeypatch.setenv("DENO_NO_UPDATE_CHECK", "1")
+    monkeypatch.setenv("DENO_AUTH_TOKENS", "secret@example.com")
+    code = "import json, os; print(json.dumps(dict(os.environ)))"
+    env = json.loads(run_command([sys.executable, "-c", code], 30).stdout)
+    assert env["DENO_DIR"] == "/tmp/deno" and env["DENO_NO_UPDATE_CHECK"] == "1"
+    assert "DENO_AUTH_TOKENS" not in env
+
+
+def test_challenge_solver_ships_with_the_environment() -> None:
+    # yt-dlp[default,pin-deno]: the ejs scripts plus a Deno binary in the venv's scripts dir,
+    # which yt-dlp searches before PATH. Without them YouTube formats silently go missing.
+    from yt_dlp.extractor.youtube.jsc._builtin.vendor import _info
+    from yt_dlp.utils._jsruntime import DenoJsRuntime
+
+    ejs_version = importlib.metadata.version("yt-dlp-ejs")
+    assert ejs_version.split(".")[:2] == _info.VERSION.split(".")[:2]
+    deno = Path(sysconfig.get_path("scripts")) / "deno"
+    out = run_command([str(deno), "--version"], 30)
+    assert out.returncode == 0
+    version = tuple(int(n) for n in out.stdout.split()[1].split(".")[:3])
+    assert version >= DenoJsRuntime.MIN_SUPPORTED_VERSION
 
 
 def test_run_command_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
@@ -541,3 +573,33 @@ def test_audio_selector_never_picks_a_format_without_audio() -> None:
 
     error = classify_error(f"ERROR: {info.value}")
     assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT
+
+
+@pytest.mark.slow
+def test_real_probe_solves_youtube_challenges_with_deno() -> None:
+    """Live YouTube probe with `-v` in place of `--no-warnings`: Deno must solve the player
+    challenges. A missing or broken runtime only warns (and formats go missing), which the
+    pipeline would otherwise only see as deferred `NO_FORMAT` jobs."""
+    if os.environ.get("CLIPPER_SLOW_TESTS") != "1":
+        pytest.skip("set CLIPPER_SLOW_TESTS=1 (needs network)")
+    lines: list[str] = []
+
+    def verbose(
+        args: Sequence[str], timeout_s: float, *, cancel: threading.Event | None = None
+    ) -> RunResult:
+        assert "--no-warnings" in args
+        args = ["-v" if a == "--no-warnings" else a for a in args]
+        return run_command(args, timeout_s, on_stderr_line=lines.append, cancel=cancel)
+
+    info = YtDlp.from_env(verbose, {}).probe(URL)
+
+    stderr = "".join(lines)
+    assert info["id"] == "dQw4w9WgXcQ"
+    assert "Solving JS challenges using deno" in stderr
+    for failure in (
+        "No supported JavaScript runtime",
+        "n challenge solving failed",
+        "Signature solving failed",
+        "Error solving",
+    ):
+        assert failure not in stderr

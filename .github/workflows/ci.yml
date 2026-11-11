@@ -141,6 +141,16 @@ jobs:
             echo "::warning::remotion versions passes cleanly; remove the CLP-108 zod exception here and the zod override in render/package.json"
           fi
 
+      - name: Doctor (read-only, non-root)
+        # Every external tool, including yt-dlp's Deno challenge solver, in the
+        # production sandbox; a non-zero exit fails the job. --network none also proves
+        # the solver needs no network.
+        timeout-minutes: 5
+        run: >-
+          docker run --rm --read-only --tmpfs /tmp --user 10001:10001
+          --cap-drop ALL --security-opt no-new-privileges:true
+          --network none --pids-limit 512 --memory 1g clipper:ci doctor
+
       - name: Render smoke test (read-only, non-root)
         timeout-minutes: 10
         run: >-

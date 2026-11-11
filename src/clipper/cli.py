@@ -52,6 +52,8 @@ app = typer.Typer(
     help="24/7 auto-clipper: detect, transcribe, select highlights, render, review.",
     no_args_is_help=True,
     add_completion=False,
+    # Older typer printed local variables (environment, secrets) in tracebacks by default.
+    pretty_exceptions_show_locals=False,
 )
 app.add_typer(posts_app, name="posts")
 app.add_typer(campaigns_app, name="campaigns")
@@ -162,6 +164,21 @@ def _check_accounts(config_path: Path, cfg: AppConfig) -> AccountsConfig:
             + (f"; campaign {a.campaign}" if a.campaign else "")
         )
     return accounts
+
+
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Check ffmpeg, ffprobe, yt-dlp, its challenge solver (Deno) and node.
+
+    Needs no config file or database. Exits 1 when any check failed."""
+    from clipper import doctor
+
+    checks = doctor.run_checks()
+    for check in checks:
+        typer.echo(doctor.format_check(check))
+    typer.echo(doctor.summary(checks))
+    if any(c.status == "fail" for c in checks):
+        raise typer.Exit(code=1)
 
 
 @app.command("migrate")

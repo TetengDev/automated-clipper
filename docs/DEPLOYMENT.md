@@ -95,7 +95,9 @@ from fetching code. yt-dlp puts the proxy URL, credentials included, in Deno's
 ffmpeg decoding untrusted media ([CLP-71](https://linear.app/tengdev/issue/CLP-71)).
 
 Downloads failing with "Requested format is not available" across many videos usually means
-the runtime is broken: run yt-dlp with `-v` and look for `Solving JS challenges using deno`.
+the runtime is broken: run `docker compose run --rm --no-deps worker doctor` first (it runs
+the real solver scripts through Deno in the worker's sandbox), then yt-dlp with `-v` and
+look for `Solving JS challenges using deno`.
 The slow test `CLIPPER_SLOW_TESTS=1 uv run pytest -k real_probe` checks this against a live
 video.
 
@@ -345,5 +347,12 @@ campaign. `clipper campaigns list` lists every submission.
 `scripts/deploy.sh <previous-tag>`. Because migrations are additive, the older code still runs against the newer schema.
 
 ## Runbook
+
+Run `docker compose run --rm --no-deps worker doctor` after every image update and before
+filing a download bug (`--no-deps`: do not start the `migrate` service first). It needs no
+config or database and prints one line per tool (ffmpeg, ffprobe, the ffmpeg filters the
+pipeline uses, yt-dlp, yt-dlp-ejs with yt-dlp's version and hash checks, Deno with a real
+challenge-solver run, node), then exits 1 if any check failed. Locally: `uv run clipper
+doctor`.
 
 See `docs/RUNBOOK.md` (written in E5-S8). It covers YouTube bot blocks, quota, stuck jobs, a full disk, budgets, Twitch auth, key rotation, rollback, restore, and adding a creator.

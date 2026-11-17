@@ -146,6 +146,8 @@ class YouTubeMonitor:
     format_retries: dict[str, _Failure] = field(default_factory=dict)
     """Videos whose last lookup was a format error, by id (`attempts`: the streak). Kept
     apart from `failures` because these never count toward giving up."""
+    janitor: Callable[[], object] | None = None
+    """Called after each cycle unless stopping (`Janitor.tick`, CLP-38; never raises)."""
 
     def run_forever(self, creators: Sequence[Creator]) -> None:
         """Poll every interval (with jitter) until `stop` is set. A failing cycle (e.g. the
@@ -157,6 +159,8 @@ class YouTubeMonitor:
                 self.run_cycle(creators)
             except Exception:
                 logger.exception("monitor cycle failed; next cycle as scheduled")
+            if self.janitor is not None and not self.stop.is_set():
+                self.janitor()
             self.stop.wait(interval_s * self.rng.uniform(1 - JITTER, 1 + JITTER))
         logger.info("monitor stopped")
 

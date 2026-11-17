@@ -224,10 +224,15 @@ def run_monitor(
             "--first-run", help="Override first_run_mode for creators polled the first time."
         ),
     ] = None,
+    media_dir: Annotated[
+        Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Per-job media the janitor cleans.")
+    ] = jobs.DEFAULT_MEDIA_ROOT,
 ) -> None:
-    """Poll creators 24/7 and enqueue new content.
+    """Poll creators 24/7 and enqueue new content. Between polls, the janitor applies the
+    retention and disk budget settings to the media dir at most once an hour.
 
     SIGTERM/SIGINT finish the current creator's poll, then exit."""
+    from clipper.janitor import Janitor
     from clipper.pipeline.ytdlp import YtDlpError
 
     app_ctx = _app(ctx)
@@ -253,7 +258,11 @@ def run_monitor(
                 source = _youtube_source(secrets, http, stop_event)
             except YtDlpError as exc:
                 _fail(f"run-monitor: {exc}")
-            monitor = YouTubeMonitor(conn, cfg, source, first_run_mode=first_run, stop=stop_event)
+            _, alert = _notifiers(http, "run-monitor")
+            janitor = Janitor(conn, cfg, media_dir, alert)
+            monitor = YouTubeMonitor(
+                conn, cfg, source, first_run_mode=first_run, stop=stop_event, janitor=janitor.tick
+            )
             if once:
                 report = monitor.run_cycle(creators)
                 _print_cycle(report)
@@ -303,16 +312,16 @@ def _posting_config(conn: sqlite3.Connection, config_path: Path) -> PostingConfi
     return live
 
 
-def _notifiers(http: httpx.Client) -> tuple[Notify, Notify]:
-    """Discord webhooks for submission pings and missed-deadline alerts. Pings go to
-    DISCORD_WEBHOOK_URL, alerts to DISCORD_ALERTS_WEBHOOK_URL (else the ping webhook);
-    without either, messages go to the log. A malformed URL stops the worker."""
+def _notifiers(http: httpx.Client, command: str = "run-worker") -> tuple[Notify, Notify]:
+    """Discord webhooks for submission pings and alerts (missed deadlines, the janitor's disk
+    alert). Pings go to DISCORD_WEBHOOK_URL, alerts to DISCORD_ALERTS_WEBHOOK_URL (else the
+    ping webhook); without either, messages go to the log. A malformed URL stops `command`."""
     from clipper.notify import DiscordWebhook, log_notify
 
     try:
         secrets = Secrets()
     except ValidationError as exc:
-        _fail(f"run-worker: {exc}")
+        _fail(f"{command}: {exc}")
 
     def hook(value: SecretStr | None, name: str) -> Notify | None:
         if value is None or not value.get_secret_value().strip():

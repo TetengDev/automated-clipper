@@ -986,6 +986,27 @@ def test_run_forever_sleeps_the_jittered_interval_and_survives_cycle_errors(
     assert len(set(sleeps)) > 1
 
 
+def test_run_forever_calls_the_janitor_hook_after_each_cycle_until_stopped(
+    conn, cfg, source, clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    monitor = make(conn, cfg, source, clock, janitor=lambda: events.append("janitor"))
+
+    def cycle(creators):
+        events.append("cycle")
+        if len(events) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        if events.count("cycle") == 3:
+            monitor.stop.set()  # SIGTERM during the cycle: exit without the janitor
+
+    monkeypatch.setattr(monitor, "run_cycle", cycle)
+    monkeypatch.setattr(monitor.stop, "wait", lambda seconds: monitor.stop.is_set())
+
+    monitor.run_forever(cfg.creators)
+
+    assert events == ["cycle", "janitor", "cycle", "janitor", "cycle"]
+
+
 # --- CLI ----------------------------------------------------------------------------------------
 
 runner = CliRunner()
@@ -1209,3 +1230,30 @@ def test_upload_whose_id_starts_with_a_dash_is_enqueued(
     for args in probes:  # the id reaches yt-dlp only inside the canonical URL, after "--"
         assert args[-2] == "--"
         assert args[-1].startswith("https://www.youtube.com/watch?v=-")
+
+
+def test_cli_run_monitor_runs_the_janitor_on_the_media_dir(
+    cli_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, db = cli_env
+    media = tmp_path / "media"
+    audio = media / f"youtube_{V1}" / "audio_16k.flac"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"old source audio")
+    with closing(connect(db)) as c:
+        migrate(c)
+        c.execute(
+            "INSERT INTO jobs (platform, item_id, creator, source_url, status, created_at,"
+            " updated_at) VALUES ('youtube', ?, 'MrBeast', 'u', 'clips_ready', ?, ?)",
+            (V1, "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"),
+        )
+
+    def one_round(self: YouTubeMonitor, creators) -> None:
+        assert self.janitor is not None
+        self.janitor()
+
+    monkeypatch.setattr(YouTubeMonitor, "run_forever", one_round)
+    result = runner.invoke(app, [*args, "run-monitor", "--media-dir", str(media)])
+
+    assert result.exit_code == 0, result.output
+    assert not audio.exists()

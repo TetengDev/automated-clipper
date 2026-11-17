@@ -14,7 +14,7 @@ Every clip is reviewed by a person before anything is exported. Review happens i
    - **Regenerate with note**: Claude picks a new cut within ±60 s of the original, guided by the reviewer's note. This also produces version n+1 in `pending_review`.
    - **Comment**: adds to the clip's thread. Comments persist across all versions of the clip.
    - **Per-platform text** (CLP-96): the clip page shows a title, caption and hashtags for TikTok, Instagram, YouTube and Facebook. Before approval the reviewer can edit each platform's title and caption and save them (`POST /clip/{id}/variants`). The edit is stored on the current version, kept by later re-renders, and recorded as `variants_edited` in the clip's history. Each platform's limits apply: titles at most 100 characters, captions at most 2,200 characters (the YouTube description at most 5,000), and at most 5 hashtags with no generic tags such as #fyp or #viral. Every platform's text is shown open, and links or @mentions in it are flagged for checking. A save made from a page that is out of date (another tab saved first) is refused with 409 instead of overwriting.
-4. Pending clips older than `review_expiry_days` (default 7) are archived automatically.
+4. Clips still waiting for review (`pending_review` or `needs_attention`) are archived `review_expiry_days` (default 7) after they were created. The janitor does this once an hour and records an `archive` entry in the clip's history. The files of rejected and archived clips are deleted `rejected_retention_days` (default 14) after the decision; their history stays. See [Janitor](DEPLOYMENT.md#janitor).
 
 ## Clip state machine
 
@@ -25,7 +25,9 @@ pending_review ──approve──▶ approved ──export──▶ exported
       │
       ├──reject (reason)──▶ rejected
       │
-      └──edit / regenerate──▶ changes_requested ──▶ re_rendering ──▶ pending_review (v n+1)
+      ├──edit / regenerate──▶ changes_requested ──▶ re_rendering ──▶ pending_review (v n+1)
+      │
+      └──review_expiry_days pass (janitor)──▶ archived
 ```
 
 ## Pages

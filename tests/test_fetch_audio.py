@@ -152,6 +152,20 @@ def make_job(creator: str = "manual") -> Job:
     )
 
 
+def mem_db() -> sqlite3.Connection:
+    """A migrated in-memory DB holding job 1 (`make_job`), for the source-hours ledger."""
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO jobs (id, platform, item_id, creator, source_url, created_at, updated_at)"
+        " VALUES (1, ?, ?, 'manual', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        (YT.platform, YT.item_id, URL),
+    )
+    return conn
+
+
 @pytest.fixture
 def media_dir(tmp_path: Path) -> Path:
     path = tmp_path / "media" / YT.key
@@ -161,7 +175,7 @@ def media_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def ctx(media_dir: Path) -> Iterator[StageContext]:
-    with closing(sqlite3.connect(":memory:")) as conn:
+    with closing(mem_db()) as conn:
         yield StageContext(media_dir, conn, AppConfig())
 
 
@@ -277,7 +291,7 @@ def test_min_duration_uses_creator_overrides(media_dir: Path) -> None:
             ),
         ),
     )
-    with closing(sqlite3.connect(":memory:")) as conn:
+    with closing(mem_db()) as conn:
         ctx = StageContext(media_dir, conn, config)
         with pytest.raises(SkipJob, match="900s"):
             run(make_job("long"), ctx, FakeRunner())  # name match is case-insensitive
@@ -295,7 +309,7 @@ def test_unknown_duration_is_measured_then_filtered(ctx: StageContext, media_dir
 
 def test_unknown_duration_measured_into_meta(media_dir: Path) -> None:
     config = AppConfig(settings=Settings(min_duration_seconds=0))
-    with closing(sqlite3.connect(":memory:")) as conn:
+    with closing(mem_db()) as conn:
         run(make_job(), StageContext(media_dir, conn, config), FakeRunner(base_info(duration=0)))
     assert json.loads((media_dir / "meta.json").read_text())["duration_s"] == 42.5
 
@@ -533,7 +547,7 @@ def test_real_ffmpeg_tone(ctx: StageContext, media_dir: Path, tmp_path: Path) ->
 
 
 def test_not_ready_defers_thirty_minutes(media_dir: Path) -> None:
-    with closing(sqlite3.connect(":memory:")) as conn:
+    with closing(mem_db()) as conn:
         ctx = StageContext(media_dir, conn, AppConfig(), clock=lambda: T0)
         with pytest.raises(Deferred) as exc:
             run(make_job(), ctx, FakeRunner(base_info(live_status="is_upcoming")))
@@ -542,7 +556,7 @@ def test_not_ready_defers_thirty_minutes(media_dir: Path) -> None:
 
 
 def _probe_at(media_dir: Path, when: datetime, job: Job, info: dict[str, Any]) -> None:
-    with closing(sqlite3.connect(":memory:")) as conn:
+    with closing(mem_db()) as conn:
         run(job, StageContext(media_dir, conn, AppConfig(), clock=lambda: when), FakeRunner(info))
 
 
@@ -588,7 +602,7 @@ def test_max_duration_uses_creator_overrides(media_dir: Path) -> None:
             ),
         ),
     )
-    with closing(sqlite3.connect(":memory:")) as conn:
+    with closing(mem_db()) as conn:
         ctx = StageContext(media_dir, conn, config)
         with pytest.raises(SkipJob, match="too long"):
             run(make_job("Short"), ctx, FakeRunner(base_info(duration=3601)))
@@ -660,7 +674,7 @@ FORMAT_ERROR = "ERROR: [youtube] x: Requested format is not available. Use --lis
 
 
 def _fetch_at(media_dir: Path, when: datetime, runner: FakeRunner) -> None:
-    with closing(sqlite3.connect(":memory:")) as conn:
+    with closing(mem_db()) as conn:
         run(make_job(), StageContext(media_dir, conn, AppConfig(), clock=lambda: when), runner)
 
 
@@ -732,7 +746,7 @@ def test_format_error_defers_the_job_without_failing_it(db: Path, tmp_path: Path
 def _fetch_with(media_dir: Path, info: dict[str, Any], allow: bool) -> FakeRunner:
     runner = FakeRunner(info)
     config = AppConfig(settings=Settings(allow_gated_content=allow))
-    with closing(sqlite3.connect(":memory:")) as conn:
+    with closing(mem_db()) as conn:
         run(make_job(), StageContext(media_dir, conn, config), runner)
     return runner
 
@@ -764,3 +778,41 @@ def test_no_video_formats_found_defers_too(media_dir: Path) -> None:
 
     with pytest.raises(fa.NoUsableFormat):
         _fetch_at(media_dir, T0, runner)
+
+
+# --- source hours per creator per day (CLP-38) ---------------------------------------------
+
+
+def _capped(media_dir: Path, conn: sqlite3.Connection, hours: float) -> StageContext:
+    settings = Settings(max_source_hours_per_day=hours, min_duration_seconds=0)
+    return StageContext(media_dir, conn, AppConfig(settings=settings), clock=lambda: T0)
+
+
+def test_source_hours_cap_defers_before_any_download(media_dir: Path) -> None:
+    with closing(mem_db()) as conn:
+        # Another source of the same creator, 50 min, earlier today.
+        conn.execute(
+            "INSERT INTO jobs (id, platform, item_id, creator, source_url, created_at,"
+            " updated_at) VALUES (2, 'youtube', 'aaaaaaaaaaa', 'manual', 'u', ?, ?)",
+            ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO spend (job_id, provider, kind, usd, audio_seconds, created_at)"
+            " VALUES (2, 'youtube', 'source', 0, 3000, '2026-01-01T09:00:00Z')"
+        )
+        runner = FakeRunner()  # 600 s: 3000 + 600 > 0.9 h (3240 s)
+        with pytest.raises(Deferred, match="daily source hours reached") as exc:
+            run(make_job(), _capped(media_dir, conn, 0.9), runner)
+        assert exc.value.until == datetime(2026, 1, 2, tzinfo=UTC)
+        assert runner.of("download") == []
+        run(make_job(), _capped(media_dir, conn, 1.0), FakeRunner())  # 3600 s fits exactly
+        rows = conn.execute("SELECT job_id, audio_seconds FROM spend ORDER BY id").fetchall()
+    assert [tuple(r) for r in rows] == [(2, 3000.0), (1, 600.0)]
+    assert (media_dir / AUDIO_NAME).is_file()
+
+
+def test_unknown_duration_is_counted_once_measured(media_dir: Path) -> None:
+    with closing(mem_db()) as conn:
+        run(make_job(), _capped(media_dir, conn, 1.0), FakeRunner(base_info(duration=None)))
+        (seconds,) = conn.execute("SELECT audio_seconds FROM spend").fetchone()
+    assert seconds == 42.5  # what ffprobe measured

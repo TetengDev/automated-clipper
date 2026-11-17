@@ -19,6 +19,7 @@ import pytest
 
 from clipper import render
 from clipper.config import AppConfig
+from clipper.db import migrate
 from clipper.jobs import Job, JobStatus, StageContext
 from clipper.pipeline import boundaries, common, jumpcuts, quality, reframe, transcribe
 from clipper.pipeline.common import Deadline
@@ -130,7 +131,8 @@ def test_ytdlp_probe_listing_and_downloads(ref: SourceRef, media: Path) -> None:
 
 @pytest.fixture
 def ctx(media: Path) -> Iterator[StageContext]:
-    with closing(sqlite3.connect(":memory:")) as conn:
+    with closing(sqlite3.connect(":memory:", isolation_level=None)) as conn:
+        migrate(conn)  # fetch_audio records the source hours (CLP-38)
         yield StageContext(media, conn, AppConfig())
 
 

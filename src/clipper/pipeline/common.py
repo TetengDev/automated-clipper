@@ -10,6 +10,11 @@ Paid API calls go through `reserve_spend`: the budget check and a reservation of
 estimated cost happen in one `BEGIN IMMEDIATE` transaction (so two workers cannot both
 pass the check), and the row is settled to the actual cost afterwards. Over the daily cap
 the stage is `Deferred` to the next UTC midnight; it never fails or skips the job.
+
+Source hours (`max_source_hours_per_day`, per creator, CLP-38) use the same ledger: one
+`source` row per job (usd 0, the source length in `audio_seconds`), written by
+`reserve_source_hours` before the download, under the same rules (deferred to the next UTC
+midnight; a source longer than the whole cap is skipped).
 """
 
 from __future__ import annotations
@@ -296,6 +301,52 @@ def spend_today(conn: sqlite3.Connection, kind: str, now: datetime) -> float:
         (kind, start, end),
     ).fetchone()
     return float(row[0])
+
+
+SOURCE_KIND = "source"
+"""`spend.kind` of the source-hours rows; never mixed into the USD sums (those filter by kind)."""
+
+
+def reserve_source_hours(
+    conn: sqlite3.Connection, job: Job, seconds: float, *, cap_hours: float, now: datetime
+) -> None:
+    """Admit `seconds` of source for `job` against its creator's daily cap, or raise.
+
+    A job is counted once: a rerun of the stage (crash, not-ready retry) finds its row and
+    passes. Over the cap -> `Deferred` to the next UTC midnight; a source longer than the
+    whole cap can never fit -> `SkipJob`."""
+    cap_s = cap_hours * 3600
+    if seconds > cap_s:
+        raise SkipJob(
+            f"source is {seconds / 3600:.1f} h, which exceeds the daily"
+            f" max_source_hours_per_day {cap_hours:g} h"
+        )
+    start, end = _utc_day(now)
+    with transaction(conn):
+        counted = conn.execute(
+            "SELECT 1 FROM spend WHERE job_id = ? AND kind = ?", (job.id, SOURCE_KIND)
+        ).fetchone()
+        if counted is not None:
+            return
+        used = float(
+            conn.execute(
+                "SELECT COALESCE(SUM(s.audio_seconds), 0) FROM spend s"
+                " JOIN jobs j ON j.id = s.job_id"
+                " WHERE s.kind = ? AND j.creator = ? AND s.created_at >= ? AND s.created_at < ?",
+                (SOURCE_KIND, job.creator, start, end),
+            ).fetchone()[0]
+        )
+        if used + seconds > cap_s:
+            raise Deferred(
+                next_utc_midnight(now),
+                f"daily source hours reached for {job.creator} ({used / 3600:.1f} h of"
+                f" {cap_hours:g} h used, {seconds / 3600:.1f} h needed)",
+            )
+        conn.execute(
+            "INSERT INTO spend (job_id, provider, kind, usd, audio_seconds, created_at)"
+            " VALUES (?, ?, ?, 0, ?, ?)",
+            (job.id, job.ref.platform, SOURCE_KIND, round(seconds, 3), to_iso(now)),
+        )
 
 
 @dataclass

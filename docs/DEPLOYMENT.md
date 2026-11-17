@@ -247,13 +247,13 @@ How it posts:
   hashtags, within 5000 bytes. The category is 24 (Entertainment), the video is declared
   not made for kids, and `containsSyntheticMedia` is set when the clip has an AI element.
   Hashtags the caption already ends with are not added twice.
+  Each upload carries a hidden `clipper-<idempotency key>` tag. After a timeout or a crash,
+  the worker uses that tag to find the earlier upload and records it instead of uploading
+  the video twice.
 - A post that needs the paid-partnership disclosure (a campaign with `paid_partnership:
   true`) is refused before upload and turns `post_failed` with an alert: the worker does
   not set YouTube's paid-promotion disclosure. Post such a clip by hand in YouTube Studio
   with the disclosure on.
-  Each upload carries a hidden `clipper-<idempotency key>` tag. After a timeout or a crash,
-  the worker uses that tag to find the earlier upload and records it instead of uploading
-  the video twice.
 - Quota: one upload costs 1 unit of the separate "Video Uploads" bucket, which allows 100
   calls a day. A `quotaExceeded` or `uploadLimitExceeded` error moves the post to just
   after the next quota reset (midnight Pacific time). It does not count as a failed attempt.

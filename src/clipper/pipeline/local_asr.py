@@ -57,12 +57,15 @@ REQUIRED_FILES = ("config.json", "model.bin", "tokenizer.json")
 """Plus one `vocabulary.*` (txt or json); preprocessor_config.json only some models have."""
 
 EXIT_RETRY = 1
-"""Out of memory, a CTranslate2 runtime error, I/O trouble, a crash: retryable."""
+"""A crash after the model loaded (Python's exit code for an uncaught exception): retryable."""
 EXIT_USAGE = 2
 """Bad arguments: a bug in the parent, so the parent fails the job (permanent)."""
 EXIT_MODEL = 3
 """The model can never load as configured: faster-whisper not installed, model files
 missing, or a ValueError (e.g. a compute type the CPU cannot run). Permanent."""
+EXIT_LOAD = 4
+"""Loading the model failed with out of memory, a CTranslate2 runtime error (which damaged
+weights also cause) or I/O trouble: retryable."""
 
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 _REPO = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
@@ -188,7 +191,7 @@ def main(argv: Sequence[str], out: IO[str] = sys.stdout, model_class: Any = None
         return EXIT_MODEL
     except Exception as exc:  # MemoryError, CTranslate2 RuntimeError, OSError: transient
         print(f"model load failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return EXIT_RETRY
+        return EXIT_LOAD
     result = transcribe_chunk(model, audio, None if language == "-" else language)
     json.dump(result, out, ensure_ascii=False)
     return 0

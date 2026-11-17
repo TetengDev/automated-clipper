@@ -378,15 +378,25 @@ def models_dir() -> Path:
     return Path(os.environ.get("CLIPPER_MODELS_DIR") or DEFAULT_MODELS_DIR).resolve()
 
 
-def _run_asr(args: Sequence[str], timeout_s: float, what: str) -> RunResult:
+def _run_asr(
+    args: Sequence[str],
+    timeout_s: float,
+    what: str,
+    on_load_failure: Callable[[], None] | None = None,
+) -> RunResult:
     """Run the ASR child like ffmpeg (`run_media`), but tell a model that cannot be loaded
-    (permanent) apart from a crash, OOM kill or timeout (retryable)."""
+    (permanent) apart from a crash, OOM kill or timeout (retryable). `on_load_failure`
+    runs first when the child could not load the model, for either reason."""
     try:
         result = default_runner()(args, timeout_s)
     except CommandTimeout as exc:
         raise MediaError(f"{what}: {exc}") from None
+    if on_load_failure and result.returncode in (local_asr.EXIT_MODEL, local_asr.EXIT_LOAD):
+        on_load_failure()
     if result.returncode == local_asr.EXIT_MODEL:
         raise PermanentError(f"{what}: cannot load the model: {stderr_tail(result.stderr)}")
+    if result.returncode == local_asr.EXIT_LOAD:
+        raise MediaError(f"{what}: model load failed: {stderr_tail(result.stderr)}")
     if result.returncode == local_asr.EXIT_USAGE:
         raise PermanentError(f"{what}: bad arguments: {stderr_tail(result.stderr)}")
     if result.returncode != 0:
@@ -479,6 +489,17 @@ class FasterWhisperTranscriber:
                         path.unlink(missing_ok=True)
         shutil.rmtree(snapshot, ignore_errors=True)
 
+    def drop_marker(self) -> None:
+        """Make the next `ensure_model` fetch and fully verify the snapshot again: the
+        model failed to load, and the cheap check before each job misses damage inside
+        model.bin's bytes."""
+        marker = self.snapshot_dir / COMPLETE_MARKER
+        if marker.is_file():
+            logger.warning(
+                "whisper model %s: load failed; snapshot to be verified again", self.model
+            )
+            marker.unlink(missing_ok=True)
+
     def transcribe(
         self, audio: Path, *, language: str | None, timeout_s: float | None = None
     ) -> ChunkTranscript:
@@ -491,7 +512,8 @@ class FasterWhisperTranscriber:
             str(audio),
         ]
         timeout = CHUNK_CALL_TIMEOUT_S if timeout_s is None else timeout_s
-        result = _run_asr(args, timeout, f"local transcription of {audio.name}")
+        what = f"local transcription of {audio.name}"
+        result = _run_asr(args, timeout, what, on_load_failure=self.drop_marker)
         try:
             body = json.loads(result.stdout)
             chunk = _parse_verbose_json(body)

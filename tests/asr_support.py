@@ -48,6 +48,8 @@ class FakeWhisperModel:
     instances: list[FakeWhisperModel] = []
     segments: list[SimpleNamespace] = []
     language = "tl"
+    load_error: BaseException | None = None
+    """Raised by the constructor: CTranslate2 failing to load the weights."""
 
     def __init__(
         self,
@@ -58,6 +60,8 @@ class FakeWhisperModel:
         cpu_threads: int,
         local_files_only: bool,
     ) -> None:
+        if self.load_error is not None:
+            raise self.load_error
         self.model = model_size_or_path
         self.kwargs = {
             "device": device,
@@ -203,6 +207,7 @@ def install_fake_asr(monkeypatch: pytest.MonkeyPatch, models_dir: Path) -> FakeA
     FakeWhisperModel.instances = []
     FakeWhisperModel.segments = [seg("kumusta mga lods", 0.0), seg("salamat po", 3.0)]
     FakeWhisperModel.language = "tl"
+    FakeWhisperModel.load_error = None
     monkeypatch.setenv("CLIPPER_MODELS_DIR", str(models_dir))
     for name, pin in list(config.WHISPER_MODELS.items()):  # the fake weights are "pinned"
         monkeypatch.setitem(config.WHISPER_MODELS, name, pin._replace(files=FAKE_PINS))

@@ -911,9 +911,10 @@ def test_child_missing_model_files_are_permanent(model_dir: Path, missing: str) 
     [
         (ImportError("no faster_whisper"), local_asr.EXIT_MODEL),
         (ValueError("Requested float16 compute type, but the target device"), local_asr.EXIT_MODEL),
-        (MemoryError(), local_asr.EXIT_RETRY),
-        (RuntimeError("aligned_alloc: failed to allocate memory"), local_asr.EXIT_RETRY),
-        (OSError("No space left on device"), local_asr.EXIT_RETRY),
+        (MemoryError(), local_asr.EXIT_LOAD),
+        (RuntimeError("aligned_alloc: failed to allocate memory"), local_asr.EXIT_LOAD),
+        (RuntimeError("Unable to load model.bin: unexpected end of file"), local_asr.EXIT_LOAD),
+        (OSError("No space left on device"), local_asr.EXIT_LOAD),
     ],
 )
 def test_child_load_failure_mapping(model_dir: Path, error: BaseException, code: int) -> None:
@@ -922,6 +923,19 @@ def test_child_load_failure_mapping(model_dir: Path, error: BaseException, code:
 
     argv = [str(model_dir), "int8", "1", "en", "c.flac"]
     assert local_asr.main(argv, out=io.StringIO(), model_class=broken) == code
+
+
+def test_child_load_failure_has_its_own_exit_code(model_dir: Path) -> None:
+    """A crash after the load exits 1 (Python's code for an uncaught exception), so the
+    parent can tell a failed load (which may be damaged weights) apart from it."""
+    assert local_asr.EXIT_LOAD not in {0, 1, local_asr.EXIT_USAGE, local_asr.EXIT_MODEL}
+
+    class Crashes(FakeWhisperModel):
+        def transcribe(self, *a, **kw):
+            raise RuntimeError("decoding failed")
+
+    with pytest.raises(RuntimeError, match="decoding failed"):  # the real child exits 1
+        local_asr.main([str(model_dir), "int8", "1", "en", "c.flac"], io.StringIO(), Crashes)
 
 
 def test_child_without_faster_whisper_is_permanent(
@@ -988,7 +1002,12 @@ def test_backend_child_timeout_is_retryable(monkeypatch: pytest.MonkeyPatch, tmp
 
 @pytest.mark.parametrize(
     ("returncode", "permanent"),
-    [(local_asr.EXIT_MODEL, True), (local_asr.EXIT_USAGE, True), (local_asr.EXIT_RETRY, False)],
+    [
+        (local_asr.EXIT_MODEL, True),
+        (local_asr.EXIT_USAGE, True),
+        (local_asr.EXIT_RETRY, False),
+        (local_asr.EXIT_LOAD, False),
+    ],
 )
 def test_backend_maps_child_exit_codes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int, permanent: bool
@@ -1199,6 +1218,42 @@ def test_swapped_tokenizer_fails_verification(fake_asr: FakeAsr, tmp_path: Path)
     fake_asr.fetch_plan = ["ok"]
     assert local().ensure_model() == snapshot  # the swapped blob was dropped, not relinked
     assert (snapshot / "tokenizer.json").read_bytes() == FAKE_FILES["tokenizer.json"]
+
+
+@pytest.mark.parametrize(
+    ("error", "permanent"),
+    [
+        (RuntimeError("Unable to load model.bin: unexpected end of file"), False),
+        (ValueError("config.json: Expecting value: line 1 column 1"), True),
+    ],
+)
+def test_model_load_failure_drops_the_marker(
+    fake_asr: FakeAsr, tmp_path: Path, error: BaseException, permanent: bool
+) -> None:
+    """CLP-75: weights damaged in a way the cheap check misses fail the load; the next
+    attempt then fetches and fully verifies the snapshot instead of failing again."""
+    snapshot = local().ensure_model()
+    FakeWhisperModel.load_error = error
+    with pytest.raises(PermanentError if permanent else MediaError, match="load") as exc:
+        local().transcribe(tmp_path / "c.flac", language="en")
+    assert isinstance(exc.value, PermanentError) is permanent
+    assert not (snapshot / tr.COMPLETE_MARKER).exists()
+    FakeWhisperModel.load_error = None
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2  # fetched and fully verified again
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+
+
+@pytest.mark.parametrize("returncode", [local_asr.EXIT_RETRY, local_asr.EXIT_USAGE, -9])
+def test_other_child_failures_keep_the_marker(
+    fake_asr: FakeAsr, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int
+) -> None:
+    snapshot = local().ensure_model()
+    result = ytdlp.RunResult(returncode, "", "Killed")
+    monkeypatch.setattr(ytdlp, "run_command", lambda a, t, **kw: result)
+    with pytest.raises((MediaError, PermanentError)):
+        local().transcribe(tmp_path / "c.flac", language="en")
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
 
 
 def test_ensure_model_fetch_failure_is_retryable(

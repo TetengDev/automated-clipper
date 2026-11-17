@@ -541,6 +541,8 @@ AUDIO_ONLY = {
     "vcodec": "none", "acodec": "mp4a.40.2",
 }  # fmt: skip
 MUXED_HLS = [_hls(h, t) for h, t in [(1080, 5e3), (144, 100), (720, 3e3), (480, 1200), (360, 700)]]
+ACODEC_UNKNOWN = {**_hls(360, 700), "format_id": "hls-360-nocodecs", "acodec": None}
+"""A muxed HLS variant whose playlist has no CODECS: yt-dlp cannot tell if it has audio."""
 
 
 def _select(formats: list[dict[str, object]], selector: str = ytdlp.AUDIO_FORMAT) -> str:
@@ -562,6 +564,7 @@ FIXTURES = {
     "muxed above 1080p only": [_hls(1440, 9000), _hls(2160, 16000)],
     "audio only": [AUDIO_ONLY],
     "video only": [_video_only(1080), _video_only(720)],
+    "muxed, acodec unknown": [ACODEC_UNKNOWN],
     "nothing": [],
 }
 
@@ -580,7 +583,9 @@ def test_probe_selector_implies_the_audio_selector(name: str) -> None:
     assert _select(formats)  # raises if the audio selector found nothing
 
 
-@pytest.mark.parametrize("name", ["audio only", "video only", "muxed above 1080p only"])
+@pytest.mark.parametrize(
+    "name", ["audio only", "video only", "muxed above 1080p only", "muxed, acodec unknown"]
+)
 def test_probe_selector_rejects_what_the_clip_download_cannot_use(name: str) -> None:
     # Audio but no video (a partial breakage): the job would otherwise pay for ASR and the
     # LLM and only then fail in fetch_clips. Video but no audio: the clips would be silent.
@@ -610,10 +615,18 @@ def test_audio_selector_caps_a_muxed_only_fallback(
     assert _select(formats) == chosen
 
 
-def test_audio_selector_never_picks_a_format_without_audio() -> None:
-    # Plain `best` falls back to a video-only format here, and ffmpeg -vn then fails.
+@pytest.mark.parametrize(
+    "formats",
+    [[_video_only(1080), _video_only(720)], [ACODEC_UNKNOWN], [ACODEC_UNKNOWN, _video_only(720)]],
+    ids=["video only", "acodec unknown", "acodec unknown and video-only"],
+)
+def test_audio_selector_never_picks_a_format_without_audio(
+    formats: list[dict[str, object]],
+) -> None:
+    # Plain `best` falls back to a video-only format here, and ffmpeg -vn then fails. A
+    # format whose acodec is unknown may be one too: strict `!=none` (no `?`) drops it.
     with pytest.raises(Exception, match="Requested format is not available") as info:
-        _select([_video_only(1080), _video_only(720)])
+        _select(formats)
 
     error = classify_error(f"ERROR: {info.value}")
     assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT

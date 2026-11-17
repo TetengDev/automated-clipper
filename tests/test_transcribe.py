@@ -1146,12 +1146,24 @@ def test_whisper_model_allowlist_is_pinned() -> None:
     from clipper.config import WHISPER_MODELS
 
     assert {"large-v3-turbo", "large-v3", "medium", "tiny"} <= set(WHISPER_MODELS)
-    for repo, revision, sha256 in WHISPER_MODELS.values():
-        assert re.fullmatch(r"[\w.-]+/[\w.-]+", repo)
-        assert re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9a-f]{64}", sha256)
-    assert WHISPER_MODELS["tiny"][:2] == TINY
-    assert WHISPER_MODELS["large-v3-turbo"].sha256 == (
-        "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da"
+    for pin in WHISPER_MODELS.values():
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+", pin.repo)
+        assert re.fullmatch(r"[0-9a-f]{40}", pin.revision)
+        assert {"config.json", "model.bin", "tokenizer.json"} <= set(pin.files)
+        assert any(name.startswith("vocabulary.") for name in pin.files)
+        for size, sha256 in pin.files.values():  # every file of the snapshot is pinned
+            assert size > 0 and re.fullmatch(r"[0-9a-f]{64}", sha256)
+        assert pin.sha256 == pin.files["model.bin"].sha256
+        assert pin.files["model.bin"].size > 50_000_000
+    assert (WHISPER_MODELS["tiny"].repo, WHISPER_MODELS["tiny"].revision) == TINY
+    turbo = WHISPER_MODELS["large-v3-turbo"].files
+    assert turbo["model.bin"] == (
+        1617884929,
+        "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
+    )
+    assert turbo["tokenizer.json"] == (
+        2710337,
+        "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
     )
     with pytest.raises(ValueError, match="unknown whisper model"):
         tr.FasterWhisperTranscriber(model="../../etc")

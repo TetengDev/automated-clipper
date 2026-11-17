@@ -309,7 +309,8 @@ def is_generic(tag: str) -> bool:
 def is_disclosure(tag: str) -> bool:
     """A paid-partnership tag, or a lookalike of one (`#аԁ`, `#ꜱponsored`, `#co11ab`,
     `#ad一`)."""
-    keys = [_key(r, trailing_digits=True) for r in _readings(tag)]
+    # With and without a trailing number: #ad2024 is #ad, and #prom0 ends in an o.
+    keys = [_key(r, trailing_digits=strip) for r in _readings(tag) for strip in (True, False)]
     return any(k in _DISCLOSURE_KEYS or k.startswith(_DISCLOSURE_PREFIX_KEYS) for k in keys)
 
 

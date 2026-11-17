@@ -714,6 +714,10 @@ CONFUSABLE = [
     "#coIIab",
     "#AÐ一",  # the capitals reading, padded with CJK
     "#PAIÐ一",
+    "#prom0",  # a final 0 for o is not a trailing number
+    "#pr0m0",
+    "#ad2024",  # a trailing number still does not hide #ad
+    "#ad1",
 ]
 
 

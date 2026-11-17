@@ -16,9 +16,9 @@ from typing import Any
 
 import bcrypt
 import pytest
-from e2e_support import VIDEO_NAME, LiveApp, Server, make_video
 from playwright.sync_api import ConsoleMessage, Page
 
+from e2e_support import VIDEO_NAME, LiveApp, Server, make_video
 from review_support import make_env
 
 

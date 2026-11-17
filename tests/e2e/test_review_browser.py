@@ -8,12 +8,12 @@ import sqlite3
 from collections.abc import Callable
 
 import pytest
-from e2e_support import LiveApp
 from playwright.sync_api import BrowserContext, Page, Playwright, Response, expect
 
 from clipper.campaigns import Campaign
 from clipper.review.app import _INVALID_FORM, MAX_FORM_FIELDS
 from clipper.review.routes import CHECKS_UNCONFIRMED
+from e2e_support import LiveApp
 from posting_support import FakeAccount
 
 pytestmark = pytest.mark.e2e

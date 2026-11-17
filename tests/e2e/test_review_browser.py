@@ -114,6 +114,7 @@ def test_a_approves_and_moves_to_the_next_clip(live_app: StartApp, page: Page) -
     for day in (1, 2, 3):
         app.clip(job, created_at=f"2027-01-0{day}T00:00:00Z")
     app.login(page)
+    expect(page.locator(".clip-card")).to_have_count(3)
     first, second, _ = card_hrefs(page)
     page.locator(".clip-card").first.click()
     expect(page).to_have_url(app(first))

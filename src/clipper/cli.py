@@ -371,6 +371,7 @@ def run_worker(
     live = _posting_config(conn, app_ctx.config_path)
     http = _http_client()
     notify, alert = _notifiers(http)
+    worker.alert = alert
     # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
     posting = PostingStage(
         conn=conn,

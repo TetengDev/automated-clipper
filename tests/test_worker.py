@@ -29,6 +29,7 @@ from clipper.jobs import heartbeat as heartbeat_mod
 from clipper.jobs import worker as worker_mod
 from clipper.jobs.queue import DEFAULT_LEASE, JobConflict
 from clipper.jobs.stages import DEFAULT_STAGES
+from clipper.notify import NotifyError
 from clipper.pipeline import build_stages
 from clipper.urls import SourceRef
 
@@ -614,3 +615,80 @@ def test_deferred_keeps_status_reschedules_and_does_not_consume_attempts(
 def test_deferred_requires_aware_datetime() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         Deferred(datetime(2026, 1, 1), "x")
+
+
+# --- failed-job alert (CLP-34) ----------------------------------------------------------
+
+
+def test_job_out_of_attempts_sends_one_alert(make_worker: MakeWorker, db: Path) -> None:
+    pipeline = StubPipeline()
+    pipeline.fail_at[JobStatus.FETCHING_AUDIO] = RuntimeError("geo-blocked")
+    clock = FakeClock()
+    worker = make_worker(pipeline, clock)
+    alerts: list[str] = []
+    worker.alert = alerts.append
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+
+    for _ in range(10):
+        _drain(worker)
+        clock.now += timedelta(hours=1)
+
+    assert _status(db, job.id) is JobStatus.FAILED
+    assert alerts == [
+        f"Job {job.id} failed (youtube_dQw4w9WgXcQ, manual) at fetching_audio: gave up after"
+        f" 5 attempts: RuntimeError: geo-blocked. Run `clipper retry {job.id}` to try again."
+    ]
+
+
+@pytest.mark.parametrize(
+    ("exc", "alerted"), [(PermanentError("private video"), True), (SkipJob("too short"), False)]
+)
+def test_permanent_failure_alerts_and_skip_does_not(
+    make_worker: MakeWorker, exc: Exception, alerted: bool
+) -> None:
+    pipeline = StubPipeline()
+    pipeline.fail_at[JobStatus.FETCHING_AUDIO] = exc
+    worker = make_worker(pipeline)
+    alerts: list[str] = []
+    worker.alert = alerts.append
+    enqueue(worker.conn, YT, T0, creator="manual")
+
+    _drain(worker)
+
+    assert [("PermanentError: private video" in a) for a in alerts] == ([True] if alerted else [])
+
+
+def test_job_given_up_at_claim_alerts(make_worker: MakeWorker, db: Path) -> None:
+    """Its workers kept dying mid-stage: the next claim marks it failed."""
+    worker = make_worker()
+    alerts: list[str] = []
+    worker.alert = alerts.append
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.conn.execute("UPDATE jobs SET attempts = 5 WHERE id = ?", (job.id,))
+
+    assert not worker.run_once()
+
+    assert _status(db, job.id) is JobStatus.FAILED
+    assert alerts == [
+        f"Job {job.id} failed: gave up after 5 attempts (worker died mid-stage)."
+        f" Run `clipper retry {job.id}` to try again."
+    ]
+
+
+def test_alert_that_cannot_be_sent_is_logged(
+    make_worker: MakeWorker, db: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    pipeline = StubPipeline()
+    pipeline.fail_at[JobStatus.FETCHING_AUDIO] = PermanentError("private video")
+    worker = make_worker(pipeline)
+
+    def down(text: str) -> None:
+        raise NotifyError("discord webhook returned 503")
+
+    worker.alert = down
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+
+    _drain(worker)
+
+    assert _status(db, job.id) is JobStatus.FAILED
+    assert f"job {job.id}: failure alert not sent: discord webhook returned 503" in caplog.text

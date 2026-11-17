@@ -44,6 +44,7 @@ from clipper.jobs.stages import (
     StageContext,
     StageDef,
 )
+from clipper.notify import Notify
 from clipper.redact import redact
 
 DEFAULT_MEDIA_ROOT = Path("data/media")
@@ -86,6 +87,8 @@ class Worker:
     worker_id: str
     stages: Mapping[JobStatus, StageDef] = field(default_factory=lambda: dict(DEFAULT_STAGES))
     media_root: Path = DEFAULT_MEDIA_ROOT
+    alert: Notify | None = None
+    """Told when a job reaches `failed` (CLP-34); run-worker passes the alerts webhook."""
     clock: Clock = utcnow
     lease: timedelta = DEFAULT_LEASE
     posting: PeriodicPass | None = None
@@ -101,13 +104,17 @@ class Worker:
         """Process one stage of one due job. Returns False when nothing was due."""
         job: Job | None = None
         try:
+            gave_up: list[tuple[int, str]] = []
             job = claim_next(
                 self.conn,
                 self.clock(),
                 worker_id=self.worker_id,
                 statuses=self.stages.keys(),
                 lease=self.lease,
+                gave_up=gave_up,
             )
+            for job_id, reason in gave_up:
+                self._alert(job_id, f"Job {job_id} failed: {redact(reason)}.")
             if job is None:
                 return False
             self._run_stage(job)
@@ -157,6 +164,7 @@ class Worker:
             error = redact(f"{type(exc).__name__}: {exc}")
             logger.error("%s: failed permanently: %s", log, error)
             self._terminal(job, JobStatus.FAILED, error)
+            self._alert_failed(job, error)
         except JobConflict:
             raise  # the stage found its lease lost (hold_lease): nothing to record
         except Exception as exc:
@@ -166,11 +174,25 @@ class Worker:
             retry_at = record_failure(self.conn, job, error, self.clock(), worker_id=self.worker_id)
             if retry_at is None:
                 logger.error("%s: out of attempts, marked failed", log)
+                self._alert_failed(job, f"gave up after {job.attempts} attempts: {error}")
             else:
                 logger.info("%s: retry at %s", log, retry_at.isoformat())
         else:
             nxt = advance(self.conn, job, self.clock(), worker_id=self.worker_id)
             logger.info("%s -> %s", log, nxt)
+
+    def _alert_failed(self, job: Job, reason: str) -> None:
+        where = f"({job.ref.key}, {job.creator}) at {job.status}"
+        self._alert(job.id, f"Job {job.id} failed {where}: {reason}.")
+
+    def _alert(self, job_id: int, text: str) -> None:
+        """Send a failed-job alert; one that cannot be sent is only logged."""
+        if self.alert is None:
+            return
+        try:
+            self.alert(f"{text} Run `clipper retry {job_id}` to try again.")
+        except Exception as exc:
+            logger.warning("job %s: failure alert not sent: %s", job_id, redact(str(exc)))
 
     def _terminal(self, job: Job, status: JobStatus, reason: str) -> None:
         mark_terminal(self.conn, job, status, reason, self.clock(), worker_id=self.worker_id)

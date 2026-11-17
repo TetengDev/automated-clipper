@@ -283,3 +283,16 @@ def test_recorded_version_with_another_name_is_rejected(tmp_path: Path) -> None:
         migrate(conn, [Migration(3, "b", "CREATE TABLE b(x);"), Migration(4, "c", "")])
 
     assert "b" not in _tables(conn) and current_version(conn) == 3
+
+
+def test_name_recorded_while_waiting_for_the_lock_is_checked(tmp_path: Path) -> None:
+    """CLP-79: another process records version 2 under another name after the pre-check
+    (here: migration 1 does it, as if from a second process) and before this one takes
+    the lock for version 2."""
+    conn = connect(tmp_path / "state.db")
+    racer = "CREATE TABLE a(x);\nINSERT INTO schema_version(version, name) VALUES (2, 'other');"
+
+    with pytest.raises(MigrationError, match="migration 2: the database recorded 'other'.*'b'"):
+        migrate(conn, [Migration(1, "a", racer), Migration(2, "b", "CREATE TABLE b(x);")])
+
+    assert "b" not in _tables(conn)

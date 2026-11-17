@@ -581,7 +581,7 @@ def test_invalid_clip_is_skipped_others_render(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     highlights = [
-        _highlight(1, 10.0, 15.0, hook="x" * 121),  # too long for the hook card
+        _highlight(1, 10.0, 10.2),  # shorter than an EDL allows
         _highlight(2, 20.0, 25.0),
         _highlight(3, 30.0, 300.0),  # longer than an EDL allows
     ]
@@ -704,6 +704,22 @@ def test_combining_mark_floods_and_private_use_are_cleaned(
     ]
     assert edl.hook is not None and edl.hook.text == "Wo\u0336\u0336w"
     assert fake.calls[1]["edl"].hook is None
+
+
+def test_text_that_nfc_lengthens_is_cut_to_the_edl_limits(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    """CLP-67: NFC can lengthen text (U+0958 is a composition exclusion: 2 characters in
+    NFC), so the cleaned hook and words are cut to the EDL limits afterwards."""
+    words = [{"word": "\u0958" * 40, "start": 10.1, "end": 10.5}]
+    _setup(media, [_highlight(1, 10.0, 15.0, hook="\u0958" * 100)], words=words)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    edl = fake.calls[0]["edl"]
+    assert edl.hook is not None and edl.hook.text == "\u0915\u093c" * 60
+    assert [w.text for w in edl.words] == ["\u0915\u093c" * 32]
+    assert [r["rank"] for r in _rows(conn)] == [1]
 
 
 def test_normal_text_and_emoji_survive_caption_cleaning(

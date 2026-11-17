@@ -132,6 +132,8 @@ logger = logging.getLogger(__name__)
 
 MAX_WORD_CHARS = 64
 """EDL limit for one caption word."""
+MAX_HOOK_CHARS = 120
+"""EDL limit for the hook text."""
 MAX_MARKS = 2
 """Combining marks kept per base character in caption text (CLP-67)."""
 CLIP_WORST_CASE_S = (
@@ -187,12 +189,13 @@ def _clips(data: Any, name: str) -> list[Any]:
     return clips
 
 
-def _caption_text(text: str) -> str:
+def _caption_text(text: str, max_chars: int) -> str:
     """`strip_control`, then NFC with at most MAX_MARKS combining marks (Mn, Me) after each
     character and no private-use (Co) or surrogate (Cs) characters: a flood of marks
     spills over the caption box, and a private-use character renders blank. Marks are
-    counted after NFC, so a precomposed letter keeps the marks it is made of. Empty when
-    no letter, number, punctuation or symbol is left (only marks, a lone ZWJ or VS16)."""
+    counted after NFC, so a precomposed letter keeps the marks it is made of. Cut to
+    `max_chars` last (NFC can lengthen text). Empty when no letter, number, punctuation
+    or symbol is left (only marks, a lone ZWJ or VS16)."""
     kept, marks = [], 0
     for c in unicodedata.normalize("NFC", strip_control(text)):
         category = unicodedata.category(c)
@@ -201,7 +204,8 @@ def _caption_text(text: str) -> str:
         marks = marks + 1 if category in ("Mn", "Me") else 0
         if marks <= MAX_MARKS:
             kept.append(c)
-    text = strip_control(unicodedata.normalize("NFC", "".join(kept)))  # whitespace again
+    # strip_control again: a dropped character can leave two spaces side by side.
+    text = strip_control(unicodedata.normalize("NFC", "".join(kept)))[:max_chars]
     return text if any(unicodedata.category(c)[0] in "LNPS" for c in text) else ""
 
 
@@ -211,7 +215,7 @@ def _words(transcript: Any, offset: float, start: float, end: float) -> list[dic
     for w in transcript.get("words") or ():
         if w["end"] <= start or w["start"] >= end:
             continue
-        text = _caption_text(str(w["word"]))[:MAX_WORD_CHARS]
+        text = _caption_text(str(w["word"]), MAX_WORD_CHARS)
         if text:
             begin = round(max(w["start"] - offset, 0.0), 3)
             words.append(
@@ -262,7 +266,9 @@ def _plan(
             {
                 "source": {"path": section["path"], "in_s": in_s, "out_s": out_s},
                 # An empty hook (also after cleaning) means no hook card.
-                "hook": {"text": hook} if (hook := _caption_text(clip.get("hook") or "")) else None,
+                "hook": {"text": hook}
+                if (hook := _caption_text(clip.get("hook") or "", MAX_HOOK_CHARS))
+                else None,
                 "words": _words(transcript, offset, start, end),
             }
         )

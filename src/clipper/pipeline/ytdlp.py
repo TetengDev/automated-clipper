@@ -54,7 +54,7 @@ tmpfs, as its home is on the read-only root."""
 AUDIO_MAX_FILESIZE = "4G"
 AUDIO_FALLBACK_TBR = 3000
 """kbps: the highest bitrate of the last (smallest muxed) audio fallback. 720p30 HLS (about
-3 Mbps) still passes, 1080p and 720p60 do not. At this rate 3 h is about
+3 Mbps) usually passes, 1080p and 720p60 do not. At this rate 3 h is about
 AUDIO_MAX_FILESIZE."""
 AUDIO_FORMAT = (
     f"bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none][tbr<=?{AUDIO_FALLBACK_TBR}]"

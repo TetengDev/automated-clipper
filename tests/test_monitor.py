@@ -501,6 +501,7 @@ def test_bot_check_is_retried_every_poll_and_never_gives_up(conn, cfg, source, c
 
 
 def test_format_errors_back_off_to_hourly_and_never_give_up(conn, cfg, source, clock) -> None:
+    # No other video probes fine here, so the errors never count toward giving up.
     not_first_poll(conn)
     source.feeds[BEAST] = [Upload(V1, T0)]
     source.meta[V1] = "format: Requested format is not available"

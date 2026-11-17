@@ -17,6 +17,7 @@ transcript.json (shared contract with CLP-15/16):
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -28,8 +29,9 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
@@ -107,6 +109,12 @@ MODEL_FETCH_TIMEOUT_S = 30 * 60.0
 """Budget for fetching one model, including the one retry after a failed verification."""
 COMPLETE_MARKER = ".clipper-complete"
 """Written into a snapshot once every pinned file's size and sha256 were verified."""
+_MARKER_TMP = re.compile(rf"{re.escape(COMPLETE_MARKER)}(\.\d+)?\.tmp")
+"""The marker's temp file, named per process (before CLP-76 without the pid); one left
+behind by a killed process is harmless."""
+STORE_LOCK = ".lock"
+"""`flock`ed in the models dir while a process checks, fetches, heals or marks."""
+STORE_LOCK_POLL_S = 0.2
 LOCAL_RTF_BUDGET = 3
 """A local chunk may take up to 3x its length (large-v3 on a slow VPS CPU), never less
 than CHUNK_CALL_TIMEOUT_S; the stage deadline still caps it."""
@@ -442,41 +450,46 @@ class FasterWhisperTranscriber:
         model.bin's blob name; model.bin's full hash runs at fetch). Otherwise it is
         fetched (in a child, all within `timeout_s`), fully verified and marked; a snapshot
         that fails verification is discarded and fetched once more, then this raises a
-        retryable `MediaError`."""
+        retryable `MediaError`.
+
+        All of it runs under the store lock, so two processes (the worker and an operator's
+        `bench-transcribe`) never fetch or discard under each other: the second waits, then
+        finds the marker."""
         pin = WHISPER_MODELS[self.model]
         snapshot = self.snapshot_dir
         marker = snapshot / COMPLETE_MARKER
-        if marker.is_file():
-            problems = snapshot_problems(snapshot, pin, hash_model=False)
-            if not problems:
-                return snapshot
-            logger.warning(
-                "whisper model %s: marked snapshot damaged (%s); fetching it again",
-                self.model,
-                _describe(problems),
-            )
-            self._discard(snapshot, problems)
-        self.models_dir.mkdir(parents=True, exist_ok=True)
-        args = [*ASR_COMMAND, "fetch", pin.repo, pin.revision, str(self.models_dir)]
         what = f"downloading whisper model {self.model}"
         started = time.monotonic()
-        problems: dict[str, FileProblem] = {}
-        for _ in range(2):
-            left = timeout_s - (time.monotonic() - started)
-            if left <= 1.0:
-                break
-            _run_asr(args, left, what)
-            problems = snapshot_problems(snapshot, pin)
-            if not problems:
-                tmp = marker.with_name(f"{marker.name}.tmp")
-                tmp.write_text(pin.sha256, encoding="utf-8")
-                os.replace(tmp, marker)
-                return snapshot
-            logger.warning(
-                "whisper model %s: snapshot rejected (%s)", self.model, _describe(problems)
-            )
-            self._discard(snapshot, problems)
-        raise MediaError(f"{what}: {_describe(problems) or 'out of time'}")
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        with _store_lock(self.models_dir, timeout_s, what):
+            if marker.is_file():
+                problems = snapshot_problems(snapshot, pin, hash_model=False)
+                if not problems:
+                    return snapshot
+                logger.warning(
+                    "whisper model %s: marked snapshot damaged (%s); fetching it again",
+                    self.model,
+                    _describe(problems),
+                )
+                self._discard(snapshot, problems)
+            args = [*ASR_COMMAND, "fetch", pin.repo, pin.revision, str(self.models_dir)]
+            problems: dict[str, FileProblem] = {}
+            for _ in range(2):
+                left = timeout_s - (time.monotonic() - started)
+                if left <= 1.0:
+                    break
+                _run_asr(args, left, what)
+                problems = snapshot_problems(snapshot, pin)
+                if not problems:
+                    tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+                    tmp.write_text(pin.sha256, encoding="utf-8")
+                    os.replace(tmp, marker)
+                    return snapshot
+                logger.warning(
+                    "whisper model %s: snapshot rejected (%s)", self.model, _describe(problems)
+                )
+                self._discard(snapshot, problems)
+            raise MediaError(f"{what}: {_describe(problems) or 'out of time'}")
 
     def _discard(self, snapshot: Path, problems: dict[str, FileProblem]) -> None:
         """Drop the snapshot links; for each file whose content is wrong also its repo blob
@@ -554,11 +567,12 @@ def snapshot_problems(
     with `hash_model=False` model.bin only gets its size and blob name checked, since
     hashing gigabytes before every job is too slow."""
     root = snapshot.parents[2].resolve()  # <models>/models--<repo>/snapshots/<revision>
-    ours = {*pin.files, COMPLETE_MARKER, f"{COMPLETE_MARKER}.tmp"}
+    ours = {*pin.files, COMPLETE_MARKER}
     problems: dict[str, FileProblem] = {}
     if snapshot.is_dir():
         for extra in sorted(set(os.listdir(snapshot)) - ours):
-            problems[extra] = FileProblem("not pinned", bad_content=False)
+            if not _MARKER_TMP.fullmatch(extra):
+                problems[extra] = FileProblem("not pinned", bad_content=False)
     for name, want in pin.files.items():
         path = snapshot / name
         if not path.is_file():
@@ -580,6 +594,27 @@ def snapshot_problems(
 
 def _describe(problems: dict[str, FileProblem]) -> str:
     return "; ".join(f"{name} {p.reason}" for name, p in problems.items())
+
+
+@contextmanager
+def _store_lock(models_dir: Path, timeout_s: float, what: str) -> Iterator[None]:
+    """Hold `fcntl.flock` on the models dir's lock file; a retryable `MediaError` when
+    another process holds it for all of `timeout_s` (e.g. a long fetch). The fd is not
+    inherited (PEP 446), so a child never keeps the lock."""
+    fd = os.open(models_dir / STORE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise MediaError(f"{what}: model store busy (another process)") from None
+                time.sleep(STORE_LOCK_POLL_S)
+        yield
+    finally:
+        os.close(fd)  # releases the lock
 
 
 def call_timeout(backend: Transcriber, chunk_seconds: float) -> float:

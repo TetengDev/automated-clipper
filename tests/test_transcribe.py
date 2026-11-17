@@ -1200,6 +1200,7 @@ def test_snapshot_problems_unpinned_files(fake_asr: FakeAsr, tmp_path: Path) -> 
     snapshot = write_snapshot(tmp_path / "models", *TINY)
     (snapshot / tr.COMPLETE_MARKER).write_text("x")
     (snapshot / f"{tr.COMPLETE_MARKER}.tmp").write_text("x")
+    (snapshot / f"{tr.COMPLETE_MARKER}.4242.tmp").write_text("x")
     assert tr.snapshot_problems(snapshot, _fake_pin()) == {}  # the marker files are ours
     (snapshot / "preprocessor_config.json").write_text("{}")
     (snapshot / "extra").mkdir()

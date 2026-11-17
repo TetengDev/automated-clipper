@@ -70,7 +70,8 @@ def _span(field: str) -> range:
 
 
 def _prefold(text: str) -> str:
-    """Must match `clipper.metadata._prefold`."""
+    """`clipper.metadata._prefold` without its last step (dropping the neutral apostrophes,
+    which look like no ASCII letter or digit)."""
     text = unicodedata.normalize("NFKD", unicodedata.normalize("NFKD", text).casefold())
     return "".join(c for c in text if not unicodedata.category(c).startswith("M"))
 

@@ -832,3 +832,4 @@ def test_the_vendored_unicode_data_matches_the_runtime():
     """The generated tables are Unicode 15.0 (Python 3.12): a newer Python needs them
     regenerated (scripts/gen_hashtag_data.py), or new letters would have no script."""
     assert unicodedata.unidata_version == hashtag_data.UNICODE_VERSION
+    assert "UNKNOWN" not in hashtag_data.SCRIPT_NAMES  # every letter, mark and number has one

@@ -707,6 +707,13 @@ CONFUSABLE = [
     "#co11ab",
     "#col1ab",
     "#ϜΥΡ",  # Greek capitals: digamma, upsilon, rho (the small letters read #ϝup)
+    # i, l, 1 and I are one letter, and o and 0 (CLP-112 fix round 2).
+    "#aff11iate",
+    "#v1ra1",
+    "#viraI",
+    "#coIIab",
+    "#AÐ一",  # the capitals reading, padded with CJK
+    "#PAIÐ一",
 ]
 
 
@@ -838,13 +845,53 @@ def test_cleaning_the_bypass_corpus_is_idempotent_and_leaves_nothing_unusable(ra
     assert clean_hashtags(tags) == tags
 
 
-@pytest.mark.parametrize("link", ["https://x.co/page#ad", "site.com/page#fyp", "x.co/#ad"])
-def test_a_tag_inside_a_link_is_left_to_the_link_rules(link):
-    text = f"see {link} now"
-    assert clean_caption(text) == text
+def _plain_problems(text: str) -> list[str]:
     meta = PostMetadata(title="T", caption=text, hashtags=["#a1", "#b1", "#c1"], flags={})
-    assert preflight(meta, "tiktok", 35.0, plain=True) == []
+    return preflight(meta, "tiktok", 35.0, plain=True)
+
+
+def test_a_generic_tag_inside_a_url_is_left_to_the_link_rules():
+    text = "see https://site.com/page#fyp now"
+    assert clean_caption(text) == text
+    assert _plain_problems(text) == []
+    meta = PostMetadata(title="T", caption=text, hashtags=["#a1", "#b1", "#c1"], flags={})
     assert any("links or mentions" in p for p in preflight(meta, "tiktok", 35.0))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Only a URL (https://, www.) carries a path a tag can sit in (CLP-112 fix round 2).
+        "@bob/#ad hi",
+        "lol.ok/#ad hi",
+        "1.2.3.4/#ad",
+        "name dot com/#ad",
+        "name[.]com/#ad",
+        "x.co/#ad#fyp#viral",
+        "@bob/#fyp hi",
+        "site.com/page#fyp",
+        # Caught before, still caught.
+        "word.#ad",
+        "x.co#ad",
+        "see.it#ad",
+        "e.g/#ad",
+        "and/or #ad",
+    ],
+)
+def test_a_tag_after_a_mention_or_bare_domain_is_read_as_a_tag(text):
+    assert _plain_problems(text) != []
+    once = clean_caption(text)
+    assert not any(t in once for t in ("#ad", "#fyp", "#viral"))
+    assert _plain_problems(once) == []
+
+
+@pytest.mark.parametrize(
+    "url", ["https://x.co/#ad", "www.x.co/page#sponsored", "https://x.co/p#аd"]
+)
+def test_a_disclosure_like_tag_inside_a_url_is_kept_but_holds_a_plain_post(url):
+    text = f"see {url} now"
+    assert clean_caption(text) == text  # the URL is never cut
+    assert any("disclosure-like" in p for p in _plain_problems(text))
 
 
 def test_the_vendored_tables_hold_their_invariants():

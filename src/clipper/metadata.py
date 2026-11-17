@@ -134,7 +134,10 @@ _IDNA_DOTS = str.maketrans({"\u3002": ".", "\uff61": ".", "\ufe12": ".", "\u2024
 _HOST = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
 _INLINE_TAG = re.compile(r"#\w+")
 _LINK_PATH = re.compile(r"(?:/\S*)?")
-"""The path after a matched link: a bare domain's match ends at its TLD."""
+"""The rest of a URL's path, where its match stopped short."""
+_URL = re.compile(r"(?i:https?://|www\.)")
+"""Only a link written as a URL carries a path a `#` can sit in; after a mention, an IP or a
+bare, spoken or obfuscated domain (`@bob/#ad`, `x.co/#ad`) a `#` starts a tag."""
 _LINK_IN_PATH = re.compile(rf"(?i:www\.|https?:|[\w-]\.(?:{_TLDS})\b)")
 """Another link inside an allowed URL's path; a file name ("download.html") is fine."""
 
@@ -270,44 +273,44 @@ def _readings(tag: str) -> list[str]:
         readings.append(capitals)
     scripts = _scripts(unicodedata.normalize("NFKC", tag))
     if "LATIN" in scripts and scripts & _CJK:
-        readings.append(
-            "".join(c for c in folded if c.isascii() or (c.isalpha() and _script(c) == "LATIN"))
-        )
+        readings += [
+            "".join(c for c in r if c.isascii() or (c.isalpha() and _script(c) == "LATIN"))
+            for r in list(readings)
+        ]
     return readings
 
 
-def _keys(folded: str, *, trailing_digits: bool = False) -> set[str]:
+_ONE_LETTER = str.maketrans("l", "i")
+
+
+def _key(folded: str, *, trailing_digits: bool = False) -> str:
     """What a prefolded reading is compared as: without `_` (and, with `trailing_digits`,
-    without digits at the end), skeleton taken with digits read as letters (`#v1ral`,
-    `#f0r_y0u`) and as confusables reads them (`#co11ab`: 1 reads l)."""
+    without digits at the end), its skeleton with the other digits read as letters, and i
+    and l as one letter, so 1 and a capital I written for either match too (`#v1ra1`,
+    `#viraI`, `#co11ab`, `#f0r_y0u`; 0 and o are already one)."""
     key = folded.replace("_", "")
     if trailing_digits:
         key = key.rstrip("0123456789")
-    return {_skeleton(key.translate(_LOOKALIKE_DIGITS)), _skeleton(key)}
+    return _skeleton(key).translate(_LOOKALIKE_DIGITS).translate(_ONE_LETTER)
 
 
-_GENERIC_KEYS = frozenset(k for t in GENERIC_HASHTAGS for k in _keys(_prefold(t)))
-_DISCLOSURE_KEYS = frozenset(
-    k for t in DISCLOSURE_HASHTAGS for k in _keys(_prefold(t), trailing_digits=True)
-)
+_GENERIC_KEYS = frozenset(_key(_prefold(t)) for t in GENERIC_HASHTAGS)
+_DISCLOSURE_KEYS = frozenset(_key(_prefold(t), trailing_digits=True) for t in DISCLOSURE_HASHTAGS)
 _DISCLOSURE_PREFIX_KEYS = tuple(
-    k for t in DISCLOSURE_PREFIXES for k in _keys(_prefold(t), trailing_digits=True)
+    _key(_prefold(t), trailing_digits=True) for t in DISCLOSURE_PREFIXES
 )
 
 
 def is_generic(tag: str) -> bool:
     """A reach tag, or a lookalike of one (`#ꜰʏᴘ`, `#vırɑl`, `#v1ral`, `#f_y_p`, `#fypノ`)."""
-    return any(k in _GENERIC_KEYS for r in _readings(tag) for k in _keys(r))
+    return any(_key(r) in _GENERIC_KEYS for r in _readings(tag))
 
 
 def is_disclosure(tag: str) -> bool:
     """A paid-partnership tag, or a lookalike of one (`#аԁ`, `#ꜱponsored`, `#co11ab`,
     `#ad一`)."""
-    return any(
-        k in _DISCLOSURE_KEYS or k.startswith(_DISCLOSURE_PREFIX_KEYS)
-        for r in _readings(tag)
-        for k in _keys(r, trailing_digits=True)
-    )
+    keys = [_key(r, trailing_digits=True) for r in _readings(tag)]
+    return any(k in _DISCLOSURE_KEYS or k.startswith(_DISCLOSURE_PREFIX_KEYS) for k in keys)
 
 
 def _is_padding(char: str) -> bool:
@@ -471,17 +474,19 @@ def _link_host(link: str) -> str | None:
     return host
 
 
-def _inline_tags(text: str) -> list[tuple[str, int, int]]:
+def _inline_tags(text: str, *, in_links: bool = False) -> list[tuple[str, int, int]]:
     """Each hashtag written into `text`, as read on the match copy (so `#fyp` padded with
     an invisible or combining character reads as `#fyp`), with its span in `text`. The
     span runs to the next character the copy kept, so the padding and any marks after the
     tag go with it (the copy keeps no marks). A tag with an invisible character inside
     (`#fyp` + ZWJ + `x`) is also read up to it, since a platform may end the tag there; both
-    readings share the span. A `#` inside a link or its path (`https://site.com/page#fyp`,
-    `site.com/page#fyp`) starts no tag: the link rules judge it."""
+    readings share the span. A `#` inside a URL (`https://site.com/page#fyp`) starts no tag
+    unless `in_links`: the link rules judge it (see `_URL`)."""
     copy, origin = _match_copy(text)
     links = [
-        (m.start(), _LINK_PATH.match(copy, m.end()).end()) for m in LINK_OR_MENTION.finditer(copy)
+        (m.start(), _LINK_PATH.match(copy, m.end()).end() if _URL.match(m.group(0)) else m.end())
+        for m in LINK_OR_MENTION.finditer(copy)
+        if not in_links
     ]
     tags: list[tuple[str, int, int]] = []
     for m in _INLINE_TAG.finditer(copy):
@@ -542,9 +547,15 @@ def inline_unusable_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
 
 
 def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
-    """Disclosure-like hashtags written into `text` itself, other than `allowed` ones."""
+    """Disclosure-like hashtags written into `text` itself, other than `allowed` ones. A
+    `#` inside a URL counts here too (fail closed): stripping leaves URLs whole, so a
+    disclosure-like fragment holds the post for a person to look at."""
     ok = {_fold(t) for t in allowed}
-    return [t for t, _, _ in _inline_tags(text) if is_disclosure(t) and _fold(t) not in ok]
+    return [
+        t
+        for t, _, _ in _inline_tags(text, in_links=True)
+        if is_disclosure(t) and _fold(t) not in ok
+    ]
 
 
 def _unusable(tag: str) -> bool:

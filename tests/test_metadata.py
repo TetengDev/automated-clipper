@@ -605,11 +605,13 @@ def test_plain_preflight_skips_only_the_campaign_rules():
         flags={},
     )
     problems = preflight(bad, "youtube", 200.0, plain=True)
-    assert [p.split(" ", 2)[1] for p in problems] == [
-        "clip",  # length
-        "16",  # hashtags over the platform's cap
-        "generic",
-        "title",  # < or >
-        "disclosure-like",
-        "title",  # too long
+    expected = [
+        "clip length 200 s",
+        "16 hashtags, at most 15",
+        "generic hashtags #FYP",
+        "contains < or >",
+        "disclosure-like tags in the text: #ad",
+        "title is longer than 100",
     ]
+    assert len(problems) == len(expected)
+    assert all(any(e in p for p in problems) for e in expected), problems

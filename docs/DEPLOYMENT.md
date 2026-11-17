@@ -253,6 +253,11 @@ fails is `held` with the reason on the review app's Scheduled page and in
 `clipper posts list`, and it is never published. Logos, negative framing and reposts
 cannot be seen by the pipeline: the reviewer checks them before approving.
 
+A post for an account outside any campaign goes through the platform part of the same
+check: the platform's length, title, caption and hashtag limits, generic hashtags, and
+disclosure-like tags (`#ad`, `#sponsored`) written into the title or caption. A post that
+fails is held the same way. Links, mentions and too few hashtags hold only campaign posts.
+
 The worker runs the same check again just before it publishes, with the config as it is
 on disk (reloaded when `creators.yaml`, `accounts.yaml` or `campaigns.yaml` changes), so a
 campaign that was disabled, ended or tightened after scheduling (or a post rescheduled

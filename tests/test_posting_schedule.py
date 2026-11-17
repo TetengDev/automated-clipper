@@ -20,7 +20,7 @@ from clipper.posting.models import (
     InvalidPostTransition,
     PostStatus,
 )
-from clipper.posting.scheduler import schedule_for_clip
+from clipper.posting.scheduler import recheck_held, schedule_for_clip
 from posting_support import FakeAccount
 from review_support import Env, make_env
 
@@ -359,6 +359,21 @@ def test_a_plain_post_outside_the_platforms_length_is_held(env: Env) -> None:
 
     assert post.status == PostStatus.HELD
     assert post.error == "instagram: clip length 200 s is outside 3-180 s"
+
+
+def test_recheck_releases_a_held_plain_post_only_once_it_passes(env: Env) -> None:
+    account = FakeAccount(id="ig_main", platform="instagram")
+    clip_id = approved_clip(env, duration_s=200.0)
+    (held,) = schedule_for_clip(env.conn, clip_id, [account], NOW)
+
+    def recheck():
+        return recheck_held(env.conn, [account], {}, NOW, is_sensitive=lambda _: False)
+
+    assert [p.id for p in recheck().still_held] == [held.id]
+    env.conn.execute("UPDATE clip_versions SET duration_s = 60 WHERE clip_id = ?", (clip_id,))
+    (released,) = recheck().released
+    assert released.id == held.id
+    assert released.status == PostStatus.SCHEDULED and released.error is None
 
 
 def test_a_plain_post_is_not_held_for_links_mentions_or_few_hashtags(env: Env) -> None:

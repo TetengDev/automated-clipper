@@ -355,4 +355,10 @@ pipeline uses, yt-dlp, yt-dlp-ejs with yt-dlp's version and hash checks, Deno wi
 challenge-solver run, node), then exits 1 if any check failed. Locally: `uv run clipper
 doctor`.
 
+`run-worker` and `run-monitor` also run the yt-dlp-ejs and Deno checks once at boot
+([CLP-129](https://linear.app/tengdev/issue/CLP-129)). A failure is logged at ERROR with the
+same hint `doctor` prints and sent to the alerts webhook (`DISCORD_ALERTS_WEBHOOK_URL`, else
+`DISCORD_WEBHOOK_URL`); the service keeps running, because yt-dlp still downloads without the
+solver, just with fewer formats. A passing check logs one INFO line.
+
 See `docs/RUNBOOK.md` (written in E5-S8). It covers YouTube bot blocks, quota, stuck jobs, a full disk, budgets, Twitch auth, key rotation, rollback, restore, and adding a creator.

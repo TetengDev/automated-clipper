@@ -1,0 +1,77 @@
+name: Nightly slow tests
+
+# The `slow` and `render` tests skip in CI: a real `tiny` Whisper model, real scene and face
+# detection, and real Remotion renders. This runs them against dev every night (CLP-72); a
+# failure shows up as GitHub's failed-run notification. `schedule` only fires from the
+# default branch's copy of this file.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  slow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Absolute: conftest runs each test in its own tmp dir, so the relative default
+      # (data/models) would not find the models. The tiny Whisper test reads data/models
+      # under the checkout directly, so both point at the same place.
+      CLIPPER_MODELS_DIR: ${{ github.workspace }}/data/models
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.11.31"
+          enable-cache: true
+          save-cache: ${{ github.ref == 'refs/heads/dev' }}
+
+      # A stalled mirror once hung this step for over an hour (CLP-131): apt retries
+      # and times out per request, the whole install retries once, and the step is capped.
+      - name: Install ffmpeg
+        timeout-minutes: 10
+        run: |
+          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
+          apt_install() { "${apt[@]}" update && "${apt[@]}" install -y --no-install-recommends ffmpeg; }
+          apt_install || apt_install
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: render/package-lock.json
+
+      # As in the Dockerfile: no lifecycle scripts, and Chrome headless shell fetched up
+      # front so the first render test does not download it.
+      - name: Install render dependencies
+        working-directory: render
+        run: |
+          npm ci --ignore-scripts
+          npx --no-install remotion browser ensure
+
+      # Each fails the step if the pinned download cannot be fetched or verified (a missing
+      # model would only skip its test).
+      - name: Fetch models
+        run: |
+          uv run python -m clipper.pipeline.local_asr fetch \
+            Systran/faster-whisper-tiny d90ca5fe260221311c53c58e660288d3deb8d356 "$CLIPPER_MODELS_DIR"
+          uv run python -c "import sys; from clipper.pipeline.reframe import ensure_model; sys.exit(ensure_model() is None)"
+
+      # The live YouTube probe is left out: YouTube often bot-blocks GitHub runner IPs, so
+      # it would fail for reasons outside the code. Run it by hand (docs/DEPLOYMENT.md).
+      - name: Slow and render tests
+        env:
+          CLIPPER_SLOW_TESTS: "1"
+        run: >-
+          uv run pytest -m "slow or render" -q
+          --deselect tests/test_ytdlp.py::test_real_probe_solves_youtube_challenges_with_deno

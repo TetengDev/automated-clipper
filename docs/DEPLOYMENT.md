@@ -305,6 +305,11 @@ campaign. `clipper campaigns list` lists every submission.
   1. Rebuild the image with the latest yt-dlp.
   2. Smoke-test a metadata fetch and a 10 s section download.
   3. If the smoke test passes, auto-tag a patch release. If it fails, send a Discord alert.
+- **`nightly-slow.yml`** runs the `slow` and `render` tests that normal CI skips, every night against dev, on manual dispatch, and on a PR that changes the workflow file:
+  1. Install ffmpeg, Node, the render dependencies and Chrome headless shell.
+  2. Fetch the pinned `tiny` Whisper model and the face model.
+  3. Run the tests. Any skipped test fails the run. The live YouTube probe is left out, because YouTube often blocks GitHub runner IPs.
+  4. On failure, GitHub sends its failed-run notification. For a scheduled run, GitHub emails only the person who last edited the workflow's cron line.
 - **Migrations** run when a service starts. They are additive only, so rolling back is always safe.
 
 ## Environments

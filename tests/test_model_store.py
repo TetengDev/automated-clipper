@@ -28,6 +28,7 @@ from asr_support import (
     FAKE_MODEL_SHA256,
     FAKE_PINS,
     FakeAsr,
+    FakeWhisperModel,
     install_fake_asr,
     write_snapshot,
 )
@@ -409,3 +410,26 @@ def test_the_lock_file_is_shared_with_every_uid(fake_asr: FakeAsr, tmp_path: Pat
     finally:
         os.umask(previous)
     assert stat.S_IMODE(os.stat(tmp_path / "models" / ".lock").st_mode) == 0o666
+
+
+def test_a_failed_load_leaves_the_marker_while_another_process_holds_the_lock(
+    fake_asr: FakeAsr,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """That process may be checking or healing the snapshot; the marker is dropped on a
+    later failed load instead, when the lock is free."""
+    snapshot = local().ensure_model()
+    monkeypatch.setattr(FakeWhisperModel, "load_error", RuntimeError("Unable to load model.bin"))
+    with (
+        held_lock(tmp_path / "models"),
+        caplog.at_level(logging.WARNING, logger=tr.__name__),
+        pytest.raises(MediaError, match="model load failed"),
+    ):
+        local().transcribe(tmp_path / "c.flac", language="en")
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+    assert "model store busy; marker kept" in caplog.text
+    with pytest.raises(MediaError, match="model load failed"):
+        local().transcribe(tmp_path / "c.flac", language="en")  # lock free now
+    assert not (snapshot / tr.COMPLETE_MARKER).exists()

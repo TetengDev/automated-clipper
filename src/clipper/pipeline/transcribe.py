@@ -515,13 +515,31 @@ class FasterWhisperTranscriber:
     def drop_marker(self) -> None:
         """Make the next `ensure_model` fetch and fully verify the snapshot again: the
         model failed to load, and the cheap check before each job misses damage inside
-        model.bin's bytes."""
+        model.bin's bytes. Only with the store lock, never waiting for it: a process that
+        holds it may be checking or healing this snapshot, and the next failed load drops
+        the marker instead."""
         marker = self.snapshot_dir / COMPLETE_MARKER
-        if marker.is_file():
+        if not marker.is_file():
+            return
+        try:
+            fd = _open_store_lock(self.models_dir, f"whisper model {self.model}")
+        except (MediaError, OSError) as exc:
+            logger.warning("whisper model %s: marker kept, no store lock: %s", self.model, exc)
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                logger.warning(
+                    "whisper model %s: load failed; model store busy; marker kept", self.model
+                )
+                return
             logger.warning(
                 "whisper model %s: load failed; snapshot to be verified again", self.model
             )
             marker.unlink(missing_ok=True)
+        finally:
+            os.close(fd)
 
     def transcribe(
         self, audio: Path, *, language: str | None, timeout_s: float | None = None

@@ -12,8 +12,10 @@ import fcntl
 import hashlib
 import logging
 import os
+import stat
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -366,3 +368,44 @@ def test_a_pruned_store_file_takes_its_manifest_and_lock_file_along(
     assert not old.with_name(old.name + ".lock").exists()
     assert kept.with_name(kept.name + ".refs").exists()
     assert kept.with_name(kept.name + ".lock").exists()
+
+
+def test_a_fifo_planted_as_the_lock_file_is_refused_without_hanging(
+    fake_asr: FakeAsr, tmp_path: Path
+) -> None:
+    models = tmp_path / "models"
+    models.mkdir()
+    os.mkfifo(models / ".lock")
+    outcome: list[BaseException | Path] = []
+
+    def run() -> None:
+        try:
+            outcome.append(local().ensure_model(timeout_s=5))
+        except BaseException as exc:  # surfaced below
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)  # a hung open must not hang pytest
+    thread.start()
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "ensure_model blocked opening a FIFO"
+    (error,) = outcome
+    assert isinstance(error, MediaError) and not isinstance(error, PermanentError)
+    assert "not a regular file" in str(error)
+    assert fake_asr.fetch_calls() == []
+
+
+def test_a_dir_planted_as_the_lock_file_is_refused(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    (tmp_path / "models" / ".lock").mkdir(parents=True)
+    with pytest.raises(MediaError, match="not a regular file"):
+        local().ensure_model(timeout_s=5)
+    assert fake_asr.fetch_calls() == []
+
+
+def test_the_lock_file_is_shared_with_every_uid(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    """Like the Hub client's own locks: another uid's umask must not lock the worker out."""
+    previous = os.umask(0o077)
+    try:
+        local().ensure_model()
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(os.stat(tmp_path / "models" / ".lock").st_mode) == 0o666

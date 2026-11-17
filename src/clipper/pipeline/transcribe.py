@@ -32,7 +32,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
@@ -603,14 +603,32 @@ def _describe(problems: dict[str, FileProblem]) -> str:
     return "; ".join(f"{name} {p.reason}" for name, p in problems.items())
 
 
+def _open_store_lock(models_dir: Path, what: str) -> int:
+    """An fd on the models dir's lock file, for `flock`. Read-only (`flock` needs no write
+    access) and shared with every uid (0o666, as the Hub client does), so a lock file
+    `bench-transcribe` created as another user still works. Non-blocking, so a FIFO
+    planted there cannot hang the open; anything but a regular file is refused with a
+    retryable `MediaError`. The fd is not inherited (PEP 446): a child never holds it."""
+    flags = os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(models_dir / STORE_LOCK, flags, 0o666)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise MediaError(f"{what}: {models_dir / STORE_LOCK} is not a regular file")
+        if info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) != 0o666:
+            with suppress(OSError):
+                os.fchmod(fd, 0o666)  # the umask narrowed it
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 @contextmanager
 def _store_lock(models_dir: Path, timeout_s: float, what: str) -> Iterator[None]:
     """Hold `fcntl.flock` on the models dir's lock file; a retryable `MediaError` when
-    another process holds it for all of `timeout_s` (e.g. a long fetch). The fd is not
-    inherited (PEP 446), so a child never keeps the lock. Read-only: `flock` needs no
-    write access, so a lock file another uid created (e.g. `bench-transcribe` run as the
-    operator) still works."""
-    fd = os.open(models_dir / STORE_LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    another process holds it for all of `timeout_s` (e.g. a long fetch)."""
+    fd = _open_store_lock(models_dir, what)
     try:
         deadline = time.monotonic() + timeout_s
         while True:

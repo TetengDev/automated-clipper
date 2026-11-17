@@ -24,6 +24,7 @@ settings:
   disk_budget_gb: 150
   media_retention_hours: 48
   review_expiry_days: 7
+  rejected_retention_days: 14     # rejected/archived clips' files are deleted after this
   reframe: auto                   # auto = face-tracked crop when faces are found; or blurred_fill
   jump_cuts: silences             # cuts inside a clip: silences, full (+ stutters, fillers) or off
 

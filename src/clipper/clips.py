@@ -42,6 +42,7 @@ class ReviewAction(StrEnum):
     EXPORT = "export"
     EXPORT_FAILED = "export_failed"
     VARIANTS_EDITED = "variants_edited"
+    ARCHIVE = "archive"  # by the janitor, after review_expiry_days (CLP-38)
 
 
 REJECT_REASONS: tuple[str, ...] = (

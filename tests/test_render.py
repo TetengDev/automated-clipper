@@ -774,7 +774,8 @@ def test_run_process_wait_after_kill_is_bounded(
 
             def communicate(timeout: float | None = None) -> Any:
                 if timeout == 5:  # the stage's own wait: interrupted once the escapee runs
-                    while not pidfile.exists():
+                    deadline = time.monotonic() + 10
+                    while not pidfile.exists() and time.monotonic() < deadline:
                         time.sleep(0.05)
                     raise KeyboardInterrupt
                 return real(timeout=timeout)

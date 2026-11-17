@@ -1179,15 +1179,21 @@ def test_any_jump_cut_error_keeps_the_clip_whole(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    word = "secret"  # only in the message: the frames show the source line
+
     def boom(*a: Any, **kw: Any) -> Any:
-        raise ValueError("bad cut")
+        raise ValueError(f"bad cut\n{word}")
 
     monkeypatch.setattr(rc, "plan_cuts", boom)
     edl = _render_mode(conn, tmp_path, fake, "silences", "aaaaaaaaaaa", _gap_words())
     assert (edl.segments, edl.cuts) == (None, ())
     (record,) = [r for r in caplog.records if "jump cuts rejected" in r.getMessage()]
-    # A logic bug must not hide behind the fallback: the traceback is logged.
-    assert record.levelname == "WARNING" and record.exc_info is not None
+    # A logic bug must not hide behind the fallback: the exception type and its frames
+    # are logged, but never its raw message (CLP-79), only the cleaned first line.
+    message = record.getMessage()
+    assert record.levelname == "WARNING" and record.exc_info is None
+    assert "ValueError" in message and "in boom" in message and "bad cut" in message
+    assert "secret" not in caplog.text
     assert len(_rows(conn)) == 1
 
 

@@ -462,6 +462,31 @@ def test_over_budget_deletes_the_oldest_source_media_first_until_under(
     assert report.freed_bytes == 100 * (len(SOURCE_FILES) + len(SECTION_FILES))
 
 
+def test_the_models_dir_counts_toward_the_disk_budget(
+    conn: sqlite3.Connection, root: Path, tmp_path: Path
+) -> None:
+    """CLP-76: the Whisper models share the disk. The janitor only reads them (the monitor
+    mounts them read-only); it frees space from source media instead."""
+    add_job(conn, "aaaaaaaaaaa", age=HOUR)  # well inside media retention
+    job = job_dir(root, "aaaaaaaaaaa")
+    models = tmp_path / "models"
+    weights = models / "models--Systran--faster-whisper-tiny" / "blobs" / "weights"
+    weights.parent.mkdir(parents=True)
+    with weights.open("wb") as fh:
+        fh.truncate(2 * GB)  # sparse: counts 2 GB, takes no space
+    alerts: list[str] = []
+    janitor = make(conn, root, alerts=alerts, disk_budget_gb=1)
+    janitor.models_dir = models
+
+    report = janitor.run()
+
+    assert report.usage_bytes is not None and report.usage_bytes > 2 * GB
+    assert alerts and "media and models use 2.0 GB" in alerts[0]
+    assert not (job / "audio_16k.flac").exists()
+    assert (job / "clips" / "1" / "v1.mp4").is_file()
+    assert weights.stat().st_size == 2 * GB
+
+
 def test_disk_alert_fires_once_per_crossing_of_80_percent(
     conn: sqlite3.Connection, root: Path
 ) -> None:

@@ -13,10 +13,12 @@ logged and reported; the others still run.
   (`v<N>.mp4/jpg/json`), transcripts and the other small artifacts stay.
 - `prune_dead_clips`: `rejected` and `archived` clips lose their clip dir
   `rejected_retention_days` after their last status change. Their DB rows stay.
-- `enforce_disk_budget`: measures the media dir. At 80% of `disk_budget_gb` the `alert`
-  notifier fires once per crossing; it fires again only after usage has dropped below 80%.
-  That state is kept in memory, so a restart can send it once more. Above the budget, the
-  source media of `clips_ready` jobs goes too, oldest job first, until usage is under it.
+- `enforce_disk_budget`: measures the media dir and the Whisper models dir (`models_dir`,
+  which it only reads: run-monitor mounts it read-only, and the worker prunes it, CLP-76).
+  At 80% of `disk_budget_gb` the `alert` notifier fires once per crossing; it fires again
+  only after usage has dropped below 80%. That state is kept in memory, so a restart can
+  send it once more. Above the budget, the source media of `clips_ready` jobs goes too,
+  oldest job first, until usage is under it.
 
 Deletion rules. Files are deleted only here, and only inside `media_root`:
 - Paths are built from validated parts (`SourceRef.key`, a clip's rank, fixed names) under
@@ -95,7 +97,7 @@ class JanitorReport:
     """Files deleted."""
     freed_bytes: int = 0
     usage_bytes: int | None = None
-    """The media dir's size, as measured for the disk budget."""
+    """The media dir's size plus the models dir's, as measured for the disk budget."""
     errors: list[str] = field(default_factory=list)
 
 
@@ -107,6 +109,8 @@ class Janitor:
     alert: Notify
     clock: Clock = utcnow
     disk_usage: Callable[[Path], int] = media_bytes
+    models_dir: Path | None = None
+    """Counted in the disk budget, never cleaned here."""
     last_run: datetime | None = None
     disk_alerted: bool = False
     """Usage is at or above 80% and the alert went out; reset once it drops below."""
@@ -202,12 +206,14 @@ class Janitor:
         budget = budget_gb * GB
         root = self.media_root.resolve()
         used = self.disk_usage(root)
+        if self.models_dir is not None:
+            used += self.disk_usage(self.models_dir.resolve())
         report.usage_bytes = used
         if used < ALERT_SHARE * budget:
             self.disk_alerted = False
         elif not self.disk_alerted:
             text = (
-                f"Disk: media uses {used / GB:.1f} GB, {used / budget:.0%} of the"
+                f"Disk: media and models use {used / GB:.1f} GB, {used / budget:.0%} of the"
                 f" {budget_gb} GB disk budget"
             )
             try:
@@ -224,8 +230,8 @@ class Janitor:
             if used <= budget:
                 return
         logger.warning(
-            "janitor: media uses %.1f GB, over the %d GB disk budget, with no source media"
-            " left to delete",
+            "janitor: media and models use %.1f GB, over the %d GB disk budget, with no"
+            " source media left to delete",
             used / GB,
             budget_gb,
         )

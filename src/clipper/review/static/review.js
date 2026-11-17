@@ -1,4 +1,5 @@
-// Keyboard shortcuts on the clip page: a approve, r reject, j/k next/previous.
+// Keyboard shortcuts on the clip page: a approve, r reject, j/k next/previous; and live
+// counters on the per-platform title and caption fields.
 // External file because the CSP forbids inline scripts.
 (function () {
   "use strict";
@@ -64,5 +65,48 @@
   document.addEventListener("keydown", function (event) {
     if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
     if (handle(event.key, event.target)) event.preventDefault();
+  });
+
+  // Counters (CLP-117). A field says how its platform counts (`data-count`): code points on
+  // Instagram, YouTube and Facebook, where `maxlength` (UTF-16 units) would stop an emoji
+  // caption at half the limit, or UTF-16 units on TikTok. The server's check still decides.
+  function measure(field) {
+    var value = field.value;
+    return field.getAttribute("data-count") === "code-points" ? Array.from(value).length : value.length;
+  }
+
+  function number(n) {
+    return n.toLocaleString("en-US");
+  }
+
+  function countText(field) {
+    var limit = parseInt(field.getAttribute("data-limit"), 10);
+    var used = measure(field);
+    var unit = field.getAttribute("data-unit");
+    if (used > limit) return number(used - limit) + " " + unit + " over the limit of " + number(limit);
+    return number(used) + " of " + number(limit) + " " + unit;
+  }
+
+  // One polite live region, written once typing pauses, so a screen reader is not read
+  // every keystroke.
+  var announceTimer = null;
+  function announce(text) {
+    var status = document.getElementById("variant-count-status");
+    if (!status) return;
+    window.clearTimeout(announceTimer);
+    announceTimer = window.setTimeout(function () {
+      status.textContent = text;
+    }, 1000);
+  }
+
+  document.addEventListener("input", function (event) {
+    var field = event.target;
+    if (!field || !field.hasAttribute || !field.hasAttribute("data-counter")) return;
+    var out = document.getElementById(field.getAttribute("data-counter"));
+    if (!out) return;
+    var text = countText(field);
+    out.textContent = text;
+    out.classList.toggle("over", measure(field) > parseInt(field.getAttribute("data-limit"), 10));
+    announce(field.getAttribute("data-label") + ": " + text);
   });
 })();

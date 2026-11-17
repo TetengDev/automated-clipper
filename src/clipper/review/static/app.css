@@ -136,6 +136,9 @@ p.sensitive-note { font-weight: 600; margin: 0 0 0.75rem; }
 .variant summary { cursor: pointer; font-weight: 600; }
 .variant label { display: block; margin-top: 0.5rem; font-size: 0.875rem; }
 .variant input, .variant textarea { width: 100%; box-sizing: border-box; }
+.char-count { color: var(--muted); font-size: 0.8rem; margin: 0.25rem 0 0; }
+.char-count.over { color: var(--error); font-weight: 600; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .variant-notice { border-left: 3px solid var(--accent); margin: 0.5rem 0; padding-left: 0.75rem; font-size: 0.875rem; }
 .actions { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; }
 .reject { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }

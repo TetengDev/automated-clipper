@@ -176,6 +176,12 @@ class PlatformLimits:
     documentation says otherwise."""
     unit: str = "characters"
 
+    @property
+    def counts_code_points(self) -> bool:
+        """Whether `length` counts code points. An HTML `maxlength` counts UTF-16 units, so
+        the review editor sets one only where the platform counts those too (CLP-117)."""
+        return self.length is len
+
 
 PLATFORM_LIMITS: Mapping[str, PlatformLimits] = {
     # TikTok counts its limits in UTF-16 units: an emoji is usually two.

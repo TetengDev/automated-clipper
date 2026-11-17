@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from clipper import clips
-from clipper.metadata import fingerprint
+from clipper.metadata import caption_room, fingerprint
 from review_support import Env, login, make_env
 
 PLATFORMS = ("tiktok", "instagram", "youtube", "facebook")
@@ -429,3 +429,80 @@ def test_link_warnings_show_the_text_as_typed(client: TestClient, env: Env) -> N
     html = client.get(f"/clip/{clip_id}").text
 
     assert "links or mentions: prize．com, Scam.Rocks</p>" in html
+
+
+# --- the editor lets a reviewer type as much as Variant accepts (CLP-117) ---------------------
+
+FIRE = "\U0001f525"  # one code point, two UTF-16 units
+
+
+def field_tag(html: str, field_id: str) -> str:
+    match = re.search(rf'<(?:input|textarea) id="{field_id}"[^>]*>', html)
+    assert match is not None, field_id
+    return match.group(0)
+
+
+def counter(html: str, field_id: str) -> str:
+    match = re.search(rf'<p id="{field_id}-count"[^>]*>([^<]*)</p>', html)
+    assert match is not None, field_id
+    return match.group(1)
+
+
+@pytest.mark.parametrize("platform", ["instagram", "youtube", "facebook"])
+def test_code_point_platforms_have_a_counter_instead_of_maxlength(
+    client: TestClient, env: Env, platform: str
+) -> None:
+    """HTML maxlength counts UTF-16 units: an emoji caption would stop at half the limit."""
+    clip_id = env.clip()
+    store(env, clip_id, {**STORED, platform: {**STORED[platform], "caption": FIRE * 3}})
+    room = caption_room(platform, STORED[platform]["hashtags"])
+
+    html = client.get(f"/clip/{clip_id}").text
+
+    for field, limit, count in (("title", 100, len(f"{platform} title")), ("caption", room, 3)):
+        tag = field_tag(html, f"{platform}-{field}")
+        assert "maxlength" not in tag
+        assert f'data-limit="{limit}"' in tag and 'data-count="code-points"' in tag
+        assert f"{platform}-{field}-count" in described_by(html, f"{platform}-{field}")
+        assert counter(html, f"{platform}-{field}") == f"{count} of {limit:,} characters"
+
+
+def test_tiktok_keeps_maxlength_and_counts_utf16_units(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    store(env, clip_id, {**STORED, "tiktok": {**STORED["tiktok"], "caption": FIRE * 3}})
+    room = caption_room("tiktok", STORED["tiktok"]["hashtags"])
+
+    html = client.get(f"/clip/{clip_id}").text
+
+    tag = field_tag(html, "tiktok-caption")
+    assert f'maxlength="{room}"' in tag and 'data-count="utf16"' in tag
+    assert 'maxlength="100"' in field_tag(html, "tiktok-title")
+    assert counter(html, "tiktok-caption") == f"6 of {room:,} UTF-16 units"
+
+
+def test_the_counter_announces_through_one_polite_live_region(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    store(env, clip_id, STORED)
+
+    html = client.get(f"/clip/{clip_id}").text
+
+    section = html[html.index('id="clip-variants"') : html.index('id="action-error"')]
+    assert section.count("aria-live=") == 1  # one region for every field, not one per field
+    assert re.search(
+        r'<p id="variant-count-status" class="visually-hidden" aria-live="polite">', html
+    )
+
+
+def test_an_emoji_caption_past_half_the_limit_saves_on_instagram(
+    client: TestClient, env: Env
+) -> None:
+    clip_id = env.clip()
+    store(env, clip_id, STORED)
+    room = caption_room("instagram", STORED["instagram"]["hashtags"])
+
+    accepted = post(client, clip_id, version=1, instagram_caption=FIRE * room)
+    too_long = post(client, clip_id, version=1, instagram_caption=FIRE * (room + 1))
+
+    assert accepted.status_code == 200
+    assert stored(env, clip_id)["instagram"]["caption"] == FIRE * room
+    assert too_long.status_code == 422

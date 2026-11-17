@@ -1046,6 +1046,7 @@ def early_claims(monkeypatch: pytest.MonkeyPatch, lead: timedelta = LEAD) -> Non
         platforms: Collection[str],
         limit: int = 10,
         exclude: Collection[int] = (),
+        early: object = None,  # PR #54 passes this; the stub always claims early
     ) -> list[Post]:
         with transaction(conn):
             rows = conn.execute(

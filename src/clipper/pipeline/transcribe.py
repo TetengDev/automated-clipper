@@ -386,12 +386,15 @@ def _run_asr(
 ) -> RunResult:
     """Run the ASR child like ffmpeg (`run_media`), but tell a model that cannot be loaded
     (permanent) apart from a crash, OOM kill or timeout (retryable). `on_load_failure`
-    runs first when the child could not load the model, for either reason."""
+    runs first when loading the model failed in a way damaged files cause (`EXIT_LOAD`);
+    not for `EXIT_MODEL`, a setup that can never load (e.g. an unsupported compute type),
+    which would otherwise cost a re-fetch and full hash on every job. A corrupt small file
+    such as config.json is caught by the per-job small-file hash instead."""
     try:
         result = default_runner()(args, timeout_s)
     except CommandTimeout as exc:
         raise MediaError(f"{what}: {exc}") from None
-    if on_load_failure and result.returncode in (local_asr.EXIT_MODEL, local_asr.EXIT_LOAD):
+    if on_load_failure and result.returncode == local_asr.EXIT_LOAD:
         on_load_failure()
     if result.returncode == local_asr.EXIT_MODEL:
         raise PermanentError(f"{what}: cannot load the model: {stderr_tail(result.stderr)}")

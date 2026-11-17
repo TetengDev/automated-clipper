@@ -141,9 +141,11 @@ The worker transcribes with faster-whisper on CPU (`transcriber: local`, the def
   retries later. A file with the wrong bytes also loses its blob, so the next fetch
   downloads it instead of linking the same bytes again.
 - **Self-heal**: before each job a marked snapshot is checked cheaply (every file's size,
-  the small files' hashes, model.bin's blob name), so a truncated blob is fetched again. If
-  the model still fails to load, the worker removes the marker and the next attempt
-  fetches and fully hashes the snapshot.
+  the small files' hashes, model.bin's blob name, no unpinned files, no links out of the
+  models dir), so a truncated blob or a planted file is fetched again. If CTranslate2
+  still fails to load the weights, the worker removes the marker and the next attempt
+  fetches and fully hashes the snapshot. A setup that can never load (such as a compute
+  type the CPU lacks) fails the job without touching the marker.
 - **Image**: faster-whisper and its native wheels (CTranslate2, onnxruntime, PyAV) add
   about 320 MB to the image.
 

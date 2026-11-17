@@ -1287,23 +1287,14 @@ def test_swapped_tokenizer_fails_verification(fake_asr: FakeAsr, tmp_path: Path)
     assert (snapshot / "tokenizer.json").read_bytes() == FAKE_FILES["tokenizer.json"]
 
 
-@pytest.mark.parametrize(
-    ("error", "permanent"),
-    [
-        (RuntimeError("Unable to load model.bin: unexpected end of file"), False),
-        (ValueError("config.json: Expecting value: line 1 column 1"), True),
-    ],
-)
-def test_model_load_failure_drops_the_marker(
-    fake_asr: FakeAsr, tmp_path: Path, error: BaseException, permanent: bool
-) -> None:
+def test_model_load_failure_drops_the_marker(fake_asr: FakeAsr, tmp_path: Path) -> None:
     """CLP-75: weights damaged in a way the cheap check misses fail the load; the next
     attempt then fetches and fully verifies the snapshot instead of failing again."""
     snapshot = local().ensure_model()
-    FakeWhisperModel.load_error = error
-    with pytest.raises(PermanentError if permanent else MediaError, match="load") as exc:
+    FakeWhisperModel.load_error = RuntimeError("Unable to load model.bin: unexpected end of file")
+    with pytest.raises(MediaError, match="model load failed") as exc:
         local().transcribe(tmp_path / "c.flac", language="en")
-    assert isinstance(exc.value, PermanentError) is permanent
+    assert not isinstance(exc.value, PermanentError)
     assert not (snapshot / tr.COMPLETE_MARKER).exists()
     FakeWhisperModel.load_error = None
     assert local().ensure_model() == snapshot
@@ -1311,7 +1302,23 @@ def test_model_load_failure_drops_the_marker(
     assert (snapshot / tr.COMPLETE_MARKER).is_file()
 
 
-@pytest.mark.parametrize("returncode", [local_asr.EXIT_RETRY, local_asr.EXIT_USAGE, -9])
+def test_model_that_can_never_load_keeps_the_marker(fake_asr: FakeAsr, tmp_path: Path):
+    """A configuration the CPU cannot run (permanent) says nothing about the files: no
+    re-fetch and full hash on every job. A corrupt config.json is caught by the per-job
+    small-file hash instead."""
+    snapshot = local().ensure_model()
+    FakeWhisperModel.load_error = ValueError("Requested float16 compute type, but the target")
+    with pytest.raises(PermanentError, match="cannot load the model"):
+        local().transcribe(tmp_path / "c.flac", language="en")
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+    FakeWhisperModel.load_error = None
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 1
+
+
+@pytest.mark.parametrize(
+    "returncode", [local_asr.EXIT_MODEL, local_asr.EXIT_RETRY, local_asr.EXIT_USAGE, -9]
+)
 def test_other_child_failures_keep_the_marker(
     fake_asr: FakeAsr, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int
 ) -> None:

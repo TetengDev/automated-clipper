@@ -4,8 +4,9 @@ figures and odd URLs."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -14,8 +15,10 @@ import pytest
 
 from clipper.campaigns import Campaign
 from clipper.config import ConfigError
+from clipper.jobs.models import to_iso
 from clipper.notify import DiscordWebhook, NotifyError
 from clipper.submissions import (
+    RETRY_MAX,
     AlreadySubmitted,
     SubmissionPass,
     SubmissionStatus,
@@ -328,3 +331,180 @@ def test_a_failed_send_releases_every_stamp_it_claimed(env: Env) -> None:
 
     [submission] = list_submissions(env.conn)
     assert submission.notified_at is None and submission.reminded_at is None
+
+
+# --- CLP-126: back off by error class, millisecond stamps, unsafe URLs logged once ------
+
+
+class Refuses(Recorder):
+    """A webhook that raises `error` for the first `times` messages, then delivers."""
+
+    def __init__(self, error: Exception, times: int = 1) -> None:
+        super().__init__()
+        self.error = error
+        self.times = times
+        self.calls = 0
+
+    def __call__(self, text: str) -> None:
+        self.calls += 1
+        if self.times:
+            self.times -= 1
+            raise self.error
+        super().__call__(text)
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 413])
+def test_a_4xx_fails_only_that_message(
+    env: Env, status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    for n in range(2):
+        posted_post(env, url=f"https://www.tiktok.com/@kai.clips/video/{n}")
+    ping = Refuses(NotifyError(f"discord webhook returned {status}", status=status))
+    now = [POSTED + timedelta(seconds=5)]
+    sub_pass = make_pass(env, now, ping)
+
+    with caplog.at_level(logging.ERROR, logger="clipper.submissions"):
+        sub_pass.run_once()
+    now[0] += timedelta(minutes=11)  # past any backoff
+    sub_pass.run_once()
+
+    assert ping.calls == 2  # the other link was pinged in the same pass; no resend
+    assert len(ping.messages) == 1
+    assert all(s.notified_at is not None for s in list_submissions(env.conn))
+    [refused] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert str(status) in refused.getMessage() and "/campaigns" in refused.getMessage()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        NotifyError("discord webhook unreachable (ConnectTimeout)"),
+        NotifyError("discord webhook returned 500", status=500),
+        NotifyError("discord webhook returned 503", status=503),
+        NotifyError("discord webhook returned 429", status=429),
+        RuntimeError("a notifier we do not know"),
+    ],
+)
+def test_transport_errors_429_and_5xx_back_off_the_whole_webhook(
+    env: Env, error: Exception
+) -> None:
+    for n in range(3):
+        posted_post(env, url=f"https://www.tiktok.com/@kai.clips/video/{n}")
+    ping = Refuses(error, times=99)
+    now = [POSTED + timedelta(seconds=5)]
+    sub_pass = make_pass(env, now, ping)
+
+    sub_pass.run_once()
+    now[0] += timedelta(seconds=10)
+    sub_pass.run_once()
+
+    assert ping.calls == 1
+    assert all(s.notified_at is None for s in list_submissions(env.conn))
+
+
+def test_a_429_waits_as_long_as_discord_asks(env: Env) -> None:
+    posted_post(env)
+    ping = Refuses(NotifyError("discord webhook returned 429", status=429, retry_after=120))
+    now = [POSTED + timedelta(seconds=5)]
+    sub_pass = make_pass(env, now, ping)
+
+    sub_pass.run_once()
+    now[0] += timedelta(seconds=119)  # past the usual 30 s, inside Discord's 120 s
+    sub_pass.run_once()
+    assert ping.calls == 1
+    now[0] += timedelta(seconds=2)
+    sub_pass.run_once()
+
+    assert ping.calls == 2 and len(ping.messages) == 1
+
+
+def test_a_429_wait_is_capped_at_the_longest_backoff(env: Env) -> None:
+    posted_post(env)
+    ping = Refuses(NotifyError("discord webhook returned 429", status=429, retry_after=86400))
+    now = [POSTED + timedelta(seconds=5)]
+    sub_pass = make_pass(env, now, ping)
+
+    sub_pass.run_once()
+    now[0] += RETRY_MAX + timedelta(seconds=1)
+    sub_pass.run_once()
+
+    assert len(ping.messages) == 1
+
+
+def test_an_unsafe_https_url_is_logged_once(env: Env, caplog: pytest.LogCaptureFixture) -> None:
+    posted_post(env, url="https://a.example/x>tail")
+    now = [POSTED + timedelta(seconds=5)]
+    sub_pass = make_pass(env, now, Recorder())
+
+    with caplog.at_level(logging.WARNING, logger="clipper.submissions"):
+        sub_pass.run_once()
+        now[0] += timedelta(seconds=10)
+        sub_pass.run_once()
+
+    [skipped] = [r.getMessage() for r in caplog.records if "plain https" in r.getMessage()]
+    assert "tail" not in skipped  # the URL itself may forge log text: never logged
+    assert list_submissions(env.conn) == []
+
+
+def test_ping_stamps_have_milliseconds(env: Env) -> None:
+    posted_post(env)
+    now = POSTED + timedelta(seconds=5, milliseconds=250)
+
+    make_pass(env, [now], Recorder()).run_once()
+
+    [stamp] = env.conn.execute("SELECT notified_at FROM campaign_submissions").fetchone()
+    assert stamp == "2027-01-15T14:00:05.250Z"
+
+
+def test_a_failed_send_never_clears_a_stamp_another_worker_wrote_that_second(env: Env) -> None:
+    posted_post(env)
+    deadline = POSTED + timedelta(minutes=30)
+    ping, other_alert = Recorder(), Recorder()
+    other = SubmissionPass(env.conn, CAMPAIGNS, ping, other_alert, clock=lambda: deadline)
+
+    class Racing(SubmissionPass):
+        raced = False
+
+        def _claim(self, submission_id: int, columns: tuple[str, ...], now: datetime) -> bool:
+            if not self.raced:
+                # Between this worker's read and its claim, another worker (5 ms behind
+                # it, so not yet past the deadline) sends the first ping.
+                self.raced = True
+                other.run_once()
+            return super()._claim(submission_id, columns, now)
+
+    down = Down()
+    late = deadline + timedelta(milliseconds=5)
+    Racing(env.conn, CAMPAIGNS, ping, down, clock=lambda: late).run_once()  # type: ignore[arg-type]
+
+    [submission] = list_submissions(env.conn)
+    assert submission.notified_at is not None and submission.reminded_at is not None
+    assert submission.overdue_alerted_at is None  # the failed alert is released for a retry
+    make_pass(env, [deadline + timedelta(minutes=1)], ping, other_alert).run_once()
+    assert len(ping.messages) == 1  # no second first ping
+    assert len(other_alert.messages) == 1
+
+
+def test_old_second_stamps_still_work_next_to_millisecond_ones(env: Env) -> None:
+    posted_post(env, campaign_id="quick")
+    now = POSTED + timedelta(seconds=5, milliseconds=400)
+    make_pass(env, [now], Recorder()).run_once()
+    # A row stamped by the worker before this change: second resolution, same second.
+    env.conn.execute(
+        "UPDATE campaign_submissions SET notified_at = NULL, reminded_at = ?",
+        (to_iso(now),),
+    )
+    down = Down()
+
+    SubmissionPass(env.conn, QUICK, down, down, clock=lambda: now).run_once()  # type: ignore[arg-type]
+
+    [submission] = list_submissions(env.conn)
+    assert down.calls == 1 and submission.notified_at is None
+    raw = env.conn.execute("SELECT reminded_at FROM campaign_submissions").fetchone()[0]
+    assert raw == "2027-01-15T14:00:05Z"  # the old stamp is not ours to release
+    assert submission.reminded_at == POSTED + timedelta(seconds=5)
+
+    ping = Recorder()
+    later = now + timedelta(minutes=1)
+    SubmissionPass(env.conn, QUICK, ping, ping, clock=lambda: later).run_once()
+    assert len(ping.messages) == 1  # the first ping, and no reminder on top

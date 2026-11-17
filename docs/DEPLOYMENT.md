@@ -282,7 +282,11 @@ submit itself is a manual step: the clipper never scrapes these sites or logs in
 The worker sends a reminder 10 minutes before the deadline. When the deadline passes
 without a submission, it sends one alert to `DISCORD_ALERTS_WEBHOOK_URL`, or to the ping
 webhook when no alerts webhook is set. Without either webhook, the messages go to the
-worker log. A failed send is retried with backoff.
+worker log. When Discord is unreachable, rate-limits the webhook (429) or returns a 5xx,
+the send is retried with backoff, waiting as long as Discord's `Retry-After` asks, up to
+10 minutes. When Discord refuses one message with any other status (a 4xx, which
+includes a deleted webhook), that message is not retried: the worker logs an error, and
+the link stays on the Campaigns page.
 
 When a program reports approved views and the payout for a submission, record them with
 `clipper campaigns earnings <id> --views N --payout 12.50`. `clipper campaigns rpm` and

@@ -441,3 +441,21 @@ def test_a_failed_load_leaves_the_marker_while_another_process_holds_the_lock(
     with pytest.raises(MediaError, match="model load failed"):
         local().transcribe(tmp_path / "c.flac", language="en")  # lock free now
     assert not (snapshot / tr.COMPLETE_MARKER).exists()
+
+
+def test_a_discarded_store_file_takes_its_manifest_and_lock_file_along(
+    fake_asr: FakeAsr, tmp_path: Path
+) -> None:
+    """Self-heal drops a damaged store file; its Hub sidecars go with it, as in a prune."""
+    snapshot = local().ensure_model()
+    store = _store_file(tmp_path / "models", FAKE_MODEL_BIN)
+    sidecars = [store.with_name(store.name + suffix) for suffix in (".refs", ".lock")]
+    for sidecar in sidecars:
+        sidecar.write_text("")
+    store.write_bytes(b"short")  # truncated: the cheap check flags model.bin's size
+
+    assert local().ensure_model() == snapshot
+
+    assert len(fake_asr.fetch_calls()) == 2
+    assert store.read_bytes() == FAKE_MODEL_BIN
+    assert [s for s in sidecars if s.exists()] == []

@@ -505,16 +505,22 @@ class FasterWhisperTranscriber:
 
     def _discard(self, snapshot: Path, problems: dict[str, FileProblem]) -> None:
         """Drop the snapshot links; for each file whose content is wrong also its repo blob
-        and the stored file behind it, or the Hub client would link the same bytes again."""
+        and the stored file behind it, or the Hub client would link the same bytes again.
+        A shared-store file takes its `.refs` manifest and `.lock` file along, as in
+        `prune_unpinned`."""
         root = self.models_dir.resolve()
         for name, problem in problems.items():
             link = snapshot / name
             if problem.bad_content and link.is_symlink():
                 target = link.parent / os.readlink(link)
                 repo_blob = target.parent.resolve() / target.name
-                for path in (link.resolve(), repo_blob):  # content first, then the link to it
+                content = link.resolve()
+                for path in (content, repo_blob):  # content first, then the link to it
                     if path.is_relative_to(root):
                         path.unlink(missing_ok=True)
+                if content.parent.parent == root / "blobs":  # we hold the store lock
+                    for sidecar in (".refs", ".lock"):
+                        content.with_name(f"{content.name}{sidecar}").unlink(missing_ok=True)
         shutil.rmtree(snapshot, ignore_errors=True)
 
     def drop_marker(self) -> None:

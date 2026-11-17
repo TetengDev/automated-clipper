@@ -5,7 +5,7 @@
 
   function typing(target) {
     var tag = target && target.tagName;
-    // A checkbox (the sensitive-clip confirm box) takes no text: shortcuts still apply.
+    // A checkbox (a confirm box) takes no text: shortcuts still apply.
     if (tag === "INPUT" && target.type === "checkbox") return false;
     return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (target && target.isContentEditable);
   }
@@ -18,8 +18,11 @@
   // Returns true when the key triggered an action.
   function handle(key, target) {
     var reason = document.getElementById("reason-tag");
-    // Sensitive clips: approving needs the faces check box ticked (CLP-87).
-    var confirm = document.getElementById("confirm-sensitive");
+    // Approving needs every confirm box ticked: the faces check on sensitive clips (CLP-87),
+    // the campaign's reviewer checks (CLP-114).
+    var unticked = ["confirm-sensitive", "confirm-reviewer-checks"]
+      .map(function (id) { return document.getElementById(id); })
+      .filter(function (box) { return box && !box.checked; })[0];
     if (key === "r" && reason && target === reason) {
       // `r` pressed again in the reason picker submits once a reason is chosen.
       var submit = usable("reject-btn");
@@ -32,8 +35,8 @@
       case "a": {
         var approve = usable("approve-btn");
         if (!approve) return false;
-        if (confirm && !confirm.checked) {
-          confirm.focus();
+        if (unticked) {
+          unticked.focus();
         } else {
           approve.click();
         }

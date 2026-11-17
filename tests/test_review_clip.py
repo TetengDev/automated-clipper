@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from collections.abc import Iterator
@@ -13,10 +14,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from clipper import clips
+from clipper.campaigns import Campaign
 from clipper.clips import ClipStatus, InvalidTransition
 from clipper.metadata import fingerprint
 from clipper.review import routes
 from clipper.review.app import STATIC_DIR
+from posting_support import FakeAccount
 from review_support import BASE_URL, Env, generate_mp4, login, make_env
 
 NOW = datetime(2027, 1, 15, 8, 0, tzinfo=UTC)
@@ -931,3 +934,164 @@ def test_saving_the_platform_text_keeps_the_view(client: TestClient, env: Env) -
     )
 
     assert response.headers["HX-Redirect"] == f"/clip/{clip_id}?{view}"
+
+
+# --- CLP-114: a campaign's reviewer-only checks before approval ----------------------------
+
+CHECKS_BOX = 'type="checkbox" name="confirm_reviewer_checks" value="1"'
+
+
+def campaign(**overrides: object) -> Campaign:
+    base: dict[str, object] = {
+        "id": "vyro_mrbeast",
+        "program": "vyro",
+        "creator": "MrBeast",
+        "platforms": ["tiktok"],
+        "forbidden": ["logos", "negative_framing", "ai_content"],
+    }
+    base.update(overrides)
+    return Campaign.model_validate(base)
+
+
+def campaign_client(
+    env: Env, *found: Campaign, accounts: list[FakeAccount] | None = None
+) -> TestClient:
+    briefs = {c.id: c for c in found} if found else {"vyro_mrbeast": campaign()}
+    client = env.client(
+        accounts=accounts if accounts is not None else [FakeAccount(campaign="vyro_mrbeast")],
+        campaigns=briefs,
+    )
+    client.csrf = login(client)  # type: ignore[attr-defined]
+    return client
+
+
+def test_clip_page_shows_the_campaign_reviewer_checks(env: Env) -> None:
+    client = campaign_client(env)
+
+    html = client.get(f"/clip/{env.clip()}").text
+
+    assert 'id="reviewer-checks"' in html and "vyro_mrbeast" in html
+    assert "No logos" in html and "No negative framing" in html
+    assert "ai_content" not in html  # checked by the pipeline, not the reviewer
+    assert CHECKS_BOX in html
+
+
+def test_each_campaign_is_listed_once(env: Env) -> None:
+    reposts = campaign(id="other_mrbeast", forbidden=["reposts"])
+    accounts = [
+        FakeAccount(id="tt_main", campaign="vyro_mrbeast"),
+        FakeAccount(id="tt_two", campaign="vyro_mrbeast"),
+        FakeAccount(id="yt_main", platform="youtube", campaign="other_mrbeast"),
+    ]
+    client = campaign_client(env, campaign(), reposts, accounts=accounts)
+
+    html = client.get(f"/clip/{env.clip()}").text
+
+    assert html.count('class="campaign-id"') == 2
+    assert "Not a repost" in html
+
+
+@pytest.mark.parametrize(
+    ("accounts", "brief"),
+    [
+        ([FakeAccount(campaign="vyro_mrbeast")], campaign(forbidden=["ai_content"])),
+        ([FakeAccount(campaign="vyro_mrbeast", enabled=False)], campaign()),
+        ([FakeAccount(campaign="vyro_mrbeast", creators=["Kai Cenat"])], campaign()),
+        ([FakeAccount(campaign=None)], campaign()),
+        ([FakeAccount(campaign="unknown")], campaign()),
+        ([], campaign()),
+    ],
+    ids=["no-reviewer-checks", "account-off", "other-creator", "no-campaign", "unknown", "none"],
+)
+def test_no_checks_box_when_no_campaign_check_applies(
+    env: Env, accounts: list[FakeAccount], brief: Campaign
+) -> None:
+    client = campaign_client(env, brief, accounts=accounts)
+    clip_id = env.clip(video_path="missing.mp4")
+
+    html = client.get(f"/clip/{clip_id}").text
+
+    assert 'id="reviewer-checks"' not in html and CHECKS_BOX not in html
+    assert post(client, f"/clip/{clip_id}/approve", version=1).status_code == 200
+
+
+def test_a_campaign_of_another_creator_does_not_apply(env: Env) -> None:
+    accounts = [FakeAccount(campaign="vyro_mrbeast", creators=["MrBeast", "Kai Cenat"])]
+    client = campaign_client(env, accounts=accounts)
+
+    html = client.get(f"/clip/{env.clip(env.job('Kai Cenat'))}").text
+
+    assert CHECKS_BOX not in html
+
+
+def test_a_disabled_campaign_still_needs_the_checks(env: Env) -> None:
+    """Fails closed: its held posts can be released later by `clipper posts recheck`."""
+    client = campaign_client(env, campaign(enabled=False))
+
+    assert CHECKS_BOX in client.get(f"/clip/{env.clip()}").text
+
+
+@pytest.mark.parametrize("htmx", [True, False])
+@pytest.mark.parametrize("confirm", [None, "", "0", "on"])
+def test_approving_without_the_campaign_checks_is_refused(
+    env: Env, htmx: bool, confirm: str | None
+) -> None:
+    client = campaign_client(env)
+    clip_id = env.clip()
+    data = {} if confirm is None else {"confirm_reviewer_checks": confirm}
+
+    response = post(client, f"/clip/{clip_id}/approve", htmx=htmx, version=1, **data)
+
+    assert response.status_code == 422
+    assert 'class="error" role="alert"' in response.text
+    assert "Confirm you checked the campaign rules" in response.text
+    assert env.status(clip_id) == "pending_review"
+    assert env.reviews(clip_id) == []
+
+
+def test_confirmed_campaign_checks_are_audited(env: Env) -> None:
+    client = campaign_client(env)
+    clip_id = env.clip(video_path="missing.mp4")
+
+    response = post(client, f"/clip/{clip_id}/approve", version=1, confirm_reviewer_checks="1")
+
+    assert response.status_code == 200
+    assert env.status(clip_id) == "approved"
+    assert json.loads(env.reviews(clip_id)[0]["payload"]) == {
+        "confirmed_reviewer_checks": {"vyro_mrbeast": ["logos", "negative_framing"]}
+    }
+
+
+def test_a_sensitive_campaign_clip_needs_both_confirmations(env: Env) -> None:
+    client = campaign_client(env)
+    clip_id = env.clip(sensitive=True, video_path="missing.mp4")
+
+    html = client.get(f"/clip/{clip_id}").text
+    faces_only = post(client, f"/clip/{clip_id}/approve", version=1, confirm_sensitive="1")
+    checks_only = post(client, f"/clip/{clip_id}/approve", version=1, confirm_reviewer_checks="1")
+    both = post(
+        client,
+        f"/clip/{clip_id}/approve",
+        version=1,
+        confirm_sensitive="1",
+        confirm_reviewer_checks="1",
+    )
+
+    assert CONFIRM_BOX in html and CHECKS_BOX in html
+    assert (faces_only.status_code, checks_only.status_code, both.status_code) == (422, 422, 200)
+    assert json.loads(env.reviews(clip_id)[0]["payload"]) == {
+        "confirmed_sensitive": True,
+        "confirmed_reviewer_checks": {"vyro_mrbeast": ["logos", "negative_framing"]},
+    }
+
+
+def test_retrying_the_export_needs_no_campaign_confirmation(env: Env) -> None:
+    client = campaign_client(env)
+    clip_id = env.clip(video_path="missing.mp4")
+    post(client, f"/clip/{clip_id}/approve", version=1, confirm_reviewer_checks="1")
+
+    page = client.get(f"/clip/{clip_id}").text
+    response = post(client, f"/clip/{clip_id}/approve")
+
+    assert "Retry export" in page and CHECKS_BOX not in page
+    assert response.status_code == 200

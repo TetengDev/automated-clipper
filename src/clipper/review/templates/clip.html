@@ -45,8 +45,21 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="version" value="{{ v.version }}">
         {% if sensitive %}
-        <label class="confirm-sensitive"><input type="checkbox" name="confirm_sensitive" value="1" id="confirm-sensitive">
+        <label class="confirm-check"><input type="checkbox" name="confirm_sensitive" value="1" id="confirm-sensitive">
           I checked faces of minors and victims</label>
+        {% endif %}
+        {% if reviewer_checks %}
+        <fieldset class="reviewer-checks" id="reviewer-checks">
+          <legend>Campaign checks (the pipeline cannot see these)</legend>
+          <ul>
+            {% for campaign_id, checks in reviewer_checks.items() %}
+            <li><span class="campaign-id">{{ campaign_id }}</span>:
+              {% for check in checks %}{{ check_labels.get(check, check) }}{% if not loop.last %}, {% endif %}{% endfor %}</li>
+            {% endfor %}
+          </ul>
+          <label class="confirm-check"><input type="checkbox" name="confirm_reviewer_checks" value="1" id="confirm-reviewer-checks">
+            I checked these in the video</label>
+        </fieldset>
         {% endif %}
         <button type="submit" id="approve-btn">Approve (a)</button>
       </form>

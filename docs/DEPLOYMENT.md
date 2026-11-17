@@ -155,7 +155,8 @@ The worker transcribes with faster-whisper on CPU (`transcriber: local`, the def
   deploy fetches it and, still under the lock, deletes every snapshot no pin names, then
   the blobs only those snapshots used. The worker does this, not the janitor: only the
   worker can write the models dir. Pruning never follows a symlink, never touches anything
-  outside the models dir, and logs and skips a path it cannot delete.
+  outside the models dir, and logs and skips a path it cannot delete. If it cannot read a
+  snapshot or blobs dir, it deletes no blobs that run.
 - **Needs symlinks**: the snapshot files are symlinks into the Hub client's blob store, and
   the cheap check relies on them. Keep the models dir on a filesystem with symlinks (ext4,
   APFS, a Docker volume or bind mount of one). Without them the Hub client copies the

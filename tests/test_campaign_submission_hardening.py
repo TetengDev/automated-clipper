@@ -353,7 +353,7 @@ class Refuses(Recorder):
         super().__call__(text)
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 413])
+@pytest.mark.parametrize("status", [400, 405, 413, 422])
 def test_a_4xx_fails_only_that_message(
     env: Env, status: int, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -400,6 +400,35 @@ def test_transport_errors_429_and_5xx_back_off_the_whole_webhook(
 
     assert ping.calls == 1
     assert all(s.notified_at is None for s in list_submissions(env.conn))
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_a_broken_webhook_is_backed_off_and_every_ping_kept_for_a_retry(
+    env: Env, status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    for n in range(3):
+        posted_post(env, url=f"https://www.tiktok.com/@kai.clips/video/{n}")
+    ping = Refuses(NotifyError(f"discord webhook returned {status}", status=status), times=2)
+    now = [POSTED + timedelta(seconds=5)]
+    sub_pass = make_pass(env, now, ping)
+
+    with caplog.at_level(logging.WARNING, logger="clipper.submissions"):
+        sub_pass.run_once()
+        now[0] += timedelta(seconds=10)  # inside the backoff: nothing tried
+        sub_pass.run_once()
+        assert ping.calls == 1
+        assert all(s.notified_at is None for s in list_submissions(env.conn))
+        now[0] += timedelta(seconds=31)  # still broken: one try, backed off again
+        sub_pass.run_once()
+        assert ping.calls == 2
+    now[0] += timedelta(seconds=61)  # the operator fixed the webhook
+    sub_pass.run_once()
+
+    assert len(ping.messages) == 3
+    assert all(s.notified_at is not None for s in list_submissions(env.conn))
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2  # once per backoff window, not once per ping
+    assert all(str(status) in e and "webhook URL" in e for e in errors)
 
 
 def test_a_429_waits_as_long_as_discord_asks(env: Env) -> None:

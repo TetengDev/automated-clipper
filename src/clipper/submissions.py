@@ -40,6 +40,9 @@ from clipper.redact import redact
 REMIND_BEFORE = timedelta(minutes=10)
 RETRY_FIRST = timedelta(seconds=30)
 RETRY_MAX = timedelta(minutes=10)
+# Statuses that mean the webhook itself is broken (unauthorised, revoked, deleted), not
+# the message: backed off and retried like an outage until the operator fixes the URL.
+WEBHOOK_BROKEN = frozenset({401, 403, 404})
 RPM_PLACES = Decimal("0.01")
 MAX_PAYOUT = Decimal("1000000000")
 MAX_VIEWS = 10**15
@@ -497,8 +500,9 @@ class SubmissionPass:
     """One pass per worker poll: record new submissions, ping, remind, alert.
 
     Each message is claimed in the DB before it is sent (`<column> IS NULL` -> now), so two
-    workers never send the same one. When a webhook is unreachable, returns 429 or 5xx
-    (or a notifier raises anything but `NotifyError`), the claim is released for a retry
+    workers never send the same one. When a webhook is unreachable, returns 429, 5xx or
+    401/403/404 (a broken webhook: logged as an error, the URL needs fixing), or a
+    notifier raises anything but `NotifyError`, the claim is released for a retry
     and the webhook is backed off as a whole (30 s doubling to 10 min; a 429's wait is
     honoured up to 10 min) and the rest of the pass skips it, so a Discord outage
     costs one timeout per backoff, not one per row. Any other status means Discord refused
@@ -647,7 +651,8 @@ class SubmissionPass:
             send(text)
         except Exception as exc:
             status = exc.status if isinstance(exc, NotifyError) else None
-            if status is not None and status != 429 and status < 500:
+            broken = status in WEBHOOK_BROKEN
+            if status is not None and status != 429 and status < 500 and not broken:
                 logger.error(
                     "submission %d: %s message refused (%s); not retried, the link is on"
                     " /campaigns",
@@ -662,12 +667,14 @@ class SubmissionPass:
                 delay = max(delay, timedelta(seconds=min(wait, RETRY_MAX.total_seconds())))
             self._backoff[key] = _Backoff(at=now + delay, delay=delay)
             self._down.add(key)
-            logger.warning(
-                "submission %d: %s message failed (%s); webhook retried in %ds",
+            logger.log(
+                logging.ERROR if broken else logging.WARNING,
+                "submission %d: %s message failed (%s); webhook retried in %ds%s",
                 submission.id,
                 column,
                 redact(str(exc)),
                 int(delay.total_seconds()),
+                "; check the webhook URL, it may be revoked or deleted" if broken else "",
             )
             self._release(submission.id, columns, now)
             return 0

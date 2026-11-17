@@ -2048,6 +2048,54 @@ def test_timeout_after_a_counted_failure_defers(
     assert _rows(conn) == []
 
 
+def test_render_failures_past_the_age_cap_fail_the_job(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    """CLP-89: a render stage still failing clips 48 h after it was first deferred fails
+    instead of deferring again (an outage cannot hold the job, and the queue, forever)."""
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
+    fake.fail_rank[2] = RenderError("remotion render failed with exit code 1")
+    clock = [T0]
+    ctx = StageContext(media_dir=media, conn=conn, config=AppConfig(), clock=lambda: clock[0])
+
+    with pytest.raises(Deferred):
+        rc.render_clips(job, ctx)
+    assert (media / rc.FAILING_MARKER).is_file()
+    clock[0] = T0 + rc.MAX_FAILING_AGE + timedelta(hours=1)
+    with pytest.raises(PermanentError, match="still failing 48 h after the first deferral"):
+        rc.render_clips(job, ctx)
+
+    assert not (media / rc.FAILING_MARKER).exists()
+    assert [r["rank"] for r in _rows(conn)] == [1]
+
+
+def test_late_run_without_failures_is_not_capped_and_clears_the_marker(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLP-89: the cap only fails a run that still has a failed render (a worker stopped
+    for days resumes a healthy job); the marker goes once the stage is done."""
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2, 3)])
+    _budget_for_one_clip(monkeypatch, fake)
+    fake.fail_on[1] = RenderError("remotion render failed with exit code 1")  # clip 1, once
+    clock = [T0]
+    ctx = StageContext(media_dir=media, conn=conn, config=AppConfig(), clock=lambda: clock[0])
+
+    with pytest.raises(Deferred):  # clip 1 failed, clip 2 rendered, out of budget
+        rc.render_clips(job, ctx)
+    assert (media / rc.FAILING_MARKER).is_file()
+    clock[0] = T0 + timedelta(days=3)
+    with pytest.raises(Deferred):  # clip 3 rendered, no failure: not capped
+        rc.render_clips(job, ctx)
+    rc.render_clips(job, ctx)
+
+    assert [r["rank"] for r in _rows(conn)] == [1, 2, 3]
+    assert not (media / rc.FAILING_MARKER).exists()
+
+
 def test_failure_that_cannot_be_counted_uses_an_attempt(
     conn: sqlite3.Connection, job: Job, tmp_path: Path, fake: FakeRender
 ) -> None:

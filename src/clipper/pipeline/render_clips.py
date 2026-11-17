@@ -58,7 +58,9 @@ after a render failure. That cannot loop: each clip is rendered once and counts 
 MAX_RENDER_FAILURES failures. Crashes still use up attempts (each claim is one).
 The cost of that: in an outage where every render fails (Remotion broken, disk full), a
 job runs up to about MAX_RENDER_FAILURES x clips x CLIP_WORST_CASE_S of failing renders
-before it fails, and with a single worker it holds up every job queued behind it.
+before it fails, and with a single worker it holds up every job queued behind it. So a
+run that still has a failed render MAX_FAILING_AGE (48 h) after the stage was first
+deferred with one fails the job (CLP-89, FAILING_MARKER).
 """
 
 from __future__ import annotations
@@ -76,7 +78,7 @@ import traceback
 import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +95,7 @@ from clipper.pipeline.common import (
     Deadline,
     StageTimeout,
     creator_for,
+    first_seen,
     read_json,
     settings_for,
     strip_control,
@@ -155,6 +158,11 @@ _VERSION = re.compile(r"^[\w.-]{1,64}$")
 SLOTS_DIR = ".render_slots"
 """Under the media root: one lock file per render slot (`max_concurrent_renders`)."""
 SLOT_RETRY = timedelta(minutes=1)
+FAILING_MARKER = ".render_failing_since"
+"""In the job's media dir: when a run of this stage was first deferred with a failed
+render; removed once the stage ends."""
+MAX_FAILING_AGE = timedelta(hours=48)
+"""A run that still has a failed render this long after that fails the job (CLP-89)."""
 
 
 def _version(value: Any) -> str | None:
@@ -458,6 +466,20 @@ def _left_out(rank: int, failures: int, error: str) -> str:
     return f"clip {rank}: render failed {failures} times: {error}"[:MAX_REASON_CHARS]
 
 
+def _defer(ctx: StageContext, until: datetime, reason: str, *, failing: bool) -> Exception:
+    """`Deferred` to `until`; or, like `deferring_no_format`, a `PermanentError` when a
+    render is still `failing` MAX_FAILING_AGE after the first deferral with a failed
+    render (FAILING_MARKER). A run without a failed render is never capped, so a job
+    picked up late (a stopped worker) that renders fine goes on."""
+    now = ctx.clock()
+    marker = ctx.media_dir / FAILING_MARKER
+    if failing and now - first_seen(marker, now) > MAX_FAILING_AGE:
+        marker.unlink(missing_ok=True)
+        hours = MAX_FAILING_AGE.total_seconds() / 3600
+        return PermanentError(f"{reason} (still failing {hours:.0f} h after the first deferral)")
+    return Deferred(until, reason)
+
+
 def render_clips(job: Job, ctx: StageContext) -> None:
     slots = ctx.config.settings.max_concurrent_renders
     with _render_slot(ctx.media_dir.parent, slots) as held:
@@ -574,7 +596,8 @@ def _render_clips(job: Job, ctx: StageContext) -> None:
                 raise  # no progress: this run uses up an attempt
             # Resume right away, without using up an attempt.
             note = f"{rendered} clip(s) rendered, {counted} failure(s) counted"
-            raise Deferred(ctx.clock(), f"{exc} ({note})") from None
+            failing = retry is not None or counted > 0
+            raise _defer(ctx, ctx.clock(), f"{exc} ({note})", failing=failing) from None
         if reasons:
             logger.info("job %s: clip %s quality gates: %s", job.id, rank, ", ".join(reasons))
         try:
@@ -607,7 +630,10 @@ def _render_clips(job: Job, ctx: StageContext) -> None:
         # Retry with the usual backoff for the clip's failure count, without an attempt.
         reason = redact(strip_control(str(retry).splitlines()[0]))[:MAX_REASON_CHARS]
         note = f"{rendered} clip(s) rendered, {counted} failure(s) counted"
-        raise Deferred(ctx.clock() + backoff(max(worst, 1)), f"{reason} ({note})")
+        until = ctx.clock() + backoff(max(worst, 1))
+        raise _defer(ctx, until, f"{reason} ({note})", failing=True)
+    with contextlib.suppress(OSError):  # the stage is over: the next deferral starts afresh
+        (ctx.media_dir / FAILING_MARKER).unlink(missing_ok=True)
     if not done:
         for path in left_out:  # a requeued job tries these clips afresh
             with contextlib.suppress(OSError):  # never hides the PermanentError below

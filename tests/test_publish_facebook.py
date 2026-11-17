@@ -30,6 +30,7 @@ from meta_support import (
     metadata,
     recorded,
     reply,
+    stored_metadata,
     video,
 )
 
@@ -142,6 +143,21 @@ def test_paid_partnership_is_refused_before_any_upload(
         publisher.publish(make_post(), video(tmp_path), metadata(flags=flags))
 
     assert reels.call_count == 0 and upload.call_count == 0
+
+
+def test_flags_stored_at_scheduling_reach_the_finish_call(
+    mock: respx.MockRouter, publisher: FacebookPublisher, tmp_path: Path
+) -> None:
+    """Round trip: the flag names `build_post_metadata` stores for Facebook are the ones
+    the publisher reads."""
+    reels, upload = happy(mock)
+
+    publisher.publish(make_post(), video(tmp_path), stored_metadata("facebook", ai=True))
+    assert form(reels.calls[1].request)["is_ai_generated"] == "true"
+
+    with pytest.raises(PublishRejected, match="paid partnership"):
+        publisher.publish(make_post(), video(tmp_path), stored_metadata("facebook", paid=True))
+    assert reels.call_count == 2 and upload.call_count == 1
 
 
 def test_expired_token_defers_and_pauses_the_account(

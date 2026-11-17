@@ -4,7 +4,7 @@ credentials and a fake post. No test talks to Meta: every request goes to respx.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from clipper.edl import parse_edl
+from clipper.metadata import Variant, build_post_metadata
 from clipper.posting.models import Post, PostMetadata, PostStatus
 from clipper.publish.meta import GRAPH_URL, GraphClient, TokenGuard, load_credentials
 
@@ -100,6 +102,17 @@ def metadata(
         hashtags=["#funny", "#fail", "#chair"] if hashtags is None else hashtags,
         flags={"is_ai_generated": False, "paid_partnership": False} if flags is None else flags,
     )
+
+
+def stored_metadata(platform: str, *, ai: bool = False, paid: bool = False) -> PostMetadata:
+    """The metadata the scheduler stores for a post (CLP-96/97): `build_post_metadata` with
+    an EDL that has (or has no) AI element, converted as `scheduler._plan` does."""
+    source: dict[str, Any] = {"source": {"path": "a.mp4", "in_s": 10, "out_s": 45}}
+    if ai:
+        source["hook"] = {"text": "Narrated", "ai_generated": True}
+    variants = {platform: Variant(title="Title", caption="Caption", hashtags=["#a", "#b", "#c"])}
+    built = build_post_metadata(variants, platform, edl=parse_edl(source), paid_partnership=paid)
+    return PostMetadata(**asdict(built))
 
 
 def video(tmp_path: Path, size: int = 2048) -> Path:

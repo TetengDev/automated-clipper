@@ -29,6 +29,7 @@ from meta_support import (
     metadata,
     recorded,
     reply,
+    stored_metadata,
     video,
 )
 
@@ -168,6 +169,22 @@ def test_disclosure_flags_map_to_the_container_fields(
     sent = form(routes["media"].calls.last.request)
     assert sent["is_ai_generated"] == "true"
     assert sent["is_paid_partnership"] == "true"
+
+
+@pytest.mark.parametrize(("ai", "paid"), [(True, True), (False, False)])
+def test_flags_stored_at_scheduling_reach_the_container(
+    mock: respx.MockRouter, publisher: InstagramPublisher, tmp_path: Path, ai: bool, paid: bool
+) -> None:
+    """Round trip: the flag names `build_post_metadata` stores for Instagram are the ones
+    the publisher reads."""
+    routes = container_flow(mock, "finished")
+
+    meta = stored_metadata("instagram", ai=ai, paid=paid)
+    publisher.publish(ig_post(), video(tmp_path), meta)
+
+    sent = form(routes["media"].calls.last.request)
+    assert sent["is_ai_generated"] == str(ai).lower()
+    assert sent["is_paid_partnership"] == str(paid).lower()
 
 
 def test_more_than_five_hashtags_is_refused(

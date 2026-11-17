@@ -49,7 +49,13 @@ from pydantic import SecretStr
 
 from clipper.accounts import account_tokens, token_env_name
 from clipper.jobs.models import Clock, utcnow
-from clipper.posting.models import Post, PostMetadata, PublishDeferred, PublishResult
+from clipper.posting.models import (
+    Post,
+    PostMetadata,
+    PublishDeferred,
+    PublishRejected,
+    PublishResult,
+)
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105 - an endpoint, not a secret
 UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
@@ -204,7 +210,9 @@ def _description(caption: str, hashtags: Sequence[str]) -> str:
     """The caption, then a blank line and up to five hashtags, within 5000 bytes. The
     caption is shortened to fit; the hashtags are kept."""
     caption = _visible(caption, keep_newlines=True).strip()
-    tags = " ".join(_hashtags(hashtags))
+    # Metadata stored at scheduling (CLP-97) already ends the caption with its hashtags.
+    present = {word.casefold() for word in caption.split()}
+    tags = " ".join(t for t in _hashtags(hashtags) if t.casefold() not in present)
     if not tags:
         return _fit_bytes(caption, DESCRIPTION_MAX_BYTES)
     if not caption:
@@ -218,7 +226,10 @@ def _rfc3339(moment: datetime) -> str:
 
 
 def video_resource(post: Post, metadata: PostMetadata) -> dict[str, Any]:
-    """The `videos.insert` body: private, published by YouTube at `post.scheduled_at`."""
+    """The `videos.insert` body: private, published by YouTube at `post.scheduled_at`.
+    A post that needs the paid-partnership disclosure is refused: it is not set here."""
+    if metadata.flags.get("paid_partnership", False):
+        raise PublishRejected("the YouTube publisher cannot set the paid partnership disclosure")
     return {
         "snippet": {
             "title": _title(metadata),
@@ -230,7 +241,7 @@ def video_resource(post: Post, metadata: PostMetadata) -> dict[str, Any]:
             "privacyStatus": "private",
             "publishAt": _rfc3339(post.scheduled_at),
             "selfDeclaredMadeForKids": False,
-            "containsSyntheticMedia": bool(metadata.flags.get("ai_generated", False)),
+            "containsSyntheticMedia": bool(metadata.flags.get("contains_synthetic_media", False)),
         },
     }
 

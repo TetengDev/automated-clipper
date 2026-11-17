@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -55,6 +55,23 @@ class PeriodicPass(Protocol):
     """Work the loop runs once per poll besides the job stages (CLP-92's posting stage)."""
 
     def run_once(self) -> int: ...
+
+
+@dataclass
+class ChainedPasses:
+    """Several periodic passes run as one (posting, then campaign submissions, CLP-97).
+    A pass that raises is logged and does not stop the others."""
+
+    passes: Sequence[PeriodicPass]
+
+    def run_once(self) -> int:
+        handled = 0
+        for periodic in self.passes:
+            try:
+                handled += periodic.run_once()
+            except Exception:
+                logger.exception("%s pass failed; retrying next poll", type(periodic).__name__)
+        return handled
 
 
 def default_worker_id() -> str:

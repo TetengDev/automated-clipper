@@ -39,6 +39,11 @@ updates:
     multi-ecosystem-group: dependencies
     cooldown:
       default-days: 7
+    ignore:
+      # faster-whisper 1.2.1 calls av.open(metadata_errors=...), which av 19
+      # removed; keep av<19 until faster-whisper ships a fix.
+      - dependency-name: av
+        versions: [">=19"]
 
   - package-ecosystem: npm
     directory: /render

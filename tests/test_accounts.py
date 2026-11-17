@@ -405,7 +405,7 @@ def test_check_config_summarises_accounts(tmp_path: Path, monkeypatch: pytest.Mo
 
     assert result.exit_code == 0, result.output
     assert "2 accounts" in result.output
-    lines = [line for line in result.output.splitlines() if "mrbeast_clips_" in line]
+    lines = [line for line in result.output.splitlines() if "  - mrbeast_clips_" in line]
     tt, yt = lines
     for part in ("tiktok", "@mrbeast.clips.daily", "US", "3/day", "14:00-17:00", "18:00-22:00"):
         assert part in tt

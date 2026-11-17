@@ -40,6 +40,44 @@ jobs:
       - name: Test
         run: uv run pytest --cov=clipper --cov-report=term-missing --cov-fail-under=80
 
+  # Browser tests of the review app (CLP-61): Playwright drives Chromium against the real app
+  # served by uvicorn. The default `pytest` run above leaves them out (the `e2e` marker).
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.11.31"
+          enable-cache: true
+          save-cache: false # the test job saves the same cache
+
+      # A stalled mirror once hung an apt install for over an hour (CLP-131): apt retries
+      # and times out per request, the whole install retries once, and the step is capped.
+      - name: Install ffmpeg
+        timeout-minutes: 10
+        run: |
+          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
+          apt_install() { "${apt[@]}" update && "${apt[@]}" install -y --no-install-recommends ffmpeg; }
+          apt_install || apt_install
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # Headless Chromium only, plus the system libraries it needs (installed with apt).
+      - name: Install Chromium
+        timeout-minutes: 10
+        run: |
+          install_chromium() { uv run playwright install --with-deps --only-shell chromium; }
+          install_chromium || install_chromium
+
+      - name: Browser tests
+        timeout-minutes: 3
+        run: uv run pytest tests/e2e -m e2e
 
   # Known-vulnerability gate. Required only on release/** and main (rulesets), so a
   # vulnerable dependency shows red on dev PRs but never blocks feature work;

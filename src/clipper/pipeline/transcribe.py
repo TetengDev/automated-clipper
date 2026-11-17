@@ -604,8 +604,10 @@ def _describe(problems: dict[str, FileProblem]) -> str:
 def _store_lock(models_dir: Path, timeout_s: float, what: str) -> Iterator[None]:
     """Hold `fcntl.flock` on the models dir's lock file; a retryable `MediaError` when
     another process holds it for all of `timeout_s` (e.g. a long fetch). The fd is not
-    inherited (PEP 446), so a child never keeps the lock."""
-    fd = os.open(models_dir / STORE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    inherited (PEP 446), so a child never keeps the lock. Read-only: `flock` needs no
+    write access, so a lock file another uid created (e.g. `bench-transcribe` run as the
+    operator) still works."""
+    fd = os.open(models_dir / STORE_LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     try:
         deadline = time.monotonic() + timeout_s
         while True:
@@ -628,43 +630,67 @@ def prune_unpinned(models_dir: Path) -> int:
 
     Only `models--*` repo dirs and the shared store `blobs/<xx>/` are looked at, and only
     through real dirs: a link is removed itself, never followed, so nothing outside the
-    models dir goes. A path that cannot be deleted is logged and skipped."""
+    models dir goes. A path that cannot be deleted is logged and skipped. A dir that
+    cannot be read stops the blob cleanup: what links a blob may be inside it."""
     root = models_dir.resolve()
     pinned = {
         root / f"models--{p.repo.replace('/', '--')}" / "snapshots" / p.revision
         for p in WHISPER_MODELS.values()
     }
-    repos = _real_dirs(root, "models--*")
+    unreadable: list[Path] = []
+    repos = _real_dirs(root, "models--*", unreadable)
     deleted = 0
     for repo in repos:
-        for revision in _real_dirs(repo / "snapshots", "*"):
+        for revision in _real_dirs(repo / "snapshots", "*", unreadable):
             if revision not in pinned:
                 deleted += _delete(revision)
+    left = {repo: _real_dirs(repo / "snapshots", "*", unreadable) for repo in repos}
     used = {
         _link_target(path)
-        for repo in repos
-        for revision in _real_dirs(repo / "snapshots", "*")
-        for path in _tree(revision)
+        for revisions in left.values()
+        for revision in revisions
+        for path in _tree(revision, unreadable)
     }
-    for repo in repos:
-        if not _real_dirs(repo / "snapshots", "*"):
-            deleted += _delete(repo)  # no revision left: refs, blobs and all
-            continue
-        for blob in _entries(repo / "blobs"):
-            if blob not in used:
-                deleted += _delete(blob)
-    stored = {_link_target(blob) for repo in repos for blob in _entries(repo / "blobs")}
-    for prefix in _real_dirs(root / "blobs", "??"):
-        for entry in _entries(prefix):
-            if _STORE_FILE.fullmatch(entry.name) and entry not in stored:
-                deleted += _delete(entry) + _delete(entry.with_name(f"{entry.name}.refs"))
+    if not unreadable:
+        deleted += _drop_unused_blobs(root, left, used, unreadable)
+    if unreadable:
+        logger.warning("whisper models: blobs not cleaned up, %s could not be read", unreadable[0])
     if deleted:
         logger.info("whisper models: pruned %d unpinned file(s) and dir(s)", deleted)
     return deleted
 
 
-def _entries(directory: Path) -> list[Path]:
-    """What a real dir holds; nothing for a link, a file or a miss."""
+def _drop_unused_blobs(
+    root: Path, left: dict[Path, list[Path]], used: set[Path | None], unreadable: list[Path]
+) -> int:
+    """Delete repo dirs with no revision `left`, the repo blobs no snapshot link `used`,
+    then the shared-store files no repo blob links to (unless a blobs dir is unreadable)."""
+    deleted = 0
+    for repo, revisions in left.items():
+        if not revisions:
+            deleted += _delete(repo)  # no revision left: refs, blobs and all
+            continue
+        for blob in _entries(repo / "blobs"):
+            if blob not in used:
+                deleted += _delete(blob)
+    stored = {
+        _link_target(blob)
+        for repo, revisions in left.items()
+        if revisions
+        for blob in _entries(repo / "blobs", unreadable)
+    }
+    if unreadable:
+        return deleted
+    for prefix in _real_dirs(root / "blobs", "??"):
+        for entry in _entries(prefix):
+            if _STORE_FILE.fullmatch(entry.name) and entry not in stored:
+                deleted += _delete(entry) + _delete(entry.with_name(f"{entry.name}.refs"))
+    return deleted
+
+
+def _entries(directory: Path, unreadable: list[Path] | None = None) -> list[Path]:
+    """What a real dir holds; nothing for a link, a file or a miss. A dir that cannot be
+    read is logged and added to `unreadable`."""
     if not _is_real_dir(directory):
         return []
     try:
@@ -673,12 +699,15 @@ def _entries(directory: Path) -> list[Path]:
         return []
     except OSError as exc:
         logger.warning("whisper models: cannot read %s: %s", directory, type(exc).__name__)
+        if unreadable is not None:
+            unreadable.append(directory)
         return []
 
 
-def _real_dirs(directory: Path, pattern: str) -> list[Path]:
+def _real_dirs(directory: Path, pattern: str, unreadable: list[Path] | None = None) -> list[Path]:
     """The real dirs (not links to one) in `directory` whose name matches `pattern`."""
-    return [p for p in _entries(directory) if p.match(pattern) and _is_real_dir(p)]
+    entries = _entries(directory, unreadable)
+    return [p for p in entries if p.match(pattern) and _is_real_dir(p)]
 
 
 def _is_real_dir(path: Path) -> bool:
@@ -688,11 +717,11 @@ def _is_real_dir(path: Path) -> bool:
         return False
 
 
-def _tree(directory: Path) -> Iterator[Path]:
+def _tree(directory: Path, unreadable: list[Path]) -> Iterator[Path]:
     """Every entry under a real dir, without entering links."""
-    for entry in _entries(directory):
+    for entry in _entries(directory, unreadable):
         yield entry
-        yield from _tree(entry)
+        yield from _tree(entry, unreadable)
 
 
 def _link_target(path: Path) -> Path | None:

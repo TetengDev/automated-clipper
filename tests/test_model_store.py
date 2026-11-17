@@ -88,7 +88,8 @@ def _pin() -> config.PinnedModel:
 def held_lock(models: Path) -> Iterator[None]:
     """Another process's hold on the store lock (flock locks per open file)."""
     models.mkdir(parents=True, exist_ok=True)
-    with (models / ".lock").open("a") as fh:
+    (models / ".lock").touch()
+    with (models / ".lock").open("rb") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         yield
 
@@ -133,6 +134,18 @@ def test_ensure_model_waits_for_the_lock_then_gives_up_retryably(
 def test_the_fast_path_also_takes_the_lock(fake_asr: FakeAsr, tmp_path: Path) -> None:
     """A marked snapshot is checked under the lock too: another process may be healing it."""
     local().ensure_model()
+    with held_lock(tmp_path / "models"), pytest.raises(MediaError, match="model store busy"):
+        local().ensure_model(timeout_s=1.0)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_a_lock_file_this_process_cannot_write_still_locks(fake_asr: FakeAsr, tmp_path: Path):
+    """`bench-transcribe` run as another uid leaves a lock file the worker cannot write;
+    `flock` needs only read access."""
+    lock = tmp_path / "models" / ".lock"
+    lock.parent.mkdir()
+    lock.touch(mode=0o444)
+    assert local().ensure_model()
     with held_lock(tmp_path / "models"), pytest.raises(MediaError, match="model store busy"):
         local().ensure_model(timeout_s=1.0)
 
@@ -274,6 +287,34 @@ def test_an_undeletable_path_is_logged_and_the_prune_goes_on(
     assert not later.parents[1].exists()
     assert stuck.is_dir()
     assert f"cannot delete {stuck / 'config.json'}: PermissionError" in caplog.text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+@pytest.mark.parametrize("unreadable", ["revision", "snapshots", "blobs"])
+def test_an_unreadable_snapshot_keeps_every_blob(
+    fake_asr: FakeAsr, tmp_path: Path, caplog: pytest.LogCaptureFixture, unreadable: str
+) -> None:
+    """What the prune cannot read it cannot know is unused: a pinned snapshot or blobs dir
+    it cannot list (e.g. root-owned) keeps its blobs and store files. Stale snapshots
+    still go."""
+    models = tmp_path / "models"
+    tiny = write_snapshot(models, *TINY, arrives={"model.bin": b"tiny weights"})
+    blobs = sorted(os.listdir(tiny.parents[1] / "blobs"))
+    stale = write_snapshot(models, "Systran/faster-whisper-retired", OLD_REVISION)
+    locked = {"revision": tiny, "snapshots": tiny.parent, "blobs": tiny.parents[1] / "blobs"}[
+        unreadable
+    ]
+    locked.chmod(0o000)
+    try:
+        with caplog.at_level(logging.WARNING, logger=tr.__name__):
+            tr.FasterWhisperTranscriber(model="base").ensure_model()
+    finally:
+        locked.chmod(0o755)
+    assert sorted(os.listdir(tiny.parents[1] / "blobs")) == blobs
+    assert _store_file(models, b"tiny weights").is_file()
+    assert (tiny / "model.bin").read_bytes() == b"tiny weights"
+    assert not stale.exists()
+    assert f"cannot read {locked}" in caplog.text
 
 
 def test_nothing_is_pruned_while_another_process_holds_the_lock(

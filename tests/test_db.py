@@ -272,3 +272,14 @@ def test_a_skipped_lower_version_is_applied_later(tmp_path: Path) -> None:
     assert migrate(conn, list(m.values())) == []  # still idempotent
     versions = [r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1")]
     assert versions == [1, 2, 3, 4]
+
+
+def test_recorded_version_with_another_name_is_rejected(tmp_path: Path) -> None:
+    """CLP-79: a database that recorded 0003_a never silently skips a bundled 0003_b."""
+    conn = connect(tmp_path / "state.db")
+    migrate(conn, [Migration(3, "a", "CREATE TABLE a(x);")])
+
+    with pytest.raises(MigrationError, match="migration 3: the database recorded 'a'.*'b'"):
+        migrate(conn, [Migration(3, "b", "CREATE TABLE b(x);"), Migration(4, "c", "")])
+
+    assert "b" not in _tables(conn) and current_version(conn) == 3

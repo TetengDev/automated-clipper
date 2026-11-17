@@ -175,6 +175,15 @@ def migrate(conn: sqlite3.Connection, migrations: list[Migration] | None = None)
         )
 
     done = _applied_versions(conn)
+    if done:  # a version recorded under another name is a different migration (CLP-79)
+        recorded = dict(conn.execute("SELECT version, name FROM schema_version").fetchall())
+        for migration in ordered:
+            name = recorded.get(migration.version, migration.name)
+            if name != migration.name:
+                raise MigrationError(
+                    f"migration {migration.version}: the database recorded {name!r} but this"
+                    f" code has {migration.name!r}; two branches shipped the same version"
+                )
     applied: list[int] = []
     for migration, statements in plans:
         if migration.version in done:

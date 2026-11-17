@@ -11,7 +11,8 @@ Run it with the project's Python, so the character categories match the runtime:
 
     uv run python scripts/gen_hashtag_data.py [DIR]
 
-DIR holds the four files already downloaded; without it they are fetched. The output is
+DIR holds the four files already downloaded; without it they are fetched. A file whose
+header names another Unicode version is refused. The output is
 checked in, so nothing is downloaded at runtime or in tests.
 
 What it writes:
@@ -23,6 +24,10 @@ What it writes:
   non-ASCII letter (`ᴍ` -> `ʍ`): the Latin small capitals, read from their names
   (LATIN LETTER SMALL CAPITAL X -> x). Each target is read through the table again, so the
   module needs one pass (`ᴍ` -> m -> rn, as `m` itself reads in confusables.txt).
+- CAPITAL_CONFUSABLES: non-ASCII capitals (that survive NFKD) whose confusable is an ASCII
+  letter, for a second reading taken before case folding: Greek `ϜΥΡ` folds to `ϝυρ`, which
+  reads `ϝup`, but the capitals read FYP. ASCII capitals and small letters are left out, so
+  `I` -> l and long s -> f never apply.
 - SCRIPT_STARTS / SCRIPT_NAMES: the Script property of every letter, mark and number, as
   sorted range starts (other characters fall in the gaps and are never looked up).
 - MARK_SCRIPTS: the Script_Extensions of the combining marks that have one (the kana voiced
@@ -52,9 +57,21 @@ _SMALL_CAPITAL = re.compile(r"LATIN LETTER SMALL CAPITAL ([A-Z])")
 
 def _read(name: str, folder: Path | None) -> str:
     if folder is not None:
-        return (folder / name).read_text(encoding="utf-8")
-    with urllib.request.urlopen(URLS[name], timeout=60) as resp:  # noqa: S310 (fixed https URL)
-        return resp.read().decode("utf-8")
+        text = (folder / name).read_text(encoding="utf-8")
+    else:
+        with urllib.request.urlopen(URLS[name], timeout=60) as resp:  # noqa: S310 (fixed URL)
+            text = resp.read().decode("utf-8")
+    check_version(name, text)
+    return text
+
+
+def check_version(name: str, text: str) -> None:
+    """Refuse a file of another Unicode version: its header names it as `# Version: X`
+    (confusables.txt) or `# Scripts-X.txt` (the UCD files)."""
+    head = "\n".join(text.splitlines()[:10])
+    stem = name.removesuffix(".txt")
+    if f"# Version: {VERSION}" not in head and f"# {stem}-{VERSION}.txt" not in head:
+        raise SystemExit(f"{name} is not Unicode {VERSION}")
 
 
 def _rows(text: str) -> Iterator[list[str]]:
@@ -76,7 +93,7 @@ def _prefold(text: str) -> str:
     return "".join(c for c in text if not unicodedata.category(c).startswith("M"))
 
 
-def confusables(text: str) -> dict[int, str]:
+def _raw(text: str) -> dict[str, str]:
     raw: dict[str, str] = {}
     for source, target, *_ in _rows(text):
         raw[chr(int(source, 16))] = "".join(chr(int(cp, 16)) for cp in target.split())
@@ -84,6 +101,11 @@ def confusables(text: str) -> dict[int, str]:
         match = _SMALL_CAPITAL.fullmatch(unicodedata.name(chr(cp), ""))
         if match and not _ASCII.fullmatch(_prefold(raw.get(chr(cp), "-"))):
             raw[chr(cp)] = match.group(1).lower()
+    return raw
+
+
+def confusables(text: str) -> dict[int, str]:
+    raw = _raw(text)
     # Only characters the runtime sees: a capital is case-folded first, and its small letter
     # need not look like the same thing (long s is confusable with f, but folds to s).
     table: dict[int, str] = {}
@@ -95,6 +117,27 @@ def confusables(text: str) -> dict[int, str]:
             table[ord(source)] = ascii_
     while closed := {cp: t.translate(table) for cp, t in table.items() if t.translate(table) != t}:
         table.update(closed)
+    return table
+
+
+def capitals(text: str) -> dict[int, str]:
+    """Non-ASCII capitals that look like an ASCII letter while their small letter may not
+    (Greek Υ looks like Y, υ like u), for a reading taken before case folding. Only what
+    survives NFKD (the runtime decomposes first). A capital that reads as l (Greek Ι) reads
+    as i when its small letter does, since it looks like the capital I."""
+    raw = _raw(text)
+    small = confusables(text)
+    table: dict[int, str] = {}
+    for source, target in sorted(raw.items()):
+        if source.isascii() or unicodedata.category(source) not in {"Lu", "Lt"}:
+            continue
+        if unicodedata.normalize("NFKD", source) != source:
+            continue
+        ascii_ = _prefold(target)
+        if ascii_ == "l" and small.get(ord(_prefold(source))) == "i":
+            ascii_ = "i"
+        if _ASCII.fullmatch(ascii_):
+            table[ord(source)] = ascii_
     return table
 
 
@@ -152,7 +195,10 @@ def _mark_entry(cp: int, names: tuple[str, ...]) -> list[str]:
 
 
 def render(
-    table: dict[int, str], starts: list[tuple[int, str]], marks: dict[int, tuple[str, ...]]
+    table: dict[int, str],
+    starts: list[tuple[int, str]],
+    marks: dict[int, tuple[str, ...]],
+    capital_table: dict[int, str] | None = None,
 ) -> str:
     out = [
         '"""Unicode data for the hashtag checks in `clipper.metadata` (CLP-112). Generated by',
@@ -165,6 +211,14 @@ def render(
         *(f'    0x{cp:04X}: "{target}",  # {_char(cp)}' for cp, target in table.items()),
         "}",
         '"""A folded letter or digit -> the ASCII it looks like."""',
+        "",
+        "CAPITAL_CONFUSABLES: dict[int, str] = {",
+        *(
+            f'    0x{cp:04X}: "{target}",  # {_char(cp)}'
+            for cp, target in (capital_table or {}).items()
+        ),
+        "}",
+        '"""A non-ASCII capital -> the ASCII letter it looks like, read before case folding."""',
         "",
         "SCRIPT_STARTS: tuple[int, ...] = (",
         *(f"    0x{cp:04X},  # {_char(cp)}" for cp, _ in starts),
@@ -190,11 +244,13 @@ def main(argv: list[str]) -> int:
         return 1
     folder = Path(argv[1]) if len(argv) > 1 else None
     names = _script_names(_read("PropertyValueAliases.txt", folder))
+    confusables_txt = _read("confusables.txt", folder)
     OUT.write_text(
         render(
-            confusables(_read("confusables.txt", folder)),
+            confusables(confusables_txt),
             scripts(_read("Scripts.txt", folder), names),
             mark_scripts(_read("ScriptExtensions.txt", folder), names),
+            capitals(confusables_txt),
         ),
         encoding="utf-8",
     )

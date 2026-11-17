@@ -6,6 +6,8 @@ from __future__ import annotations
 import types
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "gen_hashtag_data.py"
 # Loaded from source, so no __pycache__ lands in scripts/ (test_accounts reads every file there).
 gen = types.ModuleType("gen_hashtag_data")
@@ -55,3 +57,32 @@ def test_the_rendered_module_is_valid_python():
     assert namespace["CONFUSABLES"] == {0x0430: "a"}
     assert namespace["SCRIPT_NAMES"] == ("COMMON", "LATIN")
     assert namespace["MARK_SCRIPTS"] == {0x3099: ("HIRAGANA",)}
+
+
+def test_a_source_file_of_another_unicode_version_is_refused():
+    gen.check_version("Scripts.txt", "# Scripts-15.0.0.txt\n# Date: 2022\n")
+    gen.check_version("confusables.txt", "# confusables.txt\n# Version: 15.0.0\n")
+    for name, text in [
+        ("Scripts.txt", "# Scripts-15.1.0.txt\n"),
+        ("confusables.txt", "# confusables.txt\n# Version: 16.0.0\n"),
+        ("confusables.txt", "no header at all\n"),
+    ]:
+        with pytest.raises(SystemExit, match="not Unicode 15.0.0"):
+            gen.check_version(name, text)
+
+
+def test_capitals_whose_small_letter_looks_different_get_their_own_table():
+    sample = (
+        CONFUSABLES
+        + """
+03DC ;\t0046 ;\tMA\t# ( Ϝ → F ) GREEK LETTER DIGAMMA
+03A5 ;\t0059 ;\tMA\t# ( Υ → Y ) GREEK CAPITAL LETTER UPSILON
+03C5 ;\t0075 ;\tMA\t# ( υ → u ) GREEK SMALL LETTER UPSILON
+0399 ;\t006C ;\tMA\t# ( Ι → l ) GREEK CAPITAL LETTER IOTA
+03B9 ;\t0069 ;\tMA\t# ( ι → i ) GREEK SMALL LETTER IOTA
+"""
+    )
+    capitals = gen.capitals(sample)
+    assert capitals[0x03DC] == "f" and capitals[0x03A5] == "y"
+    assert capitals[0x0399] == "i"  # reads I, as its small letter does, not l
+    assert ord("I") not in capitals and 0x017F not in capitals  # ASCII and small letters

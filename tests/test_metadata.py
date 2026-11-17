@@ -23,6 +23,7 @@ from clipper.metadata import (
     coerce_variants,
     derive_variants,
     fingerprint,
+    is_hashtag,
     links_or_mentions,
     preflight,
     truncate_words,
@@ -539,3 +540,52 @@ def test_mixed_script_hashtags_are_dropped_from_model_output(tag):
 def test_single_script_and_cjk_tags_still_pass(tag):
     assert variant(hashtags=["#mrbeast", tag, "#island"]).hashtags[1] == tag
     assert clean_hashtags(["#mrbeast", tag]) == ["#mrbeast", tag]
+
+
+# --- combining marks (CLP-113) --------------------------------------------------------------
+
+MARKED = [
+    "#नमस्ते",  # Devanagari: virama and vowel sign (Mn)
+    "#हिन्दी",  # Devanagari: spacing vowel signs (Mc)
+    "#ราตรี",  # Thai vowel sign
+    "#ที่",  # Thai: a tone mark stacked on a vowel sign
+    "#தமிழ்",  # Tamil: spacing vowel sign and virama
+    "#ᜋ᜔ᜈ",  # Baybayin with the virama
+]
+
+
+@pytest.mark.parametrize("tag", MARKED)
+def test_tags_with_combining_marks_pass(tag):
+    assert is_hashtag(tag)
+    assert variant(hashtags=["#mrbeast", tag, "#island"]).hashtags[1] == tag
+    assert clean_hashtags(["#mrbeast", tag]) == ["#mrbeast", tag]
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "#\u094d",  # a mark on its own
+        "#\u094dनमस",  # a mark straight after #
+        "#\u0e35abc",
+        "#_\u094d",  # a mark after an underscore or a digit has no letter to sit on
+        "#2\u0e35",
+        "#fyp\u0323",  # a Latin tag padded with a combining mark is still #fyp
+        "#ad\u094d",  # ... or with another script's mark
+        "#fyp\u0e35",
+        "#ad\u200d",  # a joiner is not a mark
+    ],
+)
+def test_marks_without_a_same_script_letter_before_them_are_rejected(tag):
+    assert not is_hashtag(tag)
+    assert clean_hashtags(["#mrbeast", tag]) == ["#mrbeast"]
+    with pytest.raises(ValidationError, match="invalid hashtag"):
+        variant(hashtags=["#mrbeast", tag, "#island"])
+
+
+def test_the_50_limit_counts_code_points_marks_included():
+    assert is_hashtag("#" + "न\u094d" * 25)
+    assert not is_hashtag("#" + "न\u094d" * 25 + "न")
+    assert is_hashtag("#" + "a" * 50)
+    assert not is_hashtag("#" + "a" * 51)
+    assert not is_hashtag("#")
+    assert not is_hashtag("nohash")

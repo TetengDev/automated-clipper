@@ -126,7 +126,6 @@ _HOST = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
 _INLINE_TAG = re.compile(r"#\w+")
 _LINK_IN_PATH = re.compile(rf"(?i:www\.|https?:|[\w-]\.(?:{_TLDS})\b)")
 """Another link inside an allowed URL's path; a file name ("download.html") is fine."""
-HASHTAG = re.compile(r"^#\w{1,50}$")
 
 
 def utf16_len(text: str) -> int:
@@ -273,6 +272,13 @@ _SCRIPT_MIXES = (
 "highly restrictive" profile (UTS #39)."""
 
 
+def _script(char: str) -> str:
+    """The script of a letter or combining mark, read from the first word of its Unicode
+    name; a mark of no one script is named COMBINING."""
+    word = unicodedata.name(char, "UNKNOWN").split(" ", 1)[0]
+    return _SCRIPT_ALIASES.get(word, word)
+
+
 def _scripts(folded: str) -> set[str]:
     """The scripts of the letters in an NFKC-folded tag, read from the first word of each
     letter's Unicode name (LATIN, CYRILLIC, GREEK, ...). Digits, `_` and combining marks
@@ -285,8 +291,7 @@ def _scripts(folded: str) -> set[str]:
         if char in _KANA_MARKS:
             kana_marks = True
             continue
-        word = unicodedata.name(char, "UNKNOWN").split(" ", 1)[0]
-        scripts.add(_SCRIPT_ALIASES.get(word, word))
+        scripts.add(_script(char))
     if kana_marks and not scripts & _KANA:
         scripts.add("KANA MARK")
     return scripts
@@ -305,6 +310,34 @@ def _mixed_scripts(tag: str) -> list[str]:
     ):
         return ["LATIN", "non-ASCII digits"]
     return []
+
+
+_MARKS = frozenset({"Mn", "Mc"})
+_HASHTAG_MAX = 50
+
+
+def is_hashtag(tag: str) -> bool:
+    """`#` and 1-50 code points, each a letter, a digit, `_`, or a combining mark (Mn, Mc)
+    of the same script as the letter it sits on, so `#नमस्ते`, `#ที่` and `#ᜋ᜔ᜈ` pass. A mark
+    on its own, straight after `#`, `_` or a digit, or of another script or none (`#fyp`
+    with a combining dot below, `#ad` with a Devanagari virama) is rejected: it would pad a
+    Latin tag past the generic, disclosure and mixed-script checks."""
+    body = tag[1:]
+    if not tag.startswith("#") or not 1 <= len(body) <= _HASHTAG_MAX:
+        return False
+    base: str | None = None  # the script of the letter the next mark would sit on
+    for char in body:
+        category = unicodedata.category(char)
+        if category in _MARKS:
+            if _script(char) != base:
+                return False
+        elif category.startswith("L"):
+            base = _script(char)
+        elif category.startswith("N") or char == "_":
+            base = None
+        else:
+            return False
+    return True
 
 
 def is_mixed_script(tag: str) -> bool:
@@ -361,7 +394,7 @@ def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -
         tag = normalize_hashtag(raw)
         key = _fold(tag)
         usable = (
-            HASHTAG.fullmatch(tag)
+            is_hashtag(tag)
             and not is_generic(tag)
             and not is_disclosure(tag)
             and not is_mixed_script(tag)
@@ -419,7 +452,7 @@ class Variant(BaseModel):
         if len(tags) > _VARIANT_HASHTAGS_MAX:
             raise ValueError(f"at most {_VARIANT_HASHTAGS_MAX} hashtags")
         for tag in tags:
-            if not HASHTAG.fullmatch(tag):
+            if not is_hashtag(tag):
                 raise ValueError(f"invalid hashtag {tag!r}")
             if is_generic(tag):
                 raise ValueError(f"generic hashtag {tag} says nothing about the clip")
@@ -575,7 +608,7 @@ def build_post_metadata(
     campaign: list[str] = []
     for raw in campaign_tags:
         tag = normalize_hashtag(raw)
-        if not HASHTAG.fullmatch(tag):
+        if not is_hashtag(tag):
             raise ValueError(f"invalid campaign tag {raw!r}")
         if _fold(tag) not in {_fold(t) for t in campaign}:
             campaign.append(tag)

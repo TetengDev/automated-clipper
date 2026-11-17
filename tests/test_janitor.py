@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -107,7 +109,12 @@ def add_clip(
     conn.execute(
         "INSERT INTO clip_versions (clip_id, version, start_s, end_s, video_path, thumb_path,"
         " created_at) VALUES (?, 1, 0, 30, ?, ?, ?)",
-        (clip_id, f"x/clips/{rank}/v1.mp4", f"x/clips/{rank}/v1.jpg", to_iso(T0)),
+        (
+            clip_id,
+            f"x/clips/{rank}/v1.mp4",
+            f"x/clips/{rank}/v1.jpg",
+            to_iso(T0 - (created or age)),
+        ),
     )
     return clip_id
 
@@ -164,15 +171,24 @@ def test_reviewable_clips_past_review_expiry_are_archived(
     assert updated[0] == to_iso(T0)  # the rejected/archived retention counts from here
 
 
-def test_review_expiry_counts_from_creation_not_last_update(
+def test_review_expiry_counts_from_the_current_version(
     conn: sqlite3.Connection, root: Path
 ) -> None:
-    clip = add_clip(conn, add_job(conn, "aaaaaaaaaaa"), 1, "pending_review", created=8 * DAY)
-    conn.execute("UPDATE clips SET updated_at = ? WHERE id = ?", (to_iso(T0), clip))
+    job = add_job(conn, "aaaaaaaaaaa")
+    stale = add_clip(conn, job, 1, "pending_review", created=8 * DAY)
+    conn.execute("UPDATE clips SET updated_at = ? WHERE id = ?", (to_iso(T0), stale))
+    rerendered = add_clip(conn, job, 2, "pending_review", created=30 * DAY)
+    conn.execute(
+        "INSERT INTO clip_versions (clip_id, version, start_s, end_s, created_at)"
+        " VALUES (?, 2, 0, 30, ?)",
+        (rerendered, to_iso(T0 - 2 * DAY)),
+    )  # a re-render landed v2 back in review two days ago
+    conn.execute("UPDATE clips SET current_version = 2 WHERE id = ?", (rerendered,))
 
     make(conn, root, review_expiry_days=7).run()
 
-    assert status(conn, clip) == "archived"
+    assert status(conn, stale) == "archived"  # a later status touch does not reset it
+    assert status(conn, rerendered) == "pending_review"
 
 
 # --- source media retention -------------------------------------------------------------
@@ -272,6 +288,76 @@ def test_files_a_post_uses_are_kept(conn: sqlite3.Connection, root: Path) -> Non
     make(conn, root).run()
 
     assert video.is_file()
+
+
+@contextmanager
+def unwritable(path: Path) -> Iterator[None]:
+    path.chmod(0o555)
+    try:
+        yield
+    finally:
+        path.chmod(0o755)
+
+
+needs_permissions = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores file permissions"
+)
+
+
+@needs_permissions
+def test_an_undeletable_file_is_logged_and_the_sweep_moves_on(
+    conn: sqlite3.Connection, root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    add_job(conn, "aaaaaaaaaaa", age=90 * DAY)
+    stuck = job_dir(root, "aaaaaaaaaaa")
+    add_job(conn, "bbbbbbbbbbb", age=80 * DAY)
+    later = job_dir(root, "bbbbbbbbbbb")
+
+    with unwritable(stuck):  # e.g. a dir a host-side run left root-owned
+        report = make(conn, root).run()
+
+    assert report.errors == []
+    assert (stuck / "audio_16k.flac").is_file()
+    assert not (later / "audio_16k.flac").exists()
+    assert not (later / "clips" / "1" / "source.mp4").exists()
+    assert f"{stuck / 'audio_16k.flac'}" in caplog.text and "PermissionError" in caplog.text
+
+
+@needs_permissions
+def test_the_disk_budget_sweep_moves_past_an_undeletable_job(
+    conn: sqlite3.Connection, root: Path
+) -> None:
+    add_job(conn, "aaaaaaaaaaa", age=10 * HOUR)
+    stuck = job_dir(root, "aaaaaaaaaaa")
+    add_job(conn, "bbbbbbbbbbb", age=5 * HOUR)
+    later = job_dir(root, "bbbbbbbbbbb")
+
+    with unwritable(stuck), unwritable(stuck / "clips" / "1"):
+        report = make(conn, root, usage=GB + 100, disk_budget_gb=1).run()
+
+    assert report.errors == []
+    assert (stuck / "audio_16k.flac").is_file()
+    assert not (later / "audio_16k.flac").exists()
+
+
+@needs_permissions
+def test_an_unreadable_dead_clip_dir_is_logged_and_skipped(
+    conn: sqlite3.Connection, root: Path
+) -> None:
+    job = add_job(conn, "aaaaaaaaaaa", age=1 * HOUR)
+    path = job_dir(root, "aaaaaaaaaaa", ranks=(1, 2))
+    add_clip(conn, job, 1, "rejected", age=30 * DAY)
+    add_clip(conn, job, 2, "rejected", age=30 * DAY)
+    locked = path / "clips" / "1"
+    locked.chmod(0o000)
+    try:
+        report = make(conn, root).run()
+    finally:
+        locked.chmod(0o755)
+
+    assert report.errors == []
+    assert locked.is_dir()
+    assert not (path / "clips" / "2").exists()
 
 
 # --- symlinks and the media root --------------------------------------------------------
@@ -430,7 +516,7 @@ def test_a_failing_sweep_is_reported_and_the_others_still_run(
     conn: sqlite3.Connection, root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clip = add_clip(conn, add_job(conn, "aaaaaaaaaaa", age=90 * DAY), 1, "pending_review")
-    conn.execute("UPDATE clips SET created_at = ?", (to_iso(T0 - 30 * DAY),))
+    conn.execute("UPDATE clip_versions SET created_at = ?", (to_iso(T0 - 30 * DAY),))
     path = job_dir(root, "aaaaaaaaaaa", ranks=())
     janitor = make(conn, root)
 

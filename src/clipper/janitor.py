@@ -5,7 +5,8 @@ Each sweep is one method, named in `SWEEPS` and run in that order. A sweep that 
 logged and reported; the others still run.
 
 - `expire_reviews`: clips still waiting for review (`pending_review`, `needs_attention`)
-  `review_expiry_days` after they were created are `archived`, with an `archive` audit row.
+  `review_expiry_days` after their current version was created are `archived`, with an
+  `archive` audit row. A re-render that returns a clip to review starts the wait over.
 - `prune_sources`: `clips_ready` jobs older than `media_retention_hours` (since they became
   ready) lose their source media: the audio, leftover downloads, and each clip's downloaded
   section (`clips/<rank>/source.mp4`, its sidecar, temp files). Rendered clips
@@ -23,7 +24,8 @@ Deletion rules. Files are deleted only here, and only inside `media_root`:
 - Nothing is deleted at, through or below a symlink. A path whose real location differs
   from its own (a link anywhere below the root) is refused, links met while emptying a dir
   are left in place, and no link is ever followed.
-- Only regular files and empty dirs are removed.
+- Only regular files and empty dirs are removed. A file or dir that cannot be deleted or
+  read (e.g. root-owned) is logged and skipped; the sweep goes on with the next one.
 - Clips that are `approved`, `exported`, `changes_requested` or `re_rendering` keep their
   whole clip dir (a re-render reads the section). Any file that a clip in those states or
   a post points at is kept too.
@@ -151,8 +153,9 @@ class Janitor:
         # update, so a clip that was just approved is never archived.
         with transaction(self.conn):
             rows = self.conn.execute(
-                "SELECT id, current_version FROM clips"  # noqa: S608 - placeholders
-                f" WHERE status IN ({marks}) AND created_at < ? ORDER BY id",
+                "SELECT c.id, c.current_version FROM clips c"  # noqa: S608 - placeholders
+                " JOIN clip_versions v ON v.clip_id = c.id AND v.version = c.current_version"
+                f" WHERE c.status IN ({marks}) AND v.created_at < ? ORDER BY c.id",
                 (*waiting, to_iso(cutoff)),
             ).fetchall()
             for clip_id, version in rows:
@@ -300,14 +303,23 @@ class Janitor:
         if any(path == k or path.is_relative_to(k) for k in kept):
             return 0
         if stat.S_ISREG(info.st_mode):
-            path.unlink()
+            try:
+                path.unlink()
+            except OSError as exc:  # e.g. a root-owned dir: skip it, never stall the sweep
+                logger.warning("janitor: cannot delete %s: %s", path, type(exc).__name__)
+                return 0
             report.removed += 1
             report.freed_bytes += info.st_size
             return info.st_size
         if not stat.S_ISDIR(info.st_mode):
             logger.warning("janitor: %s is not a regular file or dir; not deleted", path)
             return 0
-        freed = sum(self._remove(root, child, kept, report) for child in sorted(path.iterdir()))
+        try:
+            children = sorted(path.iterdir())
+        except OSError as exc:
+            logger.warning("janitor: cannot read %s: %s", path, type(exc).__name__)
+            return 0
+        freed = sum(self._remove(root, child, kept, report) for child in children)
         with suppress(OSError):  # not empty: something in it was kept or refused
             path.rmdir()
         return freed

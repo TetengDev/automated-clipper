@@ -17,10 +17,15 @@
   that handles them runs (e.g. `waiting_vod` until the VOD poller exists).
 - While a stage runs, the worker's heartbeat renews the claim lease (DEFAULT_LEASE) every
   quarter lease (`clipper.jobs.heartbeat`). Only a worker that stalls for longer than the
-  lease loses the job to another worker; its late result is dropped, and writes a stage
-  makes besides its artifact must be fenced with `hold_lease` on `ctx.worker_id` (as the
-  clip insert is). Every claim counts as an attempt, so a stage that keeps killing its
-  worker ends the job as failed after MAX_ATTEMPTS claims.
+  lease loses the job to another worker; its late result is dropped. A DB write a stage
+  makes besides its outcome that must not land after the lease is lost is fenced with
+  `hold_lease` on `ctx.worker_id`, in the write's own transaction. Today that is the clip
+  insert (rendering). The only other stage DB writes are spend-ledger rows
+  (`clipper.pipeline.common.reserve_spend`, transcribing and selecting); they are not
+  fenced on purpose, since they record money a call really spent. Files a stage writes
+  outside its artifact (caches, render failure markers) are not fenced either. Every
+  claim counts as an attempt, so a stage that keeps killing its worker ends the job as
+  failed after MAX_ATTEMPTS claims.
 """
 
 from __future__ import annotations

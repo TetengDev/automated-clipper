@@ -27,6 +27,7 @@ from clipper.db import connect, migrate
 from clipper.jobs.queue import enqueue
 from clipper.monitor import (
     COMPONENT,
+    MAX_FORMAT_ERRORS_WITH_SIBLINGS,
     MAX_METADATA_ATTEMPTS,
     FirstRun,
     SeenStatus,
@@ -519,6 +520,61 @@ def test_format_errors_back_off_to_hourly_and_never_give_up(conn, cfg, source, c
     assert attempts_at[:6] == [0, 10, 30, 70, 130, 190]  # 10 min doubling, capped at 1 h
     assert len(attempts_at) == 4 + (24 * 60 - 130) // 60 + 1
     assert V1 not in seen(conn) and monitor.failures == {}
+
+
+def _poll_x_with_a_new_sibling_each_time(conn, cfg, source, clock, sibling) -> list[dict]:
+    """x never gets a usable format; each poll lists one new upload, `sibling(vid)`, before
+    it (so probed first). Returns each poll's errors."""
+    x = "x" * 11
+    not_first_poll(conn)
+    source.meta[x] = "format: Requested format is not available"
+    monitor = make(conn, cfg, source, clock)
+    listed = [Upload(x, T0)]
+    errors = []
+    for vid in (V1, V2, V3):
+        listed = [Upload(vid, T0), *listed]
+        source.feeds[BEAST] = listed
+        source.meta[vid] = sibling(vid)
+        errors.append(monitor.run_cycle([cfg.creator("MrBeast")]).errors)
+        clock.now += timedelta(hours=2)  # past the longest backoff
+    return errors
+
+
+def test_format_errors_while_siblings_probe_fine_give_up_on_the_video(
+    conn, cfg, source, clock
+) -> None:
+    # The player works for this creator's other videos, so x itself has no format the clip
+    # selector accepts (e.g. a silent upload): after MAX_FORMAT_ERRORS_WITH_SIBLINGS such
+    # polls it is recorded unavailable instead of being probed hourly while listed.
+    x = "x" * 11
+    seen_after: list[str | None] = []
+
+    def sibling(vid: str) -> VideoMeta:
+        seen_after.append(seen(conn).get(x))
+        return video(vid)
+
+    errors = _poll_x_with_a_new_sibling_each_time(conn, cfg, source, clock, sibling)
+
+    assert MAX_FORMAT_ERRORS_WITH_SIBLINGS == 3
+    assert seen(conn)[x] == "unavailable"
+    assert seen_after == [None, None, None]  # not before the third such poll
+    assert [seen(conn)[v] for v in (V1, V2, V3)] == ["enqueued"] * 3
+    assert {"creator": "MrBeast", "item": x, "error": "no usable format in 3 polls where"
+            " other videos probed fine; given up"} in errors[2]  # fmt: skip
+
+
+def test_format_errors_while_siblings_are_only_upcoming_never_count(
+    conn, cfg, source, clock
+) -> None:
+    # yt-dlp fails on a scheduled stream before choosing any format: no sign the player
+    # works, so a player breakage cannot give up on x this way.
+    x = "x" * 11
+
+    _poll_x_with_a_new_sibling_each_time(
+        conn, cfg, source, clock, lambda vid: video(vid, status="is_upcoming")
+    )
+
+    assert x not in seen(conn)
 
 
 @pytest.mark.parametrize("interval_minutes", [60, 90])

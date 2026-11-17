@@ -10,8 +10,9 @@ worker's heartbeat renews the lease (`renew_lease`, `clipper.jobs.heartbeat`).
 from __future__ import annotations
 
 import dataclasses
+import random
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 
 from clipper.db import transaction
@@ -22,6 +23,9 @@ from clipper.urls import SourceRef, canonical_url
 DEFAULT_LEASE = timedelta(hours=2)
 BACKOFF_BASE = timedelta(minutes=1)
 BACKOFF_CAP = timedelta(hours=1)
+BACKOFF_JITTER = 0.2
+"""A retry waits backoff x a random factor in [0.8, 1.2] (CLP-34), so jobs that failed
+together (an outage) do not all retry in the same poll."""
 MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 2000
 MAX_TITLE_CHARS = 500
@@ -239,10 +243,22 @@ def backoff(attempts: int) -> timedelta:
     return min(BACKOFF_BASE * 2 ** min(max(attempts - 1, 0), 16), BACKOFF_CAP)
 
 
+def jittered(
+    delay: timedelta, uniform: Callable[[float, float], float] = random.uniform
+) -> timedelta:
+    return delay * uniform(1 - BACKOFF_JITTER, 1 + BACKOFF_JITTER)
+
+
 def record_failure(
-    conn: sqlite3.Connection, job: Job, error: str, now: datetime, *, worker_id: str
+    conn: sqlite3.Connection,
+    job: Job,
+    error: str,
+    now: datetime,
+    *,
+    worker_id: str,
+    uniform: Callable[[float, float], float] = random.uniform,
 ) -> datetime | None:
-    """Keep the status, schedule a retry with exponential backoff.
+    """Keep the status, schedule a retry with exponential backoff and jitter.
 
     `job.attempts` already counts this attempt (claim_next bumps it). Once it reaches
     MAX_ATTEMPTS the job is marked failed; returns None.
@@ -262,7 +278,7 @@ def record_failure(
             ),
         )
         return None
-    retry_at = now + backoff(attempts)
+    retry_at = now + jittered(backoff(attempts), uniform)
     _finish(
         conn,
         job,

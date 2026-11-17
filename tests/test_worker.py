@@ -445,7 +445,7 @@ def test_stage_error_is_recorded_and_retried_after_backoff(
     assert failed.last_error == "RuntimeError: llm timeout"
 
     del pipeline.fail_at[JobStatus.SELECTING]
-    clock.now = T0 + timedelta(minutes=1)
+    clock.now = T0 + timedelta(minutes=1.2)  # backoff(1) plus the most jitter
     _drain(worker)
     assert _status(db, job.id) is JobStatus.CLIPS_READY
 

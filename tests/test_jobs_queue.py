@@ -19,6 +19,7 @@ from clipper.jobs.queue import (
     enqueue,
     get_job,
     hold_lease,
+    jittered,
     mark_terminal,
     record_failure,
     release_claim,
@@ -127,8 +128,9 @@ def test_record_failure_backs_off_and_keeps_status(conn: sqlite3.Connection) -> 
     assert failed.status is JobStatus.DETECTED
     assert failed.attempts == 1
     assert failed.last_error is not None and len(failed.last_error) == 2000
-    assert retry_at == T0 + timedelta(minutes=1)
-    assert claim_next(conn, T0 + timedelta(seconds=59), worker_id="w", statuses=ALL) is None
+    assert retry_at is not None
+    assert T0 + timedelta(seconds=48) <= retry_at <= T0 + timedelta(seconds=72)  # 1 min ±20%
+    assert claim_next(conn, T0 + timedelta(seconds=47), worker_id="w", statuses=ALL) is None
     again = claim_next(conn, retry_at, worker_id="w", statuses=ALL)
     assert again is not None and again.attempts == 2  # counted at claim
 
@@ -294,3 +296,30 @@ def test_hold_lease_passes_only_for_the_live_holder(conn: sqlite3.Connection) ->
     release_claim(conn, job, "w1", T0)
     with pytest.raises(JobConflict), transaction(conn):
         hold_lease(conn, job.id, "w1", T0)
+
+
+@pytest.mark.parametrize(("factor", "seconds"), [(0.8, 96), (1.0, 120), (1.2, 144)])
+def test_retry_delay_is_jittered_by_up_to_20_percent(
+    conn: sqlite3.Connection, factor: float, seconds: int
+) -> None:
+    """CLP-34: jobs that failed together (an outage) do not all retry in the same poll."""
+    enqueue(conn, YT, T0, creator="manual")
+    conn.execute("UPDATE jobs SET attempts = 1")
+    job = claim_next(conn, T0, worker_id="w", statuses=ALL)
+    assert job is not None and job.attempts == 2
+    bounds: list[tuple[float, float]] = []
+
+    def uniform(low: float, high: float) -> float:
+        bounds.append((low, high))
+        return factor
+
+    retry_at = record_failure(conn, job, "boom", T0, worker_id="w", uniform=uniform)
+
+    assert bounds == [(0.8, 1.2)]
+    assert retry_at == T0 + timedelta(seconds=seconds)  # backoff(2) = 120 s
+
+
+def test_retry_delays_spread_out() -> None:
+    delays = {jittered(backoff(3)) for _ in range(50)}
+    assert len(delays) > 1
+    assert all(timedelta(seconds=192) <= d <= timedelta(seconds=288) for d in delays)

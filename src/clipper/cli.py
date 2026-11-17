@@ -760,9 +760,18 @@ def status() -> None:
 
 @app.command("retry")
 def retry(
-    ctx: typer.Context, job_id: Annotated[int, typer.Argument(help="Job ID to retry.")]
+    ctx: typer.Context,
+    job_id: Annotated[int, typer.Argument(help="Job ID to retry.")],
+    media_root: Annotated[
+        Path,
+        typer.Option(
+            envvar="CLIPPER_MEDIA_DIR", help="Per-job stage artifacts (render failure counts)."
+        ),
+    ] = jobs.DEFAULT_MEDIA_ROOT,
 ) -> None:
-    """Re-queue a failed or skipped job."""
+    """Re-queue a failed or skipped job, with fresh render tries for every clip."""
+    from clipper.pipeline.render_clips import clear_failures
+
     conn = _open_db(_app(ctx).db_path)
     try:
         job = jobs.get_job(conn, job_id)
@@ -770,6 +779,11 @@ def retry(
             _fail(f"job {job_id} not found")
         if job.status not in jobs.RETRYABLE:
             _fail(f"job {job_id} is {job.status}; only failed/skipped jobs can be retried")
+        try:  # before the requeue, while no worker can touch the job
+            clear_failures(media_root.resolve() / job.ref.key)  # the key is a validated SourceRef
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+            typer.echo(f"warning: render failure counts not cleared: {reason}", err=True)
         job = jobs.requeue(conn, job_id, jobs.utcnow())
     except (sqlite3.Error, jobs.JobConflict) as exc:
         _fail(f"retry failed: {exc}")

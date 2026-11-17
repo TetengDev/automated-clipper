@@ -43,9 +43,9 @@ first, then those closest to the limit, so failing clips at the front cannot spe
 run's budget before a good clip gets its turn. A clip with bad input (invalid EDL or
 metadata, `InvalidClipError` from the renderer) is left out and the others still render;
 the skipped ranks are logged once. If no clip of the job ends up rendered, the job fails
-(and the failure counts are dropped, so a requeue tries again). A requeue of a job that
-failed otherwise keeps the counts: delete `clips/<rank>/render_failures.json` to give a
-left-out clip fresh tries.
+(and the failure counts are dropped, so a requeue tries again). `clipper retry` drops
+the counts of a job that failed otherwise (`clear_failures`); `enqueue --retry` keeps
+them.
 
 A clip is only started if the stage budget still covers its worst case
 (CLIP_WORST_CASE_S), so a run never outlives the claim lease; else `StageTimeout` and the
@@ -407,6 +407,19 @@ def _prior_failures(section: Any, media_dir: Path) -> int:
     if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
         return 0  # _plan reports it as invalid
     return _failures(_marker(media_dir, rank))[0]
+
+
+def clear_failures(media_dir: Path) -> None:
+    """Drop the job's render failure counts and FAILING_MARKER (`clipper retry`), so a
+    requeued job gives every clip fresh tries. A symlinked `clips/` or clip directory is
+    skipped: a planted link must not redirect the unlink."""
+    (media_dir / FAILING_MARKER).unlink(missing_ok=True)
+    clips = media_dir / "clips"
+    if clips.is_symlink() or not clips.is_dir():
+        return
+    for clip_dir in clips.iterdir():
+        if clip_dir.name.isdigit() and not clip_dir.is_symlink():
+            (clip_dir / FAILURES_MARKER).unlink(missing_ok=True)
 
 
 def _try_order(failures: int) -> tuple[bool, int]:

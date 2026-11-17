@@ -275,6 +275,52 @@ def test_retry_requeues_failed_or_skipped_job(tmp_path: Path) -> None:
     assert (row["status"], row["skip_reason"]) == ("detected", None)
 
 
+def test_retry_clears_the_jobs_render_failure_counts(tmp_path: Path) -> None:
+    """CLP-89: a retried job gives every clip fresh render tries; only that job's markers
+    under --media-root go, never through a symlink."""
+    db_path, media = tmp_path / "state.db", tmp_path / "media"
+    db = ["--db", str(db_path)]
+    runner.invoke(app, [*db, "enqueue", "https://youtu.be/dQw4w9WgXcQ"])
+    with closing(connect(db_path)) as conn:
+        conn.execute("UPDATE jobs SET status = 'failed', last_error = 'no clip'")
+    job_dir, other = media / "youtube_dQw4w9WgXcQ", media / "youtube_aaaaaaaaaaa"
+    outside = tmp_path / "outside"
+    markers = [job_dir / f"clips/{rank}/render_failures.json" for rank in (1, 2)]
+    kept = [
+        other / "clips/1/render_failures.json",
+        job_dir / "clips/1/v1.json",
+        outside / "render_failures.json",
+    ]
+    for path in [*markers, *kept]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"failures": 2, "error": "x"}')
+    (job_dir / "clips/3").symlink_to(outside)
+    (job_dir / ".render_failing_since").write_text("2026-10-21T12:00:00+00:00")
+
+    result = runner.invoke(app, [*db, "retry", "1", "--media-root", str(media)])
+
+    assert result.exit_code == 0, result.output
+    assert "requeued job 1 (detected)" in result.output
+    assert not any(p.exists() for p in markers)
+    assert not (job_dir / ".render_failing_since").exists()
+    assert all(p.exists() for p in kept)
+
+
+def test_retry_still_requeues_when_counts_cannot_be_cleared(tmp_path: Path) -> None:
+    db_path, media = tmp_path / "state.db", tmp_path / "media"
+    db = ["--db", str(db_path)]
+    runner.invoke(app, [*db, "enqueue", "https://youtu.be/dQw4w9WgXcQ"])
+    with closing(connect(db_path)) as conn:
+        conn.execute("UPDATE jobs SET status = 'failed', last_error = 'no clip'")
+    (media / "youtube_dQw4w9WgXcQ/clips/1/render_failures.json").mkdir(parents=True)
+
+    result = runner.invoke(app, [*db, "retry", "1", "--media-root", str(media)])
+
+    assert result.exit_code == 0, result.output
+    assert "warning: render failure counts not cleared" in result.stderr
+    assert "requeued job 1 (detected)" in result.output
+
+
 def test_retry_missing_job_fails_cleanly(tmp_path: Path) -> None:
     result = runner.invoke(app, ["--db", str(tmp_path / "state.db"), "retry", "42"])
 

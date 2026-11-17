@@ -522,9 +522,9 @@ def test_format_errors_back_off_to_hourly_and_never_give_up(conn, cfg, source, c
     assert V1 not in seen(conn) and monitor.failures == {}
 
 
-def _poll_x_with_a_new_sibling_each_time(conn, cfg, source, clock, sibling) -> list[dict]:
+def _poll_x_with_a_new_sibling_each_time(conn, cfg, source, clock, sibling):
     """x never gets a usable format; each poll lists one new upload, `sibling(vid)`, before
-    it (so probed first). Returns each poll's errors."""
+    it (so probed first). Returns the monitor and each poll's errors."""
     x = "x" * 11
     not_first_poll(conn)
     source.meta[x] = "format: Requested format is not available"
@@ -537,7 +537,7 @@ def _poll_x_with_a_new_sibling_each_time(conn, cfg, source, clock, sibling) -> l
         source.meta[vid] = sibling(vid)
         errors.append(monitor.run_cycle([cfg.creator("MrBeast")]).errors)
         clock.now += timedelta(hours=2)  # past the longest backoff
-    return errors
+    return monitor, errors
 
 
 def test_format_errors_while_siblings_probe_fine_give_up_on_the_video(
@@ -553,10 +553,10 @@ def test_format_errors_while_siblings_probe_fine_give_up_on_the_video(
         seen_after.append(seen(conn).get(x))
         return video(vid)
 
-    errors = _poll_x_with_a_new_sibling_each_time(conn, cfg, source, clock, sibling)
+    monitor, errors = _poll_x_with_a_new_sibling_each_time(conn, cfg, source, clock, sibling)
 
     assert MAX_FORMAT_ERRORS_WITH_SIBLINGS == 3
-    assert seen(conn)[x] == "unavailable"
+    assert seen(conn)[x] == "unavailable" and x not in monitor.format_retries
     assert seen_after == [None, None, None]  # not before the third such poll
     assert [seen(conn)[v] for v in (V1, V2, V3)] == ["enqueued"] * 3
     assert {"creator": "MrBeast", "item": x, "error": "no usable format in 3 polls where"
@@ -570,11 +570,11 @@ def test_format_errors_while_siblings_are_only_upcoming_never_count(
     # works, so a player breakage cannot give up on x this way.
     x = "x" * 11
 
-    _poll_x_with_a_new_sibling_each_time(
+    monitor, _ = _poll_x_with_a_new_sibling_each_time(
         conn, cfg, source, clock, lambda vid: video(vid, status="is_upcoming")
     )
 
-    assert x not in seen(conn)
+    assert x not in seen(conn) and x in monitor.format_retries
 
 
 @pytest.mark.parametrize("interval_minutes", [60, 90])

@@ -446,11 +446,11 @@ def _link_host(link: str) -> str | None:
 def _inline_tags(text: str, *, in_links: bool = False) -> list[tuple[str, int, int]]:
     """Each hashtag written into `text`, as read on the match copy (so `#fyp` padded with
     an invisible or combining character reads as `#fyp`), with its span in `text`. The
-    span runs to the next character the copy kept, so the padding goes with the tag, and
-    over any marks after that. A tag with an invisible character inside (`#fyp` + ZWJ +
-    `x`) is also read up to it, since a platform may end the tag there; both readings share
-    the span. A `#` inside a link (`https://site.com/page#fyp`) starts no tag unless
-    `in_links`."""
+    span runs to the next character the copy kept, so the padding and any marks after the
+    tag go with it (the copy keeps no marks). A tag with an invisible character inside
+    (`#fyp` + ZWJ + `x`) is also read up to it, since a platform may end the tag there; both
+    readings share the span. A `#` inside a link (`https://site.com/page#fyp`) starts no tag
+    unless `in_links`."""
     copy, origin = _match_copy(text)
     links = [] if in_links else [m.span() for m in LINK_OR_MENTION.finditer(copy)]
     tags: list[tuple[str, int, int]] = []
@@ -459,8 +459,6 @@ def _inline_tags(text: str, *, in_links: bool = False) -> list[tuple[str, int, i
             continue
         end = origin[m.end()] if m.end() < len(copy) else len(text)
         end = max(end, origin[m.end() - 1] + 1)
-        while end < len(text) and unicodedata.category(text[end]).startswith("M"):
-            end += 1
         cut = next(
             (
                 k

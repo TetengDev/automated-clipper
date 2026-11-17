@@ -1207,6 +1207,24 @@ def test_truncated_blob_under_marker_is_fetched_again(
     assert (snapshot / tr.COMPLETE_MARKER).is_file()
 
 
+def test_damaged_link_outside_the_models_dir_is_never_deleted(
+    fake_asr: FakeAsr, tmp_path: Path
+) -> None:
+    """A marked snapshot whose model.bin links out of the models dir to a file of the wrong
+    size: the snapshot is fetched again, but nothing outside the models dir is deleted."""
+    snapshot = local().ensure_model()
+    outside = tmp_path / "elsewhere" / "model.bin"
+    outside.parent.mkdir()
+    outside.write_bytes(b"not the weights")
+    (snapshot / "model.bin").unlink()
+    os.symlink(outside, snapshot / "model.bin")
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2
+    assert outside.read_bytes() == b"not the weights"
+    assert (snapshot / "model.bin").read_bytes() == FAKE_MODEL_BIN
+
+
 def test_swapped_tokenizer_fails_verification(fake_asr: FakeAsr, tmp_path: Path) -> None:
     """CLP-75: tokenizer.json is pinned by sha256, not only by the commit and TLS."""
     fake_asr.fetch_plan = ["swapped", "swapped"]

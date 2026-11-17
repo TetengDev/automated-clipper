@@ -99,14 +99,14 @@ def claim_next(
     worker_id: str,
     statuses: Iterable[JobStatus],
     lease: timedelta = DEFAULT_LEASE,
-    gave_up: list[tuple[int, str]] | None = None,
+    gave_up: list[tuple[sqlite3.Row, str]] | None = None,
 ) -> Job | None:
     """Atomically claim the oldest due, unclaimed job whose status is in `statuses`.
 
     The claim bumps `attempts`; the returned Job carries the bumped count. Rows that
     already used up MAX_ATTEMPTS (earlier claimers died mid-stage) and rows that cannot be
     decoded into a Job (corrupt platform/id) are marked failed and passed over, so one bad
-    row cannot wedge the queue; each is added to `gave_up` as (job id, reason).
+    row cannot wedge the queue; each is added to `gave_up` as (row, reason).
     """
     wanted = [s.value for s in statuses if s not in TERMINAL]
     if not wanted:
@@ -126,12 +126,12 @@ def claim_next(
                 return None
             if row["attempts"] >= MAX_ATTEMPTS:
                 reason = f"gave up after {row['attempts']} attempts (worker died mid-stage)"
-                _fail_row(conn, row["id"], reason, stamp, gave_up)
+                _fail_row(conn, row, reason, stamp, gave_up)
                 continue
             try:
                 job = Job.from_row(row)
             except (ValueError, TypeError) as exc:
-                _fail_row(conn, row["id"], f"undecodable job row: {exc}", stamp, gave_up)
+                _fail_row(conn, row, f"undecodable job row: {exc}", stamp, gave_up)
                 continue
             conn.execute(
                 "UPDATE jobs SET worker_id = ?, lease_until = ?, attempts = attempts + 1,"
@@ -143,13 +143,14 @@ def claim_next(
 
 def _fail_row(
     conn: sqlite3.Connection,
-    job_id: int,
+    row: sqlite3.Row,
     reason: str,
     stamp: str,
-    gave_up: list[tuple[int, str]] | None,
+    gave_up: list[tuple[sqlite3.Row, str]] | None,
 ) -> None:
+    job_id = row["id"]
     if gave_up is not None:
-        gave_up.append((job_id, reason))
+        gave_up.append((row, reason))
     conn.execute(
         "UPDATE jobs SET status = ?, last_error = ?, next_attempt_at = NULL, worker_id = NULL,"
         " lease_until = NULL, updated_at = ? WHERE id = ?",

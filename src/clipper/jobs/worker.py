@@ -104,7 +104,7 @@ class Worker:
         """Process one stage of one due job. Returns False when nothing was due."""
         job: Job | None = None
         try:
-            gave_up: list[tuple[int, str]] = []
+            gave_up: list[tuple[sqlite3.Row, str]] = []
             job = claim_next(
                 self.conn,
                 self.clock(),
@@ -113,8 +113,9 @@ class Worker:
                 lease=self.lease,
                 gave_up=gave_up,
             )
-            for job_id, reason in gave_up:
-                self._alert(job_id, f"Job {job_id} failed: {redact(reason)}.")
+            for row, reason in gave_up:  # read raw: the row may not decode into a Job
+                where = f"{row['platform']}_{row['item_id']}, {row['creator']}"
+                self._alert(row["id"], where, row["status"], redact(reason))
             if job is None:
                 return False
             self._run_stage(job)
@@ -182,13 +183,13 @@ class Worker:
             logger.info("%s -> %s", log, nxt)
 
     def _alert_failed(self, job: Job, reason: str) -> None:
-        where = f"({job.ref.key}, {job.creator}) at {job.status}"
-        self._alert(job.id, f"Job {job.id} failed {where}: {reason}.")
+        self._alert(job.id, f"{job.ref.key}, {job.creator}", job.status, reason)
 
-    def _alert(self, job_id: int, text: str) -> None:
+    def _alert(self, job_id: int, where: str, status: str, reason: str) -> None:
         """Send a failed-job alert; one that cannot be sent is only logged."""
         if self.alert is None:
             return
+        text = f"Job {job_id} failed ({where}) at {status}: {reason}."
         try:
             self.alert(f"{text} Run `clipper retry {job_id}` to try again.")
         except Exception as exc:

@@ -713,7 +713,8 @@ def test_job_given_up_at_claim_alerts(make_worker: MakeWorker, db: Path) -> None
 
     assert _status(db, job.id) is JobStatus.FAILED
     assert alerts == [
-        f"Job {job.id} failed: gave up after 5 attempts (worker died mid-stage)."
+        f"Job {job.id} failed (youtube_dQw4w9WgXcQ, manual) at detected: gave up after"
+        " 5 attempts (worker died mid-stage)."
         f" Run `clipper retry {job.id}` to try again."
     ]
 

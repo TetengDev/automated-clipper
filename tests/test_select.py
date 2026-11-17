@@ -708,6 +708,23 @@ def test_legacy_hashtags_drop_generic_disclosure_and_lookalike_tags():
     assert all(v["hashtags"] == ["#mrbeast", "#नमस्ते"] for v in (c.variants or {}).values())
 
 
+def test_inline_generic_disclosure_and_lookalike_tags_are_stripped_from_the_reply():
+    """CLP-111: the single title and caption (caption.txt, posts without a variant) lose
+    the inline tags the hashtag list would drop; the hook is burned into the video and is
+    not a hashtag path."""
+    c = Candidate(
+        start_s=1,
+        end_s=30,
+        score=5,
+        hook="h",
+        title="Big #fyp moment",
+        caption="Watch #аd now #Sponsored #kai",
+        reason="r",
+        hashtags=["#kai"],
+    )
+    assert (c.title, c.caption) == ("Big moment", "Watch now #kai")
+
+
 def test_snap_drops_candidates_far_from_any_words():
     words = [
         select._Word(word="w", start=i + 0.1, end=i + 0.6) for i in [*range(10), *range(200, 260)]

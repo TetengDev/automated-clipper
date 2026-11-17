@@ -43,7 +43,7 @@ from clipper.clips import (
 )
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
-from clipper.metadata import clean_hashtags, variants_json
+from clipper.metadata import clean_caption, clean_hashtags, clean_title, variants_json
 from clipper.redact import redact
 
 DEFAULT_OUTPUT_DIR = Path("output")
@@ -226,12 +226,14 @@ def _publish_package(
     day_dir = _check_inside(output_dir / READY_DIR / day, output_dir)
     staging_root = _make_dir_inside(output_dir / STAGING_DIR, output_dir)
     base = base_name(clip_id, clip.creator, ver.title, ver.version)
-    # A version selected before CLP-111 stored the model's tags unchecked.
+    # A version selected before CLP-111 stored the model's text and tags unchecked.
+    title = clean_title(ver.title) if ver.title is not None else None
+    caption = clean_caption(ver.caption) if ver.caption is not None else None
     hashtags = clean_hashtags(ver.hashtags, len(ver.hashtags))
     meta = {
         "clip_id": clip_id,
         "version": ver.version,
-        "title": ver.title,
+        "title": title,
         "creator": clip.creator,
         "source_url": clip.source_url,
         "source_title": clip.source_title,
@@ -239,7 +241,7 @@ def _publish_package(
         "end_s": ver.end_s,
         "score": ver.score,
         "reason": ver.reason,
-        "caption": ver.caption,
+        "caption": caption,
         "hashtags": hashtags,
         "variants": variants_json(ver.variants),
         "prompt_version": ver.prompt_version,
@@ -249,7 +251,7 @@ def _publish_package(
     stage = Path(tempfile.mkdtemp(dir=staging_root, prefix=f"{base}."))
     try:
         _copy(source, stage / names[0])
-        _write_bytes(stage / names[1], _caption_text(ver.caption, hashtags).encode())
+        _write_bytes(stage / names[1], _caption_text(caption, hashtags).encode())
         _write_bytes(
             stage / names[2], (json.dumps(meta, indent=2, ensure_ascii=False) + "\n").encode()
         )

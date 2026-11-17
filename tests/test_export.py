@@ -685,3 +685,20 @@ def test_caption_txt_keeps_every_clean_legacy_tag(env: Env) -> None:
 
     (caption,) = (env.output_dir / "ready" / "2027-01-15").glob("*.caption.txt")
     assert caption.read_text() == "Watch this\n\n" + " ".join(tags) + "\n"
+
+
+def test_export_strips_unusable_inline_tags_from_title_and_caption(env: Env) -> None:
+    """CLP-111: a stored title or caption with an inline #fyp, #ad or lookalike never puts
+    it in caption.txt or the sidecar."""
+    clip_id = approved_clip(
+        env, title="Big #fyp Moment", caption="Watch #ad this #fyр\n\nnow", hashtags=["#kai"]
+    )
+
+    run(env, clip_id)
+
+    day_dir = env.output_dir / "ready" / "2027-01-15"
+    (caption,) = day_dir.glob("*.caption.txt")
+    assert caption.read_text() == "Watch this\n\nnow\n\n#kai\n"
+    (sidecar,) = day_dir.glob("*.json")
+    meta = json.loads(sidecar.read_text())
+    assert (meta["title"], meta["caption"]) == ("Big Moment", "Watch this\n\nnow")

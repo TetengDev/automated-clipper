@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Node LTS for the Remotion renderer (render/). Only the node binary + bundled npm are
 # copied into the Python image below.
-FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS node
+FROM node:24.22.0-bookworm-slim@sha256:91acba91b842bec0bf7ea6f5e09c644c7ccad72c4996ed9616d861d1c7cd60d4 AS node
 
 FROM node AS render-deps
 WORKDIR /app/render
@@ -50,7 +50,13 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    CLIPPER_RENDER_DIR=/app/render
+    CLIPPER_RENDER_DIR=/app/render \
+    # Deno (yt-dlp[pin-deno] wheel, /opt/venv/bin/deno) solves YouTube's player challenges.
+    # yt-dlp counts any Deno stderr as a failed solve, so: cache on the tmpfs (the rootfs is
+    # read-only; Deno 2.9.8 tolerates that silently, later versions might warn), and no
+    # update check notice.
+    DENO_DIR=/tmp/deno \
+    DENO_NO_UPDATE_CHECK=1
 
 WORKDIR /app
 

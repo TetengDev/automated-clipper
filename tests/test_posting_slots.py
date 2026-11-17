@@ -22,7 +22,7 @@ from clipper.posting.scheduler import (
     day_bounds,
     slot_problems,
 )
-from clipper.posting.stage import BACKOFF_BASE, PostingStage
+from clipper.posting.stage import BACKOFF_BASE, PostingStage, allow_all
 from conftest import VALID_YAML
 from posting_support import FakeAccount, FakePublisher
 from review_support import Env, login, make_env
@@ -97,6 +97,7 @@ def stage(env: Env, clock: Clock, publisher: object, *accounts: FakeAccount, **k
         media_root=env.media_root,
         clock=clock,
         accounts={a.id: a for a in accounts},
+        guard=allow_all,
         **kw,  # type: ignore[arg-type]
     )
 
@@ -848,6 +849,19 @@ def test_account_post_times_can_skip_old_history(env: Env) -> None:
     times = repo.account_post_times(env.conn, "tt_main", since=T0 - timedelta(days=2))
 
     assert times == [recent.scheduled_at]
+
+
+def test_account_post_times_skips_held_posts_and_the_moved_post(env: Env) -> None:
+    # Held posts take no slot (CLP-97), also for the slot picker's retry and reschedule.
+    moved = make_post(env, at=T0)
+    make_post(env, at=T0 + timedelta(hours=1), status="held")
+    kept = make_post(env, at=T0 + timedelta(hours=2))
+
+    times = repo.account_post_times(
+        env.conn, "tt_main", exclude_post_id=moved.id, since=T0 - timedelta(days=2)
+    )
+
+    assert times == [kept.scheduled_at]
 
 
 # --- review pass 2 -------------------------------------------------------------------------

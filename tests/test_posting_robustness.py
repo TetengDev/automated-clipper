@@ -17,9 +17,16 @@ import pytest
 from clipper.config import AppConfig
 from clipper.db import connect
 from clipper.jobs import Job, JobStatus, StageContext, StageDef, Worker, enqueue
+from clipper.jobs.worker import ChainedPasses
 from clipper.posting import repo
 from clipper.posting.models import Post, PostStatus, PublishResult
-from clipper.posting.stage import MAX_UPLOAD, RECOVER_QUIET, STALE_UPLOAD, PostingStage
+from clipper.posting.stage import (
+    MAX_UPLOAD,
+    RECOVER_QUIET,
+    STALE_UPLOAD,
+    PostingStage,
+    allow_all,
+)
 from clipper.urls import SourceRef
 from posting_support import LookupPublisher
 from review_support import Env, make_env
@@ -84,6 +91,7 @@ def stage(
         clock=clock,
         connect=lambda: connect(env.db_path),
         heartbeat_seconds=0.01,
+        guard=allow_all,
         **kwargs,  # type: ignore[arg-type]
     )
 
@@ -279,6 +287,7 @@ def test_without_a_connection_factory_publish_still_works(env: Env, clock: Clock
         worker_id="w1",
         media_root=env.media_root,
         clock=clock,
+        guard=allow_all,
     )
 
     posting.run_once()
@@ -526,6 +535,75 @@ def test_run_worker_recover_id_releases_the_dead_workers_uploads(
     assert result.exit_code == 0, result.output
     released = fresh(env, post.id)
     assert released.status == PostStatus.UPLOADING and released.claimed_at is None
+
+
+class Other:
+    """A second pass in the chain, as run-worker's campaign submission pass (CLP-97)."""
+
+    def __init__(self, stop: threading.Event | None = None) -> None:
+        self.runs = 0
+        self.stop_on_run = stop
+
+    def run_once(self) -> int:
+        self.runs += 1
+        if self.stop_on_run is not None:
+            self.stop_on_run.set()
+        return 1
+
+
+def test_chained_passes_forward_recover_and_stop(env: Env, clock: Clock) -> None:
+    # run-worker chains the posting stage with the submission pass; --recover-id and the
+    # shutdown stop must still reach the posting stage through the chain.
+    post = make_post(env)
+    uploading(env, post, "dead", T0 - timedelta(minutes=5))
+    posting = stage(env, clock, LookupPublisher())
+    chain = ChainedPasses([posting, Other()])
+    worker = Worker(
+        conn=env.conn, config=AppConfig(), worker_id="w1", stages={}, clock=clock, posting=chain
+    )
+
+    worker.recover("dead")
+    stop = threading.Event()
+    stop.set()
+    worker.run_forever(stop, poll_seconds=0.01)
+
+    released = fresh(env, post.id)
+    assert released.status == PostStatus.UPLOADING and released.claimed_at is None
+    assert posting.stop is stop
+
+
+def test_a_stopping_chain_runs_no_further_pass() -> None:
+    stop = threading.Event()
+    first, second = Other(stop), Other()
+    chain = ChainedPasses([first, second])
+    chain.stop = stop
+
+    assert chain.run_once() == 1
+    assert (first.runs, second.runs) == (1, 0)
+
+
+def test_run_worker_runs_the_posting_chain_on_the_posting_connection(
+    env: Env, config_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The guard and the submission pass run on the posting thread; the worker's own
+    # connection refuses other threads, so they must use the posting connection.
+    from typer.testing import CliRunner
+
+    from clipper.cli import app
+
+    def one_pass_on_a_thread(self: Worker, stop: threading.Event, **_: object) -> None:
+        assert self.posting is not None
+        thread = threading.Thread(target=self.posting.run_once)
+        thread.start()
+        thread.join()
+
+    monkeypatch.setattr(Worker, "run_forever", one_pass_on_a_thread)
+    opts = ["--db", str(env.db_path), "--config", str(config_file)]
+
+    result = CliRunner().invoke(app, [*opts, "run-worker"])
+
+    assert result.exit_code == 0, result.output
+    assert "pass failed" not in caplog.text
 
 
 def test_run_worker_refuses_a_recover_id_with_control_characters(

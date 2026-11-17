@@ -14,6 +14,8 @@ Each pass (the worker runs one per poll, see `clipper.jobs.worker.Worker.posting
    (`now + BACKOFF_BASE * 2**attempts`); the `MAX_ATTEMPTS`th failure is `post_failed`
    and raises an alert. A successful upload whose result cannot be recorded because the
    post changed meanwhile alerts too (a possible duplicate).
+   Before publishing, the `guard` (the campaign pre-flight, CLP-97) runs again with the
+   current config: a post it refuses, or a guard that fails, is `held` instead.
 3. Due posts on a platform with no publisher stay `scheduled`; that is logged once per
    platform per worker run.
 
@@ -62,6 +64,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from clipper.clips import resolve_media_path
 from clipper.jobs.models import Clock, utcnow
 from clipper.jobs.worker import DEFAULT_MEDIA_ROOT
+from clipper.pipeline.common import strip_control
 from clipper.posting import repo
 from clipper.posting.models import (
     MAX_ATTEMPTS,
@@ -105,6 +108,7 @@ ROLLING_RETRY = timedelta(hours=1)
 logger = logging.getLogger(__name__)
 
 Alert = Callable[[str], None]
+Guard = Callable[[Post], "str | None"]
 
 
 def log_alert(message: str) -> None:
@@ -120,6 +124,11 @@ class PostingStage:
     media_root: Path = DEFAULT_MEDIA_ROOT
     clock: Clock = utcnow
     alert: Alert = log_alert
+    guard: Guard | None = None
+    """The publish-time campaign pre-flight (CLP-97, `scheduler.publish_guard`): a reason
+    holds the claimed post instead of publishing it. Required whenever there are
+    publishers (pass `allow_all` to opt out explicitly), so leaving it out never
+    publishes without the check."""
     batch: int = DEFAULT_BATCH
     connect: Callable[[], sqlite3.Connection] | None = None
     """Opens a DB connection for the upload heartbeat thread (None: no heartbeat)."""
@@ -152,6 +161,13 @@ class PostingStage:
                 RECOVER_QUIET,
             )
         return released
+
+    def __post_init__(self) -> None:
+        if self.publishers and self.guard is None:
+            raise ValueError(
+                "PostingStage with publishers needs a guard (scheduler.publish_guard, or"
+                " allow_all to publish without the campaign pre-flight)"
+            )
 
     def run_once(self) -> int:
         """One posting pass; returns how many posts it acted on."""
@@ -194,6 +210,8 @@ class PostingStage:
         ):
             return
         if self._held_by_caps(post):
+            return
+        if self._held(post):
             return
         try:
             path = resolve_media_path(self.media_root, post.video_path)
@@ -254,6 +272,24 @@ class PostingStage:
         finally:
             if conn is not None:
                 conn.close()
+
+    def _held(self, post: Post) -> bool:
+        """Run the guard; hold the post when it refuses (or fails: fail closed)."""
+        if self.guard is None:  # no publishers, so nothing is ever claimed
+            return False
+        try:
+            reason = self.guard(post)
+        except Exception as exc:
+            reason = f"publish pre-flight failed: {_describe(exc)}"
+        if reason is None:
+            return False
+        try:
+            repo.hold_claimed(self.conn, post, self.worker_id, reason, self.clock())
+        except PostConflict as exc:
+            logger.warning("%s: hold not recorded: %s", _label(post), exc)
+            return True
+        logger.warning("%s: held by pre-flight: %s", _label(post), strip_control(reason))
+        return True
 
     def _already_live(self, post: Post, publisher: Publisher, *, strict: bool = True) -> bool:
         """Before re-publishing after a failed attempt, ask `lookup` (when there is one)
@@ -513,6 +549,11 @@ class PostingStage:
             self.alert(message)
         except Exception:
             logger.exception("%s: alert failed", _label(post))
+
+
+def allow_all(_post: Post) -> str | None:
+    """A guard that never holds: only for stages that knowingly skip the pre-flight."""
+    return None
 
 
 def _describe(exc: Exception) -> str:

@@ -6,8 +6,9 @@ Each worker process claims under a unique id, so a crashed worker's job becomes 
 again when its lease expires (or immediately via `run-worker --recover-id <dead id>`, which
 also hands the dead worker's `uploading` posts to the posting stage's stale pass).
 
-The posting pass (CLP-92) runs on a thread of its own (CLP-105), once per poll, so a long
-job stage never delays a due post. It must therefore use a DB connection of its own.
+The posting pass (CLP-92, chained with the campaign submission pass of CLP-97) runs on a
+thread of its own (CLP-105), once per poll, so a long job stage never delays a due post.
+It must therefore use a DB connection of its own.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -80,6 +81,48 @@ class StoppablePass(PeriodicPass, Protocol):
     """A periodic pass that checks `stop` between items; `run_forever` wires it."""
 
     stop: threading.Event | None
+
+
+@dataclass
+class ChainedPasses:
+    """Several periodic passes run as one (posting, then campaign submissions, CLP-97).
+    A pass that raises is logged and does not stop the others.
+
+    The chain is itself recoverable and stoppable (CLP-105): `recover` and `stop` reach
+    every pass that has them, so `--recover-id` and shutdown still reach the posting stage,
+    and once `stop` is set no further pass starts."""
+
+    passes: Sequence[PeriodicPass]
+    _stop: threading.Event | None = field(default=None, init=False, repr=False)
+
+    @property
+    def stop(self) -> threading.Event | None:
+        return self._stop
+
+    @stop.setter
+    def stop(self, event: threading.Event | None) -> None:
+        self._stop = event
+        for periodic in self.passes:
+            if isinstance(periodic, StoppablePass) and periodic.stop is None:
+                periodic.stop = event
+
+    def recover(self, dead_worker_id: str) -> int:
+        return sum(
+            periodic.recover(dead_worker_id)
+            for periodic in self.passes
+            if isinstance(periodic, RecoverablePass)
+        )
+
+    def run_once(self) -> int:
+        handled = 0
+        for periodic in self.passes:
+            if self._stop is not None and self._stop.is_set():
+                break
+            try:
+                handled += periodic.run_once()
+            except Exception:
+                logger.exception("%s pass failed; retrying next poll", type(periodic).__name__)
+        return handled
 
 
 def default_worker_id() -> str:

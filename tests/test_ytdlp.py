@@ -625,7 +625,7 @@ def test_audio_selector_caps_a_muxed_only_fallback(
 def test_audio_selector_bounds_the_bitrate_of_the_last_fallback(
     formats: list[dict[str, object]], chosen: str
 ) -> None:
-    assert ytdlp.AUDIO_FALLBACK_MAX_TBR == 3000
+    assert ytdlp.AUDIO_FALLBACK_TBR == 3000
     assert _select(formats) == chosen
 
 

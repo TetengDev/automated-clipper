@@ -52,15 +52,15 @@ CACHE_DIR_ENV = "CLIPPER_YTDLP_CACHE_DIR"
 """yt-dlp's cache dir. Unset: yt-dlp's default (~/.cache/yt-dlp). The image sets it to the
 tmpfs, as its home is on the read-only root."""
 AUDIO_MAX_FILESIZE = "4G"
-AUDIO_FALLBACK_MAX_TBR = 3000
-"""kbps. The smallest muxed fallback's bitrate cap: 720p30 HLS (about 3 Mbps) still passes,
-1080p and 720p60 do not. At this rate 3 h is about AUDIO_MAX_FILESIZE."""
+AUDIO_FALLBACK_TBR = 3000
+"""kbps: the highest bitrate of the last (smallest muxed) audio fallback. 720p30 HLS (about
+3 Mbps) still passes, 1080p and 720p60 do not. At this rate 3 h is about
+AUDIO_MAX_FILESIZE."""
 AUDIO_FORMAT = (
-    "bestaudio/best[height<=480][acodec!=none]"
-    f"/worst[acodec!=none][tbr<=?{AUDIO_FALLBACK_MAX_TBR}]"
+    f"bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none][tbr<=?{AUDIO_FALLBACK_TBR}]"
 )
 """Audio-only when there is one; else a muxed format of 480p at most, else the smallest
-muxed one of AUDIO_FALLBACK_MAX_TBR at most (or of unknown bitrate). `--max-filesize` is
+muxed one of AUDIO_FALLBACK_TBR at most (or of unknown bitrate). `--max-filesize` is
 checked per HTTP request, so for HLS per fragment: it does not bound a whole muxed
 download, the height and bitrate caps do (bytes = bitrate x duration). Not
 `filesize_approx`: yt-dlp leaves it unset for HLS and DASH formats. `[acodec!=none]`:
@@ -71,7 +71,7 @@ CLIP_FORMAT = "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]"
 """The clip download's selector (fetch_clips), and the probe's. Whatever it accepts, the
 audio selector accepts too: either `ba` exists, or a muxed format with audio does, which
 the audio fallbacks take. One exception: a video with only muxed formats, all above 480p
-and AUDIO_FALLBACK_MAX_TBR (YouTube's HLS always has a 480p one); its audio download is
+and AUDIO_FALLBACK_TBR (YouTube's HLS always has a 480p one); its audio download is
 a format error. `[acodec!=none]`: plain `b` falls back to a video-only format when there
 is no audio at all, which would make silent clips."""
 SECTION_MAX_FILESIZE = "2G"

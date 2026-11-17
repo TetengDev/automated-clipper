@@ -190,10 +190,15 @@ def _limits(platform: str) -> PlatformLimits:
         raise ValueError(f"unknown platform: {platform!r}") from None
 
 
+def clean_title(text: str) -> str:
+    """Control and invisible characters and unusable inline hashtags stripped."""
+    return strip_control(strip_unusable_tags(text))
+
+
 def clean_caption(text: str) -> str:
-    """Control and invisible characters stripped per line; line breaks kept (at most one
-    blank line in a row)."""
-    lines = [strip_control(line) for line in text.splitlines()]
+    """Control and invisible characters and unusable inline hashtags stripped per line;
+    line breaks kept (at most one blank line in a row)."""
+    lines = [clean_title(line) for line in text.splitlines()]
     out: list[str] = []
     for line in lines:
         if not line and (not out or not out[-1]):
@@ -375,6 +380,45 @@ def _link_host(link: str) -> str | None:
     return host
 
 
+def _inline_tags(text: str) -> list[tuple[str, int, int]]:
+    """Each hashtag written into `text`, as read on the match copy (so `#fyp` padded with
+    an invisible or combining character reads as `#fyp`), with its span in `text`. The
+    span runs to the next character the copy kept, so the padding goes with the tag, and
+    over any marks after that."""
+    copy, origin = _match_copy(text)
+    tags: list[tuple[str, int, int]] = []
+    for m in _INLINE_TAG.finditer(copy):
+        end = origin[m.end()] if m.end() < len(copy) else len(text)
+        end = max(end, origin[m.end() - 1] + 1)
+        while end < len(text) and unicodedata.category(text[end]).startswith("M"):
+            end += 1
+        tags.append((m.group(0), origin[m.start()], end))
+    return tags
+
+
+def strip_unusable_tags(text: str) -> str:
+    """`text` without the inline hashtags that `clean_hashtags` would drop."""
+    parts: list[str] = []
+    last = 0
+    for tag, start, end in _inline_tags(text):
+        if _unusable(tag):
+            parts.append(text[last : max(start, last)])
+            last = max(end, last)
+    parts.append(text[last:])
+    return "".join(parts)
+
+
+def inline_unusable_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
+    """Generic, malformed or mixed-script hashtags written into `text` itself, other than
+    `allowed` ones; disclosure-like ones are `inline_disclosure_tags`."""
+    ok = {_fold(t) for t in allowed}
+    return [
+        t
+        for t, _, _ in _inline_tags(text)
+        if _unusable(t) and not is_disclosure(t) and _fold(t) not in ok
+    ]
+
+
 def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
     """Disclosure-like hashtags written into `text` itself, other than `allowed` ones."""
     ok = {_fold(t) for t in allowed}
@@ -383,9 +427,14 @@ def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
     ]
 
 
+def _unusable(tag: str) -> bool:
+    """Malformed, generic, disclosure-like or mixed-script: never a model's tag."""
+    return not is_hashtag(tag) or is_generic(tag) or is_disclosure(tag) or is_mixed_script(tag)
+
+
 def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -> list[str]:
-    """Lenient: malformed, generic, mixed-script and repeated tags are dropped, the rest cut
-    to `limit`."""
+    """Lenient: malformed, generic, disclosure-like, mixed-script and repeated tags are
+    dropped, the rest cut to `limit`."""
     out: list[str] = []
     seen: set[str] = set()
     for raw in tags:
@@ -393,13 +442,7 @@ def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -
             continue
         tag = normalize_hashtag(raw)
         key = _fold(tag)
-        usable = (
-            is_hashtag(tag)
-            and not is_generic(tag)
-            and not is_disclosure(tag)
-            and not is_mixed_script(tag)
-        )
-        if usable and key not in seen:
+        if not _unusable(tag) and key not in seen:
             seen.add(key)
             out.append(tag)
     return out[:limit]
@@ -438,7 +481,7 @@ class Variant(BaseModel):
     @field_validator("title", mode="after")
     @classmethod
     def _clean_title(cls, value: str) -> str:
-        return strip_control(value)
+        return clean_title(value)
 
     @field_validator("caption", mode="after")
     @classmethod
@@ -500,7 +543,7 @@ def caption_room(platform: str, tags: Sequence[str]) -> int:
 def _fit(platform: str, title: str, caption: str, tags: Sequence[object]) -> Variant:
     limits = _limits(platform)
     hashtags = clean_hashtags(tags, limits.hashtags_max)
-    title, caption = strip_control(title), clean_caption(caption)
+    title, caption = clean_title(title), clean_caption(caption)
     if platform == "youtube":
         title, caption = _ANGLE.sub("", title), _ANGLE.sub("", caption)
     return Variant.model_validate(
@@ -723,6 +766,11 @@ def preflight(
     inline = inline_disclosure_tags(f"{metadata.title}\n{metadata.caption}", metadata.hashtags)
     if inline:
         problems.append(f"{platform}: disclosure-like tags in the text: {' '.join(inline)}")
+    unusable = inline_unusable_tags(f"{metadata.title}\n{metadata.caption}", metadata.hashtags)
+    if unusable:
+        problems.append(
+            f"{platform}: generic, malformed or mixed-script tags in the text: {' '.join(unusable)}"
+        )
     if limits.length(metadata.title) > limits.title_max:
         problems.append(f"{platform}: title is longer than {limits.title_max} {limits.unit}")
     if limits.length(metadata.caption) > limits.caption_max:

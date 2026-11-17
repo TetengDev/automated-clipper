@@ -19,6 +19,7 @@ from clipper.metadata import (
     Variant,
     build_post_metadata,
     caption_room,
+    clean_caption,
     clean_hashtags,
     coerce_variants,
     derive_variants,
@@ -615,3 +616,64 @@ def test_plain_preflight_skips_only_the_campaign_rules():
     ]
     assert len(problems) == len(expected)
     assert all(any(e in p for p in problems) for e in expected), problems
+
+
+# --- inline tags in the title and caption (CLP-111 fix round 1) -----------------------------
+
+SMALL_CAPS = pytest.param(
+    "#ꜱponsored",
+    marks=pytest.mark.xfail(strict=True, reason="single-script Latin lookalike, CLP-112"),
+)
+REJECTED_INLINE = [
+    "Watch #fyp #viral",
+    "Watch #аd",  # Cyrillic а
+    "#fyр",  # Cyrillic р
+    "#ѕponsored",  # Cyrillic dze
+    "#sponѕored",
+    SMALL_CAPS,
+]
+
+
+@pytest.mark.parametrize("text", REJECTED_INLINE)
+def test_plain_preflight_holds_rejected_inline_tags(text):
+    meta = PostMetadata(title="T", caption=text, hashtags=["#a1", "#b1", "#c1"], flags={})
+    assert preflight(meta, "tiktok", 35.0, plain=True) != []
+    titled = dataclasses.replace(meta, title=text, caption="C")
+    assert preflight(titled, "tiktok", 35.0, plain=True) != []
+
+
+@pytest.mark.parametrize("text", REJECTED_INLINE)
+def test_rejected_inline_tags_are_stripped_from_the_title_and_caption(text):
+    def words(line: str) -> str:  # the text without its tags
+        return " ".join(w for w in line.split() if not w.startswith("#"))
+
+    v = variant(title=f"Big {text} moment", caption=f"Line {text} one\nLine two #kai")
+    assert v.title == words(f"Big {text} moment")
+    assert v.caption == words(f"Line {text} one") + "\nLine two #kai"
+    out = coerce_variants(None, f"Big {text}", f"Cap {text}", ["#kai", "#chair", "#fall"])
+    expected = (words(f"Big {text}"), words(f"Cap {text}"))
+    assert all((x.title, x.caption) == expected for x in out.values())
+
+
+def test_inline_tag_stripping_takes_padding_and_disclosure_tags_too():
+    assert clean_caption("a #ad b #fyp\u0323 c #f\u200byp d #Sponsored_2024") == "a b c d"
+    assert clean_caption("#fyp#ad") == ""
+
+
+def test_usable_inline_tags_are_kept():
+    text = "Watch #नमस्ते #kai #東京タワー and C# code, #1 fan"
+    assert clean_caption(text) == text
+    meta = PostMetadata(title="T", caption=text, hashtags=["#a1", "#b1", "#c1"], flags={})
+    assert preflight(meta, "tiktok", 35.0, plain=True) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["##ad x", "#a#fyp#b", "x#fyp\u0301y #ad\u094d!", "#\u2060fyp #fyp\x07", "½#fy\ufe0fp"],
+)
+def test_inline_tag_stripping_is_idempotent(text):
+    """Stored variants are validated on every load: a second pass must change nothing, or
+    the fingerprint drifts and every edit reads as stale."""
+    once = clean_caption(text)
+    assert clean_caption(once) == once
+    assert variant(caption=once).caption == once

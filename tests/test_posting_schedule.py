@@ -341,13 +341,15 @@ def test_a_plain_post_never_carries_generic_disclosure_or_lookalike_tags(env: En
     assert published.caption == "Watch this\n\n#kai #funny #money"
 
 
-def test_a_plain_post_with_an_inline_disclosure_tag_is_held(env: Env) -> None:
-    clip_id = approved_clip(env, caption="Watch this #ad")
+def test_a_plain_post_never_carries_rejected_inline_tags(env: Env) -> None:
+    clip_id = approved_clip(env, title="Big #fyр moment", caption="Watch this #ad #viral now")
 
     (post,) = schedule_for_clip(env.conn, clip_id, [FakeAccount()], NOW)
 
-    assert post.status == PostStatus.HELD
-    assert post.error == "tiktok: disclosure-like tags in the text: #ad"
+    published = repo.metadata_for(env.conn, post)
+    assert post.status == PostStatus.SCHEDULED
+    assert published.title == "Big moment"
+    assert published.caption == "Watch this now\n\n#funny"
 
 
 def test_a_plain_post_outside_the_platforms_length_is_held(env: Env) -> None:

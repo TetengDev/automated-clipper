@@ -326,3 +326,19 @@ def test_nothing_is_pruned_while_another_process_holds_the_lock(
     assert stale.is_dir()
     local().ensure_model()
     assert not stale.exists()
+
+
+def test_a_failing_prune_still_returns_the_verified_snapshot(
+    fake_asr: FakeAsr, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The snapshot is verified and marked before the prune runs: a prune bug must not
+    fail the attempt."""
+
+    def broken(models_dir: Path) -> int:
+        raise RuntimeError("prune bug")
+
+    monkeypatch.setattr(tr, "prune_unpinned", broken)
+    with caplog.at_level(logging.ERROR, logger=tr.__name__):
+        snapshot = local().ensure_model()
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+    assert "pruning unpinned revisions failed" in caplog.text

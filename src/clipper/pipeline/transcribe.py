@@ -487,7 +487,10 @@ class FasterWhisperTranscriber:
                     tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
                     tmp.write_text(pin.sha256, encoding="utf-8")
                     os.replace(tmp, marker)
-                    prune_unpinned(self.models_dir)
+                    try:  # the snapshot is verified: a prune failure must not fail the job
+                        prune_unpinned(self.models_dir)
+                    except Exception:
+                        logger.exception("whisper models: pruning unpinned revisions failed")
                     return snapshot
                 logger.warning(
                     "whisper model %s: snapshot rejected (%s)", self.model, _describe(problems)

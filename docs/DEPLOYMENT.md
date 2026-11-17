@@ -153,8 +153,9 @@ clip renders, the job fails.
 - `clipper retry <job>` deletes the job's counts, so every clip gets fresh tries. It finds
   them under `--media-root` (default `data/media`, or `CLIPPER_MEDIA_DIR`), so pass the
   worker's media directory if it is not the default. `clipper enqueue --retry` keeps the
-  counts: delete `render_failures.json` by hand to give a left-out clip fresh tries. When no
-  clip rendered, the job drops its counts itself.
+  counts and the 48 h clock below: delete `render_failures.json` and `.render_failing_since`
+  by hand to give the clips fresh tries. When no clip rendered, the job drops its counts
+  itself.
 - Outage cap: when every render fails (Remotion broken, disk full), a job keeps trying for
   up to about 3 x clips x `CLIP_WORST_CASE_S` (the worst case of one clip). With a single
   worker, every job queued behind it waits too. So a job whose renders still fail 48 h

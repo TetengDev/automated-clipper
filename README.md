@@ -12,12 +12,13 @@
 ## Quickstart (local)
 
 ```bash
-uv sync
+brew install ffmpeg               # macOS; the pipeline's only system tool (renders also need Node)
+uv sync                           # also brings yt-dlp's Deno runtime (YouTube challenges)
 cp .env.example .env              # fill in keys as features need them
 uv run clipper check-config       # validate config/creators.yaml
 uv run clipper migrate            # create data/state.db
 uv run pytest                     # tests
-docker compose build              # image with ffmpeg + yt-dlp
+docker compose build              # image with ffmpeg + yt-dlp + Deno
 ```
 
 Highlights are picked through the Claude Code CLI on your Claude subscription

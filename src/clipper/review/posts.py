@@ -37,13 +37,20 @@ RECENT_POSTED = 20
 def scheduled_page(request: Request, _user: User, conn: Conn) -> Response:
     upcoming = repo.list_posts(conn, statuses=(PostStatus.SCHEDULED, PostStatus.UPLOADING))
     failed = repo.list_posts(conn, statuses=(PostStatus.POST_FAILED,), newest_first=True)
+    held = repo.list_posts(conn, statuses=(PostStatus.HELD,), newest_first=True)
     posted = repo.list_posts(
         conn, statuses=(PostStatus.POSTED,), newest_first=True, limit=RECENT_POSTED
     )
     return render(
         request,
         "scheduled.html",
-        {"upcoming": upcoming, "failed": failed, "posted": posted, "next": SCHEDULED_PAGE},
+        {
+            "upcoming": upcoming,
+            "failed": failed,
+            "held": held,
+            "posted": posted,
+            "next": SCHEDULED_PAGE,
+        },
     )
 
 

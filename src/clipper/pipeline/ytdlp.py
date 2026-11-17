@@ -74,8 +74,12 @@ PUMP_JOIN_TIMEOUT_S = 5.0
 CHILD_ENV_ALLOWLIST = (
     "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "XDG_CACHE_HOME",
     "SSL_CERT_FILE", "SSL_CERT_DIR",
+    # yt-dlp hands its environment to Deno (YouTube challenges): cache dir on the tmpfs,
+    # and no update check, whose stderr notice would fail the solve.
+    "DENO_DIR", "DENO_NO_UPDATE_CHECK",
 )  # fmt: skip
-"""Children (yt-dlp, ffmpeg, ffprobe) never see API keys or other secrets from our env."""
+"""Children (yt-dlp and its Deno, ffmpeg, ffprobe) never see API keys or other secrets from
+our env."""
 
 
 @dataclass(frozen=True)

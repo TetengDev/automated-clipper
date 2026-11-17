@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, NoReturn
 
 import typer
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from clipper import jobs
 from clipper.config import (
@@ -32,16 +32,21 @@ from clipper.monitor import CycleReport, FirstRun, YouTubeMonitor
 from clipper.pipeline import build_stages
 from clipper.posting.cli import app as posts_app
 from clipper.posting.stage import HEARTBEAT_BUSY_MS, PostingStage
+from clipper.submissions_cli import app as campaigns_app
 from clipper.urls import InvalidSourceURL, parse_source_url
 
 if TYPE_CHECKING:
     import httpx
 
+    from clipper.accounts import AccountsConfig
+    from clipper.campaigns import PostingConfig
+    from clipper.notify import Notify
     from clipper.resolve import Resolved
     from clipper.sources.youtube import MetadataProvider, YouTubeSource
 
 EXIT_NOT_IMPLEMENTED = 70  # EX_SOFTWARE; distinct from Click's usage-error code 2
 MANUAL_CREATOR = "manual"
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(
     help="24/7 auto-clipper: detect, transcribe, select highlights, render, review.",
@@ -49,6 +54,7 @@ app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(posts_app, name="posts")
+app.add_typer(campaigns_app, name="campaigns")
 
 
 @dataclass(frozen=True)
@@ -103,10 +109,33 @@ def check_config(ctx: typer.Context) -> None:
     for creator in cfg.creators:
         platforms = [p for p in ("youtube", "twitch") if getattr(creator, p) is not None]
         typer.echo(f"  - {creator.name} [{creator.region}] {', '.join(platforms)}")
-    _check_accounts(_app(ctx).config_path, cfg)
+    accounts = _check_accounts(_app(ctx).config_path, cfg)
+    _check_campaigns(_app(ctx).config_path, cfg, accounts)
 
 
-def _check_accounts(config_path: Path, cfg: AppConfig) -> None:
+def _check_campaigns(config_path: Path, cfg: AppConfig, accounts: AccountsConfig) -> None:
+    """Campaigns summary for check-config (CLP-97), with the audience policy guard."""
+    from clipper.campaigns import (
+        campaigns_path,
+        load_campaigns,
+        summary,
+        unconfigured_campaigns,
+    )
+
+    path = campaigns_path(config_path)
+    try:
+        campaigns = load_campaigns(path, cfg, accounts)
+    except ConfigError as exc:
+        _fail(str(exc))
+    found = "" if path.exists() else f" ({path} not found)"
+    typer.echo(f"ok: {len(campaigns.campaigns)} campaigns{found}")
+    for campaign in campaigns.campaigns:
+        typer.echo(f"  - {summary(campaign)}")
+    for warning in unconfigured_campaigns(accounts, campaigns):
+        typer.echo(f"warning: {warning}", err=True)
+
+
+def _check_accounts(config_path: Path, cfg: AppConfig) -> AccountsConfig:
     """Accounts summary for check-config (CLP-91): token status only, never values."""
     from clipper.accounts import (
         account_tokens,
@@ -130,7 +159,9 @@ def _check_accounts(config_path: Path, cfg: AppConfig) -> None:
             f"  - {a.id}{state} {a.platform} {a.handle} [{a.market}] {a.posts_per_day}/day "
             f"windows {', '.join(a.windows)} {a.timezone}; "
             f"tokens: {token_status(account_tokens(a.id, env))}"
+            + (f"; campaign {a.campaign}" if a.campaign else "")
         )
+    return accounts
 
 
 @app.command("migrate")
@@ -258,6 +289,46 @@ def _open_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _posting_config(conn: sqlite3.Connection, config_path: Path) -> PostingConfig:
+    """Accounts and campaigns for the worker (CLP-97). Checked now (a bad config stops the
+    worker) and reloaded whenever a file changes."""
+    from clipper.campaigns import PostingConfig
+
+    live = PostingConfig(config_path)
+    try:
+        live.current()
+    except ConfigError as exc:
+        conn.close()
+        _fail(str(exc))
+    return live
+
+
+def _notifiers(http: httpx.Client) -> tuple[Notify, Notify]:
+    """Discord webhooks for submission pings and missed-deadline alerts. Pings go to
+    DISCORD_WEBHOOK_URL, alerts to DISCORD_ALERTS_WEBHOOK_URL (else the ping webhook);
+    without either, messages go to the log. A malformed URL stops the worker."""
+    from clipper.notify import DiscordWebhook, log_notify
+
+    try:
+        secrets = Secrets()
+    except ValidationError as exc:
+        _fail(f"run-worker: {exc}")
+
+    def hook(value: SecretStr | None, name: str) -> Notify | None:
+        if value is None or not value.get_secret_value().strip():
+            return None
+        try:
+            return DiscordWebhook(value.get_secret_value().strip(), http)
+        except ValueError:
+            _fail(f"{name} must be a https://discord.com/api/webhooks/... URL")
+
+    notify = hook(secrets.discord_webhook_url, "DISCORD_WEBHOOK_URL")
+    alert = hook(secrets.discord_alerts_webhook_url, "DISCORD_ALERTS_WEBHOOK_URL")
+    if notify is None:
+        logger.warning("DISCORD_WEBHOOK_URL is not set: campaign submission pings go to the log")
+    return notify or log_notify, alert or notify or log_notify
+
+
 @app.command("run-worker")
 def run_worker(
     ctx: typer.Context,
@@ -296,25 +367,38 @@ def run_worker(
         stages=build_stages(),
         media_root=media_dir,
     )
+    from clipper.campaigns import LiveCampaigns
+    from clipper.jobs.worker import ChainedPasses
+    from clipper.posting.scheduler import publish_guard
+    from clipper.submissions import SubmissionPass
+
+    live = _posting_config(conn, app_ctx.config_path)
+    http = _http_client()
+    notify, alert = _notifiers(http)
     # The posting pass runs on its own thread (CLP-105), so it gets its own connection;
     # check_same_thread=False only because `recover` uses it here before that thread starts.
+    # The guard and the submission pass run on that thread too, so they use it as well.
     # Its upload heartbeat opens one more, per upload.
     db_path = app_ctx.db_path
     try:
         posting_conn = connect(db_path, check_same_thread=False)
     except (sqlite3.Error, OSError) as exc:
+        http.close()
         conn.close()
         _fail(f"cannot open database {db_path}: {exc}")
     stop = threading.Event()
     # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
-    worker.posting = PostingStage(
+    posting = PostingStage(
         conn=posting_conn,
         publishers={},
         worker_id=worker.worker_id,
         media_root=media_dir,
+        guard=publish_guard(posting_conn, live, media_dir.resolve()),
         connect=lambda: connect(db_path, busy_timeout_ms=HEARTBEAT_BUSY_MS),
         stop=stop,
     )
+    submitting = SubmissionPass(posting_conn, LiveCampaigns(live), notify, alert)
+    worker.posting = ChainedPasses([posting, submitting])
     try:
         if recover_id:
             worker.recover(recover_id)
@@ -327,10 +411,12 @@ def run_worker(
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
     finally:
-        # A posting thread that outlived an interrupt may still be using its connection;
-        # leave that one to process exit rather than close it under the thread.
+        # A posting thread that outlived an interrupt may still be using its connection
+        # and the webhook client; leave those to process exit rather than close them
+        # under the thread.
         if not worker.posting_running:
             posting_conn.close()
+            http.close()
         conn.close()
 
 

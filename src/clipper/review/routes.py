@@ -40,6 +40,8 @@ from clipper.metadata import (
     fingerprint,
     links_or_mentions,
 )
+from clipper.posting import repo as post_repo
+from clipper.posting.models import PostStatus
 from clipper.posting.scheduler import schedule_for_clip
 from clipper.review.app import flash, get_db, render, require_user
 
@@ -286,13 +288,41 @@ def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.Clip
         flash(request, f"Clip {clip.id} is sensitive: not scheduled for posting.")
         return
     try:
-        created = schedule_for_clip(conn, clip.id, accounts, _now(request))
+        created = schedule_for_clip(
+            conn,
+            clip.id,
+            accounts,
+            _now(request),
+            campaigns=request.app.state.campaigns,
+            media_root=request.app.state.media_root,
+        )
     except Exception:
         logger.exception("scheduling posts for clip %d failed", clip.id)
         flash(request, f"Clip {clip.id}: scheduling posts failed; see the server log.")
         return
-    if created:
-        flash(request, f"Scheduled {len(created)} post(s) for clip {clip.id}.")
+    held = [p for p in created if p.status == PostStatus.HELD]
+    scheduled = len(created) - len(held)
+    earlier = [
+        p
+        for p in post_repo.list_posts(conn, statuses=(PostStatus.HELD,), clip_id=clip.id)
+        if p not in held
+    ]
+    if earlier:
+        # Approving again does not re-check posts held before (one post per account).
+        flash(
+            request,
+            f"Clip {clip.id} has {len(earlier)} post(s) still held from before; run"
+            " `clipper posts recheck` to check them again.",
+        )
+    if scheduled:
+        flash(request, f"Scheduled {scheduled} post(s) for clip {clip.id}.")
+    if held:
+        # The reasons are on the Scheduled page; the flash says where to look.
+        flash(
+            request,
+            f"Clip {clip.id}: {len(held)} post(s) held by the campaign pre-flight"
+            f" ({', '.join(p.account_id for p in held)}); see Scheduled for the reasons.",
+        )
 
 
 def export_in_background(state: State, clip_id: int) -> None:

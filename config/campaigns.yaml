@@ -1,0 +1,100 @@
+# Clipping campaigns (CLP-97): the brief of each paid campaign an account posts for.
+# Validate with: uv run clipper check-config
+#
+# An account joins a campaign with `campaign: <id>` in accounts.yaml. Only the campaign's
+# `creator` clips count for it; the account's market must be one of the audience rule's
+# markets and its platform one of the campaign's platforms, or check-config fails.
+#
+# Every post to a campaign account goes through a pre-flight at scheduling. When the clip
+# or its metadata breaks the brief (too short or long, a required hashtag missing, a
+# forbidden keyword, AI content when the brief forbids it, the campaign ended), the post
+# is `held` with the reason on the Scheduled page, and is never published. After fixing the
+# config, `clipper posts recheck` schedules the held posts that now pass.
+#
+# OWNER TODO: the values below are placeholders from the epic's research notes (CLP-90),
+# not the real briefs. For each campaign, open the live brief on the program's site, copy
+# its rules in, and only then set `brief_verified: true`. While `brief_verified` is false,
+# every post for that campaign is held ("the brief is a placeholder"), so nothing is
+# posted under rules nobody checked.
+#
+# Fields:
+#   program            vyro | whop | reach | sponsor
+#   creator            a name from creators.yaml
+#   platforms          tiktok | instagram | youtube | facebook
+#   min_duration_s, max_duration_s   clip length the brief accepts
+#   required_hashtags  added to every post at scheduling and checked by the pre-flight
+#   forbidden          logos | negative_framing | ai_content | reposts. ai_content is checked
+#                      from the render (any AI hook voice or generated footage holds the
+#                      post); the others are for the reviewer to check before approving.
+#   forbidden_keywords words that must not appear in the title, caption or hashtags
+#   audience_rule      markets (ISO country codes) and the share of the audience they need
+#   submit_within_minutes   deadline for submitting the post link after it goes live
+#   rate_per_1k, per_clip_cap, budget, currency   payout terms, for the earnings report
+#   ends_at            ISO 8601 with an offset; posts after it are held
+#   paid_partnership   the brief requires the platform's paid-partnership toggle
+#
+# Never add AI voice-overs or generated footage to campaign clips (CLP-90): Reach bans any
+# AI content permanently. Raffy Tulfo in Action, Ivana Alawi and Cong TV have no program:
+# no campaign for them.
+
+campaigns:
+  - id: vyro_mrbeast
+    program: vyro
+    creator: MrBeast
+    platforms: [tiktok, youtube, instagram, facebook]
+    brief_verified: false  # OWNER TODO: copy the rules from the live Vyro brief, then true
+    min_duration_s: 20  # OWNER TODO: confirm (epic note: "clips at least 20 s")
+    max_duration_s: null  # OWNER TODO
+    required_hashtags: ["#mrbeast", "#mrbeastpartner"]  # OWNER TODO: confirm
+    forbidden: []  # OWNER TODO
+    forbidden_keywords: []  # OWNER TODO
+    audience_rule: null  # OWNER TODO
+    submit_within_minutes: null  # OWNER TODO
+    rate_per_1k: 1.00  # OWNER TODO: confirm (epic note: about $1 per 1,000 views, Oct 2026)
+    per_clip_cap: null  # OWNER TODO
+    budget: null  # OWNER TODO
+    currency: USD
+    ends_at: null  # OWNER TODO
+    paid_partnership: false  # OWNER TODO
+
+  - id: reach_kai_cenat
+    program: reach
+    creator: Kai Cenat
+    platforms: [tiktok, youtube, instagram]  # OWNER TODO: confirm
+    brief_verified: false  # OWNER TODO: copy the rules from the live Reach/Whop brief
+    min_duration_s: null  # OWNER TODO
+    max_duration_s: null  # OWNER TODO
+    required_hashtags: []  # OWNER TODO
+    forbidden: [ai_content]  # epic: any AI content is a permanent ban
+    forbidden_keywords: []  # OWNER TODO
+    audience_rule:  # epic: at least 50% of the audience in US/CA/UK/AU/NZ
+      markets: [US, CA, GB, AU, NZ]
+      min_share: 0.5
+    submit_within_minutes: 30  # epic: link submitted within 30 minutes of posting
+    rate_per_1k: null  # OWNER TODO: pooled payout
+    per_clip_cap: null  # OWNER TODO
+    budget: null  # OWNER TODO
+    currency: USD
+    ends_at: null  # OWNER TODO
+    paid_partnership: false  # OWNER TODO
+    enabled: false  # no account posts Kai Cenat clips yet
+
+  - id: sponsor_ishowspeed
+    program: sponsor
+    creator: IShowSpeed
+    platforms: [tiktok, youtube, instagram]  # OWNER TODO
+    brief_verified: false  # OWNER TODO: one entry per sponsor campaign, from its brief
+    min_duration_s: null  # OWNER TODO
+    max_duration_s: null  # OWNER TODO
+    required_hashtags: []  # OWNER TODO
+    forbidden: []  # OWNER TODO
+    forbidden_keywords: []  # OWNER TODO
+    audience_rule: null  # OWNER TODO
+    submit_within_minutes: null  # OWNER TODO
+    rate_per_1k: null  # OWNER TODO (epic example: a sponsor at $1 per 1,000 views)
+    per_clip_cap: null  # OWNER TODO
+    budget: null  # OWNER TODO
+    currency: USD
+    ends_at: null  # OWNER TODO
+    paid_partnership: true  # sponsor-funded: OWNER TODO confirm the brief requires it
+    enabled: false  # no account posts IShowSpeed clips yet

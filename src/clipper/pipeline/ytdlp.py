@@ -72,8 +72,9 @@ CLIP_FORMAT = "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]"
 audio selector accepts too: either `ba` exists, or a muxed format with audio does, which
 the audio fallbacks take. One exception: a video with only muxed formats, all above 480p
 and AUDIO_FALLBACK_TBR (YouTube's HLS ladder normally has a 480p one); its audio
-download is a format error. `[acodec!=none]`: plain `b` falls back to a video-only format
-when there is no audio at all, which would make silent clips."""
+download is a format error, deferred like a player breakage and failed after 48 h (about
+96 attempts, each a probe and a download). `[acodec!=none]`: plain `b` falls back to a
+video-only format when there is no audio at all, which would make silent clips."""
 SECTION_MAX_FILESIZE = "2G"
 STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
 """yt-dlp's probe JSON is often several MB; anything bigger is cut (and fails to parse)."""

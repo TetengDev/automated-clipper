@@ -77,7 +77,10 @@ MAX_FORMAT_ERRORS_WITH_SIBLINGS = 3
 """A format error in a poll where another of the creator's videos probed fine means the
 player works: this video has no format the clip selector accepts (e.g. no audio, or no
 video). After this many such polls it is recorded `unavailable`. A player breakage that
-hits every video fails the first one probed, which stops the batch, so it never counts."""
+hits every video fails the first one probed, which stops the batch, so it never counts.
+Limits: the count is kept in memory only, so a monitor restart (a deploy) sets it back
+to 0. A sibling counts only when it is new (unseen) and probed in the same poll, so the
+count grows with the creator's upload rate: about 3 weeks for a weekly uploader."""
 
 
 class FirstRun(StrEnum):

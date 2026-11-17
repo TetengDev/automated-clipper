@@ -116,7 +116,15 @@ The slow test `CLIPPER_SLOW_TESTS=1 uv run pytest -k real_probe` checks this aga
 video. A breakage that hits every video is retried until it is fixed. The monitor gives up
 on a video (records it `unavailable`) after it has had format errors in 3 polls where other
 videos from the same creator probed fine: an upload with no audio, for example. To fetch
-such a video anyway, enqueue it by hand.
+such a video anyway, enqueue it by hand. That count is kept in memory only, so a monitor
+restart (a deploy) sets it back to 0. Only a new upload probed in the same poll counts as
+a sibling that probed fine, so the count grows with the creator's upload rate: about 3
+weeks for a weekly uploader.
+
+The bitrate cap on the audio download's last fallback leaves one gap. A video whose only
+formats are muxed, all above 480p and 3000 kbps, passes the probe, but its audio download
+finds no format. The worker defers it like a player breakage and fails it after 48 h,
+which costs about 96 attempts, each a yt-dlp probe and download.
 
 ## Local transcription
 

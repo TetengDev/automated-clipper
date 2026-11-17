@@ -151,10 +151,16 @@ The worker transcribes with faster-whisper on CPU (`transcriber: local`, the def
   an exclusive `flock` on `<models dir>/.lock`, so the worker and an operator's
   `clipper bench-transcribe` never fetch or delete under each other. The second one waits
   (up to its fetch budget, then the job retries later) and then finds the snapshot ready.
+  `flock` only works on a local filesystem: keep the models dir on a local disk (or a
+  Docker volume or bind mount of one), never on NFS shared across hosts.
 - **Old revisions are pruned**: when a pin moves to a new commit, the first job after the
   deploy fetches it and, still under the lock, deletes every snapshot no pin names, then
-  the blobs only those snapshots used. The worker does this, not the janitor: only the
-  worker can write the models dir. Pruning never follows a symlink, never touches anything
+  the blobs only those snapshots used. Pruning runs in the worker's transcribe stage, after
+  a verified fetch, not in the janitor: the monitor mounts the models dir read-only, so
+  only the worker can write it. `bench-transcribe` and the quality gate never prune, so a
+  run from a checkout with other pins cannot delete the worker's model. A model dropped
+  from `WHISPER_MODELS` stays on disk until the next fetch of any model. Pruning never
+  follows a symlink, never touches anything
   outside the models dir, and logs and skips a path it cannot delete. If it cannot read a
   snapshot or blobs dir, it deletes no blobs that run.
 - **Needs symlinks**: the snapshot files are symlinks into the Hub client's blob store, and
@@ -208,9 +214,11 @@ the worker's).
   files stay.
 - Rejected and archived clips lose their clip dir `rejected_retention_days` (default 14)
   after the decision. Their database rows and history stay.
-- The disk budget counts the media dir plus the models dir (`CLIPPER_MODELS_DIR`). The
-  janitor only reads the models dir (compose mounts it read-only in `monitor`); the worker
-  prunes old model revisions (see [Local transcription](#local-transcription)).
+- The disk budget counts the media dir plus the models dir (`CLIPPER_MODELS_DIR`), so set
+  `disk_budget_gb` with room for the models too (large-v3 is about 3 GB, large-v3-turbo
+  about 1.6 GB). The janitor only reads the models dir (compose mounts it read-only in
+  `monitor`) and never deletes models; the worker prunes old model revisions (see
+  [Local transcription](#local-transcription)).
 - When the media dir and models dir together reach 80% of `disk_budget_gb`, an alert goes
   to the alerts webhook,
   once per crossing; it is sent again only after usage drops below 80% (or after a

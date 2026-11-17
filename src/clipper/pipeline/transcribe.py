@@ -544,15 +544,24 @@ class FileProblem(NamedTuple):
 def snapshot_problems(
     snapshot: Path, pin: PinnedModel, *, hash_model: bool = True
 ) -> dict[str, FileProblem]:
-    """What is wrong with each pinned file of `snapshot`; empty when every one is there
-    with its pinned size and SHA-256. The small files (a few MB) are always hashed; with
-    `hash_model=False` model.bin only gets its size and blob name checked, since hashing
-    gigabytes before every job is too slow."""
+    """What is wrong with `snapshot`, per entry; empty when it holds exactly the pinned
+    files (plus our marker), each inside the models dir with its pinned size and SHA-256.
+    Unpinned entries count: faster-whisper loads preprocessor_config.json whenever it is
+    there, and the smaller models pin none. The small files (a few MB) are always hashed;
+    with `hash_model=False` model.bin only gets its size and blob name checked, since
+    hashing gigabytes before every job is too slow."""
+    root = snapshot.parents[2].resolve()  # <models>/models--<repo>/snapshots/<revision>
+    ours = {*pin.files, COMPLETE_MARKER, f"{COMPLETE_MARKER}.tmp"}
     problems: dict[str, FileProblem] = {}
+    if snapshot.is_dir():
+        for extra in sorted(set(os.listdir(snapshot)) - ours):
+            problems[extra] = FileProblem("not pinned", bad_content=False)
     for name, want in pin.files.items():
         path = snapshot / name
         if not path.is_file():
             problems[name] = FileProblem("missing", bad_content=False)
+        elif not path.resolve().is_relative_to(root):
+            problems[name] = FileProblem("links outside the models dir", bad_content=False)
         elif (size := path.stat().st_size) != want.size:
             problems[name] = FileProblem(f"size {size}, pinned {want.size}", bad_content=True)
         elif name == "model.bin" and not hash_model:

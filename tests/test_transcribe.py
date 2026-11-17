@@ -1191,6 +1191,42 @@ def test_snapshot_problems_missing_and_relinked_files(fake_asr: FakeAsr, tmp_pat
     )
 
 
+def test_snapshot_problems_unpinned_files(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    """faster-whisper reads preprocessor_config.json whenever it is there, and the small
+    models pin none: a planted one (or anything else unpinned) is a problem."""
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    (snapshot / tr.COMPLETE_MARKER).write_text("x")
+    (snapshot / f"{tr.COMPLETE_MARKER}.tmp").write_text("x")
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {}  # the marker files are ours
+    (snapshot / "preprocessor_config.json").write_text("{}")
+    (snapshot / "extra").mkdir()
+    unpinned = tr.FileProblem("not pinned", bad_content=False)
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {
+        "extra": unpinned,
+        "preprocessor_config.json": unpinned,
+    }
+
+
+def test_snapshot_problems_link_outside_the_models_dir(fake_asr: FakeAsr, tmp_path: Path):
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    outside = tmp_path / "tokenizer.json"
+    outside.write_bytes(FAKE_FILES["tokenizer.json"])  # the pinned bytes, elsewhere
+    (snapshot / "tokenizer.json").unlink()
+    os.symlink(outside, snapshot / "tokenizer.json")
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {
+        "tokenizer.json": tr.FileProblem("links outside the models dir", bad_content=False)
+    }
+
+
+def test_planted_file_under_marker_is_fetched_again(fake_asr: FakeAsr, tmp_path: Path):
+    snapshot = local().ensure_model()
+    (snapshot / "preprocessor_config.json").write_text('{"feature_size": 1}')
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2
+    assert not (snapshot / "preprocessor_config.json").exists()
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+
+
 @pytest.mark.parametrize("name", ["model.bin", "tokenizer.json"])
 def test_truncated_blob_under_marker_is_fetched_again(
     fake_asr: FakeAsr, tmp_path: Path, name: str
@@ -1223,6 +1259,19 @@ def test_damaged_link_outside_the_models_dir_is_never_deleted(
     assert len(fake_asr.fetch_calls()) == 2
     assert outside.read_bytes() == b"not the weights"
     assert (snapshot / "model.bin").read_bytes() == FAKE_MODEL_BIN
+
+
+def test_discard_deletes_nothing_outside_the_models_dir(fake_asr: FakeAsr, tmp_path: Path):
+    """The guard on its own, behind `snapshot_problems` (which already reports such a link
+    without bad_content): even a content problem never deletes outside the models dir."""
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    outside = tmp_path / "elsewhere.bin"
+    outside.write_bytes(b"x")
+    (snapshot / "model.bin").unlink()
+    os.symlink(outside, snapshot / "model.bin")
+    local()._discard(snapshot, {"model.bin": tr.FileProblem("size 1", bad_content=True)})
+    assert outside.read_bytes() == b"x"
+    assert not snapshot.exists()
 
 
 def test_swapped_tokenizer_fails_verification(fake_asr: FakeAsr, tmp_path: Path) -> None:

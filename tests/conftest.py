@@ -73,7 +73,8 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 @pytest.fixture(autouse=True)
 def _no_boot_check(monkeypatch: pytest.MonkeyPatch) -> None:
     """run-worker and run-monitor run doctor's Deno solver check at boot (CLP-129); tests
-    never start the real Deno."""
+    never start the real Deno. A test of the real check imports `startup_check` by name at
+    module level (as test_doctor.py does), before this stub replaces the module attribute."""
     monkeypatch.setattr(doctor, "startup_check", lambda service, alert: None)
 
 

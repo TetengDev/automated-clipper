@@ -21,7 +21,8 @@ Artifacts (shared contract with later stages):
 Live / upcoming / still-processing sources raise `SourceNotReady`, a `Deferred` (+30 min,
 no attempt used); once the job is older than 48 h that becomes a `PermanentError`. The
 stream path reaches this stage only after `waiting_vod`. Sources longer than
-`max_duration_seconds` are skipped, and yt-dlp is capped with `--max-filesize`.
+`max_duration_seconds` are skipped, and yt-dlp is capped with `--max-filesize` and, for
+a muxed fallback, by AUDIO_FORMAT's height and bitrate caps.
 Members-only and Premium videos (yt-dlp `availability`) are skipped unless
 `allow_gated_content`.
 

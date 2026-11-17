@@ -76,7 +76,7 @@ def test_download_requests_audio_only_and_returns_file(tmp_path: Path) -> None:
     args, _ = runner.calls[0]
     # Audio-only when there is one, else a small muxed format with audio (ffmpeg drops the
     # video): --max-filesize only bounds each HLS fragment, not a whole muxed download.
-    selector = "bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none]"
+    selector = "bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none][tbr<=?3000]"
     assert args[args.index("-f") + 1] == selector == ytdlp.AUDIO_FORMAT
     assert args[args.index("--load-info-json") + 1] == str(info)
     assert args[-2:] == ["--", URL]
@@ -613,6 +613,34 @@ def test_audio_selector_caps_a_muxed_only_fallback(
     formats: list[dict[str, object]], chosen: str
 ) -> None:
     assert _select(formats) == chosen
+
+
+@pytest.mark.parametrize(
+    ("formats", "chosen"),
+    [
+        ([_hls(1080, 5000), _hls(720, 3000)], "hls-720"),  # at the cap
+        ([_hls(1080, 5000), {**_hls(720, 3000), "tbr": None}], "hls-720"),  # tbr unknown
+    ],
+)
+def test_audio_selector_bounds_the_bitrate_of_the_last_fallback(
+    formats: list[dict[str, object]], chosen: str
+) -> None:
+    assert ytdlp.AUDIO_FALLBACK_MAX_TBR == 3000
+    assert _select(formats) == chosen
+
+
+def test_audio_selector_rejects_a_muxed_only_video_above_the_bitrate_cap() -> None:
+    # Bytes = bitrate x duration, and --max-filesize does not bound an HLS download. The
+    # probe still accepts this video (the one gap in "probe implies audio"): its audio
+    # download is a format error. YouTube's HLS ladder always has a <=480p rung.
+    formats = [_hls(1080, 5000), _hls(720, 4500)]
+    assert _select(formats, ytdlp.CLIP_FORMAT) == "hls-1080"
+
+    with pytest.raises(Exception, match="Requested format is not available") as info:
+        _select(formats)
+
+    error = classify_error(f"ERROR: {info.value}")
+    assert isinstance(error, Unavailable) and error.reason == ytdlp.NO_FORMAT
 
 
 @pytest.mark.parametrize(

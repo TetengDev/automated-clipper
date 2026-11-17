@@ -367,7 +367,7 @@ canonical_url). Empty: the pipeline, the renderer and export only use `ref.key` 
 
 
 def item_id_uses(source: str) -> int:
-    """The number of places in `source` that read a SourceRef's bare id."""
+    """The number of places in `source` that may put a bare video id into an argv or path."""
     return sum(
         (isinstance(n, ast.Attribute) and n.attr == "item_id")
         or (isinstance(n, ast.Name) and n.id == "item_id")

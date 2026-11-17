@@ -75,18 +75,18 @@ jobs:
         env:
           CLIPPER_SLOW_TESTS: "1"
         run: >-
-          uv run pytest -m "slow or render" -q --junitxml=slow.xml
+          uv run pytest -m "slow or render" -q --junitxml=${{ runner.temp }}/slow.xml
           --deselect tests/test_ytdlp.py::test_real_probe_solves_youtube_challenges_with_deno
 
       # A slow test skips when its model, tool or setup is missing, which would keep this run
       # green while testing nothing. Any skip fails the run (deselected tests are not listed).
       - name: Fail on skipped tests
         run: |
-          uv run python - <<'EOF'
+          uv run python - "${{ runner.temp }}/slow.xml" <<'EOF'
           import sys
           import xml.etree.ElementTree as ET
 
-          cases = list(ET.parse("slow.xml").getroot().iter("testcase"))
+          cases = list(ET.parse(sys.argv[1]).getroot().iter("testcase"))
           skipped = [f"{c.get('classname')}::{c.get('name')}" for c in cases if c.find("skipped") is not None]
           print(f"{len(cases)} tests, {len(skipped)} skipped")
           for name in skipped:

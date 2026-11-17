@@ -1,4 +1,4 @@
-"""Janitor (CLP-38): review expiry, retention sweeps and the deletion guards."""
+"""Janitor (CLP-38): review expiry, retention sweeps, disk budget, and the deletion guards."""
 
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ import pytest
 
 from clipper.config import AppConfig, Settings
 from clipper.db import connect, migrate
-from clipper.janitor import Janitor
+from clipper.janitor import GB, Janitor, media_bytes
 from clipper.jobs.models import to_iso
+from clipper.notify import NotifyError
 
 T0 = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
 DAY = timedelta(days=1)
@@ -60,6 +61,7 @@ def make(
     root: Path,
     *,
     alerts: list[str] | None = None,
+    usage: int | None = None,
     clock: Clock | None = None,
     **settings: object,
 ) -> Janitor:
@@ -70,6 +72,7 @@ def make(
         media_root=root,
         alert=sink.append,
         clock=clock or Clock(),
+        disk_usage=media_bytes if usage is None else (lambda _root: usage),
     )
 
 
@@ -239,13 +242,15 @@ def test_rejected_and_archived_clips_are_deleted_after_their_retention(
 
 
 @pytest.mark.parametrize("keep", ["approved", "exported", "changes_requested", "re_rendering"])
-def test_kept_clips_survive_every_sweep(conn: sqlite3.Connection, root: Path, keep: str) -> None:
+def test_kept_clips_survive_every_sweep_even_far_over_the_disk_budget(
+    conn: sqlite3.Connection, root: Path, keep: str
+) -> None:
     job = add_job(conn, "aaaaaaaaaaa", age=90 * DAY)
     path = job_dir(root, "aaaaaaaaaaa", ranks=(1, 2))
     add_clip(conn, job, 1, keep, age=90 * DAY)
     add_clip(conn, job, 2, "rejected", age=90 * DAY)
 
-    make(conn, root).run()
+    make(conn, root, usage=100 * GB, disk_budget_gb=1).run()
 
     assert names(path / "clips" / "1") == {*SECTION_FILES, *RENDERED_FILES}
     assert not (path / "clips" / "2").exists()
@@ -289,7 +294,7 @@ def test_planted_symlinks_are_never_followed_or_deleted(
     (root / "youtube_bbbbbbbbbbb").symlink_to(outside, target_is_directory=True)
     (outside / "audio_16k.flac").write_bytes(b"outside")
 
-    make(conn, root).run()
+    make(conn, root, usage=100 * GB, disk_budget_gb=1).run()
 
     assert (outside / "secret.flac").read_bytes() == b"not media"
     assert (outside / "clipdir" / "v1.mp4").read_bytes() == b"not media either"
@@ -337,6 +342,74 @@ def test_a_missing_media_root_still_expires_reviews(conn: sqlite3.Connection, ro
 
     assert status(conn, clip) == "archived"
     assert report.errors == []
+
+
+def test_media_bytes_counts_files_and_skips_symlinks(root: Path, outside: Path) -> None:
+    (root / "a").mkdir()
+    (root / "a" / "f").write_bytes(b"x" * 10)
+    (root / "g").write_bytes(b"x" * 5)
+    (root / "a" / "link").symlink_to(outside / "secret.flac")
+    (root / "dir-link").symlink_to(outside, target_is_directory=True)
+
+    assert media_bytes(root) == 15  # regular files only; links are never followed
+    assert media_bytes(root / "missing") == 0
+
+
+# --- disk budget ------------------------------------------------------------------------
+
+
+def test_over_budget_deletes_the_oldest_source_media_first_until_under(
+    conn: sqlite3.Connection, root: Path
+) -> None:
+    add_job(conn, "aaaaaaaaaaa", age=10 * HOUR)
+    older = job_dir(root, "aaaaaaaaaaa")
+    add_job(conn, "bbbbbbbbbbb", age=5 * HOUR)
+    newer = job_dir(root, "bbbbbbbbbbb")
+    before = names(newer)
+
+    report = make(conn, root, usage=GB + 100, disk_budget_gb=1).run()
+
+    assert not (older / "audio_16k.flac").exists()
+    assert not (older / "clips" / "1" / "source.mp4").exists()
+    assert (older / "clips" / "1" / "v1.mp4").is_file()
+    assert names(newer) == before
+    assert report.freed_bytes == 100 * (len(SOURCE_FILES) + len(SECTION_FILES))
+
+
+def test_disk_alert_fires_once_per_crossing_of_80_percent(
+    conn: sqlite3.Connection, root: Path
+) -> None:
+    alerts: list[str] = []
+    clock = Clock()
+    usage = [int(GB * f) for f in (0.79, 0.81, 0.9, 0.5, 0.85)]
+    janitor = make(conn, root, alerts=alerts, clock=clock, disk_budget_gb=1)
+    janitor.disk_usage = lambda _root: usage.pop(0)
+
+    for _ in range(5):
+        janitor.run()
+        clock.now += HOUR
+
+    assert len(alerts) == 2
+    assert "81%" in alerts[0] and "of the 1 GB disk budget" in alerts[0]
+    assert "85%" in alerts[1]
+
+
+def test_a_failed_disk_alert_is_sent_again_next_run(conn: sqlite3.Connection, root: Path) -> None:
+    sent: list[str] = []
+
+    def flaky(text: str) -> None:
+        if not sent and not getattr(flaky, "failed", False):
+            flaky.failed = True  # type: ignore[attr-defined]
+            raise NotifyError("discord webhook returned 500")
+        sent.append(text)
+
+    janitor = make(conn, root, usage=int(GB * 0.9), disk_budget_gb=1)
+    janitor.alert = flaky
+    janitor.run()
+    janitor.run()
+    janitor.run()
+
+    assert len(sent) == 1
 
 
 # --- schedule and isolation -------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Janitor (CLP-38): review expiry and media retention.
+"""Janitor (CLP-38): review expiry, media retention and the disk budget.
 
 run-monitor calls `tick()` after every poll cycle; the sweeps run at most once an hour.
 Each sweep is one method, named in `SWEEPS` and run in that order. A sweep that fails is
@@ -12,6 +12,10 @@ logged and reported; the others still run.
   (`v<N>.mp4/jpg/json`), transcripts and the other small artifacts stay.
 - `prune_dead_clips`: `rejected` and `archived` clips lose their clip dir
   `rejected_retention_days` after their last status change. Their DB rows stay.
+- `enforce_disk_budget`: measures the media dir. At 80% of `disk_budget_gb` the `alert`
+  notifier fires once per crossing; it fires again only after usage has dropped below 80%.
+  That state is kept in memory, so a restart can send it once more. Above the budget, the
+  source media of `clips_ready` jobs goes too, oldest job first, until usage is under it.
 
 Deletion rules. Files are deleted only here, and only inside `media_root`:
 - Paths are built from validated parts (`SourceRef.key`, a clip's rank, fixed names) under
@@ -42,7 +46,7 @@ from clipper.clips import REVIEWABLE, ClipStatus, ReviewAction, record_review, r
 from clipper.config import AppConfig
 from clipper.db import transaction
 from clipper.jobs.models import Clock, JobStatus, to_iso, utcnow
-from clipper.notify import Notify
+from clipper.notify import Notify, NotifyError
 from clipper.pipeline.fetch_audio import AUDIO_NAME, INFO_TMP_NAME, SOURCE_STEM
 from clipper.pipeline.fetch_clips import SIDECAR, TMP_STEM
 from clipper.redact import redact
@@ -50,10 +54,12 @@ from clipper.urls import InvalidSourceURL, SourceRef
 
 logger = logging.getLogger(__name__)
 
+GB = 10**9
+ALERT_SHARE = 0.8
 INTERVAL = timedelta(hours=1)
 SECTION_NAME = "source.mp4"
 """A clip's downloaded section (`fetching_clips`), inside `clips/<rank>/`."""
-SWEEPS = ("expire_reviews", "prune_sources", "prune_dead_clips")
+SWEEPS = ("expire_reviews", "prune_sources", "prune_dead_clips", "enforce_disk_budget")
 KEPT = frozenset(
     {
         ClipStatus.APPROVED,
@@ -68,12 +74,26 @@ DEAD = (ClipStatus.REJECTED, ClipStatus.ARCHIVED)
 Sweep = Callable[[datetime, "JanitorReport"], None]
 
 
+def media_bytes(root: Path) -> int:
+    """Bytes in the regular files under `root`. Links are not followed or counted."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            with suppress(OSError):
+                info = os.lstat(os.path.join(dirpath, name))
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+    return total
+
+
 @dataclass
 class JanitorReport:
     archived: int = 0
     removed: int = 0
     """Files deleted."""
     freed_bytes: int = 0
+    usage_bytes: int | None = None
+    """The media dir's size, as measured for the disk budget."""
     errors: list[str] = field(default_factory=list)
 
 
@@ -84,7 +104,10 @@ class Janitor:
     media_root: Path
     alert: Notify
     clock: Clock = utcnow
+    disk_usage: Callable[[Path], int] = media_bytes
     last_run: datetime | None = None
+    disk_alerted: bool = False
+    """Usage is at or above 80% and the alert went out; reset once it drops below."""
 
     def tick(self) -> JanitorReport | None:
         """The monitor's hook: run when an hour has passed since the last run. Never raises."""
@@ -170,6 +193,39 @@ class Janitor:
             clip_dir = _clip_dir(root, platform, item_id, rank)
             if clip_dir is not None:
                 self._remove(root, clip_dir, kept, report)
+
+    def enforce_disk_budget(self, now: datetime, report: JanitorReport) -> None:
+        budget_gb = self.config.settings.disk_budget_gb
+        budget = budget_gb * GB
+        root = self.media_root.resolve()
+        used = self.disk_usage(root)
+        report.usage_bytes = used
+        if used < ALERT_SHARE * budget:
+            self.disk_alerted = False
+        elif not self.disk_alerted:
+            text = (
+                f"Disk: media uses {used / GB:.1f} GB, {used / budget:.0%} of the"
+                f" {budget_gb} GB disk budget"
+            )
+            try:
+                self.alert(text)
+            except NotifyError as exc:
+                logger.warning("janitor: disk alert not sent (%s); next run tries again", exc)
+            else:
+                self.disk_alerted = True
+        if used <= budget:
+            return
+        kept = self._kept(root)
+        for key in self._ready_jobs(now):
+            used -= self._prune_job(root, key, kept, report)
+            if used <= budget:
+                return
+        logger.warning(
+            "janitor: media uses %.1f GB, over the %d GB disk budget, with no source media"
+            " left to delete",
+            used / GB,
+            budget_gb,
+        )
 
     # --- helpers --------------------------------------------------------------------------
 

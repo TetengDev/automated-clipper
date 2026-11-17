@@ -1,18 +1,28 @@
-"""Review app: request bodies are capped before any form parsing (CLP-104)."""
+"""Review app: request bodies are capped before any form parsing (CLP-104), forms are
+capped at 200 fields, and HTMX requests get a readable 413 (CLP-110)."""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException
+from starlette.formparsers import FormParser, MultiPartParser
 from starlette.requests import Request
 from starlette.types import Message
 
 from clipper.metadata import PLATFORM_LIMITS
-from clipper.review.app import MAX_REQUEST_BODY_BYTES, SECURITY_HEADERS
+from clipper.review.app import (
+    MAX_FORM_FIELDS,
+    MAX_REQUEST_BODY_BYTES,
+    SECURITY_HEADERS,
+    csrf_protect,
+)
 from review_support import Env, login, make_env
 
 ONE_MB = 1024 * 1024
@@ -188,11 +198,11 @@ def test_streamed_body_one_byte_over_the_limit_is_413(client: TestClient) -> Non
     assert_plain_413(response)
 
 
-def assert_plain_413(response) -> None:  # type: ignore[no-untyped-def]
+def assert_plain_413(response, text: str = "Request body too large") -> None:  # type: ignore[no-untyped-def]
     """Both 413 paths (declared length, streamed overflow) give the same closing response."""
     assert response.status_code == 413
     assert response.headers["content-type"].startswith("text/plain")
-    assert response.text == "Request body too large"
+    assert response.text == text
     assert response.headers["connection"] == "close"
     for name in SECURITY_HEADERS:
         assert name in response.headers
@@ -332,3 +342,265 @@ def test_overflow_after_the_response_started_is_reraised() -> None:
     scope = {"type": "http", "method": "POST", "path": "/x", "headers": []}
     with pytest.raises(_BodyTooLarge):
         asyncio.run(_BodySizeLimit(inner, max_bytes=10)(scope, receive, send))
+
+
+# --- CLP-110: form field cap, and a readable 413 for HTMX ----------------------------------
+
+FORM = {"Content-Type": "application/x-www-form-urlencoded"}
+HTMX = {"HX-Request": "true", "HX-Target": "action-error"}
+
+
+@pytest.fixture
+def fields_parsed(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Counts every field the form parsers finish, to prove a refused form is not parsed."""
+    parsed: list[int] = []
+    for parser in (FormParser, MultiPartParser):
+        original = parser.on_part_end if parser is MultiPartParser else parser.on_field_end
+
+        def spy(self, _original=original) -> None:  # type: ignore[no-untyped-def]
+            parsed.append(1)
+            _original(self)
+
+        name = "on_part_end" if parser is MultiPartParser else "on_field_end"
+        monkeypatch.setattr(parser, name, spy)
+    return parsed
+
+
+def _urlencoded(csrf: str, fields: int) -> bytes:
+    """A form of exactly `fields` fields, the CSRF token among them."""
+    return "&".join([f"csrf_token={csrf}", *(f"f{i}=x" for i in range(fields - 1))]).encode()
+
+
+BOUNDARY = "clp110boundary"
+
+
+def _multipart(csrf: str, parts: int) -> bytes:
+    """A multipart form of exactly `parts` parts, the CSRF token among them."""
+    names = ["csrf_token", *(f"f{i}" for i in range(parts - 1))]
+    out = b""
+    for name in names:
+        value = csrf if name == "csrf_token" else "x"
+        out += (
+            f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+        ).encode()
+    return out + f"--{BOUNDARY}--\r\n".encode()
+
+
+MULTIPART = {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
+
+
+def test_form_field_limit_is_200() -> None:
+    assert MAX_FORM_FIELDS == 200
+
+
+def test_thousands_of_fields_are_413_before_they_are_parsed(
+    client: TestClient, env: Env, fields_parsed: list[int]
+) -> None:
+    csrf = login(client)
+    clip_id = env.clip()
+    body = b"version=1&fingerprint=x&" + _urlencoded(csrf, 5000)
+    fields_parsed.clear()
+
+    response = client.post(f"/clip/{clip_id}/variants", content=body, headers=FORM)
+
+    assert_plain_413(response, "Too many form fields")
+    assert fields_parsed == []
+    assert env.reviews(clip_id) == []
+
+
+def test_streamed_thousands_of_fields_are_413(client: TestClient, env: Env) -> None:
+    csrf = login(client)
+    clip_id = env.clip()
+    body = b"version=1&fingerprint=x&" + _urlencoded(csrf, 5000)
+
+    response = client.post(f"/clip/{clip_id}/variants", content=_stream(body, 7), headers=FORM)
+
+    assert_plain_413(response, "Too many form fields")
+
+
+def test_bare_separators_count_as_fields(client: TestClient) -> None:
+    """`a&a&a...`, the shape the issue describes: about 128K fields under the byte cap."""
+    csrf = login(client)
+    body = f"csrf_token={csrf}&".encode() + b"&".join([b"a"] * 100_000)
+
+    response = client.post("/logout", content=body, headers=FORM)
+
+    assert_plain_413(response, "Too many form fields")
+
+
+@pytest.mark.parametrize("chunk", [7, 1_000_000])
+def test_form_at_the_field_limit_reaches_the_route(client: TestClient, chunk: int) -> None:
+    body = _urlencoded(login(client), MAX_FORM_FIELDS)
+
+    response = client.post("/logout", content=_stream(body, chunk), headers=FORM)
+
+    assert response.status_code == 303  # parsed, CSRF checked, logged out
+
+
+@pytest.mark.parametrize("chunk", [7, 1_000_000])
+def test_form_one_field_over_the_limit_is_413(client: TestClient, chunk: int) -> None:
+    body = _urlencoded(login(client), MAX_FORM_FIELDS + 1)
+
+    response = client.post("/logout", content=_stream(body, chunk), headers=FORM)
+
+    assert_plain_413(response, "Too many form fields")
+
+
+@pytest.mark.parametrize("chunk", [7, 1_000_000])  # 7 splits the boundary across chunks
+def test_multipart_at_the_field_limit_reaches_the_route(client: TestClient, chunk: int) -> None:
+    body = _multipart(login(client), MAX_FORM_FIELDS)
+
+    response = client.post("/logout", content=_stream(body, chunk), headers=MULTIPART)
+
+    assert response.status_code == 303
+
+
+@pytest.mark.parametrize("chunk", [7, 1_000_000])
+def test_multipart_one_part_over_the_limit_is_413(
+    client: TestClient, chunk: int, fields_parsed: list[int]
+) -> None:
+    body = _multipart(login(client), MAX_FORM_FIELDS + 1)
+    fields_parsed.clear()
+
+    response = client.post("/logout", content=_stream(body, chunk), headers=MULTIPART)
+
+    assert_plain_413(response, "Too many form fields")
+    if chunk > len(body):
+        assert fields_parsed == []
+
+
+def test_csrf_check_parses_no_more_than_the_field_limit() -> None:
+    """Behind the middleware this cannot trigger; on its own, the dependency still stops."""
+    body = _urlencoded("t", MAX_FORM_FIELDS + 1)
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/logout",
+        "headers": [(b"content-type", FORM["Content-Type"].encode())],
+        "session": {"csrf": "t"},
+        "app": object(),
+    }
+    with pytest.raises(HTTPException, match=f"Maximum number of fields is {MAX_FORM_FIELDS}"):
+        asyncio.run(csrf_protect(Request(scope, receive)))
+
+
+def _oversized_variants_edit(csrf: str) -> dict[str, str]:
+    """The issue's case: four 20k-character emoji captions, which the route would accept
+    field by field, but which percent-encode to almost 1 MB."""
+    data = {"version": "1", "fingerprint": "0" * 64}
+    for platform in PLATFORM_LIMITS:
+        data[f"{platform}_caption"] = "\U0001f600" * 20_000
+    return data
+
+
+def assert_htmx_413(response, message: str) -> None:  # type: ignore[no-untyped-def]
+    assert response.status_code == 413
+    assert response.headers["content-type"].startswith("text/html")
+    assert re.fullmatch(
+        rf'<p class="error" role="alert">{re.escape(message)}</p>\s*', response.text
+    )
+    assert response.headers["HX-Retarget"] == "#action-error"
+    assert response.headers["HX-Reswap"] == "innerHTML"
+    assert response.headers["connection"] == "close"
+    for name in SECURITY_HEADERS:
+        assert name in response.headers
+
+
+TOO_LONG = "Not saved: the form is over 256 KB. Shorten the text and try again."
+TOO_MANY = "Not saved: the form has too many fields."
+
+
+def test_oversized_htmx_variants_edit_shows_an_error(client: TestClient, env: Env) -> None:
+    csrf = login(client)
+    clip_id = env.clip()
+
+    response = client.post(
+        f"/clip/{clip_id}/variants",
+        data=_oversized_variants_edit(csrf),
+        headers={**HTMX, "X-CSRF-Token": csrf},
+    )
+
+    assert_htmx_413(response, TOO_LONG)
+    assert env.reviews(clip_id) == []
+
+
+def test_streamed_oversized_htmx_edit_shows_an_error(client: TestClient, env: Env) -> None:
+    """No Content-Length: the overflow is caught mid-parse, by the app's exception handler."""
+    csrf = login(client)
+    clip_id = env.clip()
+
+    def chunks() -> Iterator[bytes]:
+        yield b"version=1&tiktok_caption="
+        for _ in range(64):
+            yield b"x" * 16 * 1024
+
+    response = client.post(
+        f"/clip/{clip_id}/variants",
+        content=chunks(),
+        headers={**FORM, **HTMX, "X-CSRF-Token": csrf},
+    )
+
+    assert_htmx_413(response, TOO_LONG)
+
+
+def test_htmx_form_with_too_many_fields_shows_an_error(client: TestClient, env: Env) -> None:
+    csrf = login(client)
+    clip_id = env.clip()
+
+    response = client.post(
+        f"/clip/{clip_id}/variants",
+        content=_urlencoded(csrf, 5000),
+        headers={**FORM, **HTMX, "X-CSRF-Token": csrf},
+    )
+
+    assert_htmx_413(response, TOO_MANY)
+
+
+def test_htmx_413_goes_to_the_requests_own_error_slot(client: TestClient) -> None:
+    """Posts and campaigns pages have their own slots (`post-error-N`)."""
+    csrf = login(client)
+
+    response = client.post(
+        "/posts/7/cancel",
+        content=_urlencoded(csrf, 5000),
+        headers={**FORM, "HX-Request": "true", "HX-Target": "post-error-7"},
+    )
+
+    assert response.status_code == 413
+    assert response.headers["HX-Retarget"] == "#post-error-7"
+
+
+@pytest.mark.parametrize("target", [None, "", "a, body", "#x", "1abc", "x y"])
+def test_htmx_413_without_a_plain_target_id_is_not_retargeted(
+    client: TestClient, target: str | None
+) -> None:
+    """Only a plain element id is echoed back as a selector; otherwise htmx keeps its own."""
+    headers = {**FORM, "HX-Request": "true"}
+    if target is not None:
+        headers["HX-Target"] = target
+
+    response = client.post("/login", content=b"&" * 1000, headers=headers)
+
+    assert response.status_code == 413
+    assert "HX-Retarget" not in response.headers
+    assert response.headers["HX-Reswap"] == "innerHTML"
+    assert 'class="error"' in response.text
+
+
+def test_htmx_config_swaps_a_413_into_the_target(client: TestClient, env: Env) -> None:
+    """htmx does not swap 4xx unless a responseHandling rule says so; the first rule whose
+    pattern matches the status wins, as in htmx's `resolveResponseHandling`."""
+    login(client)
+    page = client.get(f"/clip/{env.clip()}")
+    meta = re.search(r'<meta name="htmx-config"\s+content=\'([^\']*)\'', page.text)
+    assert meta
+    rules = json.loads(meta.group(1))["responseHandling"]
+
+    rule = next(r for r in rules if re.search(r["code"], "413"))
+
+    assert rule["swap"] is True
+    assert rule.get("error") is False

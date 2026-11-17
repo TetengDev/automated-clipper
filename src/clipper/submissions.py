@@ -499,8 +499,8 @@ class SubmissionPass:
     Each message is claimed in the DB before it is sent (`<column> IS NULL` -> now), so two
     workers never send the same one. When a webhook is unreachable, returns 429 or 5xx
     (or a notifier raises anything but `NotifyError`), the claim is released for a retry
-    and the webhook is backed off as a whole (30 s doubling to 10 min, or longer if a 429
-    asks for it, up to 10 min) and the rest of the pass skips it, so a Discord outage
+    and the webhook is backed off as a whole (30 s doubling to 10 min; a 429's wait is
+    honoured up to 10 min) and the rest of the pass skips it, so a Discord outage
     costs one timeout per backoff, not one per row. Any other status means Discord refused
     that one message: it keeps its claim (a resend would fail the same way) and is logged;
     the link stays on the review app's Campaigns page."""

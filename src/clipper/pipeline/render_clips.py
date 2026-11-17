@@ -191,7 +191,8 @@ def _caption_text(text: str) -> str:
     """`strip_control`, then NFC with at most MAX_MARKS combining marks (Mn, Me) after each
     character and no private-use (Co) or surrogate (Cs) characters: a flood of marks
     spills over the caption box, and a private-use character renders blank. Marks are
-    counted after NFC, so a precomposed letter keeps the marks it is made of."""
+    counted after NFC, so a precomposed letter keeps the marks it is made of. Empty when
+    no letter, number, punctuation or symbol is left (only marks, a lone ZWJ or VS16)."""
     kept, marks = [], 0
     for c in unicodedata.normalize("NFC", strip_control(text)):
         category = unicodedata.category(c)
@@ -200,7 +201,8 @@ def _caption_text(text: str) -> str:
         marks = marks + 1 if category in ("Mn", "Me") else 0
         if marks <= MAX_MARKS:
             kept.append(c)
-    return strip_control(unicodedata.normalize("NFC", "".join(kept)))  # whitespace again
+    text = strip_control(unicodedata.normalize("NFC", "".join(kept)))  # whitespace again
+    return text if any(unicodedata.category(c)[0] in "LNPS" for c in text) else ""
 
 
 def _words(transcript: Any, offset: float, start: float, end: float) -> list[dict[str, Any]]:

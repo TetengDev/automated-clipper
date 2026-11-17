@@ -673,8 +673,9 @@ def test_combining_mark_floods_and_private_use_are_cleaned(
     conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
 ) -> None:
     """CLP-67: at most 2 combining marks per character, counted after NFC (so a
-    precomposed letter keeps its own); private-use characters go, and a word made only
-    of them is dropped. The hook is cleaned the same way."""
+    precomposed letter keeps its own); private-use characters go. A word with no letter,
+    number, punctuation or symbol left (only marks, a lone ZWJ or VS16) is dropped. The
+    hook is cleaned the same way."""
     words = [
         {"word": "a" + "\u0301" * 50 + "b", "start": 10.1, "end": 10.5},
         {"word": "\u0301" * 5, "start": 10.6, "end": 10.9},
@@ -682,21 +683,27 @@ def test_combining_mark_floods_and_private_use_are_cleaned(
         {"word": "x\ue000y", "start": 12.1, "end": 12.5},
         {"word": "p \ue000 q", "start": 12.6, "end": 12.9},
         {"word": "o\u0301\u200b\u0301\u0301", "start": 13.1, "end": 13.5},
+        {"word": "\u200d", "start": 13.6, "end": 13.7},
+        {"word": "\ufe0f", "start": 13.8, "end": 13.9},
     ]
     zalgo_hook = "Wo" + "\u0336" * 40 + "w"
-    _setup(media, [_highlight(1, 10.0, 15.0, hook=zalgo_hook)], words=words)
+    highlights = [
+        _highlight(1, 10.0, 15.0, hook=zalgo_hook),
+        _highlight(2, 20.0, 25.0, hook="\u200d\ufe0f\u0301"),
+    ]
+    _setup(media, highlights, words=words)
 
     rc.render_clips(job, _ctx(media, conn))
 
     edl = fake.calls[0]["edl"]
     assert [w.text for w in edl.words] == [
         "\u00e1\u0301\u0301b",
-        "\u0301\u0301",
         "xy",
         "p q",
         "\u00f3\u0301\u0301",
     ]
     assert edl.hook is not None and edl.hook.text == "Wo\u0336\u0336w"
+    assert fake.calls[1]["edl"].hook is None
 
 
 def test_normal_text_and_emoji_survive_caption_cleaning(

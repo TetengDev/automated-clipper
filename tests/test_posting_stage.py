@@ -23,7 +23,7 @@ from clipper.posting.models import (
     PublishDeferred,
     PublishResult,
 )
-from clipper.posting.stage import BACKOFF_BASE, STALE_UPLOAD, PostingStage
+from clipper.posting.stage import BACKOFF_BASE, STALE_UPLOAD, PostingStage, allow_all
 from posting_support import FakePublisher, LookupPublisher
 from review_support import Env, make_env
 
@@ -91,7 +91,7 @@ def stage(env: Env, clock: Clock, publishers: dict, **kwargs: object) -> Posting
         worker_id="w1",
         media_root=env.media_root,
         clock=clock,
-        **kwargs,  # type: ignore[arg-type]
+        **{"guard": allow_all, **kwargs},  # type: ignore[arg-type]
     )
 
 

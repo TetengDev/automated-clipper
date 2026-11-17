@@ -216,8 +216,20 @@ def test_publish_at_in_the_past_is_still_sent_private(
 
 
 def test_ai_elements_set_contains_synthetic_media(clock: Clock) -> None:
-    meta = PostMetadata(title="t", caption="c", flags={"ai_generated": True})
+    # The flag name `build_post_metadata` stores for YouTube posts (CLP-96/97).
+    meta = PostMetadata(title="t", caption="c", flags={"contains_synthetic_media": True})
     assert video_resource(make_post(), meta)["status"]["containsSyntheticMedia"] is True
+
+
+def test_a_paid_partnership_post_is_refused_before_any_upload(
+    clock: Clock, video: Path, google: respx.MockRouter
+) -> None:
+    # The publisher does not set YouTube's paid-promotion disclosure, so a campaign post
+    # that needs it is never published without it.
+    meta = PostMetadata(title="t", caption="c", flags={"paid_partnership": True})
+    with pytest.raises(ValueError, match="paid partnership"):
+        publisher(clock).publish(make_post(), video, meta)
+    assert not google.calls
 
 
 def test_title_is_capped_at_100_characters_without_angle_brackets() -> None:
@@ -246,6 +258,13 @@ def test_description_keeps_at_most_five_hashtags_and_fits_5000_bytes() -> None:
     assert len(description.encode("utf-8")) <= 5000
     assert description.endswith("\n\n#funny #fail #a #b #c")
     assert "<" not in description and ">" not in description
+
+
+def test_description_does_not_repeat_hashtags_already_in_the_caption() -> None:
+    # Metadata stored at scheduling (CLP-97) already ends the caption with its hashtags.
+    meta = PostMetadata(title="t", caption="Wow\n\n#funny #Fail", hashtags=["#funny", "#fail"])
+    description = video_resource(make_post(), meta)["snippet"]["description"]
+    assert description == "Wow\n\n#funny #Fail"
 
 
 def test_upload_is_sent_in_chunks_and_resumed_after_a_server_error(
@@ -973,15 +992,37 @@ def test_run_worker_registers_the_youtube_publisher(
 ) -> None:
     seen = _run_worker(tmp_path, config_file, monkeypatch, ACCOUNTS_YAML)
     assert set(seen["publishers"]) == {"youtube"}
+    assert seen["guard"] is not None  # publishing always runs the campaign pre-flight
 
 
-def test_run_worker_starts_without_publishers_when_accounts_yaml_is_invalid(
-    tmp_path: Path,
-    config_file: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+def test_run_worker_stops_when_accounts_yaml_is_invalid(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The worker's campaign pre-flight (CLP-97) checks the accounts config at start, so an
+    # invalid accounts.yaml stops the worker before any publisher is built.
+    from typer.testing import CliRunner
+
+    from clipper import cli
+
+    built: list[Any] = []
+    monkeypatch.setattr(cli, "PostingStage", lambda **kwargs: built.append(kwargs))
+    (config_file.parent / "accounts.yaml").write_text("accounts: [{id: Bad}]\n")
+    opts = ["--db", str(tmp_path / "s.db"), "--config", str(config_file)]
+    result = CliRunner().invoke(
+        cli.app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)]
+    )
+    assert result.exit_code == 1
+    assert "invalid accounts config" in result.output
+    assert built == []
+
+
+def test_publishers_are_off_when_accounts_yaml_is_invalid(
+    config_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from clipper import cli
+    from clipper.config import load_config
+
+    (config_file.parent / "accounts.yaml").write_text("accounts: [{id: Bad}]\n")
     with caplog.at_level(logging.ERROR):
-        seen = _run_worker(tmp_path, config_file, monkeypatch, "accounts: [{id: Bad}]\n")
-    assert seen["publishers"] == {}
+        assert cli._publishers(config_file, load_config(config_file)) == {}
     assert "posting is off" in caplog.text

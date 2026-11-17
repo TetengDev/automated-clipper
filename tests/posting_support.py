@@ -25,6 +25,7 @@ class FakeAccount:
     warmup_start: date | None = None
     warmup_days: int = 14
     enabled: bool = True
+    campaign: str | None = None
 
 
 @dataclass

@@ -60,6 +60,46 @@ The select stage asks Claude for highlights in one of two ways (`selector` in
   - Check your plan's terms before running this unattended on a server.
 - **`api`**: the paid Messages API with `ANTHROPIC_API_KEY`, capped by `daily_llm_usd_cap`.
 
+## yt-dlp
+
+yt-dlp needs a JavaScript runtime to solve YouTube's player challenges; without one it
+falls back to a client that is deprecated and misses formats. The dependency is
+`yt-dlp[default,pin-deno]`, so `uv sync` (and the image) installs:
+
+- `yt-dlp-ejs`, the challenge solver scripts.
+- Deno, from the `deno` wheel that the Deno organisation publishes on PyPI. It lands in the
+  venv's `bin/` (`/opt/venv/bin/deno` in the image), which yt-dlp searches before `PATH`.
+  Nothing extra to install on macOS or the server.
+
+yt-dlp pins the exact version of both, so `uv lock --upgrade-package yt-dlp` moves all three
+together. That matters for Deno: its V8 runs JavaScript downloaded from YouTube, so it should
+not fall behind on security fixes.
+
+yt-dlp counts any Deno stderr output as a failed solve. In the image, `DENO_DIR=/tmp/deno`
+puts Deno's cache on the tmpfs (the root filesystem is read-only; Deno 2.9.8 tolerates an
+unwritable cache silently, but a later version might warn) and `DENO_NO_UPDATE_CHECK=1`
+stops the update check and its notice. CI runs Deno in the read-only container and fails
+on any stderr. Both names are on the child-process allowlist in
+`pipeline/ytdlp.py`; no other `DENO_*` variable reaches yt-dlp or Deno.
+
+Optional settings in `.env`:
+
+- `CLIPPER_YTDLP_COOKIES`: path to a `cookies.txt` for members-only or age-gated videos
+  (see `allow_gated_content`).
+- `CLIPPER_YTDLP_PROXY`: proxy URL for every yt-dlp call. Its password is masked in logs.
+
+Security: yt-dlp runs Deno with no `--allow-*` flags, so the challenge script gets no file,
+network, environment or subprocess access; `--no-prompt` turns a permission request into an
+error, `--no-config` ignores config files, and `--no-remote --no-npm --cached-only` stop it
+from fetching code. yt-dlp puts the proxy URL, credentials included, in Deno's
+`HTTP(S)_PROXY`; without `--allow-env` the script cannot read it. The residual risk is a V8 escape running as uid 10001, the same as
+ffmpeg decoding untrusted media ([CLP-71](https://linear.app/tengdev/issue/CLP-71)).
+
+Downloads failing with "Requested format is not available" across many videos usually means
+the runtime is broken: run yt-dlp with `-v` and look for `Solving JS challenges using deno`.
+The slow test `CLIPPER_SLOW_TESTS=1 uv run pytest -k real_probe` checks this against a live
+video.
+
 ## Local transcription
 
 The worker transcribes with faster-whisper on CPU (`transcriber: local`, the default).
@@ -300,6 +340,68 @@ token and the client secret are local variables inside httpx.
 
 To revoke access, remove the app at <https://myaccount.google.com/permissions> for that
 Google account. Its account then pauses on the next post, with an alert.
+
+## Campaigns
+
+Paid clipping campaigns live in `config/campaigns.yaml` (or the file named by
+`CLIPPER_CAMPAIGNS`), one entry per campaign brief. An account joins one with
+`campaign: <id>` in `accounts.yaml`; only the campaign creator's clips count for it.
+
+1. Copy the rules from the live brief on the program's site: length, required hashtags,
+   forbidden elements and keywords, the audience rule, the submission deadline, the
+   payout terms and the end date. The shipped entries are placeholders from the epic's
+   research notes, marked `OWNER TODO`. Do not guess a rule the brief does not state.
+2. Set `brief_verified: true` only after that check. While it is false, every post for
+   the campaign is **held**.
+3. Run `clipper check-config`. It prints one line per campaign. It fails when an account
+   cannot be assigned to its campaign: the platform is not one the campaign takes, the
+   account does not post the campaign's creator, or the account's `market` is not one of
+   the audience rule's markets (a PH account cannot deliver a US audience).
+
+When a clip is approved, each campaign account's post goes through a pre-flight: the
+platform limits, the brief's length range, its required hashtags (added to the post
+automatically), its forbidden keywords, the paid-partnership toggle, the end date, and
+AI content when the brief forbids it. AI content is read from the render sidecar; a clip
+without one is held under an AI ban, because nothing shows it is free of AI. A post that
+fails is `held` with the reason on the review app's Scheduled page and in
+`clipper posts list`, and it is never published. Logos, negative framing and reposts
+cannot be seen by the pipeline: the reviewer checks them before approving.
+
+The worker runs the same check again just before it publishes, with the config as it is
+on disk (reloaded when `creators.yaml`, `accounts.yaml` or `campaigns.yaml` changes), so a
+campaign that was disabled, ended or tightened after scheduling (or a post rescheduled
+past the campaign's end) is held instead of posted. If the config is invalid, due
+campaign posts are held until it is fixed. A held post keeps its file reserved on its platform, so
+no other account on that platform gets the same file meanwhile.
+
+After fixing the config, `clipper posts recheck` runs the pre-flight again, on the clip's
+current version, and schedules the held posts that now pass; the others keep a hold with
+the current reason. Otherwise cancel them on the Scheduled page or with
+`clipper posts cancel <id>`. Cancelling is final for that clip on that account.
+
+### Link submission
+
+Vyro, Reach and Whop pay only for links submitted on their sites, and Reach wants them
+within 30 minutes of posting. None of them documents a free submission API, so the
+submit itself is a manual step: the clipper never scrapes these sites or logs in to them.
+
+1. When a campaign post goes live, the worker records a submission and pings
+   `DISCORD_WEBHOOK_URL` with the link, the campaign, the deadline (posted time plus the
+   brief's `submit_within_minutes`) and the command to mark it done.
+2. Submit the link on the program's site.
+3. Mark it submitted on the review app's Campaigns page or with
+   `clipper campaigns submit <id>`. The submission time is recorded, and a submission
+   after the deadline is flagged late.
+
+The worker sends a reminder 10 minutes before the deadline. When the deadline passes
+without a submission, it sends one alert to `DISCORD_ALERTS_WEBHOOK_URL`, or to the ping
+webhook when no alerts webhook is set. Without either webhook, the messages go to the
+worker log. A failed send is retried with backoff.
+
+When a program reports approved views and the payout for a submission, record them with
+`clipper campaigns earnings <id> --views N --payout 12.50`. `clipper campaigns rpm` and
+the Campaigns page show RPM (payout per 1,000 approved views) per account and per
+campaign. `clipper campaigns list` lists every submission.
 
 ## CI/CD
 

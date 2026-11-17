@@ -527,9 +527,8 @@ def assert_htmx_413(response, message: str) -> None:  # type: ignore[no-untyped-
     assert re.fullmatch(
         rf'<p class="error" role="alert">{re.escape(message)}</p>\s*', response.text
     )
-    assert response.headers["HX-Retarget"] == "#action-error"
-    assert response.headers["HX-Reswap"] == "innerHTML"
     assert response.headers["connection"] == "close"
+    assert "HX-Retarget" not in response.headers  # htmx already targets the error slot
     for name in SECURITY_HEADERS:
         assert name in response.headers
 
@@ -584,35 +583,13 @@ def test_htmx_form_with_too_many_fields_shows_an_error(client: TestClient, env: 
     assert_htmx_413(response, TOO_MANY)
 
 
-def test_htmx_413_goes_to_the_requests_own_error_slot(client: TestClient) -> None:
-    """Posts and campaigns pages have their own slots (`post-error-N`)."""
-    csrf = login(client)
+def test_htmx_413_with_an_unknown_detail_shows_the_detail() -> None:
+    from clipper.review.app import _too_large
 
-    response = client.post(
-        "/posts/7/cancel",
-        content=_urlencoded(csrf, 5000),
-        headers={**FORM, "HX-Request": "true", "HX-Target": "post-error-7"},
-    )
+    response = _too_large({"type": "http", "headers": [(b"hx-request", b"true")]}, "Other")
 
     assert response.status_code == 413
-    assert response.headers["HX-Retarget"] == "#post-error-7"
-
-
-@pytest.mark.parametrize("target", [None, "", "a, body", "#x", "1abc", "x y"])
-def test_htmx_413_without_a_plain_target_id_is_not_retargeted(
-    client: TestClient, target: str | None
-) -> None:
-    """Only a plain element id is echoed back as a selector; otherwise htmx keeps its own."""
-    headers = {**FORM, "HX-Request": "true"}
-    if target is not None:
-        headers["HX-Target"] = target
-
-    response = client.post("/login", content=b"&" * 1000, headers=headers)
-
-    assert response.status_code == 413
-    assert "HX-Retarget" not in response.headers
-    assert response.headers["HX-Reswap"] == "innerHTML"
-    assert 'class="error"' in response.text
+    assert b'<p class="error" role="alert">Other</p>' in response.body
 
 
 def test_htmx_config_swaps_a_413_into_the_target(client: TestClient, env: Env) -> None:

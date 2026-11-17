@@ -84,7 +84,6 @@ _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _PUBLIC_PATHS = frozenset({"/login", "/healthz"})
 _BCRYPT_HASH = re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$")
 _CONTENT_LENGTH = re.compile(r"[0-9]+")
-_ELEMENT_ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 _BODY_TOO_LARGE = "Request body too large"
 _TOO_MANY_FIELDS = "Too many form fields"
 # What an HTMX request's 413 shows the reviewer, in the action's error slot.
@@ -311,18 +310,14 @@ class _BodySizeLimit:
 
 
 def _too_large(scope: Scope, detail: str = _BODY_TOO_LARGE) -> Response:
-    """The 413: plain text, or for HTMX the `_action_error.html` fragment, swapped into the
-    element the request targeted (`HX-Target`, when it is a plain id) so the reviewer sees
-    it. Rendered without `render()`: the middleware runs outside the session."""
+    """The 413: plain text, or for HTMX the `_action_error.html` fragment, which htmx swaps
+    into the action's error slot (its `hx-target`; base.html lets 413s swap). Rendered
+    without `render()`: the middleware runs outside the session."""
     headers = {"Connection": "close"}
-    request_headers = Headers(scope=scope)
-    if request_headers.get("hx-request") != "true":
+    if Headers(scope=scope).get("hx-request") != "true":
         return PlainTextResponse(detail, 413, headers=headers)
-    target = request_headers.get("hx-target", "")
-    if _ELEMENT_ID.fullmatch(target):
-        headers["HX-Retarget"] = f"#{target}"
-    headers["HX-Reswap"] = "innerHTML"
-    html = templates.get_template("_action_error.html").render(message=_TOO_LARGE_MESSAGES[detail])
+    message = _TOO_LARGE_MESSAGES.get(detail, detail)
+    html = templates.get_template("_action_error.html").render(message=message)
     return HTMLResponse(html, 413, headers=headers)
 
 

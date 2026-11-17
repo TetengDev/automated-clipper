@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ from pydantic import SecretStr
 
 from clipper.accounts import Account, AccountsConfig
 from clipper.config import Secrets
+from clipper.edl import parse_edl
+from clipper.metadata import Variant, build_post_metadata
 from clipper.posting.models import Post, PostMetadata, PostStatus, PublishDeferred, Publisher
 from clipper.posting.publishers import build_publishers
 from clipper.posting.youtube import (
@@ -219,6 +222,24 @@ def test_ai_elements_set_contains_synthetic_media(clock: Clock) -> None:
     # The flag name `build_post_metadata` stores for YouTube posts (CLP-96/97).
     meta = PostMetadata(title="t", caption="c", flags={"contains_synthetic_media": True})
     assert video_resource(make_post(), meta)["status"]["containsSyntheticMedia"] is True
+
+
+def test_flags_stored_at_scheduling_reach_the_upload() -> None:
+    """Round trip: the flags `build_post_metadata` stores for a YouTube post (CLP-96/97),
+    converted as the scheduler does, are the ones the publisher reads."""
+    source = {"source": {"path": "a.mp4", "in_s": 10, "out_s": 45}}
+    ai_edl = parse_edl({**source, "hook": {"text": "Narrated", "ai_generated": True}})
+    variants = {"youtube": Variant(title="Title", caption="Caption", hashtags=["#a", "#b", "#c"])}
+
+    def stored(*, edl: Any = None, paid: bool = False) -> PostMetadata:
+        built = build_post_metadata(variants, "youtube", edl=edl, paid_partnership=paid)
+        return PostMetadata(**asdict(built))
+
+    status = video_resource(make_post(), stored(edl=ai_edl))["status"]
+    assert status["containsSyntheticMedia"] is True
+    assert video_resource(make_post(), stored())["status"]["containsSyntheticMedia"] is False
+    with pytest.raises(ValueError, match="paid partnership"):
+        video_resource(make_post(), stored(paid=True))
 
 
 def test_a_paid_partnership_post_is_refused_before_any_upload(

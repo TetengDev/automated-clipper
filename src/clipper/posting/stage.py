@@ -40,12 +40,15 @@ CLP-106 (with the accounts config, `accounts`):
   (`pick_slot`), so retries keep to its windows, gap, posts per day, warm-up and platform
   cap. With no free slot within `MAX_DAYS_AHEAD` days the post is `post_failed` and alerts.
 * At claim time (after the lookup of an earlier attempt), in one write transaction:
-  a post that would take its account over its local day's `daily_limit` (the platform
-  cap on the UTC day for an account not in the config), over the platform cap in a
-  rolling 24 hours, or inside the minimum gap after its last upload, is deferred to the
-  account's next free slot (audit `post_deferred`, no attempt counted), or, with no free
-  slot, is `post_failed` and alerts. Posts posted, in flight, or with failed attempts in
-  the window count (`repo.uploads_between`).
+  a post that would take its account over the `daily_limit` of the local day it publishes
+  on (the platform cap on the UTC day for an account not in the config), over the
+  platform cap in a rolling 24 hours, or inside the minimum gap after its last upload, is
+  deferred to the account's next free slot (audit `post_deferred`, no attempt counted),
+  or, with no free slot, is `post_failed` and alerts. Posts posted, in flight, or with
+  failed attempts in the window count (`repo.uploads_between`). A post claimed before its
+  slot publishes at its slot, so the day and the gap are those of `max(now, scheduled_at)`,
+  and a deferral is never earlier than the slot nor sooner than `MIN_DEFER` from now.
+  One pass handles each post at most once, so it never defers the same post twice.
 * Posts of an account missing from the config keep the plain backoff.
 """
 
@@ -97,6 +100,8 @@ HEARTBEAT_BUSY_MS = 2_000
 MAX_UPLOAD = timedelta(hours=4)
 """The heartbeat stops after this long, so a publish that never returns goes stale."""
 BACKOFF_BASE = timedelta(minutes=5)
+MIN_DEFER = timedelta(minutes=5)
+"""A deferral is never sooner than this, so one pass cannot spin on a post."""
 UNRESOLVED = repo.UNRESOLVED_PREFIX
 DEFAULT_BATCH = 10
 MAX_STALE_PER_PASS = DEFAULT_BATCH
@@ -173,6 +178,7 @@ class PostingStage:
         """One posting pass; returns how many posts it acted on."""
         handled = self._recover_stale()
         self._warn_unpublishable()
+        seen: set[int] = set()
         # One post at a time (claim, publish, record), so a post never sits claimed while
         # others upload and cannot go stale before it is even tried.
         for _ in range(self.batch):
@@ -184,9 +190,11 @@ class PostingStage:
                 self.worker_id,
                 platforms=self.publishers.keys(),
                 limit=1,
+                exclude=seen,
             )
             if not due:
                 break
+            seen.add(due[0].id)
             self._publish(due[0])
             handled += 1
         return handled
@@ -390,7 +398,8 @@ class PostingStage:
             # Never upload unchecked, and never leave the post claimed (the stale pass
             # would hand it to a human as an unresolved upload).
             logger.error("%s: cap check failed: %s; retrying later", _label(post), _describe(exc))
-            hold = repo.Deferral(f"cap check failed: {_describe(exc)}", now + BACKOFF_BASE)
+            until = max(now + BACKOFF_BASE, post.scheduled_at)
+            hold = repo.Deferral(f"cap check failed: {_describe(exc)}", until)
             try:
                 repo.defer_claimed(self.conn, post, self.worker_id, now, lambda _: hold)
             except Exception:
@@ -411,25 +420,34 @@ class PostingStage:
         self, conn: sqlite3.Connection, post: Post, now: datetime
     ) -> repo.Deferral | None:
         """Runs inside the claim-check transaction. In order: the account's daily limit
-        for its local day (`daily_limit`; the platform cap on the UTC day for an account
-        not in the config or with a broken one), the platform cap over a rolling 24 hours
-        (counted per API attempt), and the account's minimum gap after its last upload.
-        The claim-time count is the authority on caps; the slot picker only plans."""
+        for the local day the post publishes on (`daily_limit`; the platform cap on the
+        UTC day for an account not in the config or with a broken one), the platform cap
+        over a rolling 24 hours (counted per API attempt, so from now), and the account's
+        minimum gap after its last upload. The claim-time count is the authority on caps;
+        the slot picker only plans.
+
+        A post claimed before its slot (a publisher that schedules natively) publishes at
+        its slot: the day and the gap are measured at `max(now, scheduled_at)`, and a
+        deferral searches from no earlier than the slot and `MIN_DEFER` from now, so it
+        never moves the post earlier or makes it due again at once."""
         account = self.accounts.get(post.account_id)
         cap = PLATFORM_DAILY_CAPS.get(post.platform)
         limit = cap
-        start, end = day_bounds("UTC", now)
+        at = max(now, post.scheduled_at)
+        start, end = day_bounds("UTC", at)
         if account is not None:
             try:
-                start, end = day_bounds(account.timezone, now)
+                start, end = day_bounds(account.timezone, at)
                 limit = daily_limit(account, start.astimezone(ZoneInfo(account.timezone)).date())
             except (ValueError, ZoneInfoNotFoundError) as exc:
                 logger.error("account %s: invalid schedule config: %s", account.id, exc)
                 account, limit = None, cap
-                start, end = day_bounds("UTC", now)
+                start, end = day_bounds("UTC", at)
         others = post.id
+        floor = max(post.scheduled_at, now + MIN_DEFER)
 
         def after(moment: datetime, *extra: datetime) -> datetime | None:
+            moment = max(moment, floor)
             if account is None:
                 return moment
             try:
@@ -465,8 +483,8 @@ class PostingStage:
                 )
         if account is not None and account.min_gap_minutes > 0:
             gap = timedelta(minutes=account.min_gap_minutes)
-            last = repo.last_upload(conn, account.id, now - gap, exclude_post_id=others)
-            if last is not None and now - last < gap:
+            last = repo.last_upload(conn, account.id, at - gap, exclude_post_id=others)
+            if last is not None and at - last < gap:
                 return held(
                     f"within the {account.min_gap_minutes}-minute gap of the last upload",
                     after(last + gap, last),

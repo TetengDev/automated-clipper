@@ -3,7 +3,8 @@ account's windows, gap, posts per day, warm-up and platform cap, like the first 
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import sqlite3
+from collections.abc import Collection, Iterator
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -708,8 +709,6 @@ def test_several_over_limit_posts_are_each_deferred_once_and_others_still_go(
 def test_a_database_error_in_the_cap_check_does_not_leave_the_post_uploading(
     env: Env, clock: Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import sqlite3
-
     def broken(*_: object, **__: object) -> int:
         raise sqlite3.OperationalError("disk I/O error")
 
@@ -1025,3 +1024,110 @@ def test_a_retried_post_whose_lookup_fails_is_still_uploaded(env: Env, clock: Cl
 
     assert [sent.id for sent, _, _ in publisher.calls] == [post.id]
     assert get(env, post).status == PostStatus.POSTED
+
+
+# --- an early claim (a publisher that schedules natively, CLP-94) -------------------------
+
+LEAD = timedelta(minutes=25)
+"""How early Facebook claims a first attempt (`publish/facebook.py` `LEAD_TIME`, PR #54)."""
+ALL_DAY = ["00:00-23:59"]
+
+
+def early_claims(monkeypatch: pytest.MonkeyPatch, lead: timedelta = LEAD) -> None:
+    """Make the stage claim posts `lead` before their slot, as PR #54's `claim_due(early=)`
+    does for Facebook. The claim is stamped with the real `now`, as there."""
+    from clipper.db import transaction
+
+    def claim_due(
+        conn: sqlite3.Connection,
+        now: datetime,
+        worker_id: str,
+        *,
+        platforms: Collection[str],
+        limit: int = 10,
+        exclude: Collection[int] = (),
+    ) -> list[Post]:
+        with transaction(conn):
+            rows = conn.execute(
+                "SELECT * FROM posts WHERE status = ? AND scheduled_at <= ?"
+                " ORDER BY scheduled_at, id",
+                (str(PostStatus.SCHEDULED), to_iso(now + lead)),
+            ).fetchall()
+            posts = [Post.from_row(row) for row in rows]
+            wanted = [p for p in posts if p.platform in platforms and p.id not in exclude]
+            return [repo._claim(conn, p, worker_id, now) for p in wanted[:limit]]
+
+    monkeypatch.setattr(repo, "claim_due", claim_due)
+
+
+def deferrals(env: Env, post: Post) -> int:
+    return [r["action"] for r in env.reviews(post.clip_id)].count("post_deferred")
+
+
+def test_an_early_claim_before_midnight_counts_toward_the_slots_day(
+    env: Env, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Already posted today; the post's slot is 00:10 tomorrow and it is claimed at 23:50.
+    # Today's full cap must not defer it to midnight (before its own slot), again and again.
+    account = FakeAccount(posts_per_day=1, min_gap_minutes=0, windows=ALL_DAY)
+    make_post(env, at=local(15, 20), status="posted", posted_at=local(15, 20))
+    due = make_post(env, at=local(16, 0, 10))
+    clock.now = local(15, 23, 50)
+    early_claims(monkeypatch)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, account).run_once()
+
+    assert deferrals(env, due) == 0
+    assert [sent.id for sent, _, _ in publisher.calls] == [due.id]
+    assert get(env, due).scheduled_at == local(16, 0, 10)
+
+
+def test_the_cap_decision_uses_the_local_day_of_the_slot(env: Env, clock: Clock) -> None:
+    account = FakeAccount(posts_per_day=1, min_gap_minutes=0, windows=ALL_DAY)
+    make_post(env, at=local(15, 20), status="posted", posted_at=local(15, 20))
+    due = make_post(env, at=local(16, 0, 10))
+    clock.now = local(15, 23, 50)
+    posting = stage(env, clock, FakePublisher(), account)
+
+    assert posting._cap_decision(env.conn, due, clock.now) is None
+
+
+def test_a_cap_deferral_never_moves_a_post_before_its_slot(env: Env, clock: Clock) -> None:
+    # The rolling cap alone would retry an hour from now, which is before this post's slot.
+    from clipper.posting.stage import MIN_DEFER
+
+    cap = PLATFORM_DAILY_CAPS["tiktok"]
+    clock.now = datetime(2027, 1, 15, 0, 30, tzinfo=UTC)
+    late = datetime(2027, 1, 14, 23, 30, tzinfo=UTC)
+    for _ in range(cap):
+        make_post(env, account="ghost", at=late, status="posted", posted_at=late)
+    ahead = make_post(env, account="ghost", at=clock.now + timedelta(hours=3))
+    posting = stage(env, clock, FakePublisher())
+
+    decision = posting._cap_decision(env.conn, ahead, clock.now)
+
+    assert decision is not None and decision.until is not None
+    assert decision.until >= ahead.scheduled_at
+    assert decision.until >= clock.now + MIN_DEFER
+
+
+def test_one_pass_defers_an_early_claimed_post_at_most_once(
+    env: Env, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The gap pushes the post to 00:12, still inside the early-claim lead: the same pass
+    # must not claim and defer it again, and must still reach the other account's post.
+    gapped = FakeAccount(posts_per_day=5, min_gap_minutes=30, windows=ALL_DAY)
+    other = FakeAccount(id="tt_b", min_gap_minutes=0, windows=ALL_DAY)
+    make_post(env, at=local(15, 23, 42), status="posted", posted_at=local(15, 23, 42))
+    due = make_post(env, at=local(16, 0, 10))
+    waiting = make_post(env, account="tt_b", at=local(16, 0, 12))
+    clock.now = local(15, 23, 50)
+    early_claims(monkeypatch)
+    publisher = FakePublisher()
+
+    stage(env, clock, publisher, gapped, other).run_once()
+
+    assert deferrals(env, due) == 1
+    assert get(env, due).scheduled_at >= local(16, 0, 12)
+    assert [sent.id for sent, _, _ in publisher.calls] == [waiting.id]

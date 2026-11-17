@@ -504,8 +504,10 @@ def claim_due(
     *,
     platforms: Collection[str],
     limit: int = 10,
+    exclude: Collection[int] = (),
 ) -> list[Post]:
     """Atomically move due `scheduled` posts on `platforms` to `uploading` for this worker.
+    Posts in `exclude` (already handled in this pass) are skipped.
 
     BEGIN IMMEDIATE holds the write lock from the read to the update, so two workers can
     never claim the same post.
@@ -514,11 +516,13 @@ def claim_due(
     if not wanted:
         return []
     marks = ", ".join("?" for _ in wanted)
+    skipped = sorted(exclude)
+    skip = f" AND id NOT IN ({', '.join('?' for _ in skipped)})" if skipped else ""
     with transaction(conn):
         rows = conn.execute(
             f"SELECT * FROM posts WHERE status = ? AND scheduled_at <= ? AND platform IN ({marks})"  # noqa: S608 - placeholders only
-            " ORDER BY scheduled_at, id LIMIT ?",
-            (str(PostStatus.SCHEDULED), to_iso(now), *wanted, limit),
+            f"{skip} ORDER BY scheduled_at, id LIMIT ?",
+            (str(PostStatus.SCHEDULED), to_iso(now), *wanted, *skipped, limit),
         ).fetchall()
         return [_claim(conn, Post.from_row(r), worker_id, now) for r in rows]
 

@@ -63,17 +63,17 @@ AUDIO_FORMAT = (
 muxed one of AUDIO_FALLBACK_TBR at most (or of unknown bitrate). `--max-filesize` is
 checked per HTTP request, so for HLS per fragment: it does not bound a whole muxed
 download, the height and bitrate caps do (bytes = bitrate x duration). Not
-`filesize_approx`: yt-dlp leaves it unset for HLS and DASH formats. `[acodec!=none]`:
-never a video-only format (plain `best` falls back to one, and ffmpeg -vn then fails).
-Without `?` it also excludes a format whose acodec is unknown: deliberately, the safe
-direction, so a video-only stream can never be picked."""
+`filesize_approx`: yt-dlp leaves it unset for formats from a manifest (HLS).
+`[acodec!=none]`: never a video-only format (plain `best` falls back to one, and ffmpeg
+-vn then fails). Without `?` it also excludes a format whose acodec is unknown:
+deliberately, the safe direction, so a video-only stream can never be picked."""
 CLIP_FORMAT = "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]"
 """The clip download's selector (fetch_clips), and the probe's. Whatever it accepts, the
 audio selector accepts too: either `ba` exists, or a muxed format with audio does, which
 the audio fallbacks take. One exception: a video with only muxed formats, all above 480p
-and AUDIO_FALLBACK_TBR (YouTube's HLS always has a 480p one); its audio download is
-a format error. `[acodec!=none]`: plain `b` falls back to a video-only format when there
-is no audio at all, which would make silent clips."""
+and AUDIO_FALLBACK_TBR (YouTube's HLS ladder normally has a 480p one); its audio
+download is a format error. `[acodec!=none]`: plain `b` falls back to a video-only format
+when there is no audio at all, which would make silent clips."""
 SECTION_MAX_FILESIZE = "2G"
 STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
 """yt-dlp's probe JSON is often several MB; anything bigger is cut (and fails to parse)."""

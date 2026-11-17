@@ -113,10 +113,10 @@ ffmpeg decoding untrusted media ([CLP-71](https://linear.app/tengdev/issue/CLP-7
 Downloads failing with "Requested format is not available" across many videos usually means
 the runtime is broken: run yt-dlp with `-v` and look for `Solving JS challenges using deno`.
 The slow test `CLIPPER_SLOW_TESTS=1 uv run pytest -k real_probe` checks this against a live
-video. A breakage that hits every video only defers. The monitor gives up on a video (records
-it `unavailable`) after it has had format errors in 3 polls where other videos from the same
-creator probed fine: an upload with no audio, for example. To fetch such a video anyway,
-enqueue it by hand.
+video. A breakage that hits every video is retried until it is fixed. The monitor gives up
+on a video (records it `unavailable`) after it has had format errors in 3 polls where other
+videos from the same creator probed fine: an upload with no audio, for example. To fetch
+such a video anyway, enqueue it by hand.
 
 ## Local transcription
 

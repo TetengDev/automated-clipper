@@ -1700,6 +1700,31 @@ def test_failure_that_cannot_be_written_does_not_stop_later_clips(
     assert any("not counting the failure" in r.getMessage() for r in caplog.records)
 
 
+def test_unwritable_marker_without_strerror_logs_the_error_type(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLP-89: an OSError built from a message has no strerror; its type is logged, never
+    its message (it can hold a path)."""
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+
+    def no_write(path: Path, data: Any) -> None:
+        raise OSError("/home/someone/secret path")
+
+    monkeypatch.setattr(rc, "write_json_atomic", no_write)
+    with pytest.raises(RenderError):  # nothing counted: uses up an attempt
+        rc.render_clips(job, _ctx(media, conn))
+
+    (record,) = [r for r in caplog.records if "not counting the failure" in r.getMessage()]
+    assert record.getMessage().endswith(": OSError")
+    assert "secret" not in caplog.text
+
+
 def test_all_left_out_still_fails_when_a_marker_cannot_be_removed(
     conn: sqlite3.Connection,
     job: Job,

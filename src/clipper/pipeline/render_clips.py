@@ -418,7 +418,8 @@ def _record_failure(marker: Path, failures: int, reason: str) -> bool:
         clip_dir.mkdir(parents=True, exist_ok=True)
         write_json_atomic(marker, {"failures": failures, "error": reason})
     except OSError as exc:  # e.g. a full disk, or a directory in the marker's place
-        logger.warning("cannot write %s, not counting the failure: %s", marker, exc.strerror)
+        error = exc.strerror or type(exc).__name__  # never str(exc): it can hold a path
+        logger.warning("cannot write %s, not counting the failure: %s", marker, error)
         return False
     return True
 

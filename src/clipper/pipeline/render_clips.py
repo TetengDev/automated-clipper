@@ -322,11 +322,13 @@ def _rejected(edl: EDL, what: str, fallback: str, exc: ValueError, *, trace: boo
     exception type and traceback frames if `trace`, so a logic bug cannot hide behind the
     fallback; never the raw message, which can quote a transcribed word)."""
     reason = redact(strip_control(str(exc).splitlines()[0]))[:MAX_REASON_CHARS]
-    frames = f"\n{type(exc).__name__}, from:\n" + "".join(traceback.format_tb(exc.__traceback__))
+    frames = ""
+    if trace:
+        tb = "".join(traceback.format_tb(exc.__traceback__))
+        frames = f"\n{type(exc).__name__}, from:\n{tb}"
     logger.warning(
-        "clip source %s: %s rejected, %s: %s%s", edl.source.path, what, fallback, reason,
-        frames if trace else "",
-    )  # fmt: skip
+        "clip source %s: %s rejected, %s: %s%s", edl.source.path, what, fallback, reason, frames
+    )
     return edl
 
 

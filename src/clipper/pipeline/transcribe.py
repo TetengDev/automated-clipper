@@ -447,7 +447,9 @@ class FasterWhisperTranscriber:
             self.models_dir / f"models--{pin.repo.replace('/', '--')}" / "snapshots" / pin.revision
         )
 
-    def ensure_model(self, timeout_s: float = MODEL_FETCH_TIMEOUT_S) -> Path:
+    def ensure_model(
+        self, timeout_s: float = MODEL_FETCH_TIMEOUT_S, *, prune: bool = False
+    ) -> Path:
         """The verified snapshot dir. A snapshot counts only with its completion marker and
         passing the cheap `snapshot_problems` check (every size, the small files' hashes,
         model.bin's blob name; model.bin's full hash runs at fetch). Otherwise it is
@@ -457,7 +459,9 @@ class FasterWhisperTranscriber:
 
         All of it runs under the store lock, so two processes (the worker and an operator's
         `bench-transcribe`) never fetch or discard under each other: the second waits, then
-        finds the marker. A fetch also prunes the revisions no pin names any more."""
+        finds the marker. With `prune`, a fetch also deletes the revisions no pin names any
+        more. Only the transcribe stage asks: `bench-transcribe` or the quality gate run
+        from another checkout (other pins) must never delete the worker's revision."""
         pin = WHISPER_MODELS[self.model]
         snapshot = self.snapshot_dir
         marker = snapshot / COMPLETE_MARKER
@@ -488,7 +492,8 @@ class FasterWhisperTranscriber:
                     tmp.write_text(pin.sha256, encoding="utf-8")
                     os.replace(tmp, marker)
                     try:  # the snapshot is verified: a prune failure must not fail the job
-                        prune_unpinned(self.models_dir)
+                        if prune:
+                            prune_unpinned(self.models_dir)
                     except Exception:
                         logger.exception("whisper models: pruning unpinned revisions failed")
                     return snapshot
@@ -1038,7 +1043,7 @@ def transcribe(
     results: dict[int, ChunkTranscript] = {i: r for i, r in cached.items() if r is not None}
     if todo:
         if local:  # outside the per-chunk timeouts, inside the stage budget
-            backend.ensure_model(deadline.timeout(MODEL_FETCH_TIMEOUT_S))
+            backend.ensure_model(deadline.timeout(MODEL_FETCH_TIMEOUT_S), prune=True)
         _transcribe_chunks(
             job,
             ctx,

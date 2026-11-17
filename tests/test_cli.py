@@ -330,6 +330,27 @@ def test_bench_transcribe_rejects_bad_language_and_unreadable_audio(tmp_path: Pa
     assert unreadable.exit_code == 1 and "bench-transcribe:" in unreadable.output
 
 
+def test_bench_transcribe_never_prunes_the_model_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLP-76: an operator's checkout may pin other revisions than the worker's; its
+    bench run must not delete what the worker uses."""
+    from asr_support import install_fake_asr, write_snapshot
+    from clipper.pipeline import transcribe as tr
+
+    audio = tmp_path / "a.flac"
+    audio.write_bytes(b"fLaC")
+    monkeypatch.setattr(tr, "probe_duration", lambda audio: 30.0)
+    fake = install_fake_asr(monkeypatch, tmp_path / "models")
+    workers = write_snapshot(tmp_path / "models", "Systran/faster-whisper-tiny", "0" * 40)
+
+    result = runner.invoke(app, ["bench-transcribe", str(audio), "--models", "tiny"])
+
+    assert result.exit_code == 0, result.output
+    assert len(fake.fetch_calls()) == 1
+    assert workers.is_dir()
+
+
 def test_bench_transcribe_zero_duration_and_model_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1492,6 +1492,17 @@ def test_stage_uses_creator_transcriber_override(ctx: StageContext, fake_asr: Fa
 
 
 @needs_ffmpeg
+def test_stage_local_prunes_revisions_no_pin_names(
+    ctx: StageContext, fake_asr: FakeAsr, tmp_path: Path
+) -> None:
+    """CLP-76: the transcribe stage is the one caller that prunes after its fetch."""
+    stale = write_snapshot(tmp_path / "models", "Systran/faster-whisper-retired", "0" * 40)
+    tr.transcribe(make_job(ctx.conn), ctx, chunk_s=10.0, overlap_s=2.0)
+    assert len(fake_asr.fetch_calls()) == 1
+    assert not stale.parents[1].exists()
+
+
+@needs_ffmpeg
 def test_stage_local_default_writes_same_schema_and_free_spend(
     ctx: StageContext, fake_asr: FakeAsr, tmp_path: Path
 ) -> None:

@@ -203,14 +203,22 @@ def test_a_revision_no_longer_pinned_is_pruned_after_the_new_one_is_fetched(
     old_blob = _old_only_blob(old, "preprocessor_config.json", b'{"old": true}')
     monkeypatch.setitem(config.WHISPER_MODELS, "tiny", _pin())
 
-    new = local().ensure_model()
+    new = local().ensure_model(prune=True)
 
     assert new != old and not old.exists()
     assert not old_blob.exists()
     assert tr.snapshot_problems(new, _pin()) == {}  # shared blobs and store file kept
     assert _store_file(models, FAKE_MODEL_BIN).is_file()
-    assert local().ensure_model() == new
+    assert local().ensure_model(prune=True) == new
     assert len(fake_asr.fetch_calls()) == 2
+
+
+def test_only_a_caller_that_asks_prunes(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    """`bench-transcribe` and the quality gate fetch without pruning: a checkout with other
+    pins must never delete the worker's pinned revision. Only the transcribe stage prunes."""
+    stale = write_snapshot(tmp_path / "models", TINY[0], OLD_REVISION)
+    local().ensure_model()
+    assert stale.is_dir()
 
 
 def test_a_repo_no_model_uses_is_pruned_with_its_store_files(
@@ -224,7 +232,7 @@ def test_a_repo_no_model_uses_is_pruned_with_its_store_files(
     face_model = models / "face_detection_short_range.tflite"
     face_model.write_bytes(b"reframe's model")
 
-    snapshot = local().ensure_model()
+    snapshot = local().ensure_model(prune=True)
 
     assert not gone.parents[1].exists()  # the whole repo dir
     assert not _store_file(models, b"old").exists()
@@ -242,7 +250,7 @@ def test_every_pinned_revision_survives_the_prune(fake_asr: FakeAsr, tmp_path: P
         for name, pin in config.WHISPER_MODELS.items()
         if name != "tiny"
     ]
-    local().ensure_model()
+    local().ensure_model(prune=True)
     for snapshot in pinned:
         assert sorted(os.listdir(snapshot)) == sorted(["model.bin", *FAKE_FILES])
         assert (snapshot / "model.bin").read_bytes() == FAKE_MODEL_BIN
@@ -265,7 +273,7 @@ def test_the_prune_never_follows_links_out_of_the_models_dir(
     os.symlink(outside, models / "models--evil--linked")  # a whole repo dir that is a link
     os.symlink(outside, (models / "blobs" / "ff"))  # a store prefix dir that is a link
 
-    local().ensure_model()
+    local().ensure_model(prune=True)
 
     assert precious.read_bytes() == b"keep me"
     assert (outside / "snapshots" / OLD_REVISION / "model.bin").read_bytes() == b"keep me too"
@@ -283,7 +291,7 @@ def test_an_undeletable_path_is_logged_and_the_prune_goes_on(
     stuck.chmod(0o555)  # its links cannot be removed
     try:
         with caplog.at_level(logging.WARNING, logger=tr.__name__):
-            snapshot = local().ensure_model()
+            snapshot = local().ensure_model(prune=True)
     finally:
         stuck.chmod(0o755)
     assert snapshot.is_dir() and (snapshot / tr.COMPLETE_MARKER).is_file()
@@ -310,7 +318,7 @@ def test_an_unreadable_snapshot_keeps_every_blob(
     locked.chmod(0o000)
     try:
         with caplog.at_level(logging.WARNING, logger=tr.__name__):
-            tr.FasterWhisperTranscriber(model="base").ensure_model()
+            tr.FasterWhisperTranscriber(model="base").ensure_model(prune=True)
     finally:
         locked.chmod(0o755)
     assert sorted(os.listdir(tiny.parents[1] / "blobs")) == blobs
@@ -325,9 +333,9 @@ def test_nothing_is_pruned_while_another_process_holds_the_lock(
 ) -> None:
     stale = write_snapshot(tmp_path / "models", TINY[0], OLD_REVISION)
     with held_lock(tmp_path / "models"), pytest.raises(MediaError):
-        local().ensure_model(timeout_s=1.0)
+        local().ensure_model(timeout_s=1.0, prune=True)
     assert stale.is_dir()
-    local().ensure_model()
+    local().ensure_model(prune=True)
     assert not stale.exists()
 
 
@@ -342,7 +350,7 @@ def test_a_failing_prune_still_returns_the_verified_snapshot(
 
     monkeypatch.setattr(tr, "prune_unpinned", broken)
     with caplog.at_level(logging.ERROR, logger=tr.__name__):
-        snapshot = local().ensure_model()
+        snapshot = local().ensure_model(prune=True)
     assert (snapshot / tr.COMPLETE_MARKER).is_file()
     assert "pruning unpinned revisions failed" in caplog.text
 
@@ -362,7 +370,7 @@ def test_a_pruned_store_file_takes_its_manifest_and_lock_file_along(
         for suffix in (".refs", ".lock"):
             store.with_name(store.name + suffix).write_text("")
 
-    local().ensure_model()
+    local().ensure_model(prune=True)
 
     assert not old.exists()
     assert not old.with_name(old.name + ".refs").exists()

@@ -672,8 +672,9 @@ def test_control_and_format_characters_stripped_from_words(
 def test_combining_mark_floods_and_private_use_are_cleaned(
     conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
 ) -> None:
-    """CLP-67: at most 2 combining marks per base character; private-use characters go,
-    and a word made only of them is dropped. The hook is cleaned the same way."""
+    """CLP-67: at most 2 combining marks per character, counted after NFC (so a
+    precomposed letter keeps its own); private-use characters go, and a word made only
+    of them is dropped. The hook is cleaned the same way."""
     words = [
         {"word": "a" + "\u0301" * 50 + "b", "start": 10.1, "end": 10.5},
         {"word": "\u0301" * 5, "start": 10.6, "end": 10.9},
@@ -689,11 +690,11 @@ def test_combining_mark_floods_and_private_use_are_cleaned(
 
     edl = fake.calls[0]["edl"]
     assert [w.text for w in edl.words] == [
-        "\u00e1\u0301b",
+        "\u00e1\u0301\u0301b",
         "\u0301\u0301",
         "xy",
         "p q",
-        "\u00f3\u0301",
+        "\u00f3\u0301\u0301",
     ]
     assert edl.hook is not None and edl.hook.text == "Wo\u0336\u0336w"
 
@@ -711,6 +712,7 @@ def test_normal_text_and_emoji_survive_caption_cleaning(
         "1\ufe0f\u20e3",  # keycap: VS16 + enclosing mark
         "\U0001f469\u200d\U0001f469\u200d\U0001f467",  # ZWJ family
         "\U0001f44d\U0001f3fd",  # skin tone modifier
+        "\u1f82\u03bd",  # polytonic Greek: 3 marks in NFD, precomposed in NFC
     ]
     words = [
         {"word": t, "start": 10.1 + i * 0.4, "end": 10.4 + i * 0.4} for i, t in enumerate(texts)

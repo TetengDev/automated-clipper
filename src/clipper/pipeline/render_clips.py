@@ -188,11 +188,12 @@ def _clips(data: Any, name: str) -> list[Any]:
 
 
 def _caption_text(text: str) -> str:
-    """`strip_control`, then NFC with at most MAX_MARKS combining marks (Mn, Me) on each
-    base character and no private-use (Co) or surrogate (Cs) characters: a flood of marks
-    spills over the caption box, and a private-use character renders blank."""
+    """`strip_control`, then NFC with at most MAX_MARKS combining marks (Mn, Me) after each
+    character and no private-use (Co) or surrogate (Cs) characters: a flood of marks
+    spills over the caption box, and a private-use character renders blank. Marks are
+    counted after NFC, so a precomposed letter keeps the marks it is made of."""
     kept, marks = [], 0
-    for c in unicodedata.normalize("NFD", strip_control(text)):
+    for c in unicodedata.normalize("NFC", strip_control(text)):
         category = unicodedata.category(c)
         if category in ("Co", "Cs"):
             continue

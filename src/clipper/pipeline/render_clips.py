@@ -72,6 +72,7 @@ import os
 import re
 import sqlite3
 import stat
+import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import timedelta
@@ -126,6 +127,8 @@ logger = logging.getLogger(__name__)
 
 MAX_WORD_CHARS = 64
 """EDL limit for one caption word."""
+MAX_MARKS = 2
+"""Combining marks kept per base character in caption text (CLP-67)."""
 CLIP_WORST_CASE_S = (
     DETECT_TIMEOUT_S
     + SILENCE_TIMEOUT_S
@@ -173,13 +176,28 @@ def _clips(data: Any, name: str) -> list[Any]:
     return clips
 
 
+def _caption_text(text: str) -> str:
+    """`strip_control`, then NFC with at most MAX_MARKS combining marks (Mn, Me) on each
+    base character and no private-use (Co) or surrogate (Cs) characters: a flood of marks
+    spills over the caption box, and a private-use character renders blank."""
+    kept, marks = [], 0
+    for c in unicodedata.normalize("NFD", strip_control(text)):
+        category = unicodedata.category(c)
+        if category in ("Co", "Cs"):
+            continue
+        marks = marks + 1 if category in ("Mn", "Me") else 0
+        if marks <= MAX_MARKS:
+            kept.append(c)
+    return strip_control(unicodedata.normalize("NFC", "".join(kept)))  # whitespace again
+
+
 def _words(transcript: Any, offset: float, start: float, end: float) -> list[dict[str, Any]]:
     """Transcript words overlapping [start, end], in the section's timeline (minus offset)."""
     words = []
     for w in transcript.get("words") or ():
         if w["end"] <= start or w["start"] >= end:
             continue
-        text = strip_control(str(w["word"]))[:MAX_WORD_CHARS]
+        text = _caption_text(str(w["word"]))[:MAX_WORD_CHARS]
         if text:
             begin = round(max(w["start"] - offset, 0.0), 3)
             words.append(
@@ -230,7 +248,7 @@ def _plan(
             {
                 "source": {"path": section["path"], "in_s": in_s, "out_s": out_s},
                 # An empty hook (also after cleaning) means no hook card.
-                "hook": {"text": hook} if (hook := strip_control(clip.get("hook") or "")) else None,
+                "hook": {"text": hook} if (hook := _caption_text(clip.get("hook") or "")) else None,
                 "words": _words(transcript, offset, start, end),
             }
         )

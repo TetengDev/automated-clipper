@@ -669,6 +669,62 @@ def test_control_and_format_characters_stripped_from_words(
     assert texts == ["ab", "c d", "x" * 64]
 
 
+def test_combining_mark_floods_and_private_use_are_cleaned(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    """CLP-67: at most 2 combining marks per base character; private-use characters go,
+    and a word made only of them is dropped. The hook is cleaned the same way."""
+    words = [
+        {"word": "a" + "\u0301" * 50 + "b", "start": 10.1, "end": 10.5},
+        {"word": "\u0301" * 5, "start": 10.6, "end": 10.9},
+        {"word": "\ue000\U000f0000", "start": 11.1, "end": 11.5},
+        {"word": "x\ue000y", "start": 12.1, "end": 12.5},
+        {"word": "p \ue000 q", "start": 12.6, "end": 12.9},
+        {"word": "o\u0301\u200b\u0301\u0301", "start": 13.1, "end": 13.5},
+    ]
+    zalgo_hook = "Wo" + "\u0336" * 40 + "w"
+    _setup(media, [_highlight(1, 10.0, 15.0, hook=zalgo_hook)], words=words)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    edl = fake.calls[0]["edl"]
+    assert [w.text for w in edl.words] == [
+        "\u00e1\u0301b",
+        "\u0301\u0301",
+        "xy",
+        "p q",
+        "\u00f3\u0301",
+    ]
+    assert edl.hook is not None and edl.hook.text == "Wo\u0336\u0336w"
+
+
+def test_normal_text_and_emoji_survive_caption_cleaning(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    """CLP-67: accented text (NFC), Tagalog, Persian with ZWNJ and emoji are unchanged."""
+    texts = [
+        "caf\u00e9",  # precomposed
+        "Vi\u1ec7t",  # precomposed, two diacritics
+        "\u1703\u1712\u1714",  # Tagalog (Baybayin) with its virama
+        "\u0645\u06cc\u200c\u062e\u0648\u0627\u0645",  # Persian with ZWNJ
+        "\u2764\ufe0f",  # heart + VS16 (a Mn mark)
+        "1\ufe0f\u20e3",  # keycap: VS16 + enclosing mark
+        "\U0001f469\u200d\U0001f469\u200d\U0001f467",  # ZWJ family
+        "\U0001f44d\U0001f3fd",  # skin tone modifier
+    ]
+    words = [
+        {"word": t, "start": 10.1 + i * 0.4, "end": 10.4 + i * 0.4} for i, t in enumerate(texts)
+    ]
+    decomposed = [{"word": "cafe\u0301", "start": 14.0, "end": 14.3}]
+    _setup(media, [_highlight(1, 10.0, 15.0, hook="Kain na \U0001f60b")], words=words + decomposed)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    edl = fake.calls[0]["edl"]
+    assert [w.text for w in edl.words] == [*texts, "caf\u00e9"]
+    assert edl.hook is not None and edl.hook.text == "Kain na \U0001f60b"
+
+
 def test_small_stage_budget_stops_before_a_clip(
     conn: sqlite3.Connection,
     job: Job,

@@ -32,7 +32,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import httpx
 from tenacity import (
@@ -44,7 +44,7 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from clipper.config import WHISPER_MODELS, MissingSecretError, Secrets, Settings
+from clipper.config import WHISPER_MODELS, MissingSecretError, PinnedModel, Secrets, Settings
 from clipper.jobs.models import Job
 from clipper.jobs.stages import PermanentError, StageContext, StageDef
 from clipper.pipeline import local_asr
@@ -106,7 +106,7 @@ ASR_COMMAND = (sys.executable, "-I", "-m", "clipper.pipeline.local_asr")
 MODEL_FETCH_TIMEOUT_S = 30 * 60.0
 """Budget for fetching one model, including the one retry after a failed verification."""
 COMPLETE_MARKER = ".clipper-complete"
-"""Written into a snapshot once its files and model.bin's sha256 were verified."""
+"""Written into a snapshot once every pinned file's size and sha256 were verified."""
 LOCAL_RTF_BUDGET = 3
 """A local chunk may take up to 3x its length (large-v3 on a slow VPS CPU), never less
 than CHUNK_CALL_TIMEOUT_S; the stage deadline still caps it."""
@@ -425,47 +425,58 @@ class FasterWhisperTranscriber:
 
     def ensure_model(self, timeout_s: float = MODEL_FETCH_TIMEOUT_S) -> Path:
         """The verified snapshot dir. A snapshot counts only with its completion marker and
-        a model.bin that links to the pinned blob (cheap; the full hash runs at fetch).
-        Otherwise it is fetched (in a child, all within `timeout_s`), verified and marked;
-        a snapshot that fails verification is discarded and fetched once more, then this
-        raises a retryable `MediaError`."""
+        passing the cheap `snapshot_problems` check (every size, the small files' hashes,
+        model.bin's blob name; model.bin's full hash runs at fetch). Otherwise it is
+        fetched (in a child, all within `timeout_s`), fully verified and marked; a snapshot
+        that fails verification is discarded and fetched once more, then this raises a
+        retryable `MediaError`."""
         pin = WHISPER_MODELS[self.model]
         snapshot = self.snapshot_dir
         marker = snapshot / COMPLETE_MARKER
         if marker.is_file():
-            if _blob_name(snapshot / "model.bin") == pin.sha256:
+            problems = snapshot_problems(snapshot, pin, hash_model=False)
+            if not problems:
                 return snapshot
-            self._discard(snapshot, bad_blob=False)  # marked, but model.bin was swapped
+            logger.warning(
+                "whisper model %s: marked snapshot damaged (%s); fetching it again",
+                self.model,
+                _describe(problems),
+            )
+            self._discard(snapshot, problems)
         self.models_dir.mkdir(parents=True, exist_ok=True)
         args = [*ASR_COMMAND, "fetch", pin.repo, pin.revision, str(self.models_dir)]
         what = f"downloading whisper model {self.model}"
         started = time.monotonic()
-        problem = ""
+        problems: dict[str, FileProblem] = {}
         for _ in range(2):
             left = timeout_s - (time.monotonic() - started)
             if left <= 1.0:
                 break
             _run_asr(args, left, what)
-            problem = _snapshot_problem(snapshot, pin.sha256)
-            if not problem:
+            problems = snapshot_problems(snapshot, pin)
+            if not problems:
                 tmp = marker.with_name(f"{marker.name}.tmp")
                 tmp.write_text(pin.sha256, encoding="utf-8")
                 os.replace(tmp, marker)
                 return snapshot
-            logger.warning("whisper model %s: snapshot rejected (%s)", self.model, problem)
-            self._discard(snapshot, bad_blob="sha256" in problem)
-        raise MediaError(f"{what}: {problem or 'out of time'}")
+            logger.warning(
+                "whisper model %s: snapshot rejected (%s)", self.model, _describe(problems)
+            )
+            self._discard(snapshot, problems)
+        raise MediaError(f"{what}: {_describe(problems) or 'out of time'}")
 
-    def _discard(self, snapshot: Path, *, bad_blob: bool) -> None:
-        """Drop the snapshot links; when model.bin's content is wrong also its repo blob
+    def _discard(self, snapshot: Path, problems: dict[str, FileProblem]) -> None:
+        """Drop the snapshot links; for each file whose content is wrong also its repo blob
         and the stored file behind it, or the Hub client would link the same bytes again."""
-        link = snapshot / "model.bin"
-        if bad_blob and link.is_symlink():
-            repo_blob = (link.parent / os.readlink(link)).parent.resolve() / link.readlink().name
-            root = self.models_dir.resolve()
-            for path in (link.resolve(), repo_blob):  # content first, then the link to it
-                if path.is_relative_to(root):
-                    path.unlink(missing_ok=True)
+        root = self.models_dir.resolve()
+        for name, problem in problems.items():
+            link = snapshot / name
+            if problem.bad_content and link.is_symlink():
+                target = link.parent / os.readlink(link)
+                repo_blob = target.parent.resolve() / target.name
+                for path in (link.resolve(), repo_blob):  # content first, then the link to it
+                    if path.is_relative_to(root):
+                        path.unlink(missing_ok=True)
         shutil.rmtree(snapshot, ignore_errors=True)
 
     def transcribe(
@@ -502,14 +513,39 @@ def _blob_name(link: Path) -> str | None:
         return None
 
 
-def _snapshot_problem(snapshot: Path, sha256: str) -> str:
-    """Why `snapshot` is unusable, or "" when every required file is there and model.bin
-    has the pinned SHA-256."""
-    if missing := local_asr.missing_model_files(str(snapshot)):
-        return f"missing {', '.join(missing)}"
-    with (snapshot / "model.bin").open("rb") as fh:
-        actual = hashlib.file_digest(fh, "sha256").hexdigest()
-    return "" if actual == sha256 else "model.bin sha256 mismatch"
+class FileProblem(NamedTuple):
+    reason: str
+    bad_content: bool
+    """The bytes behind the link are wrong (not just missing or linked elsewhere)."""
+
+
+def snapshot_problems(
+    snapshot: Path, pin: PinnedModel, *, hash_model: bool = True
+) -> dict[str, FileProblem]:
+    """What is wrong with each pinned file of `snapshot`; empty when every one is there
+    with its pinned size and SHA-256. The small files (a few MB) are always hashed; with
+    `hash_model=False` model.bin only gets its size and blob name checked, since hashing
+    gigabytes before every job is too slow."""
+    problems: dict[str, FileProblem] = {}
+    for name, want in pin.files.items():
+        path = snapshot / name
+        if not path.is_file():
+            problems[name] = FileProblem("missing", bad_content=False)
+        elif (size := path.stat().st_size) != want.size:
+            problems[name] = FileProblem(f"size {size}, pinned {want.size}", bad_content=True)
+        elif name == "model.bin" and not hash_model:
+            if (blob := _blob_name(path)) != want.sha256:
+                reason = f"links to blob {blob}" if blob else "is not a blob link"
+                problems[name] = FileProblem(reason, bad_content=False)
+        else:
+            with path.open("rb") as fh:
+                if hashlib.file_digest(fh, "sha256").hexdigest() != want.sha256:
+                    problems[name] = FileProblem("sha256 mismatch", bad_content=True)
+    return problems
+
+
+def _describe(problems: dict[str, FileProblem]) -> str:
+    return "; ".join(f"{name} {p.reason}" for name, p in problems.items())
 
 
 def call_timeout(backend: Transcriber, chunk_seconds: float) -> float:

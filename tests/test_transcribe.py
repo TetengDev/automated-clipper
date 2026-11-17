@@ -19,14 +19,17 @@ import pytest
 import respx
 
 from asr_support import (
+    FAKE_FILES,
+    FAKE_MODEL_BIN,
     FAKE_MODEL_SHA256,
+    SWAPPED_TOKENIZER,
     FakeAsr,
     FakeWhisperModel,
     install_fake_asr,
     seg,
     write_snapshot,
 )
-from clipper.config import AppConfig, load_config
+from clipper.config import AppConfig, PinnedModel, load_config
 from clipper.db import connect, migrate
 from clipper.jobs import Deferred, Job, PermanentError, SkipJob, StageContext, enqueue
 from clipper.jobs.models import JobStatus
@@ -1076,7 +1079,7 @@ def test_incomplete_fetch_is_retried_once(fake_asr: FakeAsr, tmp_path: Path) -> 
 
 def test_hash_mismatch_is_never_marked_complete(fake_asr: FakeAsr, tmp_path: Path) -> None:
     fake_asr.fetch_plan = ["corrupt", "corrupt"]
-    with pytest.raises(MediaError, match="sha256") as exc:
+    with pytest.raises(MediaError, match="model.bin size 9") as exc:
         local().ensure_model()
     assert not isinstance(exc.value, PermanentError)  # retryable: the next run fetches again
     assert len(fake_asr.fetch_calls()) == 2
@@ -1108,6 +1111,94 @@ def test_marker_check_follows_only_the_snapshot_link(fake_asr: FakeAsr, tmp_path
     for _ in range(3):
         assert local().ensure_model() == snapshot
     assert len(fake_asr.fetch_calls()) == 1
+
+
+def _fake_pin() -> PinnedModel:
+    return tr.WHISPER_MODELS["tiny"]  # pinned to the fake files by `fake_asr`
+
+
+def test_snapshot_problems_none_for_the_pinned_files(fake_asr: FakeAsr, tmp_path: Path):
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {}
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {}
+
+
+def test_snapshot_problems_swapped_tokenizer(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    snapshot = write_snapshot(
+        tmp_path / "models", *TINY, arrives={"tokenizer.json": SWAPPED_TOKENIZER}
+    )
+    problem = tr.FileProblem("sha256 mismatch", bad_content=True)
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {"tokenizer.json": problem}
+    # Small files are hashed on every check, also when model.bin is not.
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {
+        "tokenizer.json": problem
+    }
+
+
+@pytest.mark.parametrize("hash_model", [True, False])
+def test_snapshot_problems_truncated_model_bin(
+    fake_asr: FakeAsr, tmp_path: Path, hash_model: bool
+) -> None:
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    (snapshot / "model.bin").resolve().write_bytes(FAKE_MODEL_BIN[:5])  # two hops, then cut
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=hash_model) == {
+        "model.bin": tr.FileProblem(f"size 5, pinned {len(FAKE_MODEL_BIN)}", bad_content=True)
+    }
+
+
+def test_snapshot_problems_model_bin_hash_only_when_asked(fake_asr: FakeAsr, tmp_path: Path):
+    same_size = bytes(len(FAKE_MODEL_BIN))
+    snapshot = write_snapshot(tmp_path / "models", *TINY, arrives={"model.bin": same_size})
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {
+        "model.bin": tr.FileProblem("sha256 mismatch", bad_content=True)
+    }
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {}  # the cheap path
+
+
+def test_snapshot_problems_missing_and_relinked_files(fake_asr: FakeAsr, tmp_path: Path):
+    snapshot = write_snapshot(tmp_path / "models", *TINY, files=("config.json",))
+    other = snapshot.parents[1] / "blobs" / ("0" * 64)
+    other.write_bytes(FAKE_MODEL_BIN)  # right size and bytes, but not the pinned blob
+    (snapshot / "model.bin").unlink()
+    os.symlink(os.path.relpath(other, snapshot), snapshot / "model.bin")
+    missing = tr.FileProblem("missing", bad_content=False)
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {
+        "model.bin": tr.FileProblem(f"links to blob {'0' * 64}", bad_content=False),
+        "tokenizer.json": missing,
+        "vocabulary.txt": missing,
+    }
+    assert tr.snapshot_problems(tmp_path / "nowhere", _fake_pin()) == dict.fromkeys(
+        ["model.bin", *FAKE_FILES], missing
+    )
+
+
+@pytest.mark.parametrize("name", ["model.bin", "tokenizer.json"])
+def test_truncated_blob_under_marker_is_fetched_again(
+    fake_asr: FakeAsr, tmp_path: Path, name: str
+) -> None:
+    """CLP-75: a marked snapshot whose blob was cut short (disk error, partial restore)."""
+    snapshot = local().ensure_model()
+    (snapshot / name).resolve().write_bytes(b"cut")
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2
+    # The damaged blob was dropped, so the Hub client fetched it instead of relinking it.
+    want = FAKE_MODEL_BIN if name == "model.bin" else FAKE_FILES[name]
+    assert (snapshot / name).read_bytes() == want
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+
+
+def test_swapped_tokenizer_fails_verification(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    """CLP-75: tokenizer.json is pinned by sha256, not only by the commit and TLS."""
+    fake_asr.fetch_plan = ["swapped", "swapped"]
+    with pytest.raises(MediaError, match="tokenizer.json sha256 mismatch") as exc:
+        local().ensure_model()
+    assert not isinstance(exc.value, PermanentError)
+    snapshot = _snapshot(tmp_path / "models")
+    assert not (snapshot / tr.COMPLETE_MARKER).exists()
+    fake_asr.fetch_plan = ["ok"]
+    assert local().ensure_model() == snapshot  # the swapped blob was dropped, not relinked
+    assert (snapshot / "tokenizer.json").read_bytes() == FAKE_FILES["tokenizer.json"]
 
 
 def test_ensure_model_fetch_failure_is_retryable(

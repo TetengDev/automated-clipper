@@ -166,6 +166,17 @@ def release_claims(conn: sqlite3.Connection, worker_id: str, now: datetime) -> i
     return cur.rowcount
 
 
+def hold_lease(conn: sqlite3.Connection, job_id: int, worker_id: str, now: datetime) -> None:
+    """Fence a stage's own writes on its claim (CLP-66): inside the caller's transaction,
+    raise JobConflict unless `worker_id` still holds an unexpired lease on the job."""
+    cur = conn.execute(
+        "UPDATE jobs SET updated_at = ? WHERE id = ? AND worker_id = ? AND lease_until > ?",
+        (to_iso(now), job_id, worker_id, to_iso(now)),
+    )
+    if cur.rowcount != 1:
+        raise JobConflict(f"job {job_id} is no longer leased to {worker_id}")
+
+
 def _finish(
     conn: sqlite3.Connection, job: Job, worker_id: str, assignments: str, params: tuple[object, ...]
 ) -> None:

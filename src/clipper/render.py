@@ -108,6 +108,30 @@ class RenderResult:
     render_seconds: float
 
 
+@dataclass(frozen=True)
+class StagedClip:
+    """A finished render whose files still wait in the work dir (`stage_clip`).
+
+    `publish()` renames them to `result`'s paths; `discard()` removes the work dir and
+    must always follow, also after a publish.
+    """
+
+    result: RenderResult
+    video: Path
+    """The staged video: what checks before publishing (the quality gates) look at."""
+    work_dir: Path
+    moves: tuple[tuple[Path, Path], ...]
+
+    def publish(self) -> None:
+        try:
+            _publish(self.moves)
+        except OSError as exc:
+            raise RenderError(f"render I/O error: {exc}") from exc
+
+    def discard(self) -> None:
+        shutil.rmtree(self.work_dir, ignore_errors=True)
+
+
 def default_render_dir() -> Path:
     """`render/` package location: $CLIPPER_RENDER_DIR, else the repo checkout's render/."""
     env = os.environ.get("CLIPPER_RENDER_DIR")
@@ -525,6 +549,27 @@ def render_clip(
     edl: EDL | dict[str, Any],
     media_root: Path,
     out_dir: Path,
+    **kw: Any,
+) -> RenderResult:
+    """Render `edl` to `out_dir/<basename>.{mp4,jpg,json}` (`stage_clip`, then publish).
+
+    Use a distinct basename per clip version (e.g. ``basename=f"v{version}"``) so a
+    re-render never overwrites the files an earlier clip_versions row points at.
+    If a rename fails, the files already moved are removed again (best effort).
+    Raises RenderError on any failure.
+    """
+    staged = stage_clip(edl, media_root, out_dir, **kw)
+    try:
+        staged.publish()
+    finally:
+        staged.discard()
+    return staged.result
+
+
+def stage_clip(
+    edl: EDL | dict[str, Any],
+    media_root: Path,
+    out_dir: Path,
     *,
     runner: Runner = run_process,
     timeout_s: float = DEFAULT_RENDER_TIMEOUT_S,
@@ -534,16 +579,15 @@ def render_clip(
     concurrency: int | None = None,
     node: str = "node",
     ffmpeg: str = "ffmpeg",
-) -> RenderResult:
-    """Render `edl` to `out_dir/<basename>.{mp4,jpg,json}`.
-
-    Use a distinct basename per clip version (e.g. ``basename=f"v{version}"``) so a
-    re-render never overwrites the files an earlier clip_versions row points at.
+) -> StagedClip:
+    """Render `edl` into the private work dir `out_dir/.<basename>.work`, ready to be
+    published as `out_dir/<basename>.{mp4,jpg,json}`.
 
     Validates the EDL (pydantic) before any subprocess runs; the Remotion side validates
-    the props again (ajv) before rendering a frame. Outputs are staged in a private work dir
-    and renamed into `out_dir` only after every step succeeded; if a rename fails, the
-    files already moved are removed again (best effort). Raises RenderError on any failure.
+    the props again (ajv) before rendering a frame. Nothing reaches `out_dir` until
+    `publish()`, so the caller can check the clip and record it first (the clip insert is
+    fenced on the job's lease, CLP-66). On failure the work dir is removed and RenderError
+    is raised.
     """
     if not _BASENAME.fullmatch(basename):
         raise ValueError(f"invalid basename: {basename!r}")
@@ -680,17 +724,24 @@ def render_clip(
                     "edl": edl.to_props(),
                 },
             )
-            _publish([(staged_thumb, thumb), (staged_video, video), (staged_sidecar, sidecar)])
         except (OSError, ValueError) as exc:
-            raise RenderError(f"render I/O error: {exc}") from exc
-        finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+            raise RenderError(f"render I/O error: {exc}") from exc
+        except BaseException:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise
 
         log.info("rendered %s in %.1fs", video, render_seconds)
-        return RenderResult(
-            video_path=video,
-            thumbnail_path=thumb,
-            sidecar_path=sidecar,
-            duration_s=edl.duration_s,
-            render_seconds=render_seconds,
+        return StagedClip(
+            result=RenderResult(
+                video_path=video,
+                thumbnail_path=thumb,
+                sidecar_path=sidecar,
+                duration_s=edl.duration_s,
+                render_seconds=render_seconds,
+            ),
+            video=staged_video,
+            work_dir=work_dir,
+            # Sidecar last: it implies a complete set.
+            moves=((staged_thumb, thumb), (staged_video, video), (staged_sidecar, sidecar)),
         )

@@ -58,6 +58,9 @@ class StageContext:
     conn: sqlite3.Connection
     config: AppConfig
     clock: Clock = utcnow
+    worker_id: str | None = None
+    """The claim the stage runs under (None outside the worker): fence writes that must not
+    land after the lease is lost on it with `clipper.jobs.queue.hold_lease`."""
 
 
 Stage = Callable[[Job, StageContext], None]

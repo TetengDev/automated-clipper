@@ -25,7 +25,7 @@ from clipper.jobs import (
     get_job,
 )
 from clipper.jobs import worker as worker_mod
-from clipper.jobs.queue import DEFAULT_LEASE
+from clipper.jobs.queue import DEFAULT_LEASE, JobConflict
 from clipper.jobs.stages import DEFAULT_STAGES
 from clipper.pipeline import build_stages
 from clipper.urls import SourceRef
@@ -247,6 +247,22 @@ def test_lease_expiry_mid_stage_drops_late_result(make_worker: MakeWorker, db: P
     assert row["last_error"] is None
     assert slow.run_once()  # the slow worker keeps going
     assert _status(db, job.id) is JobStatus.SELECTING
+
+
+def test_stage_that_lost_its_lease_records_nothing(make_worker: MakeWorker, db: Path) -> None:
+    """CLP-66: a stage whose fenced write was refused (hold_lease) charges no attempt."""
+    pipeline = StubPipeline()
+    pipeline.fail_at[JobStatus.FETCHING_AUDIO] = JobConflict("job 1 is no longer leased to w1")
+    worker = make_worker(pipeline)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()  # detected -> fetching_audio
+
+    assert worker.run_once()
+
+    row = _row(db, job.id)
+    assert (row["status"], row["last_error"], row["next_attempt_at"]) == (
+        "fetching_audio", None, None,
+    )  # fmt: skip
 
 
 def test_run_forever_survives_db_errors(

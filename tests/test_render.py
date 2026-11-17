@@ -555,6 +555,41 @@ def test_thumbnail_failure_publishes_nothing(
     assert (out / "clip.mp4").read_bytes() == b"previous"
 
 
+def test_stage_clip_publishes_only_on_publish(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    """CLP-66: the stage checks and records a clip before its files go live."""
+    out = tmp_path / "out"
+    staged = render.stage_clip(
+        EDL_DATA, media_root, out, runner=FakeRunner(), render_dir=render_dir, basename="v1"
+    )
+    assert sorted(p.name for p in out.iterdir()) == [".v1.work"]
+    assert staged.video.read_bytes() == b"out"  # the gates check this one
+    assert staged.result.video_path == out.resolve() / "v1.mp4"
+
+    staged.publish()
+    staged.discard()
+
+    assert sorted(p.name for p in out.iterdir()) == ["v1.jpg", "v1.json", "v1.mp4"]
+    assert staged.result.video_path.read_bytes() == b"out"
+
+
+def test_discarded_stage_publishes_nothing(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "v1.mp4").write_bytes(b"theirs")  # e.g. the new lease owner's render
+    staged = render.stage_clip(
+        EDL_DATA, media_root, out, runner=FakeRunner(), render_dir=render_dir, basename="v1"
+    )
+
+    staged.discard()
+
+    assert sorted(p.name for p in out.iterdir()) == ["v1.mp4"]
+    assert (out / "v1.mp4").read_bytes() == b"theirs"
+
+
 def test_work_dir_symlink_is_replaced_not_followed(
     media_root: Path, render_dir: Path, tmp_path: Path
 ) -> None:

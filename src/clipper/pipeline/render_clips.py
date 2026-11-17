@@ -4,7 +4,7 @@ Input: `sections.json` (CLP-16), `highlights.json` (CLP-15) and `transcript.json
 in the job's media dir. For each section the EDL cuts the requested range out of the padded
 `clips/<rank>/source.mp4` (`[pad_start_s, pad_start_s + length]`), with the highlight's hook
 and the transcript words that overlap the clip, shifted into the section's timeline.
-`clipper.render.render_clip` writes `clips/<rank>/v1.{mp4,jpg,json}` and
+`clipper.render.stage_clip` renders `clips/<rank>/v1.{mp4,jpg,json}` into a work dir and
 `clips_repo.insert_pending_clip` records it with the highlight's title, caption, hashtags,
 per-platform variants (CLP-96), score, reason, and the prompt and playbook versions it was
 selected with. Before the EDL is final, dead air is trimmed and the clip edges are snapped
@@ -19,6 +19,9 @@ faces in most frames gets a face-tracked 9:16 crop that jumps at the same scene 
 any failure keeps the blurred fill. The rendered video then runs the quality gates
 (CLP-74, `clipper.pipeline.quality`): a failed gate stores the clip as `needs_attention`
 with its reasons; a gate that cannot run is noted but never holds the clip back.
+The insert is fenced on the job's lease (CLP-66): only while this worker still holds the
+claim are the row written and the files renamed into place, in one transaction, so a
+worker that lost its lease never publishes over the new owner's clip.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
 rerun after a crash renders only the clips without a row. The row's start_s/end_s are the
@@ -63,6 +66,7 @@ import os
 import re
 import sqlite3
 import stat
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -71,7 +75,7 @@ from clipper.clips_repo import ClipMeta, insert_pending_clip
 from clipper.config import JumpCuts, always_sensitive
 from clipper.edl import EDL, FPS, MAX_CLIP_SECONDS, frames, parse_edl
 from clipper.jobs.models import Job
-from clipper.jobs.queue import MAX_ATTEMPTS, backoff
+from clipper.jobs.queue import MAX_ATTEMPTS, JobConflict, backoff, hold_lease
 from clipper.jobs.stages import Deferred, PermanentError, StageContext, StageDef
 from clipper.metadata import coerce_variants, variants_json
 from clipper.pipeline.boundaries import DETECT_TIMEOUT_S, detect_cuts, polish
@@ -107,8 +111,8 @@ from clipper.render import (
     DEFAULT_RENDER_TIMEOUT_S,
     InvalidClipError,
     RenderError,
-    render_clip,
     resolve_source,
+    stage_clip,
 )
 
 logger = logging.getLogger(__name__)
@@ -388,6 +392,14 @@ def _record_failure(marker: Path, failures: int, reason: str) -> bool:
     return True
 
 
+def _fence(job: Job, ctx: StageContext) -> Callable[[sqlite3.Connection], None] | None:
+    """The clip insert's lease check (CLP-66); none when not run by the worker."""
+    worker_id = ctx.worker_id
+    if worker_id is None:
+        return None
+    return lambda conn: hold_lease(conn, job.id, worker_id, ctx.clock())
+
+
 def _left_out(rank: int, failures: int, error: str) -> str:
     return f"clip {rank}: render failed {failures} times: {error}"[:MAX_REASON_CHARS]
 
@@ -449,7 +461,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 end = round(edl.source.out_s + shift, 3)
             if settings.reframe == "auto" and _detectable(section):
                 edl = _reframe(edl, cuts, ctx.media_dir, deadline)
-            result = render_clip(
+            staged = stage_clip(
                 edl,
                 ctx.media_dir,
                 ctx.media_dir / "clips" / str(rank),
@@ -457,14 +469,18 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 timeout_s=deadline.timeout(DEFAULT_RENDER_TIMEOUT_S),
                 ffmpeg_timeout_s=deadline.timeout(DEFAULT_FFMPEG_TIMEOUT_S),
             )
-            reasons = check_clip(
-                edl,
-                result.video_path,
-                language=language,
-                asr=asr,
-                deadline=deadline,
-                starts_on_cut=any(abs(c - edl.source.in_s) <= 1 / FPS for c in cuts),
-            )
+            try:
+                reasons = check_clip(
+                    edl,
+                    staged.video,
+                    language=language,
+                    asr=asr,
+                    deadline=deadline,
+                    starts_on_cut=any(abs(c - edl.source.in_s) <= 1 / FPS for c in cuts),
+                )
+            except BaseException:
+                staged.discard()
+                raise
         except PermanentError as exc:
             invalid.append(redact(strip_control(str(exc)))[:MAX_REASON_CHARS])
             continue
@@ -499,16 +515,25 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             raise Deferred(ctx.clock(), f"{exc} ({note})") from None
         if reasons:
             logger.info("job %s: clip %s quality gates: %s", job.id, rank, ", ".join(reasons))
-        insert_pending_clip(
-            ctx.conn,
-            job_id=job.id,
-            rank=rank,
-            edl=edl,
-            result=result,
-            meta=replace(meta, gate_reasons=tuple(reasons)),
-            start_s=start,  # position in the source video, not in the padded section file
-            end_s=end,
-        )
+        try:
+            insert_pending_clip(
+                ctx.conn,
+                job_id=job.id,
+                rank=rank,
+                edl=edl,
+                result=staged.result,
+                meta=replace(meta, gate_reasons=tuple(reasons)),
+                start_s=start,  # position in the source video, not in the padded section file
+                end_s=end,
+                fence=_fence(job, ctx),
+                publish=staged.publish,
+            )
+        except JobConflict:
+            raise  # lease lost: the work dir may be the new owner's by now, so leave it
+        except BaseException:
+            staged.discard()
+            raise
+        staged.discard()
         done.add(rank)
         rendered += 1
         # A marker left on a done clip (crash before this, or not removable) is ignored.

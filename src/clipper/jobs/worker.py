@@ -137,7 +137,10 @@ class Worker:
                 logger.info("%s: artifact %s exists, skipping stage", log, stage.artifact)
             else:
                 media_dir.mkdir(parents=True, exist_ok=True)
-                stage.run(job, StageContext(media_dir, self.conn, self.config, self.clock))
+                ctx = StageContext(
+                    media_dir, self.conn, self.config, self.clock, worker_id=self.worker_id
+                )
+                stage.run(job, ctx)
                 if artifact is not None and not artifact.is_file():
                     raise RuntimeError(f"stage finished without producing {stage.artifact}")
         except Deferred as exc:
@@ -152,6 +155,8 @@ class Worker:
             error = redact(f"{type(exc).__name__}: {exc}")
             logger.error("%s: failed permanently: %s", log, error)
             self._terminal(job, JobStatus.FAILED, error)
+        except JobConflict:
+            raise  # the stage found its lease lost (hold_lease): nothing to record
         except Exception as exc:
             error = redact(f"{type(exc).__name__}: {exc}")
             logger.error("%s: stage error: %s", log, error)

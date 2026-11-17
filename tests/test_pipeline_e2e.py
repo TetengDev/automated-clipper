@@ -5,7 +5,7 @@ Only the outside world is faked, at its boundary:
 - yt-dlp: `clipper.pipeline.ytdlp.run_command` is replaced by a runner that answers yt-dlp
   calls by rendering real small media with ffmpeg (lavfi); ffmpeg/ffprobe calls run for real.
 - Groq: HTTP mocked with respx. Anthropic: HTTP mocked with an httpx2 MockTransport.
-- Remotion: `render_clip` is faked in most tests; `test_real_render_reaches_review_and_export`
+- Remotion: `stage_clip` is faked in most tests; `test_real_render_reaches_review_and_export`
   renders for real (skips without node or render/node_modules) and then approves and exports
   the clip through the review app.
 """
@@ -35,7 +35,7 @@ from clipper.jobs import Job, JobStatus, Worker, enqueue, get_job
 from clipper.jobs import worker as worker_mod
 from clipper.pipeline import build_stages, render_clips, select, ytdlp
 from clipper.pipeline import transcribe as tr
-from clipper.render import REMOTION_CLI, RenderResult, default_render_dir
+from clipper.render import REMOTION_CLI, RenderResult, StagedClip, default_render_dir
 from clipper.review.app import create_app
 from clipper.urls import SourceRef, canonical_url
 from review_support import BASE_URL, PASSWORD_HASH, SECRET, RecordingRunner, login
@@ -205,7 +205,7 @@ def world(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[FakeYtdlpWorld, Fak
 
 
 class FakeRender:
-    """Stands in for Remotion: writes the files `render_clip` would and returns its result."""
+    """Stands in for Remotion: stages the files `stage_clip` would and returns them."""
 
     def __init__(self) -> None:
         self.ranks: list[int] = []
@@ -213,22 +213,26 @@ class FakeRender:
 
     def __call__(
         self, edl: Any, media_root: Path, out_dir: Path, *, basename: str, **kw: Any
-    ) -> RenderResult:
+    ) -> StagedClip:
         self.ranks.append(int(out_dir.name))
         if self.crash_on == len(self.ranks):
             self.crash_on = None
             raise Crash
         assert (media_root / edl.source.path).is_file()
-        paths = [out_dir / f"{basename}.{ext}" for ext in ("mp4", "jpg", "json")]
-        for path in paths:
+        work = out_dir / f".{basename}.work"
+        work.mkdir()
+        finals = [out_dir / f"{basename}.{ext}" for ext in ("mp4", "jpg", "json")]
+        staged = [work / f.name for f in finals]
+        for path in staged:
             path.write_bytes(b"x")
-        return RenderResult(*paths, duration_s=edl.duration_s, render_seconds=0.0)
+        result = RenderResult(*finals, duration_s=edl.duration_s, render_seconds=0.0)
+        return StagedClip(result, staged[0], work, tuple(zip(staged, finals, strict=True)))
 
 
 @pytest.fixture
 def fake_render(monkeypatch: pytest.MonkeyPatch) -> FakeRender:
     render = FakeRender()
-    monkeypatch.setattr(render_clips, "render_clip", render)
+    monkeypatch.setattr(render_clips, "stage_clip", render)
     return render
 
 

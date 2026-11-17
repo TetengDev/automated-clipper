@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from clipper.db import connect, migrate
+from clipper.db import connect, migrate, transaction
 from clipper.jobs.models import PIPELINE, TERMINAL, JobStatus
 from clipper.jobs.queue import (
     BACKOFF_CAP,
@@ -18,6 +18,7 @@ from clipper.jobs.queue import (
     claim_next,
     enqueue,
     get_job,
+    hold_lease,
     mark_terminal,
     record_failure,
     release_claim,
@@ -277,3 +278,19 @@ def test_release_claim_only_touches_that_job_and_holder(conn: sqlite3.Connection
     assert not release_claim(conn, job, "w2", T0)
     assert release_claim(conn, job, "w1", T0)
     assert claim_next(conn, T0, worker_id="w2", statuses=ALL) is not None
+
+
+def test_hold_lease_passes_only_for_the_live_holder(conn: sqlite3.Connection) -> None:
+    """CLP-66: a stage fences its own writes on the claim, inside its transaction."""
+    enqueue(conn, YT, T0, creator="manual")
+    job = claim_next(conn, T0, worker_id="w1", statuses=ALL, lease=timedelta(minutes=10))
+    assert job is not None
+
+    with transaction(conn):
+        hold_lease(conn, job.id, "w1", T0 + timedelta(minutes=9))
+    for worker_id, now in (("w2", T0), ("w1", T0 + timedelta(minutes=10))):
+        with pytest.raises(JobConflict), transaction(conn):
+            hold_lease(conn, job.id, worker_id, now)
+    release_claim(conn, job, "w1", T0)
+    with pytest.raises(JobConflict), transaction(conn):
+        hold_lease(conn, job.id, "w1", T0)

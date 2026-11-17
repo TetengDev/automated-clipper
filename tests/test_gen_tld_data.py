@@ -69,3 +69,20 @@ def test_the_rendered_module_is_valid_python_and_records_its_source():
     assert namespace["TLDS"] == frozenset(gen.tlds(SAMPLE))
     assert '"कम",  # XN--11B4C3D' in source  # the label as listed
     assert '"com",\n' in source  # an ASCII TLD needs no comment
+
+
+def test_main_writes_the_module_and_refuses_to_downgrade_it(tmp_path, monkeypatch):
+    out = tmp_path / "tld_data.py"
+    monkeypatch.setattr(gen, "OUT", out)
+    source = tmp_path / "tlds-alpha-by-domain.txt"
+    source.write_text(SAMPLE, encoding="utf-8")
+
+    assert gen.main(["gen_tld_data.py", str(source)]) == 0
+    written = out.read_text(encoding="utf-8")
+    assert 'IANA_VERSION = "2026111700"' in written and '"рф",  # XN--P1AI' in written
+
+    older = SAMPLE.replace("2026111700", "2026111600")
+    source.write_text(older, encoding="utf-8")
+    with pytest.raises(SystemExit, match="older than the vendored 2026111700"):
+        gen.main(["gen_tld_data.py", str(source)])
+    assert out.read_text(encoding="utf-8") == written  # left as it was

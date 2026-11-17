@@ -647,3 +647,40 @@ def test_htmx_config_swaps_action_errors_into_the_target(
 
     assert rule["swap"] is True
     assert rule.get("error") is False
+
+
+INVALID = "Not saved: a field is missing or invalid. Reload the page and try again."
+
+
+def test_htmx_validation_error_is_a_fixed_escaped_fragment(client: TestClient, env: Env) -> None:
+    """FastAPI's default 422 reflects the input as JSON; htmx swaps 422s as HTML, so an
+    HTMX request gets a fixed message instead of the reflected value."""
+    csrf = login(client)
+    clip_id = env.clip()
+
+    response = client.post(
+        f"/clip/{clip_id}/variants",
+        data={"version": "<img src=x>", "fingerprint": "0" * 64},
+        headers={**HTMX, "X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("text/html")
+    assert re.fullmatch(
+        rf'<p class="error" role="alert">{re.escape(INVALID)}</p>\s*', response.text
+    )
+    assert "<img" not in response.text
+
+
+def test_plain_validation_error_keeps_fastapis_json(client: TestClient, env: Env) -> None:
+    csrf = login(client)
+    clip_id = env.clip()
+
+    response = client.post(
+        f"/clip/{clip_id}/variants",
+        data={"csrf_token": csrf, "version": "nope", "fingerprint": "0" * 64},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["detail"][0]["loc"] == ["body", "version"]

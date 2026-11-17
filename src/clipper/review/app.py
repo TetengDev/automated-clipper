@@ -39,6 +39,8 @@ from urllib.parse import quote, urlsplit
 
 import bcrypt
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -89,6 +91,9 @@ _CONTENT_LENGTH = re.compile(r"[0-9]+")
 _BODY_TOO_LARGE = "Request body too large"
 _TOO_MANY_FIELDS = "Too many form fields"
 _NO_MULTIPART = "Multipart forms are not accepted"
+# An HTMX request's 422 from FastAPI's own validation: htmx swaps 422s into the page, and the
+# default JSON body reflects the submitted values, so the reviewer gets this fixed text.
+_INVALID_FORM = "Not saved: a field is missing or invalid. Reload the page and try again."
 # What an HTMX request's 413 shows the reviewer, in the action's error slot.
 _TOO_LARGE_MESSAGES = {
     _BODY_TOO_LARGE: (
@@ -618,6 +623,14 @@ def create_app(
     @app.exception_handler(_BodyTooLarge)
     async def _body_too_large(request: Request, exc: _BodyTooLarge) -> Response:
         return _too_large(request.scope, exc.detail)
+
+    @app.exception_handler(RequestValidationError)
+    async def _invalid_request(request: Request, exc: RequestValidationError) -> Response:
+        if request.headers.get("HX-Request") == "true":
+            return render(
+                request, "_action_error.html", {"message": _INVALID_FORM}, status_code=422
+            )
+        return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(LoginRequired)
     async def _login_required(request: Request, _exc: LoginRequired) -> Response:

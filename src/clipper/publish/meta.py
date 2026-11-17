@@ -471,8 +471,9 @@ class MetaPublisher:
         self._credentials = credentials
         self.clock = clock
         self.campaigns = dict(campaigns or {})
-        """Account id -> campaign. Their posts are refused until CLP-97 wires the paid
-        partnership disclosure into the post metadata (fail closed)."""
+        """Account id -> campaign. Their posts are refused (fail closed): the campaign's
+        tags and paid-partnership flag now reach the stored post metadata (CLP-97), and
+        publishing campaign posts on Meta is CLP-121."""
 
     def close(self) -> None:
         """Called by the worker on exit (CLP-93's registry contract)."""
@@ -482,8 +483,8 @@ class MetaPublisher:
         campaign = self.campaigns.get(account_id)
         if campaign is not None:
             raise PublishRejected(
-                f"{self.platform}: account {account_id} posts for campaign {campaign}, and the"
-                " paid partnership disclosure is not wired in yet (CLP-97); post it by hand"
+                f"{self.platform}: account {account_id} posts for campaign {campaign};"
+                " campaign posts are published by hand until CLP-121"
             )
 
     def _deadline(self) -> datetime:

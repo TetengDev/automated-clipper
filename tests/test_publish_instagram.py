@@ -393,7 +393,7 @@ def test_campaign_account_is_refused_until_disclosure_is_wired(
             clock=clock,
             campaigns={"ig_main": "vyro_mrbeast"},
         )
-        with pytest.raises(PublishRejected, match="CLP-97"):
+        with pytest.raises(PublishRejected, match="by hand until CLP-121"):
             publisher.publish(ig_post(), video(tmp_path), metadata())
 
     assert routes["media"].call_count == 0

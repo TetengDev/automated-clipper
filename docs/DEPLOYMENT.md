@@ -375,12 +375,13 @@ cost.
   paid-partnership flag goes to `is_paid_partnership` on Instagram. The Facebook Reels
   API has no plain paid-partnership toggle, so a Facebook post that needs one is refused
   (`post_failed`, with an alert) and must be posted by hand.
-  - **Campaign accounts fail closed.** The campaign brief and its paid-partnership flag
-    are not wired into the post metadata yet
-    ([CLP-97](https://linear.app/tengdev/issue/CLP-97)), so every post on an account
-    with `campaign:` set is refused, and must be posted by hand.
-  - **AI flag.** It comes from the clip's EDL. The pipeline makes no AI elements today,
-    so it is always off; wiring the EDL into posting is a follow-up.
+  - **Campaign accounts fail closed.** Every post on an account with `campaign:` set is
+    refused, and must be posted by hand. The campaign's tags and paid-partnership flag
+    are stored with the post at scheduling
+    ([CLP-97](https://linear.app/tengdev/issue/CLP-97)); publishing campaign posts on
+    Meta is [CLP-121](https://linear.app/tengdev/issue/CLP-121).
+  - **AI flag.** It is set at scheduling from the clip's render sidecar (the EDL's AI
+    elements) and stored with the post. Posts scheduled before CLP-97 carry no AI flag.
 - **Rate limits**: before each Instagram publish the worker reads
   `content_publishing_limit`. Within 2 posts of the 24-hour limit (50), the post is
   deferred by an hour. A Graph rate-limit error (codes 4, 9, 17, 32, 613, 80001, 80002)

@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from clipper import clips
 from clipper.clips import ClipStatus, InvalidTransition
+from clipper.metadata import fingerprint
 from clipper.review import routes
 from clipper.review.app import STATIC_DIR
 from review_support import BASE_URL, Env, generate_mp4, login, make_env
@@ -768,3 +769,165 @@ def test_needs_attention_clip_can_be_decided(
     env.conn.execute("UPDATE clips SET status = 'needs_attention' WHERE id = ?", (video_clip,))
     post(client, f"/clip/{video_clip}/{action}", version=1, reason_tag="bad_cut")
     assert env.status(video_clip) == ("exported" if action == "approve" else "rejected")
+
+
+# --- CLP-62: j/k and "next after a decision" follow the queue view -----------------------
+
+SCORE_VIEW = clips.QueueFilter(sort="score")
+
+
+def seed_views(env: Env) -> dict[str, int]:
+    """Clips across creators and scores, with score and created_at ties."""
+    kai = env.job("Kai Cenat")
+    return {
+        "a": env.clip(score=9.0, created_at="2027-01-01T00:00:00Z"),
+        "b": env.clip(score=7.0, created_at="2027-01-02T00:00:00Z"),
+        "c": env.clip(kai, score=9.0, created_at="2027-01-03T00:00:00Z"),
+        "d": env.clip(score=9.0, created_at="2027-01-04T00:00:00Z"),
+        "e": env.clip(score=None, created_at="2027-01-05T00:00:00Z"),
+        "f": env.clip(score=7.0, created_at="2027-01-02T00:00:00Z"),  # b's time, higher id
+        "g": env.clip(status="rejected", score=8.0, created_at="2027-01-06T00:00:00Z"),
+    }
+
+
+def walk(env: Env, start: int, flt: clips.QueueFilter, *, older: bool) -> list[int]:
+    seen = [start]
+    while (nxt := clips.neighbour(env.conn, seen[-1], flt, older=older)) is not None:
+        seen.append(nxt)
+    return seen
+
+
+VIEWS = [
+    clips.QueueFilter(),
+    SCORE_VIEW,
+    clips.QueueFilter(creator="MrBeast", sort="score"),
+    clips.QueueFilter(min_score=8.0, sort="score"),
+    clips.QueueFilter(status=None, sort="score"),
+    clips.QueueFilter(status=None, creator="Kai Cenat"),
+]
+
+
+@pytest.mark.parametrize("flt", VIEWS)
+def test_neighbours_follow_the_queue_order_of_each_view(env: Env, flt: clips.QueueFilter) -> None:
+    seed_views(env)
+    order = [c.id for c in clips.list_queue(env.conn, flt, page_size=100)]
+
+    assert walk(env, order[0], flt, older=True) == order
+    assert walk(env, order[-1], flt, older=False) == order[::-1]
+
+
+def test_score_order_breaks_ties_by_time_then_id(env: Env) -> None:
+    ids = seed_views(env)
+
+    assert walk(env, ids["d"], SCORE_VIEW, older=True) == [
+        ids[k] for k in ("d", "c", "a", "f", "b", "e")
+    ]
+
+
+def test_a_clip_outside_the_view_keeps_its_place(env: Env) -> None:
+    """A clip just decided (or opened from elsewhere) still has neighbours in the view."""
+    ids = seed_views(env)
+
+    assert clips.neighbour(env.conn, ids["g"], SCORE_VIEW, older=True) == ids["f"]
+    assert clips.neighbour(env.conn, ids["g"], SCORE_VIEW, older=False) == ids["a"]
+    assert clips.neighbour(env.conn, 999, SCORE_VIEW, older=True) is None
+
+
+def test_next_after_wraps_within_the_view(env: Env) -> None:
+    ids = seed_views(env)
+    mrbeast = clips.QueueFilter(creator="MrBeast", sort="score")
+
+    assert clips.next_after(env.conn, ids["a"], mrbeast) == ids["f"]
+    assert clips.next_after(env.conn, ids["e"], mrbeast) == ids["d"]  # the end: wrap to the top
+    assert clips.next_after(env.conn, ids["c"], clips.QueueFilter(creator="Kai Cenat")) is None
+
+
+def test_queue_cards_link_to_the_clip_with_the_view(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    view = "status=pending_review&amp;sort=score&amp;creator=MrBeast&amp;min_score=1.5"
+
+    html = client.get("/queue?creator=MrBeast&sort=score&min_score=1.5").text
+
+    assert f'href="/clip/{clip_id}?{view}"' in html
+
+
+def test_load_more_cards_keep_the_view(client: TestClient, env: Env) -> None:
+    ids = [
+        env.clip(created_at=f"2027-01-{n + 1:02d}T00:00:00Z") for n in range(clips.PAGE_SIZE + 1)
+    ]
+
+    html = client.get("/queue?sort=newest&page=2", headers={"HX-Request": "true"}).text
+
+    assert f'href="/clip/{ids[0]}?status=pending_review&amp;sort=newest"' in html
+
+
+def test_clip_page_links_follow_the_view(client: TestClient, env: Env) -> None:
+    ids = seed_views(env)
+    view = "status=pending_review&amp;sort=score&amp;creator=MrBeast"
+
+    html = client.get(f"/clip/{ids['a']}?status=pending_review&sort=score&creator=MrBeast").text
+
+    assert f'id="next-clip" href="/clip/{ids["f"]}?{view}"' in html
+    assert f'id="prev-clip" href="/clip/{ids["d"]}?{view}"' in html
+    assert f'href="/queue?{view}"' in html
+    assert f'hx-post="/clip/{ids["a"]}/approve?{view}"' in html
+    assert f'hx-post="/clip/{ids["a"]}/reject?{view}"' in html
+    assert f'hx-post="/clip/{ids["a"]}/variants?{view}"' in html
+
+
+def test_clip_page_without_a_view_uses_newest_pending(client: TestClient, env: Env) -> None:
+    ids = seed_views(env)
+
+    html = client.get(f"/clip/{ids['a']}").text
+
+    assert f'id="prev-clip" href="/clip/{ids["b"]}"' in html  # newest first, ties by id
+    assert 'id="next-clip"' not in html
+    assert '<a href="/queue">' in html
+
+
+@pytest.mark.parametrize("query", ["status=bogus", "min_score=abc", "min_score=nan"])
+def test_clip_page_with_a_bad_view_is_422(client: TestClient, env: Env, query: str) -> None:
+    assert client.get(f"/clip/{env.clip()}?{query}").status_code == 422
+
+
+@pytest.mark.parametrize("htmx", [True, False])
+def test_decisions_move_on_within_the_view(client: TestClient, env: Env, htmx: bool) -> None:
+    ids = seed_views(env)
+    view = "status=pending_review&sort=score&creator=MrBeast"
+
+    approved = post(client, f"/clip/{ids['d']}/approve?{view}", htmx=htmx, version=1)
+    rejected = post(client, f"/clip/{ids['a']}/reject?{view}", htmx=htmx, reason_tag="boring")
+
+    where = "HX-Redirect" if htmx else "location"
+    assert approved.headers[where] == f"/clip/{ids['a']}?{view}"  # c is Kai Cenat: skipped
+    assert rejected.headers[where] == f"/clip/{ids['f']}?{view}"
+    assert env.status(ids["d"]) != "pending_review" and env.status(ids["a"]) == "rejected"
+
+
+def test_last_decision_in_a_view_returns_to_the_filtered_queue(
+    client: TestClient, env: Env
+) -> None:
+    clip_id = env.clip(env.job("Kai Cenat"))
+    env.clip()  # MrBeast: another view
+    view = "status=pending_review&sort=newest&creator=Kai+Cenat"
+
+    response = post(client, f"/clip/{clip_id}/reject?{view}", reason_tag="boring")
+
+    assert response.headers["HX-Redirect"] == f"/queue?{view}"
+
+
+def test_saving_the_platform_text_keeps_the_view(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    clip = clips.get_clip(env.conn, clip_id)
+    assert clip is not None
+    view = "status=pending_review&sort=score"
+
+    response = post(
+        client,
+        f"/clip/{clip_id}/variants?{view}",
+        version=1,
+        fingerprint=fingerprint(clip.current.variants),
+        tiktok_title="New title",
+    )
+
+    assert response.headers["HX-Redirect"] == f"/clip/{clip_id}?{view}"

@@ -115,6 +115,28 @@ def _query(flt: QueueFilter, **extra: object) -> str:
     return urlencode(params)
 
 
+def _clip_view(
+    status: Annotated[str | None, Query(max_length=32)] = None,
+    creator: Annotated[str | None, Query(max_length=200)] = None,
+    min_score: Annotated[str | None, Query(max_length=32)] = None,
+    sort: Annotated[str | None, Query(max_length=16)] = None,
+) -> QueueFilter | None:
+    """The queue view a clip page was opened from (CLP-62), carried on clip URLs as the
+    queue's query string. None (no params) is the newest-pending default."""
+    if status is None and creator is None and min_score is None and sort is None:
+        return None
+    return _parse_filter(
+        status or ClipStatus.PENDING_REVIEW.value, creator, min_score, sort or "newest"
+    )
+
+
+View = Annotated[QueueFilter | None, Depends(_clip_view)]
+
+
+def _view_query(view: QueueFilter | None) -> str:
+    return f"?{_query(view)}" if view else ""
+
+
 @router.get("/", response_class=HTMLResponse)
 @router.get("/queue", response_class=HTMLResponse)
 def queue(
@@ -139,6 +161,7 @@ def queue(
         "total": total,
         "flt": flt,
         "page": page,
+        "clip_query": _query(flt),
         "next_page_url": f"/queue?{_query(flt, page=page + 1)}" if has_more else None,
     }
     if _is_htmx(request) and page > 1:
@@ -177,7 +200,7 @@ def _with_status(flt: QueueFilter, status: ClipStatus | None) -> QueueFilter:
 
 
 @router.get("/clip/{clip_id}", response_class=HTMLResponse)
-def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn) -> Response:
+def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn, view: View) -> Response:
     clip = clips.get_clip(conn, clip_id)
     if clip is None:
         raise HTTPException(status_code=404, detail="clip not found")
@@ -189,6 +212,12 @@ def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn) -> R
             # Error class only; the full (redacted) detail stays in the server logs.
             error = str(json.loads(last["payload"]).get("error") or "")
             last_export_error = error.partition(":")[0].strip() or "unknown error"
+    if view is None:
+        next_id = clips.neighbour_pending(conn, clip_id, older=True)
+        prev_id = clips.neighbour_pending(conn, clip_id, older=False)
+    else:
+        next_id = clips.neighbour(conn, clip_id, view, older=True)
+        prev_id = clips.neighbour(conn, clip_id, view, older=False)
     return render(
         request,
         "clip.html",
@@ -197,8 +226,9 @@ def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn) -> R
             "sensitive": _sensitive(request, clip.creator, clip.current.sensitive),
             "reviews": reviews,
             "last_export_error": last_export_error,
-            "next_id": clips.neighbour_pending(conn, clip_id, older=True),
-            "prev_id": clips.neighbour_pending(conn, clip_id, older=False),
+            "next_id": next_id,
+            "prev_id": prev_id,
+            "view_query": _view_query(view),
             "reasons": REJECT_REASONS,
             "can_review": clip.status in REVIEWABLE,
             "gate_labels": GATE_REASON_LABELS,
@@ -218,9 +248,17 @@ def _action_error(request: Request, message: str, status_code: int) -> Response:
     return render(request, "_action_error.html", {"message": message}, status_code=status_code)
 
 
-def _move_on(request: Request, conn: sqlite3.Connection, clip_id: int) -> Response:
-    nxt = clips.next_pending_after(conn, clip_id)
-    location = f"/clip/{nxt}" if nxt is not None else "/queue"
+def _move_on(
+    request: Request, conn: sqlite3.Connection, clip_id: int, view: QueueFilter | None
+) -> Response:
+    """Go to the next clip in the view the clip was opened from (CLP-62), else the queue."""
+    nxt = (
+        clips.next_pending_after(conn, clip_id)
+        if view is None
+        else clips.next_after(conn, clip_id, view)
+    )
+    query = _view_query(view)
+    location = f"/clip/{nxt}{query}" if nxt is not None else f"/queue{query}"
     if _is_htmx(request):
         return Response(status_code=200, headers={"HX-Redirect": location})
     return RedirectResponse(location, status_code=303)
@@ -233,6 +271,7 @@ def approve_clip(
     _user: User,
     conn: Conn,
     background: BackgroundTasks,
+    view: View,
     version: FormVersion = None,
     confirm_sensitive: Annotated[str, Form(max_length=8)] = "",
 ) -> Response:
@@ -266,7 +305,7 @@ def approve_clip(
     if result.status == ClipStatus.APPROVED:
         if request.app.state.export_locks.busy(clip_id):
             flash(request, f"Export already in progress for clip {clip_id}.")
-            return _move_on(request, conn, clip_id)
+            return _move_on(request, conn, clip_id, view)
         background.add_task(export_in_background, request.app.state, clip_id)
         flash(
             request,
@@ -274,7 +313,7 @@ def approve_clip(
             if result.changed
             else f"Retrying export of clip {clip_id}.",
         )
-    return _move_on(request, conn, clip_id)
+    return _move_on(request, conn, clip_id, view)
 
 
 def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.ClipDetail) -> None:
@@ -359,6 +398,7 @@ def reject_clip(
     clip_id: ClipId,
     _user: User,
     conn: Conn,
+    view: View,
     reason_tag: Annotated[str, Form(max_length=32)] = "",
     version: FormVersion = None,
 ) -> Response:
@@ -372,7 +412,7 @@ def reject_clip(
         return _action_error(request, f"Cannot reject: clip is {exc.current}.", 409)
     if result.changed:
         flash(request, f"Clip {clip_id} rejected ({reason_tag}).")
-    return _move_on(request, conn, clip_id)
+    return _move_on(request, conn, clip_id, view)
 
 
 @router.get("/media/clip/{clip_id}/{version}/{kind}")
@@ -415,6 +455,7 @@ def edit_variants(
     clip_id: ClipId,
     _user: User,
     conn: Conn,
+    view: View,
     version: Annotated[int, Form(ge=1, le=MAX_ID)],
     fingerprint_seen: Annotated[str, Form(alias="fingerprint", max_length=64)],
     tiktok_title: VariantTitle = None,
@@ -487,7 +528,7 @@ def edit_variants(
         except InvalidTransition as exc:
             return _action_error(request, f"Cannot edit: clip is {exc.current}.", 409)
         flash(request, f"Saved the platform text for clip {clip_id}.")
-    location = f"/clip/{clip_id}"
+    location = f"/clip/{clip_id}{_view_query(view)}"
     if _is_htmx(request):
         return Response(status_code=200, headers={"HX-Redirect": location})
     return RedirectResponse(location, status_code=303)

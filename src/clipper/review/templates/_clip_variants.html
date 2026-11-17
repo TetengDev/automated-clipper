@@ -3,7 +3,7 @@
 <section class="variants" id="clip-variants" aria-labelledby="variants-heading">
   <h2 id="variants-heading">Per-platform text</h2>
   {% if can_review %}
-  <form method="post" action="/clip/{{ clip.id }}/variants" hx-post="/clip/{{ clip.id }}/variants"
+  <form method="post" action="/clip/{{ clip.id }}/variants{{ view_query }}" hx-post="/clip/{{ clip.id }}/variants{{ view_query }}"
         hx-target="#action-error" hx-disabled-elt="find button">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="version" value="{{ v.version }}">

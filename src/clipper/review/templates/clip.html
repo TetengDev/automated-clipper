@@ -3,10 +3,10 @@
 {% block title %}{{ v.title or "Clip" }} · Clipper review{% endblock %}
 {% block content %}
 <nav class="clip-nav">
-  <a href="/queue">&larr; Queue</a>
+  <a href="/queue{{ view_query }}">&larr; Queue</a>
   <span>
-    {% if prev_id %}<a id="prev-clip" href="/clip/{{ prev_id }}" rel="prev">Previous (k)</a>{% endif %}
-    {% if next_id %}<a id="next-clip" href="/clip/{{ next_id }}" rel="next">Next (j)</a>{% endif %}
+    {% if prev_id %}<a id="prev-clip" href="/clip/{{ prev_id }}{{ view_query }}" rel="prev">Previous (k)</a>{% endif %}
+    {% if next_id %}<a id="next-clip" href="/clip/{{ next_id }}{{ view_query }}" rel="next">Next (j)</a>{% endif %}
   </span>
 </nav>
 <article class="clip" data-clip-id="{{ clip.id }}">
@@ -40,7 +40,7 @@
     <div id="action-error" aria-live="polite"></div>
     {% if can_review %}
     <div class="actions">
-      <form method="post" action="/clip/{{ clip.id }}/approve" hx-post="/clip/{{ clip.id }}/approve"
+      <form method="post" action="/clip/{{ clip.id }}/approve{{ view_query }}" hx-post="/clip/{{ clip.id }}/approve{{ view_query }}"
             hx-target="#action-error" hx-disabled-elt="find button">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="version" value="{{ v.version }}">
@@ -50,7 +50,7 @@
         {% endif %}
         <button type="submit" id="approve-btn">Approve (a)</button>
       </form>
-      <form method="post" action="/clip/{{ clip.id }}/reject" hx-post="/clip/{{ clip.id }}/reject"
+      <form method="post" action="/clip/{{ clip.id }}/reject{{ view_query }}" hx-post="/clip/{{ clip.id }}/reject{{ view_query }}"
             hx-target="#action-error" hx-disabled-elt="find button" class="reject">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="version" value="{{ v.version }}">
@@ -64,7 +64,7 @@
     </div>
     {% elif can_retry_export %}
     {% if last_export_error %}<p class="error" id="export-error">Last export failed ({{ last_export_error }}). Details are in the server log.</p>{% endif %}
-    <form method="post" action="/clip/{{ clip.id }}/approve" hx-post="/clip/{{ clip.id }}/approve"
+    <form method="post" action="/clip/{{ clip.id }}/approve{{ view_query }}" hx-post="/clip/{{ clip.id }}/approve{{ view_query }}"
           hx-target="#action-error" hx-disabled-elt="find button">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="version" value="{{ v.version }}">

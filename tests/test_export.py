@@ -76,7 +76,8 @@ def test_export_writes_package_to_dated_folder(env: Env) -> None:
         day_dir / f"{stem}.json",
     )
     assert (day_dir / f"{stem}.mp4").read_bytes() == VIDEO
-    assert (day_dir / f"{stem}.caption.txt").read_text() == "Watch this\n\n#funny #viral\n"
+    # #viral is generic, so it is dropped (CLP-111).
+    assert (day_dir / f"{stem}.caption.txt").read_text() == "Watch this\n\n#funny\n"
     meta = json.loads((day_dir / f"{stem}.json").read_text())
     assert meta["title"] == "Big Moment!"
     assert meta["creator"] == "Kai Cenat"
@@ -657,3 +658,30 @@ def test_sidecar_carries_the_per_platform_variants(env: Env) -> None:
         "caption": "Watch this",
         "hashtags": ["#funny", "#kai"],
     }
+
+
+def test_caption_txt_drops_generic_disclosure_and_lookalike_tags(env: Env) -> None:
+    """CLP-111: a version stored with an unchecked hashtag list (selected before the
+    select-side fix) still never puts #fyp, #ad or a Cyrillic #fyр in caption.txt."""
+    stored = ["#fyp", "#ad", "#fyр", "#Sp0nsored_2024", "#kai", "#funny", "#KAI"]
+    clip_id = approved_clip(env, hashtags=stored)
+
+    run(env, clip_id)
+
+    day_dir = env.output_dir / "ready" / "2027-01-15"
+    (caption,) = day_dir.glob("*.caption.txt")
+    assert caption.read_text() == "Watch this\n\n#kai #funny\n"
+    (sidecar,) = day_dir.glob("*.json")
+    assert json.loads(sidecar.read_text())["hashtags"] == ["#kai", "#funny"]
+
+
+def test_caption_txt_keeps_every_clean_legacy_tag(env: Env) -> None:
+    """The legacy list holds up to 10 tags; cleaning drops bad ones but does not cut to the
+    variants' 5."""
+    tags = [f"#tag{i}" for i in range(8)]
+    clip_id = approved_clip(env, hashtags=tags)
+
+    run(env, clip_id)
+
+    (caption,) = (env.output_dir / "ready" / "2027-01-15").glob("*.caption.txt")
+    assert caption.read_text() == "Watch this\n\n" + " ".join(tags) + "\n"

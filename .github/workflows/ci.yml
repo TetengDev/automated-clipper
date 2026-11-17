@@ -56,13 +56,16 @@ jobs:
           enable-cache: true
           save-cache: false # the test job saves the same cache
 
-      # A stalled mirror once hung an apt install for over an hour (CLP-131): apt retries
-      # and times out per request, the whole install retries once, and the step is capped.
+      # A stalled mirror once hung an apt install for over an hour (CLP-131): every apt call
+      # in this job, Playwright's included, retries and times out per request; each install
+      # also retries once as a whole, and the steps are capped.
+      - name: Configure apt retries and timeouts
+        run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\n' | sudo tee /etc/apt/apt.conf.d/99-retries
+
       - name: Install ffmpeg
         timeout-minutes: 10
         run: |
-          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
-          apt_install() { "${apt[@]}" update && "${apt[@]}" install -y --no-install-recommends ffmpeg; }
+          apt_install() { sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg; }
           apt_install || apt_install
 
       - name: Install dependencies

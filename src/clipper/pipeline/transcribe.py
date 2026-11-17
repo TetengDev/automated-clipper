@@ -25,6 +25,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -113,8 +114,10 @@ _MARKER_TMP = re.compile(rf"{re.escape(COMPLETE_MARKER)}(\.\d+)?\.tmp")
 """The marker's temp file, named per process (before CLP-76 without the pid); one left
 behind by a killed process is harmless."""
 STORE_LOCK = ".lock"
-"""`flock`ed in the models dir while a process checks, fetches, heals or marks."""
+"""`flock`ed in the models dir while a process checks, fetches, heals, marks or prunes."""
 STORE_LOCK_POLL_S = 0.2
+_STORE_FILE = re.compile(r"[0-9a-f]{64}")
+"""A file in the Hub client's shared store (`<models>/blobs/<xx>/<hash>`)."""
 LOCAL_RTF_BUDGET = 3
 """A local chunk may take up to 3x its length (large-v3 on a slow VPS CPU), never less
 than CHUNK_CALL_TIMEOUT_S; the stage deadline still caps it."""
@@ -454,7 +457,7 @@ class FasterWhisperTranscriber:
 
         All of it runs under the store lock, so two processes (the worker and an operator's
         `bench-transcribe`) never fetch or discard under each other: the second waits, then
-        finds the marker."""
+        finds the marker. A fetch also prunes the revisions no pin names any more."""
         pin = WHISPER_MODELS[self.model]
         snapshot = self.snapshot_dir
         marker = snapshot / COMPLETE_MARKER
@@ -484,6 +487,7 @@ class FasterWhisperTranscriber:
                     tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
                     tmp.write_text(pin.sha256, encoding="utf-8")
                     os.replace(tmp, marker)
+                    prune_unpinned(self.models_dir)
                     return snapshot
                 logger.warning(
                     "whisper model %s: snapshot rejected (%s)", self.model, _describe(problems)
@@ -615,6 +619,106 @@ def _store_lock(models_dir: Path, timeout_s: float, what: str) -> Iterator[None]
         yield
     finally:
         os.close(fd)  # releases the lock
+
+
+def prune_unpinned(models_dir: Path) -> int:
+    """Delete the model revisions no `WHISPER_MODELS` pin names (left behind when a pin
+    moves on), then the repo blobs and shared-store files no remaining snapshot uses;
+    returns the entries deleted. The caller holds the store lock.
+
+    Only `models--*` repo dirs and the shared store `blobs/<xx>/` are looked at, and only
+    through real dirs: a link is removed itself, never followed, so nothing outside the
+    models dir goes. A path that cannot be deleted is logged and skipped."""
+    root = models_dir.resolve()
+    pinned = {
+        root / f"models--{p.repo.replace('/', '--')}" / "snapshots" / p.revision
+        for p in WHISPER_MODELS.values()
+    }
+    repos = _real_dirs(root, "models--*")
+    deleted = 0
+    for repo in repos:
+        for revision in _real_dirs(repo / "snapshots", "*"):
+            if revision not in pinned:
+                deleted += _delete(revision)
+    used = {
+        _link_target(path)
+        for repo in repos
+        for revision in _real_dirs(repo / "snapshots", "*")
+        for path in _tree(revision)
+    }
+    for repo in repos:
+        if not _real_dirs(repo / "snapshots", "*"):
+            deleted += _delete(repo)  # no revision left: refs, blobs and all
+            continue
+        for blob in _entries(repo / "blobs"):
+            if blob not in used:
+                deleted += _delete(blob)
+    stored = {_link_target(blob) for repo in repos for blob in _entries(repo / "blobs")}
+    for prefix in _real_dirs(root / "blobs", "??"):
+        for entry in _entries(prefix):
+            if _STORE_FILE.fullmatch(entry.name) and entry not in stored:
+                deleted += _delete(entry) + _delete(entry.with_name(f"{entry.name}.refs"))
+    if deleted:
+        logger.info("whisper models: pruned %d unpinned file(s) and dir(s)", deleted)
+    return deleted
+
+
+def _entries(directory: Path) -> list[Path]:
+    """What a real dir holds; nothing for a link, a file or a miss."""
+    if not _is_real_dir(directory):
+        return []
+    try:
+        return sorted(directory.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        logger.warning("whisper models: cannot read %s: %s", directory, type(exc).__name__)
+        return []
+
+
+def _real_dirs(directory: Path, pattern: str) -> list[Path]:
+    """The real dirs (not links to one) in `directory` whose name matches `pattern`."""
+    return [p for p in _entries(directory) if p.match(pattern) and _is_real_dir(p)]
+
+
+def _is_real_dir(path: Path) -> bool:
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _tree(directory: Path) -> Iterator[Path]:
+    """Every entry under a real dir, without entering links."""
+    for entry in _entries(directory):
+        yield entry
+        yield from _tree(entry)
+
+
+def _link_target(path: Path) -> Path | None:
+    """Where a link points (one hop, not followed further); None for anything else."""
+    try:
+        return Path(os.path.normpath(path.parent / os.readlink(path)))
+    except OSError:
+        return None
+
+
+def _delete(path: Path) -> int:
+    """Remove a file or link (never what a link points to), or a real dir bottom-up;
+    returns the entries deleted. Anything that cannot go is logged and skipped."""
+    is_dir = _is_real_dir(path)
+    deleted = sum(_delete(child) for child in _entries(path)) if is_dir else 0
+    try:
+        if is_dir:
+            path.rmdir()
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        return deleted
+    except OSError as exc:
+        logger.warning("whisper models: cannot delete %s: %s", path, type(exc).__name__)
+        return deleted
+    return deleted + 1
 
 
 def call_timeout(backend: Transcriber, chunk_seconds: float) -> float:

@@ -1,8 +1,11 @@
 """Two worker processes on one DB file (CLP-34): every job stage runs exactly once.
 
 Real processes, not threads or mocks: each runs `Worker.run_once` against the shared
-SQLite file with stub stages that record their calls. The lease is 2 s and some stages
-take 2.5 s, so only the lease heartbeat keeps the other worker from taking those over.
+SQLite file with stub stages that record their calls. The lease is 4 s, but `lease_until`
+is stored to the whole second, so a claim lasts 3 to 4 s; the heartbeat renews it every
+1 s, which leaves at least two beats of slack. One stage takes 5.5 s, longer than any
+lease, while the other worker has little else to do and polls every 50 ms: without the
+heartbeat it takes that stage over and runs it a second time.
 """
 
 from __future__ import annotations
@@ -35,8 +38,8 @@ def stage(status):
     def run(job, ctx):
         with open(calls, "a") as fh:
             fh.write(f"{job.id} {status.value} {worker_id}\\n")
-        slow = status is JobStatus.TRANSCRIBING and job.id % 7 == 0
-        time.sleep(2.5 if slow else 0.01)  # the slow ones outlive the 2 s lease
+        slow = status is JobStatus.TRANSCRIBING and job.id == 7
+        time.sleep(5.5 if slow else 0.01)  # outlives the lease
         (ctx.media_dir / f"{status.value}.done").write_text(worker_id)
     return StageDef(run, f"{status.value}.done")
 
@@ -44,7 +47,7 @@ stages = {**DEFAULT_STAGES, **{JobStatus(s): stage(JobStatus(s)) for s in sys.ar
 conn = connect(Path(db))
 worker = Worker(
     conn=conn, config=AppConfig(), worker_id=worker_id, stages=stages,
-    media_root=Path(media), lease=timedelta(seconds=2),
+    media_root=Path(media), lease=timedelta(seconds=4),
 )
 (Path(ready) / worker_id).touch()
 while len(list(Path(ready).iterdir())) < 2:

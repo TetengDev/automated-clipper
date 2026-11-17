@@ -71,6 +71,8 @@ AUDIO_SAMPLE_RATE = "48000"
 DEFAULT_RENDER_TIMEOUT_S = 900.0
 DEFAULT_FFMPEG_TIMEOUT_S = 300.0
 STDERR_TAIL_CHARS = 4000
+KILL_WAIT_S = 10.0
+"""After the SIGKILL, how long to wait for the output pipes to close (CLP-66)."""
 # Below this the input is effectively silent; loudnorm cannot (and should not) boost it.
 SILENCE_LUFS = -70.0
 JOIN_FADE_S = 0.025
@@ -127,6 +129,22 @@ def _kill_group(proc: subprocess.Popen[str]) -> None:
         os.killpg(proc.pid, signal.SIGKILL)
 
 
+def _drain_killed(proc: subprocess.Popen[str]) -> tuple[Any, Any]:
+    """(stdout, stderr) of a killed group, waiting at most KILL_WAIT_S for the pipes to
+    close. A descendant that left the group (its own session) can hold them open long
+    after the kill; then close our ends and keep what was read so far."""
+    try:
+        return proc.communicate(timeout=KILL_WAIT_S)
+    except subprocess.TimeoutExpired as exc:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=KILL_WAIT_S)  # the leader itself was killed: reaped at once
+        return exc.output, exc.stderr
+
+
 def run_process(
     argv: Sequence[str],
     *,
@@ -138,6 +156,7 @@ def run_process(
     """Run argv (no shell) in a new session; on timeout SIGKILL the whole process group.
 
     Raises subprocess.TimeoutExpired (with the captured stderr) after killing the group.
+    The wait for the killed group's output is bounded too (KILL_WAIT_S).
     """
     proc = popen(
         list(argv),
@@ -154,11 +173,11 @@ def run_process(
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_group(proc)
-        stdout, stderr = proc.communicate()
+        stdout, stderr = _drain_killed(proc)
         raise subprocess.TimeoutExpired(list(argv), timeout, output=stdout, stderr=stderr) from None
     except BaseException:  # KeyboardInterrupt etc.: never leave Chrome/ffmpeg behind
         _kill_group(proc)
-        proc.communicate()
+        _drain_killed(proc)
         raise
     # The leader exited; sweep anything it left running in its group (Chrome helpers etc.).
     # Residual risk: once every member is gone the pgid could in theory be reused by an

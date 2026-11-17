@@ -1,8 +1,10 @@
+import contextlib
 import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -700,6 +702,59 @@ def test_run_process_real_timeout_kills_children(tmp_path: Path) -> None:
         time.sleep(0.05)
     else:
         pytest.fail("grandchild still alive after timeout")
+
+
+_ESCAPEE = (
+    "import subprocess, sys, time\n"
+    "child = subprocess.Popen(['sleep', '30'], start_new_session=True)\n"
+    "open(sys.argv[1], 'w').write(str(child.pid))\n"
+    "time.sleep(30)\n"
+)
+"""Leaves a grandchild outside the process group that still holds stdout/stderr."""
+
+
+def _reap_escapee(pidfile: Path) -> None:
+    if pidfile.exists():
+        with contextlib.suppress(ProcessLookupError, ValueError):
+            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_run_process_wait_after_kill_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt: bool
+) -> None:
+    """CLP-66: a descendant that left the group keeps the pipes open after the kill; the
+    stage gives up on its output after KILL_WAIT_S instead of blocking until it exits."""
+    monkeypatch.setattr(render, "KILL_WAIT_S", 0.5)
+    pidfile = tmp_path / "escapee.pid"
+    argv = [sys.executable, "-c", _ESCAPEE, str(pidfile)]
+    expected: type[BaseException] = subprocess.TimeoutExpired
+    popen: Any = subprocess.Popen
+    if interrupt:
+        expected = KeyboardInterrupt
+
+        def popen(*args: Any, **kw: Any) -> subprocess.Popen[str]:
+            proc = subprocess.Popen(*args, **kw)  # noqa: S603 - argv built above
+            real = proc.communicate
+
+            def communicate(timeout: float | None = None) -> Any:
+                if timeout == 5:  # the stage's own wait: interrupted once the escapee runs
+                    while not pidfile.exists():
+                        time.sleep(0.05)
+                    raise KeyboardInterrupt
+                return real(timeout=timeout)
+
+            proc.communicate = communicate  # type: ignore[method-assign]
+            return proc
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(expected):
+            render.run_process(argv, timeout=1 if not interrupt else 5, popen=popen)
+        elapsed = time.monotonic() - started
+    finally:
+        _reap_escapee(pidfile)
+    assert elapsed < 5
 
 
 def test_sigterm_handler_scoped_to_render(

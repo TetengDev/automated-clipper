@@ -9,8 +9,12 @@ import yaml
 REPO = Path(__file__).resolve().parents[1]
 
 
+def _compose(name: str) -> dict:
+    return yaml.safe_load((REPO / name).read_text(encoding="utf-8"))
+
+
 def _services(name: str) -> dict:
-    return yaml.safe_load((REPO / name).read_text(encoding="utf-8"))["services"]
+    return _compose(name)["services"]
 
 
 def _mount_for(service: dict, path: str) -> tuple[str, bool]:
@@ -43,3 +47,13 @@ def test_only_the_worker_can_write_the_models_dir(service: str, read_only: bool)
 def test_override_does_not_remount_volumes() -> None:
     for name, service in _services("docker-compose.override.yml").items():
         assert "volumes" not in service, name
+
+
+@pytest.mark.parametrize("service", ["review", "monitor"])
+def test_read_only_models_services_keep_the_shared_volumes(service: str) -> None:
+    """The read-only anchor restates the shared volume list; it must not drift from it."""
+    compose = _compose("docker-compose.yml")
+    assert compose["services"][service]["volumes"] == [
+        *compose["x-clipper"]["volumes"],
+        "./data/models:/app/data/models:ro",
+    ]

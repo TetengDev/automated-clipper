@@ -165,7 +165,7 @@ def _drain_killed(proc: subprocess.Popen[str]) -> tuple[Any, Any]:
                 with contextlib.suppress(OSError):
                     pipe.close()
         with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=KILL_WAIT_S)  # the leader itself was killed: reaped at once
+            proc.wait(timeout=1.0)  # the leader itself was killed: reaped at once
         return exc.output, exc.stderr
 
 

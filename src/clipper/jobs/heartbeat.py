@@ -37,6 +37,8 @@ def _renew_until_stopped(
 ) -> None:
     conn: sqlite3.Connection | None = None
     try:
+        with contextlib.suppress(sqlite3.Error, OSError):  # else retried (and logged) per beat
+            conn = connect(db)  # now, so the first beat does not wait for it
         while not stop.wait(lease.total_seconds() / 4):
             try:
                 conn = conn or connect(db)

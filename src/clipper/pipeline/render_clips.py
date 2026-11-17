@@ -417,6 +417,7 @@ def _render_slot(media_root: Path, slots: int) -> Iterator[bool]:
     slot_dir = media_root / SLOTS_DIR
     slot_dir.mkdir(exist_ok=True)
     for index in range(slots):
+        # Render children never inherit the fd (Popen's close_fds), so the lock dies with us.
         fd = os.open(slot_dir / str(index), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

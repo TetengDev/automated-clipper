@@ -47,6 +47,7 @@ from clipper.hashtag_data import (
     SCRIPT_STARTS,
 )
 from clipper.pipeline.common import strip_control
+from clipper.tld_data import TLDS
 
 PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
 GENERIC_HASHTAGS = frozenset({"#fyp", "#foryou", "#foryoupage", "#viral", "#trending", "#fy"})
@@ -99,8 +100,12 @@ by skeleton (`#ꜱponsored`): only a campaign may add them (as campaign tags at 
 never the model or a variant."""
 _LOOKALIKE_DIGITS = str.maketrans("013457", "oieast")
 _TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online|store|live|click"
+"""Common TLDs: only these mark another link inside an allowed URL's path (`_LINK_IN_PATH`)."""
 _SPOKEN_TLDS = "com|net|org|io|ly|gg|co|xyz|link|tv|app|info|biz|click"
-"""After a spoken "dot": only TLDs that are not everyday words ("polka dot shop")."""
+"""After a spoken "dot": only TLDs that are not everyday words ("polka dot shop"); most real
+TLDs are (`to`, `is`, `shop`, `live`, `rocks`), so "scam dot rocks" is not flagged."""
+_REAL_TLD = "|".join(re.escape(t) for t in sorted(TLDS, key=lambda t: (-len(t), t)))
+"""Any IANA root-zone TLD (`tld_data`), in any case: Latin, punycode or another script."""
 # A name starts a token: never mid-word or right after a hyphen, or a dot that follows a
 # word character or hyphen, so each run of text is scanned once (no quadratic backtracking on
 # "a-a-a-..." or "a.a.a...").
@@ -108,14 +113,16 @@ _NAME = r"(?<![\w-])(?<![\w-]\.)[\w-]+"
 LINK_OR_MENTION = re.compile(
     # A URL ends before quotes, brackets and trailing punctuation.
     r"(?i:(?<![\w./:-])(?:https?://|www\.)[\w\-.~:/?#@!$&*+,;=%]*[\w\-/#=~%&+])"
-    # A domain: "name.tld" with no space around the dot. Any TLD of 2-24 letters in one
-    # case, or a common TLD in any case, so a sentence break ("the store. Me") is not one.
-    + rf"|{_NAME}(?:\.[\w-]+)*\.(?:[a-z]{{2,24}}|[A-Z]{{2,24}}|(?i:{_TLDS}))\b"
+    # A domain: "name.tld" with no space around the dot, on a real TLD in any case
+    # (`Scam.Rocks`, `сайт.рф`), so a sentence break ("the store. Me") is not one, nor a
+    # file name whose extension is no TLD (`Node.js`, `index.html`). One that is a TLD
+    # (`notes.md`, `clip.mov`) reads as a domain: it is one, and `allowed_links` admits it.
+    + rf"|{_NAME}(?:\.[\w-]+)*\.(?i:{_REAL_TLD})\b"
     # An obfuscated dot: "name[.]com", "name(dot)com", "name [d0t] info", "name . com".
-    + rf"|(?i:{_NAME}[ \t]*[\[(][ \t]*(?:\.|dot|d0t)[ \t]*[\])][ \t]*[a-z]{{2,24}}\b)"
+    + rf"|(?i:{_NAME}[ \t]*[\[(][ \t]*(?:\.|dot|d0t)[ \t]*[\])][ \t]*(?:{_REAL_TLD})\b)"
     + rf"|(?i:{_NAME}[ \t]+\.[ \t]+(?:{_SPOKEN_TLDS})\b)"
-    # Spelled out: "name d0t anything", or "name dot com" with a common TLD.
-    + rf"|(?i:{_NAME}[ \t]+d0t[ \t]+[a-z]{{2,24}}\b)"
+    # Spelled out: "name d0t rocks" with any real TLD, or "name dot com" with a common one.
+    + rf"|(?i:{_NAME}[ \t]+d0t[ \t]+(?:{_REAL_TLD})\b)"
     + rf"|(?i:{_NAME}[ \t]+dot[ \t]+(?:{_SPOKEN_TLDS})\b)"
     # An IPv4 address.
     + r"|(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)"
@@ -450,8 +457,9 @@ def is_mixed_script(tag: str) -> bool:
 
 
 def links_or_mentions(text: str) -> list[str]:
-    """Links, domains, IPs and @mentions in `text`, in order (as matched, normalized)."""
-    return [found for found, _ in _link_matches(text)]
+    """Links, domains, IPs and @mentions in `text`, in order, as typed (`name．com`, not the
+    normalized `name.com`), so a reviewer can find them in the text."""
+    return [typed for _, typed in _link_matches(text)]
 
 
 def _link_host(link: str) -> str | None:
@@ -974,7 +982,7 @@ def preflight(
     # An allowed match must also read the same as typed (up to NFKC): a combining mark in a
     # host is stripped for matching but would still be posted, to a different IDN host.
     found = [
-        f
+        typed
         for f, typed in _link_matches(f"{metadata.title}\n{metadata.caption}")
         if not (brief and brief.allows(f) and _fold(typed) == _fold(f))
     ]

@@ -266,6 +266,17 @@ whole and judged by the link rules, which hold campaign posts only, but a disclo
 one (`https://site.com/page#ad`) still holds a plain post for a person to look at. After a
 mention or a bare domain (`@bob/#ad`, `site.com/#ad`) a `#` starts a tag as usual.
 
+A bare domain counts as a link only when it ends in a real top-level domain from the IANA
+root-zone list, in any case or script (`Scam.Rocks`, `сайт.рф`, `scam.xn--p1ai`), so a
+sentence break or a file name such as `Node.js` or `index.html` is not flagged. A file name
+whose extension is also a TLD (`notes.md`, `clip.mov`, `setup.zip`) is flagged, since it is
+a working domain too; a campaign that needs one lists it in `allowed_links`. A spoken "dot"
+counts only before a TLD that is not an everyday word (`name dot com`, but not
+`scam dot rocks`). Warnings show the link as it was typed, so the reviewer can find it in
+the text. The list is vendored in `src/clipper/tld_data.py`; refresh it with
+`uv run python scripts/gen_tld_data.py` when IANA adds TLDs (it refuses a list older than
+the vendored one).
+
 Generic and disclosure tags are also caught as lookalikes written in one script, such as
 all-Cyrillic `#аԁ`, the small capitals `#ᴀᴅ` or `#ꜰʏᴘ`, Greek capitals `#ϜΥΡ`, accented
 `#àd`, digits, underscores or a capital I (`#v1ral`, `#co11ab`, `#f_y_p`, `#viraI`), or a

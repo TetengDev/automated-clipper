@@ -418,3 +418,14 @@ def test_a_typed_disclosure_like_tag_is_refused(client: TestClient, env: Env) ->
     assert response.status_code == 422
     assert "instagram caption has disclosure-like tags #paidpartnership" in response.text
     assert stored(env, clip_id) == STORED
+
+
+def test_link_warnings_show_the_text_as_typed(client: TestClient, env: Env) -> None:
+    """CLP-116: the reviewer can Find the warned text in the caption."""
+    clip_id = env.clip()
+    caption = "Claim at prize．com or Scam.Rocks"
+    store(env, clip_id, {**STORED, "youtube": {**STORED["youtube"], "caption": caption}})
+
+    html = client.get(f"/clip/{clip_id}").text
+
+    assert "links or mentions: prize．com, Scam.Rocks</p>" in html

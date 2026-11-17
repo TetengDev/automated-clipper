@@ -1067,16 +1067,40 @@ def test_cli_boot_check_failure_alerts_and_keeps_running(
     assert "run-monitor: " in failing_boot_check[0] and hint in failing_boot_check[0]
 
 
-def test_cli_malformed_alerts_webhook_stops_the_monitor(
-    cli_env, monkeypatch: pytest.MonkeyPatch
+BAD_WEBHOOK = "http://example.com/api/webhooks/9/s3cret-token"
+
+
+@pytest.mark.parametrize("name", ["DISCORD_ALERTS_WEBHOOK_URL", "DISCORD_WEBHOOK_URL"])
+def test_cli_malformed_webhook_is_logged_and_the_monitor_keeps_running(
+    cli_env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, name: str
 ) -> None:
     args, _ = cli_env
-    monkeypatch.setenv("DISCORD_ALERTS_WEBHOOK_URL", "http://example.com/hook")
+    monkeypatch.setenv(name, BAD_WEBHOOK)
 
-    result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
 
-    assert result.exit_code == 1
-    assert "DISCORD_ALERTS_WEBHOOK_URL must be a https://discord.com/api/webhooks/" in result.stderr
+    assert result.exit_code == 0, result.output
+    assert "cycle done" in result.output
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == [
+        f"run-monitor: {name} must be a https://discord.com/api/webhooks/... URL;"
+        " alerts go to the log"
+    ]
+    assert "s3cret" not in caplog.text + result.output
+
+
+def test_monitor_alert_falls_through_a_malformed_alerts_webhook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from clipper.notify import DiscordWebhook
+
+    monkeypatch.setenv("DISCORD_ALERTS_WEBHOOK_URL", BAD_WEBHOOK)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/pings")
+    with httpx.Client() as http:
+        assert isinstance(cli._alert_webhook(http, Secrets()), DiscordWebhook)
+        monkeypatch.setenv("DISCORD_WEBHOOK_URL", BAD_WEBHOOK)
+        assert cli._alert_webhook(http, Secrets()) is None
 
 
 def test_cli_warns_about_unresolved_creators(cli_env) -> None:

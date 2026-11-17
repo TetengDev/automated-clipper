@@ -359,6 +359,7 @@ doctor`.
 ([CLP-129](https://linear.app/tengdev/issue/CLP-129)). A failure is logged at ERROR with the
 same hint `doctor` prints and sent to the alerts webhook (`DISCORD_ALERTS_WEBHOOK_URL`, else
 `DISCORD_WEBHOOK_URL`); the service keeps running, because yt-dlp still downloads without the
-solver, just with fewer formats. A passing check logs one INFO line.
+solver, just with fewer formats. A passing check logs one INFO line. A malformed webhook URL
+stops the worker but not the monitor, which logs the variable name and keeps detecting.
 
 See `docs/RUNBOOK.md` (written in E5-S8). It covers YouTube bot blocks, quota, stuck jobs, a full disk, budgets, Twitch auth, key rotation, rollback, restore, and adding a creator.

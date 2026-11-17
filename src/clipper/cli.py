@@ -321,8 +321,11 @@ def _posting_config(conn: sqlite3.Connection, config_path: Path) -> PostingConfi
     return live
 
 
-def _webhook(http: httpx.Client, value: SecretStr | None, name: str) -> Notify | None:
-    """The Discord webhook `name` holds, None when unset. A malformed URL stops the service."""
+def _webhook(
+    http: httpx.Client, value: SecretStr | None, name: str, *, strict: bool = True
+) -> Notify | None:
+    """The Discord webhook `name` holds, None when unset. A malformed URL stops the worker;
+    the monitor (`strict=False`) logs it, by name only, and treats it as unset."""
     from clipper.notify import DiscordWebhook
 
     if value is None or not value.get_secret_value().strip():
@@ -330,20 +333,32 @@ def _webhook(http: httpx.Client, value: SecretStr | None, name: str) -> Notify |
     try:
         return DiscordWebhook(value.get_secret_value().strip(), http)
     except ValueError:
-        _fail(f"{name} must be a https://discord.com/api/webhooks/... URL")
+        problem = f"{name} must be a https://discord.com/api/webhooks/... URL"
+        if strict:
+            _fail(problem)
+        logger.error("run-monitor: %s; alerts go to the log", problem)
+        return None
 
 
 def _alert_webhook(http: httpx.Client, secrets: Secrets) -> Notify | None:
-    """The worker's alert webhook (DISCORD_ALERTS_WEBHOOK_URL, else DISCORD_WEBHOOK_URL)."""
-    alerts = _webhook(http, secrets.discord_alerts_webhook_url, "DISCORD_ALERTS_WEBHOOK_URL")
-    return alerts or _webhook(http, secrets.discord_webhook_url, "DISCORD_WEBHOOK_URL")
+    """The monitor's alerts: the worker's alert webhook (DISCORD_ALERTS_WEBHOOK_URL, else
+    DISCORD_WEBHOOK_URL), else None. A malformed URL never stops detection."""
+    name = "DISCORD_ALERTS_WEBHOOK_URL"
+    alerts = _webhook(http, secrets.discord_alerts_webhook_url, name, strict=False)
+    pings = secrets.discord_webhook_url
+    return alerts or _webhook(http, pings, "DISCORD_WEBHOOK_URL", strict=False)
 
 
 def _preflight(service: str, alert: Notify | None) -> None:
-    """Doctor's Deno solver check, once at boot (CLP-129): logs and alerts, never stops."""
-    from clipper import doctor
+    """Doctor's Deno solver check, once at boot (CLP-129): logs and alerts, never stops.
+    The log fallback (`log_notify`) counts as no alert: it would repeat the ERROR line."""
+    try:
+        from clipper import doctor
+        from clipper.notify import log_notify
 
-    doctor.startup_check(service, alert)
+        doctor.startup_check(service, None if alert is log_notify else alert)
+    except Exception:
+        logger.exception("%s: the Deno solver check crashed", service)
 
 
 def _notifiers(http: httpx.Client) -> tuple[Notify, Notify]:

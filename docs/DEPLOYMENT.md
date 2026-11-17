@@ -261,12 +261,14 @@ mixed-script tags written into the title or caption. A post that fails is held t
 way. Links, mentions and too few hashtags hold only campaign posts. Such inline tags are
 also stripped from the model's titles and captions, from the per-platform text and from
 the export package, so in practice the check catches only text stored before that cleaning
-existed. A `#` inside a link (`https://site.com/page#fyp`) is left alone; a disclosure-like
-one still holds the post for a person to look at.
+existed. A `#` inside a link or the path after a domain (`https://site.com/page#fyp`,
+`site.com/page#ad`) is not read as a tag: it is left alone and judged by the link rules,
+which hold campaign posts only.
 
 Generic and disclosure tags are also caught as lookalikes written in one script, such as
-all-Cyrillic `#аԁ`, the small capitals `#ᴀᴅ` or `#ꜰʏᴘ`, accented `#àd`, or a Latin tag
-padded with Japanese or Chinese (`#ad一`). The comparison uses the Unicode confusables
+all-Cyrillic `#аԁ`, the small capitals `#ᴀᴅ` or `#ꜰʏᴘ`, Greek capitals `#ϜΥΡ`, accented
+`#àd`, digits or underscores (`#v1ral`, `#co11ab`, `#f_y_p`), or a Latin tag padded with
+Japanese or Chinese (`#ad一`). The comparison uses the Unicode confusables
 table (UTS #39) and the Unicode script data, vendored in `src/clipper/hashtag_data.py` for
 Unicode 15.0 (Python 3.12). After a Python upgrade, regenerate it with
 `uv run python scripts/gen_hashtag_data.py`; a test fails until the versions match.

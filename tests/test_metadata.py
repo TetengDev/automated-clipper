@@ -4,13 +4,14 @@ flags from the EDL, and the scheduling pre-flight. Everything here is pure."""
 from __future__ import annotations
 
 import dataclasses
+import re
 import unicodedata
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from clipper import hashtag_data
+from clipper import hashtag_data, metadata
 from clipper.edl import has_ai_elements, parse_edl
 from clipper.metadata import (
     GENERIC_HASHTAGS,
@@ -696,6 +697,16 @@ CONFUSABLE = [
     "#一fyp",
     "#ad東京",
     "#ᴀᴅ一",
+    # Digit and underscore lookalikes (CLP-112 fix round 1).
+    "#v1ral",
+    "#trend1ng",
+    "#tr3nding",
+    "#f_y_p",
+    "#fyp_",
+    "#f0r_y0u",
+    "#co11ab",
+    "#col1ab",
+    "#ϜΥΡ",  # Greek capitals: digamma, upsilon, rho (the small letters read #ϝup)
 ]
 
 
@@ -791,7 +802,6 @@ def test_plain_preflight_rechecks_the_stored_hashtag_list(tag):
 @pytest.mark.parametrize(
     ("text", "cleaned"),
     [
-        ("see https://site.com/page#fyp now", "see https://site.com/page#fyp now"),
         ("##ad x", "x"),
         ("x\u200d#fyp y", "x y"),
         ("#fyp\u200dx y", "y"),  # a platform may end the tag at the joiner
@@ -826,6 +836,31 @@ def test_cleaning_the_bypass_corpus_is_idempotent_and_leaves_nothing_unusable(ra
     assert preflight(meta, "tiktok", 35.0, plain=True) == []
     tags = clean_hashtags([raw, "#kai"])
     assert clean_hashtags(tags) == tags
+
+
+@pytest.mark.parametrize("link", ["https://x.co/page#ad", "site.com/page#fyp", "x.co/#ad"])
+def test_a_tag_inside_a_link_is_left_to_the_link_rules(link):
+    text = f"see {link} now"
+    assert clean_caption(text) == text
+    meta = PostMetadata(title="T", caption=text, hashtags=["#a1", "#b1", "#c1"], flags={})
+    assert preflight(meta, "tiktok", 35.0, plain=True) == []
+    assert any("links or mentions" in p for p in preflight(meta, "tiktok", 35.0))
+
+
+def test_the_vendored_tables_hold_their_invariants():
+    for cp, target in hashtag_data.CONFUSABLES.items():
+        char = chr(cp)
+        assert metadata._prefold(char) == char and unicodedata.category(char)[0] in "LN"
+        assert re.fullmatch(r"[a-z0-9_]+", target), hex(cp)
+        assert target.translate(hashtag_data.CONFUSABLES) == target  # one pass is enough
+    for cp, target in hashtag_data.CAPITAL_CONFUSABLES.items():
+        char = chr(cp)
+        assert not char.isascii() and unicodedata.category(char) in {"Lu", "Lt"}
+        assert unicodedata.normalize("NFKD", char) == char
+        assert re.fullmatch(r"[a-z0-9_]+", target), hex(cp)
+    starts = hashtag_data.SCRIPT_STARTS
+    assert list(starts) == sorted(set(starts)) and len(starts) == len(hashtag_data.SCRIPT_NAMES)
+    assert "UNKNOWN" not in hashtag_data.SCRIPT_NAMES
 
 
 def test_the_vendored_unicode_data_matches_the_runtime():

@@ -39,7 +39,13 @@ from pydantic import (
 )
 
 from clipper.edl import EDL, has_ai_elements
-from clipper.hashtag_data import CONFUSABLES, MARK_SCRIPTS, SCRIPT_NAMES, SCRIPT_STARTS
+from clipper.hashtag_data import (
+    CAPITAL_CONFUSABLES,
+    CONFUSABLES,
+    MARK_SCRIPTS,
+    SCRIPT_NAMES,
+    SCRIPT_STARTS,
+)
 from clipper.pipeline.common import strip_control
 
 PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
@@ -127,6 +133,8 @@ _INVISIBLE = re.compile(
 _IDNA_DOTS = str.maketrans({"\u3002": ".", "\uff61": ".", "\ufe12": ".", "\u2024": "."})
 _HOST = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
 _INLINE_TAG = re.compile(r"#\w+")
+_LINK_PATH = re.compile(r"(?:/\S*)?")
+"""The path after a matched link: a bare domain's match ends at its TLD."""
 _LINK_IN_PATH = re.compile(rf"(?i:www\.|https?:|[\w-]\.(?:{_TLDS})\b)")
 """Another link inside an allowed URL's path; a file name ("download.html") is fine."""
 
@@ -250,36 +258,56 @@ _CJK = frozenset({"HAN", "HIRAGANA", "KATAKANA", "BOPOMOFO", "HANGUL"})
 
 
 def _readings(tag: str) -> list[str]:
-    """`tag` prefolded, and when it mixes Latin with Japanese, Chinese or Korean (allowed as
-    one writing system) also its Latin letters, digits and `_` on their own, so CJK padding
-    does not hide a tag: `#ad一` and `#fypノ` read `#ad` and `#fyp` too."""
+    """`tag` prefolded; read through the capital lookalikes before folding, when that differs
+    (Greek `#ϜΥΡ` reads `#fyp`, though its small letters do not); and when it mixes Latin
+    with Japanese, Chinese or Korean (allowed as one writing system) also its Latin letters,
+    digits and `_` on their own, so CJK padding does not hide a tag: `#ad一` and `#fypノ`
+    read `#ad` and `#fyp` too. A tag matching in any reading is rejected."""
     folded = _prefold(tag)
+    readings = [folded]
+    capitals = _prefold(unicodedata.normalize("NFKD", tag).translate(CAPITAL_CONFUSABLES))
+    if capitals != folded:
+        readings.append(capitals)
     scripts = _scripts(unicodedata.normalize("NFKC", tag))
-    if "LATIN" not in scripts or not scripts & _CJK:
-        return [folded]
-    latin = "".join(c for c in folded if c.isascii() or (c.isalpha() and _script(c) == "LATIN"))
-    return [folded, latin]
+    if "LATIN" in scripts and scripts & _CJK:
+        readings.append(
+            "".join(c for c in folded if c.isascii() or (c.isalpha() and _script(c) == "LATIN"))
+        )
+    return readings
 
 
-def _disclosure_key(folded: str) -> str:
-    key = folded.replace("_", "").rstrip("0123456789").translate(_LOOKALIKE_DIGITS)
-    return _skeleton(key)
+def _keys(folded: str, *, trailing_digits: bool = False) -> set[str]:
+    """What a prefolded reading is compared as: without `_` (and, with `trailing_digits`,
+    without digits at the end), skeleton taken with digits read as letters (`#v1ral`,
+    `#f0r_y0u`) and as confusables reads them (`#co11ab`: 1 reads l)."""
+    key = folded.replace("_", "")
+    if trailing_digits:
+        key = key.rstrip("0123456789")
+    return {_skeleton(key.translate(_LOOKALIKE_DIGITS)), _skeleton(key)}
 
 
-_GENERIC_KEYS = frozenset(_skeleton(_prefold(t)) for t in GENERIC_HASHTAGS)
-_DISCLOSURE_KEYS = frozenset(_disclosure_key(_prefold(t)) for t in DISCLOSURE_HASHTAGS)
-_DISCLOSURE_PREFIX_KEYS = tuple(_disclosure_key(_prefold(t)) for t in DISCLOSURE_PREFIXES)
+_GENERIC_KEYS = frozenset(k for t in GENERIC_HASHTAGS for k in _keys(_prefold(t)))
+_DISCLOSURE_KEYS = frozenset(
+    k for t in DISCLOSURE_HASHTAGS for k in _keys(_prefold(t), trailing_digits=True)
+)
+_DISCLOSURE_PREFIX_KEYS = tuple(
+    k for t in DISCLOSURE_PREFIXES for k in _keys(_prefold(t), trailing_digits=True)
+)
 
 
 def is_generic(tag: str) -> bool:
-    """A reach tag, or a lookalike of one (`#ꜰʏᴘ`, `#vırɑl`, `#fypノ`)."""
-    return any(_skeleton(r) in _GENERIC_KEYS for r in _readings(tag))
+    """A reach tag, or a lookalike of one (`#ꜰʏᴘ`, `#vırɑl`, `#v1ral`, `#f_y_p`, `#fypノ`)."""
+    return any(k in _GENERIC_KEYS for r in _readings(tag) for k in _keys(r))
 
 
 def is_disclosure(tag: str) -> bool:
-    """A paid-partnership tag, or a lookalike of one (`#аԁ`, `#ꜱponsored`, `#ad一`)."""
-    keys = [_disclosure_key(r) for r in _readings(tag)]
-    return any(k in _DISCLOSURE_KEYS or k.startswith(_DISCLOSURE_PREFIX_KEYS) for k in keys)
+    """A paid-partnership tag, or a lookalike of one (`#аԁ`, `#ꜱponsored`, `#co11ab`,
+    `#ad一`)."""
+    return any(
+        k in _DISCLOSURE_KEYS or k.startswith(_DISCLOSURE_PREFIX_KEYS)
+        for r in _readings(tag)
+        for k in _keys(r, trailing_digits=True)
+    )
 
 
 def _is_padding(char: str) -> bool:
@@ -443,16 +471,18 @@ def _link_host(link: str) -> str | None:
     return host
 
 
-def _inline_tags(text: str, *, in_links: bool = False) -> list[tuple[str, int, int]]:
+def _inline_tags(text: str) -> list[tuple[str, int, int]]:
     """Each hashtag written into `text`, as read on the match copy (so `#fyp` padded with
     an invisible or combining character reads as `#fyp`), with its span in `text`. The
     span runs to the next character the copy kept, so the padding and any marks after the
     tag go with it (the copy keeps no marks). A tag with an invisible character inside
     (`#fyp` + ZWJ + `x`) is also read up to it, since a platform may end the tag there; both
-    readings share the span. A `#` inside a link (`https://site.com/page#fyp`) starts no tag
-    unless `in_links`."""
+    readings share the span. A `#` inside a link or its path (`https://site.com/page#fyp`,
+    `site.com/page#fyp`) starts no tag: the link rules judge it."""
     copy, origin = _match_copy(text)
-    links = [] if in_links else [m.span() for m in LINK_OR_MENTION.finditer(copy)]
+    links = [
+        (m.start(), _LINK_PATH.match(copy, m.end()).end()) for m in LINK_OR_MENTION.finditer(copy)
+    ]
     tags: list[tuple[str, int, int]] = []
     for m in _INLINE_TAG.finditer(copy):
         if any(a <= m.start() < b for a, b in links):
@@ -512,15 +542,9 @@ def inline_unusable_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
 
 
 def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
-    """Disclosure-like hashtags written into `text` itself, other than `allowed` ones. A
-    `#` inside a link counts here too: stripping leaves links alone, so a disclosure-like
-    fragment holds the post for a person to look at."""
+    """Disclosure-like hashtags written into `text` itself, other than `allowed` ones."""
     ok = {_fold(t) for t in allowed}
-    return [
-        t
-        for t, _, _ in _inline_tags(text, in_links=True)
-        if is_disclosure(t) and _fold(t) not in ok
-    ]
+    return [t for t, _, _ in _inline_tags(text) if is_disclosure(t) and _fold(t) not in ok]
 
 
 def _unusable(tag: str) -> bool:

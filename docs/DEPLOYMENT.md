@@ -254,9 +254,13 @@ fails is `held` with the reason on the review app's Scheduled page and in
 cannot be seen by the pipeline: the reviewer checks them before approving.
 
 A post for an account outside any campaign goes through the platform part of the same
-check: the platform's length, title, caption and hashtag limits, generic hashtags, and
-disclosure-like tags (`#ad`, `#sponsored`) written into the title or caption. A post that
-fails is held the same way. Links, mentions and too few hashtags hold only campaign posts.
+check, at scheduling and again just before it is published: the platform's length, title,
+caption and hashtag limits, generic hashtags, and generic, disclosure-like (`#ad`,
+`#sponsored`) or mixed-script tags written into the title or caption. A post that fails is
+held the same way. Links, mentions and too few hashtags hold only campaign posts. Such
+inline tags are also stripped from the model's titles and captions, from the per-platform
+text and from the export package, so in practice the check catches only text stored before
+that cleaning existed.
 
 The worker runs the same check again just before it publishes, with the config as it is
 on disk (reloaded when `creators.yaml`, `accounts.yaml` or `campaigns.yaml` changes), so a

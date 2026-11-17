@@ -6,6 +6,8 @@ Remotion render is covered by tests/test_render_integration.py and the e2e test.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import sqlite3
@@ -1387,6 +1389,57 @@ def test_clip_is_published_after_the_fenced_insert(
     assert sorted(p.name for p in clip_dir.iterdir()) == [
         "source.mp4", "v1.jpg", "v1.json", "v1.mp4",
     ]  # fmt: skip
+
+
+@contextlib.contextmanager
+def _slot_taken(media_root: Path, index: int) -> Iterator[None]:
+    """Another worker process renders: it holds render slot `index` (an flock)."""
+    slots = media_root / ".render_slots"
+    slots.mkdir(exist_ok=True)
+    with open(slots / str(index), "a") as fh:  # its own open file, as another process has
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def test_busy_render_slots_defer_without_using_an_attempt(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    """CLP-34: at most max_concurrent_renders (default 1) render runs across the workers
+    sharing the media root; the others wait for a slot without using an attempt."""
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    ctx = StageContext(media_dir=media, conn=conn, config=AppConfig(), clock=lambda: T0)
+
+    with _slot_taken(media.parent, 0), pytest.raises(Deferred) as deferred:
+        rc.render_clips(job, ctx)
+
+    assert deferred.value.until == T0 + timedelta(minutes=1)
+    assert "all 1 render slot(s) are busy" in deferred.value.reason
+    assert fake.calls == [] and _rows(conn) == []
+    rc.render_clips(job, ctx)  # slot free again
+    assert [r["rank"] for r in _rows(conn)] == [1]
+    with _slot_taken(media.parent, 0):
+        pass  # the stage let go of its slot
+
+
+def test_render_runs_in_any_free_slot(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    config = AppConfig(settings=Settings(max_concurrent_renders=2))
+    held: list[bool] = []
+
+    def second_slot_is_ours() -> None:
+        with pytest.raises(BlockingIOError), _slot_taken(media.parent, 1):
+            pass
+        held.append(True)
+
+    fake.after.append(second_slot_is_ours)
+
+    with _slot_taken(media.parent, 0):
+        rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
+
+    assert held == [True]
+    assert [r["rank"] for r in _rows(conn)] == [1]
 
 
 def test_quarantine_limit_is_below_the_attempt_limit() -> None:

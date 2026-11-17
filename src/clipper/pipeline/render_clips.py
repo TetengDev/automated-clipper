@@ -19,6 +19,11 @@ faces in most frames gets a face-tracked 9:16 crop that jumps at the same scene 
 any failure keeps the blurred fill. The rendered video then runs the quality gates
 (CLP-74, `clipper.pipeline.quality`): a failed gate stores the clip as `needs_attention`
 with its reasons; a gate that cannot run is noted but never holds the clip back.
+At most `max_concurrent_renders` runs of this stage render at once across the workers
+sharing the media root (CLP-34): each holds an flock on a slot file in `.render_slots/`
+there, and a run that finds every slot taken is `Deferred` by SLOT_RETRY without using an
+attempt. The kernel drops the lock of a worker that dies.
+
 The insert is fenced on the job's lease (CLP-66): only while this worker still holds the
 claim are the row written and the files renamed into place, in one transaction, so a
 worker that lost its lease never publishes over the new owner's clip.
@@ -59,6 +64,7 @@ before it fails, and with a single worker it holds up every job queued behind it
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import math
@@ -66,8 +72,9 @@ import os
 import re
 import sqlite3
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +148,9 @@ FAILURES_MARKER = "render_failures.json"
 MAX_MARKER_BYTES = 4096
 """A larger failure marker is not ours: it counts as no failures."""
 _VERSION = re.compile(r"^[\w.-]{1,64}$")
+SLOTS_DIR = ".render_slots"
+"""Under the media root: one lock file per render slot (`max_concurrent_renders`)."""
+SLOT_RETRY = timedelta(minutes=1)
 
 
 def _version(value: Any) -> str | None:
@@ -400,11 +410,40 @@ def _fence(job: Job, ctx: StageContext) -> Callable[[sqlite3.Connection], None] 
     return lambda conn: hold_lease(conn, job.id, worker_id, ctx.clock())
 
 
+@contextlib.contextmanager
+def _render_slot(media_root: Path, slots: int) -> Iterator[bool]:
+    """Hold the first free of `slots` slot files (an exclusive flock) while the block runs;
+    yields False when every slot is taken."""
+    slot_dir = media_root / SLOTS_DIR
+    slot_dir.mkdir(exist_ok=True)
+    for index in range(slots):
+        fd = os.open(slot_dir / str(index), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
+        try:
+            yield True
+        finally:
+            os.close(fd)  # releases the lock
+        return
+    yield False
+
+
 def _left_out(rank: int, failures: int, error: str) -> str:
     return f"clip {rank}: render failed {failures} times: {error}"[:MAX_REASON_CHARS]
 
 
 def render_clips(job: Job, ctx: StageContext) -> None:
+    slots = ctx.config.settings.max_concurrent_renders
+    with _render_slot(ctx.media_dir.parent, slots) as held:
+        if not held:
+            raise Deferred(ctx.clock() + SLOT_RETRY, f"all {slots} render slot(s) are busy")
+        _render_clips(job, ctx)
+
+
+def _render_clips(job: Job, ctx: StageContext) -> None:
     deadline = Deadline()
     sections = _clips(read_json(ctx.media_dir / "sections.json"), "sections.json")
     selection = read_json(ctx.media_dir / "highlights.json")

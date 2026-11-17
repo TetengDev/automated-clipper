@@ -104,13 +104,21 @@ _TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online
 _SPOKEN_TLDS = "com|net|org|io|ly|gg|co|xyz|link|tv|app|info|biz|click"
 """After a spoken "dot": only TLDs that are not everyday words ("polka dot shop"); most real
 TLDs are (`to`, `is`, `shop`, `live`, `rocks`), so "scam dot rocks" is not flagged."""
-_REAL_TLD = "|".join(
-    re.escape(t) for t in sorted((t for t in TLDS if t.isascii()), key=lambda t: (-len(t), t))
-)
+
+
+def _tld_pattern(tlds: Iterable[str]) -> str:
+    return "|".join(re.escape(t) for t in sorted(tlds, key=lambda t: (-len(t), t)))
+
+
+_REAL_TLD = _tld_pattern(t for t in TLDS if t.isascii())
 """An IANA root-zone TLD (`tld_data`) written in ASCII, punycode included (`xn--p1ai`), in
-any case. A TLD in another script (`.рф`, `.みんな`) is no use outside a URL: Chinese and
-Japanese end a sentence with `。`, which IDNA reads as a dot, and words such as 中国, 在线
-and みんな are TLDs, so `我爱你。中国！` would read as a domain."""
+any case: what a plain bare domain needs. A TLD in another script (`.рф`, `.みんな`) counts
+there only in a URL: Chinese and Japanese end a sentence with `。`, which IDNA reads as a
+dot, and words such as 中国, 在线 and みんな are TLDs, so `我爱你。中国！` would read as a
+domain."""
+_ANY_TLD = _tld_pattern(TLDS)
+"""Any IANA root-zone TLD, in any script: after a deliberately obfuscated dot (`[.]`,
+`(dot)`, `d0t`), which no one types as a sentence break."""
 # A name starts a token: never mid-word or right after a hyphen, or a dot that follows a
 # word character or hyphen, so each run of text is scanned once (no quadratic backtracking on
 # "a-a-a-..." or "a.a.a...").
@@ -124,11 +132,12 @@ LINK_OR_MENTION = re.compile(
     # (`notes.md`, `clip.mov`) reads as a domain: it is one, and `allowed_links` admits it.
     # So does a capitalised TLD word glued to a dot (`this.So`): the cost of `Scam.Rocks`.
     + rf"|{_NAME}(?:\.[\w-]+)*\.(?i:{_REAL_TLD})\b"
-    # An obfuscated dot: "name[.]com", "name(dot)com", "name [d0t] info", "name . com".
-    + rf"|(?i:{_NAME}[ \t]*[\[(][ \t]*(?:\.|dot|d0t)[ \t]*[\])][ \t]*(?:{_REAL_TLD})\b)"
+    # An obfuscated dot: "name[.]com", "name(dot)com", "name [d0t] info", "name . com"; the
+    # bracketed and d0t forms take a TLD in any script ("name (dot) онлайн").
+    + rf"|(?i:{_NAME}[ \t]*[\[(][ \t]*(?:\.|dot|d0t)[ \t]*[\])][ \t]*(?:{_ANY_TLD})\b)"
     + rf"|(?i:{_NAME}[ \t]+\.[ \t]+(?:{_SPOKEN_TLDS})\b)"
     # Spelled out: "name d0t rocks" with any real TLD, or "name dot com" with a common one.
-    + rf"|(?i:{_NAME}[ \t]+d0t[ \t]+(?:{_REAL_TLD})\b)"
+    + rf"|(?i:{_NAME}[ \t]+d0t[ \t]+(?:{_ANY_TLD})\b)"
     + rf"|(?i:{_NAME}[ \t]+dot[ \t]+(?:{_SPOKEN_TLDS})\b)"
     # An IPv4 address.
     + r"|(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)"

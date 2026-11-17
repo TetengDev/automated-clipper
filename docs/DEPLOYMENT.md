@@ -269,7 +269,8 @@ mention or a bare domain (`@bob/#ad`, `site.com/#ad`) a `#` starts a tag as usua
 A bare domain counts as a link only when it ends in a real top-level domain from the IANA
 root-zone list written in ASCII, in any case (`Scam.Rocks`, `scam.xn--p1ai`), so a sentence
 break or a file name such as `Node.js` or `index.html` is not flagged. A TLD in another
-script (`.рф`, `.みんな`) counts only in a link written with `https://` or `www.`: Chinese
+script (`.рф`, `.みんな`) counts only in a link written with `https://` or `www.`, or after
+a deliberately obfuscated dot (`name (dot) онлайн`, `name[.]みんな`, `name d0t рф`): Chinese
 and Japanese end sentences with `。`, which reads as a dot, and words such as 中国 or みんな
 are TLDs, so `我爱你。中国！` must not read as a domain. A capitalised TLD word glued after a
 dot, as in `this.So`, is flagged; that is the cost of catching `Scam.Rocks`. A file name

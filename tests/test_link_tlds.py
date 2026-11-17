@@ -25,6 +25,10 @@ TAGS = ["#mrbeast", "#island", "#money"]
         "ok\u3002com",
         "name[.]rocks",
         "name d0t Rocks",
+        # A deliberately obfuscated dot is no sentence break: any real TLD, any script.
+        "name (dot) онлайн",
+        "name[.]みんな",
+        "name d0t рф",
         # A TLD in another script counts in a URL only (see the CJK sentences below).
         "go to https://сайт.рф now",
         "https://例え.みんな",
@@ -47,7 +51,6 @@ def test_a_real_tld_is_flagged_in_any_case(text):
         "감사합니다.한국!",
         # So a bare domain needs an ASCII TLD (punycode included).
         "go to сайт.рф now",
-        "name (dot) онлайн",
     ],
 )
 def test_a_bare_domain_needs_an_ascii_tld(text):

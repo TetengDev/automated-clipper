@@ -234,14 +234,17 @@ def _format_errors_since(marker: Path, now: datetime) -> datetime:
     """When the current format-error episode began. `marker` holds that start and the last
     format error (one ISO time per line; a marker from before CLP-85 holds only the start).
     An episode with no format error for NO_FORMAT_MAX_AGE is over, so one picked up late
-    (a busy or stopped worker) still counts from its start, not from now."""
+    (a busy or stopped worker) still counts from its start, not from now. A start-only
+    marker gets one NO_FORMAT_RETRY more: its episode may have been retried until now, so
+    just past the cap it fails instead of starting over."""
     start = None
     try:
         with marker.open("rb") as f:
             words = f.read(_MARKER_READ_BYTES).decode("utf-8").split()
         first, last = datetime.fromisoformat(words[0]), datetime.fromisoformat(words[-1])
         aware = first.tzinfo is not None and last.tzinfo is not None
-        if aware and first <= now and now - last <= NO_FORMAT_MAX_AGE:
+        idle_max = NO_FORMAT_MAX_AGE + (NO_FORMAT_RETRY if len(words) == 1 else timedelta())
+        if aware and first <= now and now - last <= idle_max:
             start = first
     except (OSError, ValueError, IndexError):
         pass

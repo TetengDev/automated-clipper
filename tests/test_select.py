@@ -664,6 +664,8 @@ def test_untrusted_title_and_transcript_are_fenced_and_sanitized(conn, media):
 
 
 def test_output_fields_are_limited_and_hashtags_normalized():
+    from clipper.metadata import is_hashtag
+
     c = Candidate(
         start_s=1,
         end_s=30,
@@ -686,7 +688,24 @@ def test_output_fields_are_limited_and_hashtags_normalized():
     assert (len(c.caption), len(c.reason)) == (2200, 500)
     assert c.hashtags[:2] == ["#clip", "#ok"]
     assert len(c.hashtags) == select.MAX_HASHTAGS
-    assert all(select._HASHTAG.fullmatch(t) for t in c.hashtags)
+    assert all(is_hashtag(t) for t in c.hashtags)
+
+
+def test_legacy_hashtags_drop_generic_disclosure_and_lookalike_tags():
+    """CLP-111: the single hashtag list (caption.txt, posts without a variant) gets the
+    same checks as the variants, so #fyp, #ad and a Cyrillic #fyр never get through."""
+    c = Candidate(
+        start_s=1,
+        end_s=30,
+        score=5,
+        hook="h",
+        title="t",
+        caption="c",
+        reason="r",
+        hashtags=["#fyp", "#ad", "#fyр", "#FYP", "#Sponsored", "#mrbeast", "#MrBeast", "#नमस्ते"],
+    )
+    assert c.hashtags == ["#mrbeast", "#नमस्ते"]
+    assert all(v["hashtags"] == ["#mrbeast", "#नमस्ते"] for v in (c.variants or {}).values())
 
 
 def test_snap_drops_candidates_far_from_any_words():

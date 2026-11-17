@@ -465,11 +465,12 @@ def publish_problem(
             f"campaign changed since scheduling ({post.campaign_id or 'none'} ->"
             f" {campaign_id or 'none'}); run `clipper posts recheck` or cancel the post"
         )
+    metadata = repo.metadata_for(conn, post)
     if campaign_id is None:
-        return None
+        problems = preflight(metadata, post.platform, version.duration_s, plain=True)
+        return "; ".join(problems) if problems else None
     if campaign is None:
         return f"account {account.id}: unknown campaign {campaign_id!r}"
-    metadata = repo.metadata_for(conn, post)
     edl = render_edl(media_root, post.video_path) if media_root else None
     problems = campaign_preflight(campaign, metadata, post.platform, version.duration_s, edl, now)
     return "; ".join(problems) if problems else None

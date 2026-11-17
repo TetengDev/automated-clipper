@@ -21,6 +21,7 @@ from typing import Any
 from clipper.clips import get_version
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
+from clipper.metadata import PLATFORM_LIMITS, clean_caption, clean_hashtags, clean_title
 from clipper.posting.models import (
     InvalidPostTransition,
     Post,
@@ -551,10 +552,11 @@ def metadata_for(conn: sqlite3.Connection, post: Post) -> PostMetadata:
     version = get_version(conn, post.clip_id, post.clip_version)
     if version is None:
         raise LookupError(f"clip {post.clip_id} v{post.clip_version}")
+    # That copy was stored unchecked (CLP-111).
     return PostMetadata(
-        title=version.title or "",
-        caption=version.caption or "",
-        hashtags=list(version.hashtags),
+        title=clean_title(version.title or ""),
+        caption=clean_caption(version.caption or ""),
+        hashtags=clean_hashtags(version.hashtags, PLATFORM_LIMITS[post.platform].post_hashtags_max),
     )
 
 

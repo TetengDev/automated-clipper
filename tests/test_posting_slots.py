@@ -23,7 +23,7 @@ from clipper.posting.scheduler import (
     slot_problems,
 )
 from clipper.posting.stage import BACKOFF_BASE, PostingStage, allow_all
-from conftest import VALID_YAML
+from config_support import VALID_YAML
 from posting_support import FakeAccount, FakePublisher
 from review_support import Env, login, make_env
 

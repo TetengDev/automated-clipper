@@ -2134,7 +2134,7 @@ def test_render_failures_past_the_age_cap_fail_the_job(
             rc.render_clips(job, ctx)
     assert (media / rc.FAILING_MARKER).is_file()
     clock[0] = T0 + rc.MAX_FAILING_AGE + timedelta(hours=1)
-    with pytest.raises(PermanentError, match="still failing 48 h after the first deferral"):
+    with pytest.raises(PermanentError, match="48 h into a failing-render episode; giving up"):
         rc.render_clips(job, ctx)
 
     assert not (media / rc.FAILING_MARKER).exists()

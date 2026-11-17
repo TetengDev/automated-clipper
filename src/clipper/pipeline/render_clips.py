@@ -499,7 +499,7 @@ def _defer(ctx: StageContext, until: datetime, reason: str, *, failing: bool) ->
     if failing and now - episode_since(marker, now, MAX_FAILING_AGE) > MAX_FAILING_AGE:
         marker.unlink(missing_ok=True)
         hours = MAX_FAILING_AGE.total_seconds() / 3600
-        return PermanentError(f"{reason} (still failing {hours:.0f} h after the first deferral)")
+        return PermanentError(f"{reason} ({hours:.0f} h into a failing-render episode; giving up)")
     return Deferred(until, reason)
 
 

@@ -26,8 +26,14 @@ jobs:
           enable-cache: true
           save-cache: ${{ github.ref == 'refs/heads/dev' }}
 
+      # A stalled mirror once hung this step for over an hour (CLP-131): apt retries
+      # and times out per request, the whole install retries once, and the step is capped.
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+        timeout-minutes: 10
+        run: |
+          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
+          apt_install() { "${apt[@]}" update && "${apt[@]}" install -y --no-install-recommends ffmpeg; }
+          apt_install || apt_install
 
       - name: Install dependencies
         run: uv sync --locked

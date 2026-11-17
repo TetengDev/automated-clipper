@@ -20,8 +20,8 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 - Create a non-root `deploy` user. Allow SSH key login only; disable root login and password authentication.
 - Configure `ufw` to allow only ports 22, 80, and 443. Install `fail2ban` and `unattended-upgrades`.
 - Install Docker Engine and the compose plugin. Set the timezone to UTC.
-- Create the directory layout under `/srv/clipper`: `data/`, `output/`, `config/`, `.env` (with `chmod 600`).
-- Run `chown -R 10001:10001 data output`. The containers run as uid 10001 and need write access.
+- Create the directory layout under `/srv/clipper`: `data/`, `data/models/`, `output/`, `config/`, `.env` (with `chmod 600`).
+- Run `chown -R 10001:10001 data output`. The containers run as uid 10001 and need write access. `data/models/` must exist before the first start: compose mounts it read-only into `review` and `monitor` (only the worker writes models), and Docker would create a missing one owned by root, which the worker could not write.
 - `data/models/` (or `CLIPPER_MODELS_DIR`) holds the face-detection model. The worker fetches it once from Google's storage and checks its pinned SHA-256; without it, clips keep the blurred-fill layout.
 
 ## Secrets
@@ -134,10 +134,16 @@ The worker transcribes with faster-whisper on CPU (`transcriber: local`, the def
   the VPS**: large-v3 can approach real time there. Each 10 min chunk may run for
   `max(15 min, 3 x chunk length)` = 30 min (`LOCAL_RTF_BUDGET`), within the stage's
   100 min budget; a run that hits the budget resumes from the cached chunks.
-- **Downloads are verified**: after the fetch, the required files must be present and
-  model.bin must match the pinned SHA-256; only then is `.clipper-complete` written into the
-  snapshot. A snapshot without that marker is fetched again, and one that fails
-  verification is discarded and fetched once more before the job retries later.
+- **Downloads are verified**: every file of the snapshot is pinned by size and SHA-256
+  (`WHISPER_MODELS`). After the fetch all of them must match; only then is
+  `.clipper-complete` written into the snapshot. A snapshot without that marker is fetched
+  again, and one that fails verification is discarded and fetched once more before the job
+  retries later. A file with the wrong bytes also loses its blob, so the next fetch
+  downloads it instead of linking the same bytes again.
+- **Self-heal**: before each job a marked snapshot is checked cheaply (every file's size,
+  the small files' hashes, model.bin's blob name), so a truncated blob is fetched again. If
+  the model still fails to load, the worker removes the marker and the next attempt
+  fetches and fully hashes the snapshot.
 - **Image**: faster-whisper and its native wheels (CTranslate2, onnxruntime, PyAV) add
   about 320 MB to the image.
 

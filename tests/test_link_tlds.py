@@ -17,20 +17,48 @@ TAGS = ["#mrbeast", "#island", "#money"]
 @pytest.mark.parametrize(
     "text",
     [
-        "go to сайт.рф now",  # an IDN TLD
-        "scam.онлайн",
-        "ПРИМЕР.РФ",  # capitals in another script
         "Scam.Rocks",  # a mixed-case TLD not on the common list
         "SCAM.ROCKS",
         "buy at scam.xn--p1ai",  # the punycode form of .рф
         "free stuff at shop.Example.Io today",
+        "scam\u3002com",  # an ideographic full stop is a dot to IDNA
+        "ok\u3002com",
         "name[.]rocks",
-        "name (dot) онлайн",
         "name d0t Rocks",
+        # A TLD in another script counts in a URL only (see the CJK sentences below).
+        "go to https://сайт.рф now",
+        "https://例え.みんな",
+        "www.例え.みんな",
+        "www.ПРИМЕР.РФ",
     ],
 )
-def test_a_real_tld_is_flagged_in_any_case_and_script(text):
+def test_a_real_tld_is_flagged_in_any_case(text):
     assert links_or_mentions(text), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Ordinary sentences: the full stop reads as a dot, and the next word is an IDN TLD.
+        "ありがとう。みんな！",
+        "我爱你。中国！",
+        "新店开业。购物！",
+        "感谢。在线",
+        "감사합니다.한국!",
+        # So a bare domain needs an ASCII TLD (punycode included).
+        "go to сайт.рф now",
+        "name (dot) онлайн",
+    ],
+)
+def test_a_bare_domain_needs_an_ascii_tld(text):
+    assert links_or_mentions(text) == [], text
+
+
+def test_a_glued_capitalised_tld_word_is_flagged_but_not_abbreviations():
+    """The cost of catching `Scam.Rocks`: `this.So` reads as a domain (.so is a TLD)."""
+    assert links_or_mentions("this.So") == ["this.So"]
+    for text in ("e.g. this", "Mr.Smith", "built with Node.js"):
+        assert links_or_mentions(text) == [], text
 
 
 @pytest.mark.parametrize(

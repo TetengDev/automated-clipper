@@ -104,8 +104,13 @@ _TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online
 _SPOKEN_TLDS = "com|net|org|io|ly|gg|co|xyz|link|tv|app|info|biz|click"
 """After a spoken "dot": only TLDs that are not everyday words ("polka dot shop"); most real
 TLDs are (`to`, `is`, `shop`, `live`, `rocks`), so "scam dot rocks" is not flagged."""
-_REAL_TLD = "|".join(re.escape(t) for t in sorted(TLDS, key=lambda t: (-len(t), t)))
-"""Any IANA root-zone TLD (`tld_data`), in any case: Latin, punycode or another script."""
+_REAL_TLD = "|".join(
+    re.escape(t) for t in sorted((t for t in TLDS if t.isascii()), key=lambda t: (-len(t), t))
+)
+"""An IANA root-zone TLD (`tld_data`) written in ASCII, punycode included (`xn--p1ai`), in
+any case. A TLD in another script (`.рф`, `.みんな`) is no use outside a URL: Chinese and
+Japanese end a sentence with `。`, which IDNA reads as a dot, and words such as 中国, 在线
+and みんな are TLDs, so `我爱你。中国！` would read as a domain."""
 # A name starts a token: never mid-word or right after a hyphen, or a dot that follows a
 # word character or hyphen, so each run of text is scanned once (no quadratic backtracking on
 # "a-a-a-..." or "a.a.a...").
@@ -113,10 +118,11 @@ _NAME = r"(?<![\w-])(?<![\w-]\.)[\w-]+"
 LINK_OR_MENTION = re.compile(
     # A URL ends before quotes, brackets and trailing punctuation.
     r"(?i:(?<![\w./:-])(?:https?://|www\.)[\w\-.~:/?#@!$&*+,;=%]*[\w\-/#=~%&+])"
-    # A domain: "name.tld" with no space around the dot, on a real TLD in any case
-    # (`Scam.Rocks`, `сайт.рф`), so a sentence break ("the store. Me") is not one, nor a
-    # file name whose extension is no TLD (`Node.js`, `index.html`). One that is a TLD
+    # A domain: "name.tld" with no space around the dot, on a real ASCII TLD in any case
+    # (`Scam.Rocks`, `scam.xn--p1ai`), so a sentence break ("the store. Me") is not one, nor
+    # a file name whose extension is no TLD (`Node.js`, `index.html`). One that is a TLD
     # (`notes.md`, `clip.mov`) reads as a domain: it is one, and `allowed_links` admits it.
+    # So does a capitalised TLD word glued to a dot (`this.So`): the cost of `Scam.Rocks`.
     + rf"|{_NAME}(?:\.[\w-]+)*\.(?i:{_REAL_TLD})\b"
     # An obfuscated dot: "name[.]com", "name(dot)com", "name [d0t] info", "name . com".
     + rf"|(?i:{_NAME}[ \t]*[\[(][ \t]*(?:\.|dot|d0t)[ \t]*[\])][ \t]*(?:{_REAL_TLD})\b)"

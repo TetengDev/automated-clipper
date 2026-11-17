@@ -908,7 +908,9 @@ def test_crop_the_edl_rejects_keeps_blurred_fill(
     monkeypatch.setattr(rc, "plan_reframe", lambda *a: (rf.Layout.FACE_TRACK, [(0.0, 1.5)]))
     rc.render_clips(job, _ctx(media, conn))
     assert fake.calls[0]["edl"].layout == "blurred_fill"
-    assert "face track rejected" in caplog.text
+    (record,) = [r for r in caplog.records if "face track rejected" in r.getMessage()]
+    message = record.getMessage()
+    assert "ValidationError" in message and "validation error" not in message
 
 
 def test_creator_can_opt_out_of_face_tracking(
@@ -1179,21 +1181,21 @@ def test_any_jump_cut_error_keeps_the_clip_whole(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    word = "secret"  # only in the message: the frames show the source line
+    first, word = "bad cut", "secret"  # only in the message: frames show the source line
 
     def boom(*a: Any, **kw: Any) -> Any:
-        raise ValueError(f"bad cut\n{word}")
+        raise ValueError(f"{first}\n{word}")
 
     monkeypatch.setattr(rc, "plan_cuts", boom)
     edl = _render_mode(conn, tmp_path, fake, "silences", "aaaaaaaaaaa", _gap_words())
     assert (edl.segments, edl.cuts) == (None, ())
     (record,) = [r for r in caplog.records if "jump cuts rejected" in r.getMessage()]
     # A logic bug must not hide behind the fallback: the exception type and its frames
-    # are logged, but never its raw message (CLP-79), only the cleaned first line.
+    # are logged, but never its message (CLP-79): it can quote a transcribed word.
     message = record.getMessage()
     assert record.levelname == "WARNING" and record.exc_info is None
-    assert "ValueError" in message and "in boom" in message and "bad cut" in message
-    assert "secret" not in caplog.text
+    assert "ValueError" in message and "in boom" in message
+    assert "bad cut" not in message and "secret" not in caplog.text
     assert len(_rows(conn)) == 1
 
 

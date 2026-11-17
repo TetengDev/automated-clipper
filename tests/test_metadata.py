@@ -589,3 +589,27 @@ def test_the_50_limit_counts_code_points_marks_included():
     assert not is_hashtag("#" + "a" * 51)
     assert not is_hashtag("#")
     assert not is_hashtag("nohash")
+
+
+# --- the pre-flight for a post outside any campaign (CLP-111) -------------------------------
+
+
+def test_plain_preflight_skips_only_the_campaign_rules():
+    few = PostMetadata(title="T", caption="see mrbeast.com @kai", hashtags=["#a"], flags={})
+    assert preflight(few, "tiktok", 35.0, plain=True) == []
+    assert len(preflight(few, "tiktok", 35.0)) == 2  # too few hashtags; a link and a mention
+    bad = PostMetadata(
+        title="<b>" + "t" * 100,
+        caption="Paid #ad",
+        hashtags=["#FYP", *[f"#t{i}" for i in range(15)]],
+        flags={},
+    )
+    problems = preflight(bad, "youtube", 200.0, plain=True)
+    assert [p.split(" ", 2)[1] for p in problems] == [
+        "clip",  # length
+        "16",  # hashtags over the platform's cap
+        "generic",
+        "title",  # < or >
+        "disclosure-like",
+        "title",  # too long
+    ]

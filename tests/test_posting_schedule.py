@@ -325,3 +325,47 @@ def test_retry_only_requeues_failed_posts(env: Env) -> None:
 
     with pytest.raises(InvalidPostTransition):
         repo.retry(env.conn, post.id, NOW)
+
+
+# --- plain posts: hashtags and the pre-flight (CLP-111) ----------------------------------
+
+
+def test_a_plain_post_never_carries_generic_disclosure_or_lookalike_tags(env: Env) -> None:
+    clip_id = approved_clip(env, hashtags=["#fyp", "#ad", "#fyр", "#kai", "#funny", "#money"])
+
+    (post,) = schedule_for_clip(env.conn, clip_id, [FakeAccount()], NOW)
+
+    published = repo.metadata_for(env.conn, post)  # what the posting stage sends
+    assert post.status == PostStatus.SCHEDULED
+    assert published.hashtags == ["#kai", "#funny", "#money"]
+    assert published.caption == "Watch this\n\n#kai #funny #money"
+
+
+def test_a_plain_post_with_an_inline_disclosure_tag_is_held(env: Env) -> None:
+    clip_id = approved_clip(env, caption="Watch this #ad")
+
+    (post,) = schedule_for_clip(env.conn, clip_id, [FakeAccount()], NOW)
+
+    assert post.status == PostStatus.HELD
+    assert post.error == "tiktok: disclosure-like tags in the text: #ad"
+
+
+def test_a_plain_post_outside_the_platforms_length_is_held(env: Env) -> None:
+    clip_id = approved_clip(env, duration_s=200.0)  # Instagram takes 3-180 s
+
+    (post,) = schedule_for_clip(
+        env.conn, clip_id, [FakeAccount(id="ig_main", platform="instagram")], NOW
+    )
+
+    assert post.status == PostStatus.HELD
+    assert post.error == "instagram: clip length 200 s is outside 3-180 s"
+
+
+def test_a_plain_post_is_not_held_for_links_mentions_or_few_hashtags(env: Env) -> None:
+    """Those holds are campaign rules; a plain post goes out with them."""
+    clip_id = approved_clip(env, caption="Full video on mrbeast.com, thanks @kai", hashtags=["kai"])
+
+    (post,) = schedule_for_clip(env.conn, clip_id, [FakeAccount()], NOW)
+
+    assert post.status == PostStatus.SCHEDULED
+    assert post.error is None

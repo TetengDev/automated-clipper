@@ -677,10 +677,16 @@ def _mentions(text: str, keyword: str) -> bool:
 
 
 def preflight(
-    metadata: PostMetadata, platform: str, clip_seconds: float, brief: Brief | None = None
+    metadata: PostMetadata,
+    platform: str,
+    clip_seconds: float,
+    brief: Brief | None = None,
+    *,
+    plain: bool = False,
 ) -> list[str]:
     """Problems that would get the post rejected by the platform or the campaign; empty
-    when it is good to schedule."""
+    when it is good to schedule. A `plain` post (no campaign) is not held for links,
+    mentions or too few hashtags: those are campaign rules."""
     limits = _limits(platform)
     problems: list[str] = []
     if not limits.min_seconds <= clip_seconds <= limits.max_seconds:
@@ -696,7 +702,7 @@ def preflight(
     count = len(metadata.hashtags)
     if count > limits.post_hashtags_max:
         problems.append(f"{platform}: {count} hashtags, at most {limits.post_hashtags_max}")
-    if count < limits.hashtags_min:
+    if count < limits.hashtags_min and not plain:
         problems.append(f"{platform}: {count} hashtags, use at least {limits.hashtags_min}")
     generic = [t for t in metadata.hashtags if is_generic(t)]
     if generic:
@@ -712,7 +718,7 @@ def preflight(
         for f, typed in _link_matches(f"{metadata.title}\n{metadata.caption}")
         if not (brief and brief.allows(f) and _fold(typed) == _fold(f))
     ]
-    if found:
+    if found and not plain:
         problems.append(f"{platform}: links or mentions to check: {', '.join(found)}")
     inline = inline_disclosure_tags(f"{metadata.title}\n{metadata.caption}", metadata.hashtags)
     if inline:

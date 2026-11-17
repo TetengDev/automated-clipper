@@ -39,7 +39,7 @@ from clipper.campaigns import (
 from clipper.clips import ClipDetail, ClipStatus
 from clipper.config import ConfigError
 from clipper.db import transaction
-from clipper.metadata import build_post_metadata
+from clipper.metadata import build_post_metadata, preflight
 from clipper.pipeline.common import strip_control
 from clipper.posting import repo
 from clipper.posting.models import Post, PostConflict, PostMetadata, PostStatus
@@ -215,7 +215,8 @@ def _plan(
     )
     metadata = PostMetadata(**asdict(built))
     if campaign_id is None:
-        return _Plan(None, metadata, [])
+        problems = preflight(built, account.platform, clip.current.duration_s, plain=True)
+        return _Plan(None, metadata, problems)
     if campaign is None:
         problem = f"account {account.id}: unknown campaign {campaign_id!r}; fix accounts.yaml"
         return _Plan(campaign_id, metadata, [problem])

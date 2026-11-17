@@ -4,10 +4,10 @@
     set only where the platform does too (TikTok); elsewhere the counter (review.js) shows the
     count and the server's check decides (CLP-117). -#}
 {% macro text_field(platform, field, label, value, limit, limits, adjusted) %}
-  {% set id = platform ~ "-" ~ field %}
-  {% set described = ([platform ~ "-adjusted"] if adjusted else []) + [id ~ "-count"] %}
-  {% set attrs %} id="{{ id }}" name="{{ platform }}_{{ field }}"{% if field == "caption" %} rows="4"{% endif %}{% if not limits.counts_code_points %} maxlength="{{ limit }}"{% endif %} data-limit="{{ limit }}" data-count="{{ "code-points" if limits.counts_code_points else "utf16" }}" data-unit="{{ limits.unit }}" data-label="{{ label }}" data-counter="{{ id }}-count" aria-describedby="{{ described | join(" ") }}"{% endset %}
-  {% if field == "caption" %}<textarea{{ attrs }}>{{ value }}</textarea>{% else %}<input{{ attrs }} value="{{ value }}">{% endif %}
+  {%- set id = platform ~ "-" ~ field %}
+  {%- set described = ([platform ~ "-adjusted"] if adjusted else []) + [id ~ "-count"] %}
+  {%- set attrs %} id="{{ id }}" name="{{ platform }}_{{ field }}"{% if field == "caption" %} rows="4"{% endif %}{% if not limits.counts_code_points %} maxlength="{{ limit }}"{% endif %} data-limit="{{ limit }}" data-count="{{ "code-points" if limits.counts_code_points else "utf16" }}" data-unit="{{ limits.unit }}" data-label="{{ label }}" data-counter="{{ id }}-count" aria-describedby="{{ described | join(" ") }}"{% endset %}
+  {%- if field == "caption" %}<textarea{{ attrs }}>{{ value }}</textarea>{% else %}<input{{ attrs }} value="{{ value }}">{% endif %}
   <p id="{{ id }}-count" class="char-count">{{ "{:,}".format(limits.length(value)) }} of {{ "{:,}".format(limit) }} {{ limits.unit }}</p>
 {% endmacro %}
 <section class="variants" id="clip-variants" aria-labelledby="variants-heading">

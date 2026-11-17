@@ -75,8 +75,10 @@ ignore = ["S101"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # The browser tests need Chromium (`uv run playwright install chromium`): run them with
-# `uv run pytest tests/e2e -m e2e` (the last -m wins).
-addopts = "-ra -m 'not e2e'"
+# `uv run pytest tests/e2e -m e2e` (the last -m wins). pytest-playwright deletes its --output
+# folder at the start of every run, the default one too, so it is kept inside the ignored
+# .pytest_cache instead of ./test-results.
+addopts = "-ra -m 'not e2e' --output=.pytest_cache/playwright"
 markers = [
     "e2e: Playwright browser tests of the review app (tests/e2e); left out of the default run",
     "render: real Remotion render; skips when node/npx or render/node_modules is missing",

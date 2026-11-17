@@ -327,12 +327,18 @@ def test_heartbeat_stops_once_another_worker_holds_the_job(
     )  # fmt: skip
 
 
+@pytest.mark.parametrize(
+    "error", [sqlite3.OperationalError("database is locked"), RuntimeError("unexpected")]
+)
 def test_heartbeat_retries_a_failed_renewal(
     make_worker: MakeWorker,
     db: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    error: Exception,
 ) -> None:
+    """Any renewal error is logged and the next beat tries again: the heartbeat only stops
+    with its stage or once the claim is gone."""
     pipeline = StubPipeline()
     clock = FakeClock()
     worker = make_worker(pipeline, clock)
@@ -345,7 +351,7 @@ def test_heartbeat_retries_a_failed_renewal(
     def flaky(*args: object) -> bool:
         calls.append(1)
         if len(calls) == 1:
-            raise sqlite3.OperationalError("database is locked")
+            raise error
         return real(*args)  # type: ignore[arg-type]
 
     monkeypatch.setattr(heartbeat_mod, "renew_lease", flaky)
@@ -359,7 +365,44 @@ def test_heartbeat_retries_a_failed_renewal(
 
     assert worker.run_once()
     assert _status(db, job.id) is JobStatus.TRANSCRIBING
-    assert "lease renewal failed: database is locked" in caplog.text
+    assert f"lease renewal failed: {error}" in caplog.text
+    assert "the claim lapses at its lease_until" in caplog.text
+
+
+def test_heartbeat_stop_waits_a_bounded_time(
+    make_worker: MakeWorker,
+    db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A beat stuck on a locked DB (up to the 30 s busy timeout) does not hold up the end
+    of the stage, or Ctrl-C."""
+    monkeypatch.setattr(heartbeat_mod, "JOIN_TIMEOUT_S", 0.2)
+    pipeline = StubPipeline()
+    worker = make_worker(pipeline)
+    worker.lease = timedelta(seconds=0.4)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()
+    stuck = threading.Event()
+    unblock = threading.Event()
+
+    def blocked(*args: object) -> bool:
+        stuck.set()
+        unblock.wait(5)
+        return True
+
+    monkeypatch.setattr(heartbeat_mod, "renew_lease", blocked)
+    pipeline.hooks[JobStatus.FETCHING_AUDIO] = lambda: stuck.wait(2)
+    started = time.monotonic()
+    try:
+        assert worker.run_once()
+        elapsed = time.monotonic() - started
+    finally:
+        unblock.set()
+
+    assert elapsed < 1.5
+    assert _status(db, job.id) is JobStatus.TRANSCRIBING
+    assert f"job {job.id}: lease heartbeat did not stop within 0.2 s" in caplog.text
 
 
 def test_no_heartbeat_for_an_in_memory_db() -> None:

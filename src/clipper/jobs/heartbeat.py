@@ -5,6 +5,11 @@ returns. It writes through a connection of its own (a connection is never shared
 threads, see `clipper.db.connect`). Once the claim is gone (another worker took the job
 over after this one stalled for longer than the lease) it stops renewing; the stage's
 fenced writes (`clipper.jobs.queue.hold_lease`) are then refused and its result dropped.
+
+A renewal that fails (a locked DB, any error) is logged and tried again on the next beat;
+the heartbeat never stops for that. The stage itself is never interrupted: if renewals
+keep failing until `lease_until` passes, the job is no longer protected, another worker
+may take it over, and this stage's fenced writes and result are dropped as above.
 """
 
 from __future__ import annotations
@@ -22,6 +27,11 @@ from clipper.jobs.models import Clock, Job
 from clipper.jobs.queue import renew_lease
 
 logger = logging.getLogger(__name__)
+
+JOIN_TIMEOUT_S = 5.0
+"""How long the end of a stage waits for the heartbeat thread, which may be stuck on a
+locked DB (up to the 30 s busy timeout). Left behind, it exits after that beat: once the
+outcome is recorded, its renewal no longer matches the job."""
 
 
 def database_file(conn: sqlite3.Connection) -> Path | None:
@@ -45,8 +55,14 @@ def _renew_until_stopped(
                 if not renew_lease(conn, job, worker_id, clock(), lease):
                     logger.warning("job %s: claim lost, lease heartbeat stopped", job.id)
                     return
-            except (sqlite3.Error, OSError) as exc:  # e.g. the DB stayed locked: next beat
-                logger.warning("job %s: lease renewal failed: %s", job.id, exc)
+            except Exception as exc:  # e.g. the DB stayed locked: next beat
+                logger.warning(
+                    "job %s: lease renewal failed: %s (retrying; the claim lapses at its"
+                    " lease_until unless a later beat succeeds)",
+                    job.id,
+                    exc,
+                    exc_info=not isinstance(exc, sqlite3.Error | OSError),
+                )
     finally:
         if conn is not None:
             conn.close()
@@ -73,4 +89,10 @@ def lease_heartbeat(
         yield
     finally:
         stop.set()
-        beat.join()
+        beat.join(JOIN_TIMEOUT_S)
+        if beat.is_alive():
+            logger.warning(
+                "job %s: lease heartbeat did not stop within %g s; leaving it behind",
+                job.id,
+                JOIN_TIMEOUT_S,
+            )

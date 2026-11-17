@@ -234,7 +234,7 @@ def test_the_live_region_speaks_only_when_the_count_changes_zone() -> None:
         "",
         "Instagram caption: 9 of 10 characters",
         "",
-        "Instagram caption: 1 characters over the limit of 10",
+        "Instagram caption: 1 character over the limit of 10",
         "",
         "Instagram caption: 10 of 10 characters",
         "Instagram caption: 3 of 10 characters",
@@ -247,3 +247,11 @@ def test_crossing_into_the_last_tenth_and_back_before_a_pause_says_nothing() -> 
 
     assert [step["said"] for step in log] == ["", ""]
     assert log[-1]["counter"] == "2 of 10 characters"  # the visible counter stays live
+
+
+def test_one_unit_over_the_limit_is_singular() -> None:
+    (characters,) = count([(11, False)])
+    (utf16,) = count([(6, False)], limit=11, utf16=True)
+
+    assert characters["counter"] == "1 character over the limit of 10"
+    assert utf16["counter"] == "1 UTF-16 unit over the limit of 11"

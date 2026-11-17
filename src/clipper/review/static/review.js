@@ -91,7 +91,12 @@
     var limit = limitOf(field);
     var used = measure(field);
     var unit = field.getAttribute("data-unit");
-    if (used > limit) return number(used - limit) + " " + unit + " over the limit of " + number(limit);
+    if (used > limit) {
+      var over = used - limit;
+      // "1 character over", "2 characters over".
+      var units = over === 1 ? unit.replace(/s$/, "") : unit;
+      return number(over) + " " + units + " over the limit of " + number(limit);
+    }
     return number(used) + " of " + number(limit) + " " + unit;
   }
 

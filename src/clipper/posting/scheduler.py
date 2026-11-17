@@ -254,10 +254,10 @@ def schedule_for_clip(
     Returns the posts created; an approved clip already scheduled on an account is left as
     it is, so calling this again is safe. Nothing is scheduled for a sensitive clip (its
     stored flag, or `sensitive=True` from the creator's rule), a clip that is not approved
-    or exported, or one without a rendered video. An account is skipped when the clip's
-    length is outside its platform's limits (Facebook Reels: 3-90 s, CLP-94), when the
-    same file is already scheduled, posted or held on its platform, or when it has no free
-    slot. Each skip is logged with its reason.
+    or exported, or one without a rendered video. An account with no campaign is skipped
+    when the clip's length is outside its platform's limits (Facebook Reels: 3-90 s,
+    CLP-94); an account is skipped when the same file is already scheduled, posted or held
+    on its platform, or when it has no free slot. Each skip is logged with its reason.
 
     A post for a campaign account (`campaigns` by id) whose clip or metadata breaks the
     brief is created `held` with the reasons in `error`, with or without a free slot. A
@@ -285,8 +285,11 @@ def schedule_for_clip(
         for account in eligible:
             if repo.has_post(conn, clip_id, account.id):
                 continue
+            # A campaign post outside the length range is held by its pre-flight instead,
+            # so the reviewer sees why.
+            in_campaign = campaign_for(account, clip.creator, briefs)[0] is not None
             problem = length_problem(account.platform, clip.current.duration_s)
-            if problem is not None:
+            if problem is not None and not in_campaign:
                 logger.warning(
                     "clip %d: %s; not scheduled on account %s", clip_id, problem, account.id
                 )

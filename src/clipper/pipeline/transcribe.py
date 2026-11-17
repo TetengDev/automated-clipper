@@ -632,12 +632,16 @@ def _open_store_lock(models_dir: Path, what: str) -> int:
     `bench-transcribe` created as another user still works. Non-blocking, so a FIFO
     planted there cannot hang the open; anything but a regular file is refused with a
     retryable `MediaError`. The fd is not inherited (PEP 446): a child never holds it."""
+    lock = models_dir / STORE_LOCK
     flags = os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
-    fd = os.open(models_dir / STORE_LOCK, flags, 0o666)
+    try:
+        fd = os.open(lock, flags, 0o666)
+    except IsADirectoryError as exc:  # Linux refuses O_CREAT on a dir; macOS opens it
+        raise MediaError(f"{what}: {lock} is not a regular file") from exc
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            raise MediaError(f"{what}: {models_dir / STORE_LOCK} is not a regular file")
+            raise MediaError(f"{what}: {lock} is not a regular file")
         if info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) != 0o666:
             with suppress(OSError):
                 os.fchmod(fd, 0o666)  # the umask narrowed it

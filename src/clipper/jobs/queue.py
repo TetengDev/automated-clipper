@@ -3,8 +3,8 @@
 A claim is recorded as (worker_id, lease_until), where worker_id is unique per process.
 Claimed jobs are invisible to other claimers until the holder finishes them or the lease
 expires. Each claim counts as an attempt of the current stage, so a stage that keeps
-killing its worker (nothing ever recorded) still ends in `failed`. Lease renewal
-(heartbeats) and concurrency limits come later (E3-S1b).
+killing its worker (nothing ever recorded) still ends in `failed`. While a stage runs, the
+worker's heartbeat renews the lease (`renew_lease`, `clipper.jobs.heartbeat`).
 """
 
 from __future__ import annotations
@@ -164,6 +164,18 @@ def release_claims(conn: sqlite3.Connection, worker_id: str, now: datetime) -> i
             (to_iso(now), worker_id),
         )
     return cur.rowcount
+
+
+def renew_lease(
+    conn: sqlite3.Connection, job: Job, worker_id: str, now: datetime, lease: timedelta
+) -> bool:
+    """Extend the claim on `job` to now + lease (the heartbeat); False if it is not ours."""
+    with transaction(conn):
+        cur = conn.execute(
+            "UPDATE jobs SET lease_until = ? WHERE id = ? AND status = ? AND worker_id = ?",
+            (to_iso(now + lease), job.id, job.status.value, worker_id),
+        )
+    return cur.rowcount == 1
 
 
 def hold_lease(conn: sqlite3.Connection, job_id: int, worker_id: str, now: datetime) -> None:

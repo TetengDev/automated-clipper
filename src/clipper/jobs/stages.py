@@ -15,10 +15,12 @@
   (API keys, tokens, signed URLs); `clipper.redact` scrubs known shapes only as a backstop.
 - Statuses with no registered stage are never claimed: such jobs stay put until a worker
   that handles them runs (e.g. `waiting_vod` until the VOD poller exists).
-- A stage must finish within the claim lease (DEFAULT_LEASE). There is no heartbeat yet
-  (E3-S1b): past the lease another worker may take the job over, and the late result of
-  the original worker is dropped. Every claim counts as an attempt, so a stage that keeps
-  killing its worker ends the job as failed after MAX_ATTEMPTS claims.
+- While a stage runs, the worker's heartbeat renews the claim lease (DEFAULT_LEASE) every
+  quarter lease (`clipper.jobs.heartbeat`). Only a worker that stalls for longer than the
+  lease loses the job to another worker; its late result is dropped, and writes a stage
+  makes besides its artifact must be fenced with `hold_lease` on `ctx.worker_id` (as the
+  clip insert is). Every claim counts as an attempt, so a stage that keeps killing its
+  worker ends the job as failed after MAX_ATTEMPTS claims.
 """
 
 from __future__ import annotations

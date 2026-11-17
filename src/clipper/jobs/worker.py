@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Protocol
 
 from clipper.config import AppConfig
+from clipper.jobs.heartbeat import lease_heartbeat
 from clipper.jobs.models import TERMINAL, Clock, Job, JobStatus, utcnow
 from clipper.jobs.queue import (
     DEFAULT_LEASE,
@@ -140,7 +141,8 @@ class Worker:
                 ctx = StageContext(
                     media_dir, self.conn, self.config, self.clock, worker_id=self.worker_id
                 )
-                stage.run(job, ctx)
+                with lease_heartbeat(self.conn, job, self.worker_id, self.lease, self.clock):
+                    stage.run(job, ctx)
                 if artifact is not None and not artifact.is_file():
                     raise RuntimeError(f"stage finished without producing {stage.artifact}")
         except Deferred as exc:

@@ -1,6 +1,7 @@
 import logging
 import sqlite3
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import closing
@@ -24,6 +25,7 @@ from clipper.jobs import (
     enqueue,
     get_job,
 )
+from clipper.jobs import heartbeat as heartbeat_mod
 from clipper.jobs import worker as worker_mod
 from clipper.jobs.queue import DEFAULT_LEASE, JobConflict
 from clipper.jobs.stages import DEFAULT_STAGES
@@ -263,6 +265,109 @@ def test_stage_that_lost_its_lease_records_nothing(make_worker: MakeWorker, db: 
     assert (row["status"], row["last_error"], row["next_attempt_at"]) == (
         "fetching_audio", None, None,
     )  # fmt: skip
+
+
+def _lease_until(db: Path, job_id: int) -> str:
+    return _row(db, job_id)["lease_until"]
+
+
+def test_heartbeat_renews_the_lease_while_the_stage_runs(make_worker: MakeWorker, db: Path) -> None:
+    """CLP-34: a stage that outlives the lease keeps its claim."""
+    pipeline = StubPipeline()
+    clock = FakeClock()
+    worker = make_worker(pipeline, clock)
+    worker.lease = timedelta(seconds=0.4)  # renewed every 0.1 s
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()  # detected -> fetching_audio
+    seen: list[str] = []
+
+    def long_stage() -> None:
+        seen.append(_lease_until(db, job.id))
+        clock.now = T0 + timedelta(hours=1)
+        time.sleep(0.5)
+        seen.append(_lease_until(db, job.id))
+
+    pipeline.hooks[JobStatus.FETCHING_AUDIO] = long_stage
+    threads = threading.active_count()
+
+    assert worker.run_once()
+
+    assert seen == ["2026-01-01T12:00:00Z", "2026-01-01T13:00:00Z"]
+    assert threading.active_count() == threads  # stopped with the stage
+    assert _status(db, job.id) is JobStatus.TRANSCRIBING
+
+
+def test_heartbeat_stops_once_another_worker_holds_the_job(
+    make_worker: MakeWorker, db: Path
+) -> None:
+    pipeline = StubPipeline()
+    clock = FakeClock()
+    worker = make_worker(pipeline, clock)
+    worker.lease = timedelta(seconds=0.4)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()
+
+    def taken_over() -> None:
+        with closing(connect(db)) as other:
+            other.execute(
+                "UPDATE jobs SET worker_id = 'other', lease_until = 'theirs' WHERE id = ?",
+                (job.id,),
+            )
+        clock.now = T0 + timedelta(hours=1)
+        time.sleep(0.3)
+
+    pipeline.hooks[JobStatus.FETCHING_AUDIO] = taken_over
+
+    assert worker.run_once()  # the late result is dropped
+
+    row = _row(db, job.id)
+    assert (row["worker_id"], row["lease_until"], row["status"]) == (
+        "other", "theirs", "fetching_audio",
+    )  # fmt: skip
+
+
+def test_heartbeat_retries_a_failed_renewal(
+    make_worker: MakeWorker,
+    db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pipeline = StubPipeline()
+    clock = FakeClock()
+    worker = make_worker(pipeline, clock)
+    worker.lease = timedelta(seconds=0.4)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()
+    real = heartbeat_mod.renew_lease
+    calls: list[int] = []
+
+    def flaky(*args: object) -> bool:
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(heartbeat_mod, "renew_lease", flaky)
+
+    def long_stage() -> None:
+        clock.now = T0 + timedelta(hours=1)
+        time.sleep(0.5)
+        assert _lease_until(db, job.id) == "2026-01-01T13:00:00Z"
+
+    pipeline.hooks[JobStatus.FETCHING_AUDIO] = long_stage
+
+    assert worker.run_once()
+    assert _status(db, job.id) is JobStatus.TRANSCRIBING
+    assert "lease renewal failed: database is locked" in caplog.text
+
+
+def test_no_heartbeat_for_an_in_memory_db() -> None:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        assert heartbeat_mod.database_file(conn) is None
+        threads = threading.active_count()
+        job = Job(1, YT, "manual", "https://x", JobStatus.DETECTED, False, 1)
+        with heartbeat_mod.lease_heartbeat(conn, job, "w", timedelta(seconds=1), FakeClock()):
+            assert threading.active_count() == threads
 
 
 def test_run_forever_survives_db_errors(

@@ -1008,11 +1008,16 @@ def test_no_checks_box_when_no_campaign_check_applies(
 ) -> None:
     client = campaign_client(env, brief, accounts=accounts)
     clip_id = env.clip(video_path="missing.mp4")
+    forged = env.clip(video_path="missing.mp4")
 
     html = client.get(f"/clip/{clip_id}").text
 
     assert 'id="reviewer-checks"' not in html and CHECKS_BOX not in html
     assert post(client, f"/clip/{clip_id}/approve", version=1).status_code == 200
+    # A confirmation the page never asked for is not recorded.
+    response = post(client, f"/clip/{forged}/approve", version=1, confirm_reviewer_checks="1")
+    assert response.status_code == 200
+    assert env.reviews(forged)[0]["payload"] is None
 
 
 def test_a_campaign_of_another_creator_does_not_apply(env: Env) -> None:

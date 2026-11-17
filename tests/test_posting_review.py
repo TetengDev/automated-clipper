@@ -105,6 +105,8 @@ def test_approve_says_a_plain_post_was_held_by_the_preflight(env: Env) -> None:
     assert "1 post(s) held by the pre-flight (ig_main)" in client.get("/queue").text
     page = client.get("/scheduled").text
     assert "Held by the pre-flight" in page and "campaign pre-flight" not in page
+    # CLP-112: the help text fits a plain post too.
+    assert "rejected by their platform" in page and "break their campaign's brief and" not in page
 
 
 def test_approve_without_accounts_schedules_nothing(env: Env) -> None:

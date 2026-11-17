@@ -447,8 +447,9 @@ def meta_tokens(ctx: typer.Context) -> None:
 
 
 def _publishers(config_path: Path, cfg: AppConfig) -> dict[str, Publisher]:
-    """Publishers for the platforms the accounts config posts to (CLP-93). An invalid
-    accounts config turns posting off instead of stopping the clip pipeline."""
+    """Publishers for the platforms the accounts config posts to (CLP-93). The worker has
+    already checked the accounts config (`_posting_config` stops it when invalid); if the
+    file turns invalid in between, posting is off rather than the worker stopping."""
     from clipper.accounts import accounts_path, load_accounts
     from clipper.posting.publishers import build_publishers
 

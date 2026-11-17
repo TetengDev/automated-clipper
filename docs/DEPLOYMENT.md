@@ -238,8 +238,9 @@ such an account, or its posts go out late, all together, when the publisher arri
 The worker posts to YouTube itself, through the free YouTube Data API v3
 (`src/clipper/posting/youtube.py`, [CLP-93](https://linear.app/tengdev/issue/CLP-93)). It
 registers the YouTube publisher when `accounts.yaml` has at least one enabled `youtube`
-account. If `accounts.yaml` is invalid, the worker logs `posting is off` and runs the
-rest of the pipeline. Only clips a reviewer approved are ever scheduled.
+account. If `accounts.yaml` is invalid, the worker stops at start with the error (exit
+code 1); fix the file and start it again. Only clips a reviewer approved are ever
+scheduled.
 
 How it posts:
 
@@ -250,6 +251,11 @@ How it posts:
 - The title is capped at 100 characters. The description is the caption plus up to 5
   hashtags, within 5000 bytes. The category is 24 (Entertainment), the video is declared
   not made for kids, and `containsSyntheticMedia` is set when the clip has an AI element.
+  Hashtags the caption already ends with are not added twice.
+- A post that needs the paid-partnership disclosure (a campaign with `paid_partnership:
+  true`) is refused before upload and turns `post_failed` with an alert: the worker does
+  not set YouTube's paid-promotion disclosure. Post such a clip by hand in YouTube Studio
+  with the disclosure on.
   Each upload carries a hidden `clipper-<idempotency key>` tag. After a timeout or a crash,
   the worker uses that tag to find the earlier upload and records it instead of uploading
   the video twice.

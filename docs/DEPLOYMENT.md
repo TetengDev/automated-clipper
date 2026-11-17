@@ -153,16 +153,16 @@ clip renders, the job fails.
 - `clipper retry <job>` deletes the job's counts, so every clip gets fresh tries. It finds
   them under `--media-root` (default `data/media`, or `CLIPPER_MEDIA_DIR`), so pass the
   worker's media directory if it is not the default. `clipper enqueue --retry` keeps the
-  counts and the 48 h clock below: delete `render_failures.json` and `.render_failing_since`
-  by hand to give the clips fresh tries. When no clip rendered, the job drops its counts
-  itself.
+  counts: delete `render_failures.json` by hand to give a left-out clip fresh tries. When no
+  clip rendered, the job drops its counts itself.
 - Outage cap: when every render fails (Remotion broken, disk full), a job keeps trying for
   up to about 3 x clips x `CLIP_WORST_CASE_S` (the worst case of one clip). With a single
   worker, every job queued behind it waits too. So a job whose renders still fail 48 h
-  after the first deferral with a failed render fails (`.render_failing_since` in its
-  media directory holds that time). A run in which every render works is never stopped by
-  the cap, so a job picked up late by a stopped worker goes on. Watch the worker log for
-  repeated `clip N failed` lines across jobs.
+  into an episode of failed renders fails. `.render_failing_since` in its media directory
+  holds when the episode began and its last failed render. After 48 h without a failed
+  render the episode is over, so a job picked up late by a stopped worker, or requeued
+  later, starts a new one. A run in which every render works is never stopped by the cap.
+  Watch the worker log for repeated `clip N failed` lines across jobs.
 - Two workers on the same clip (one of them after losing its lease) can overwrite each
   other's update to `render_failures.json`, so the count can come out one too low. That
   only means an extra retry; the number of tries is still bounded.

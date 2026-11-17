@@ -2048,25 +2048,67 @@ def test_timeout_after_a_counted_failure_defers(
     assert _rows(conn) == []
 
 
-def test_render_failures_past_the_age_cap_fail_the_job(
-    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
-) -> None:
-    """CLP-89: a render stage still failing clips 48 h after it was first deferred fails
-    instead of deferring again (an outage cannot hold the job, and the queue, forever)."""
-    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
-    fake.fail_rank[2] = RenderError("remotion render failed with exit code 1")
-    clock = [T0]
-    ctx = StageContext(media_dir=media, conn=conn, config=AppConfig(), clock=lambda: clock[0])
+def _failing_every_run(
+    conn: sqlite3.Connection,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: list[datetime],
+) -> StageContext:
+    """Clip 1 fails on every run (its count cannot be written, so it is never left out),
+    and each run renders one more of clips 2-5, so every run defers."""
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2, 3, 4, 5)])
+    (media / "clips/1" / rc.FAILURES_MARKER).mkdir()
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+    _budget_for_one_clip(monkeypatch, fake)
+    return StageContext(media_dir=media, conn=conn, config=AppConfig(), clock=lambda: clock[0])
 
-    with pytest.raises(Deferred):
-        rc.render_clips(job, ctx)
+
+def test_render_failures_past_the_age_cap_fail_the_job(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLP-89: renders still failing 48 h into an episode of failing runs fail the job
+    instead of deferring again (an outage cannot hold the job, and the queue, forever)."""
+    clock = [T0]
+    ctx = _failing_every_run(conn, media, fake, monkeypatch, clock)
+
+    for hours in (0, 24):
+        clock[0] = T0 + timedelta(hours=hours)
+        with pytest.raises(Deferred):
+            rc.render_clips(job, ctx)
     assert (media / rc.FAILING_MARKER).is_file()
     clock[0] = T0 + rc.MAX_FAILING_AGE + timedelta(hours=1)
     with pytest.raises(PermanentError, match="still failing 48 h after the first deferral"):
         rc.render_clips(job, ctx)
 
     assert not (media / rc.FAILING_MARKER).exists()
-    assert [r["rank"] for r in _rows(conn)] == [1]
+    assert [r["rank"] for r in _rows(conn)] == [2, 3, 4]
+
+
+def test_failing_episode_over_48_h_ago_starts_a_new_one(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLP-89: a marker whose last failure is over 48 h old (a stopped worker, a crash or
+    `enqueue --retry` leftover) is a past episode: one new failure only defers."""
+    clock = [T0]
+    ctx = _failing_every_run(conn, media, fake, monkeypatch, clock)
+    with pytest.raises(Deferred):
+        rc.render_clips(job, ctx)
+
+    clock[0] = T0 + timedelta(days=3)
+    with pytest.raises(Deferred):
+        rc.render_clips(job, ctx)
+
+    start = (media / rc.FAILING_MARKER).read_text().split()[0]
+    assert datetime.fromisoformat(start) == T0 + timedelta(days=3)
 
 
 def test_late_run_without_failures_is_not_capped_and_clears_the_marker(

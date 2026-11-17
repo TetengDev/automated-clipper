@@ -59,8 +59,9 @@ MAX_RENDER_FAILURES failures. Crashes still use up attempts (each claim is one).
 The cost of that: in an outage where every render fails (Remotion broken, disk full), a
 job runs up to about MAX_RENDER_FAILURES x clips x CLIP_WORST_CASE_S of failing renders
 before it fails, and with a single worker it holds up every job queued behind it. So a
-run that still has a failed render MAX_FAILING_AGE (48 h) after the stage was first
-deferred with one fails the job (CLP-89, FAILING_MARKER).
+run that still has a failed render MAX_FAILING_AGE (48 h) into an episode of deferrals
+with failed renders fails the job (CLP-89, FAILING_MARKER); an episode with no failed
+render for 48 h is over.
 """
 
 from __future__ import annotations
@@ -95,7 +96,7 @@ from clipper.pipeline.common import (
     Deadline,
     StageTimeout,
     creator_for,
-    first_seen,
+    episode_since,
     read_json,
     settings_for,
     strip_control,
@@ -159,10 +160,11 @@ SLOTS_DIR = ".render_slots"
 """Under the media root: one lock file per render slot (`max_concurrent_renders`)."""
 SLOT_RETRY = timedelta(minutes=1)
 FAILING_MARKER = ".render_failing_since"
-"""In the job's media dir: when a run of this stage was first deferred with a failed
-render; removed once the stage ends."""
+"""In the job's media dir: when the current episode of deferrals with a failed render
+began, and the last one (`episode_since`); removed once the stage ends."""
 MAX_FAILING_AGE = timedelta(hours=48)
-"""A run that still has a failed render this long after that fails the job (CLP-89)."""
+"""A run that still has a failed render this long into an episode fails the job (CLP-89);
+an episode with no failed render for this long is over."""
 
 
 def _version(value: Any) -> str | None:
@@ -483,12 +485,12 @@ def _left_out(rank: int, failures: int, error: str) -> str:
 
 def _defer(ctx: StageContext, until: datetime, reason: str, *, failing: bool) -> Exception:
     """`Deferred` to `until`; or, like `deferring_no_format`, a `PermanentError` when a
-    render is still `failing` MAX_FAILING_AGE after the first deferral with a failed
-    render (FAILING_MARKER). A run without a failed render is never capped, so a job
-    picked up late (a stopped worker) that renders fine goes on."""
+    render is still `failing` MAX_FAILING_AGE into an episode of deferrals with a failed
+    render (FAILING_MARKER). A run without a failed render is never capped and does not
+    extend the episode, so a job picked up late that renders fine goes on."""
     now = ctx.clock()
     marker = ctx.media_dir / FAILING_MARKER
-    if failing and now - first_seen(marker, now) > MAX_FAILING_AGE:
+    if failing and now - episode_since(marker, now, MAX_FAILING_AGE) > MAX_FAILING_AGE:
         marker.unlink(missing_ok=True)
         hours = MAX_FAILING_AGE.total_seconds() / 3600
         return PermanentError(f"{reason} (still failing {hours:.0f} h after the first deferral)")

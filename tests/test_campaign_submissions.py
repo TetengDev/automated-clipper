@@ -450,6 +450,53 @@ def test_discord_transport_error_never_shows_the_webhook_url() -> None:
         DiscordWebhook(WEBHOOK, http).send("hi")
 
     assert "secret-token-abc" not in str(info.value)
+    assert info.value.status is None and info.value.retry_after is None
+
+
+def test_a_bare_notify_error_has_no_status() -> None:
+    error = NotifyError("discord returned 503")
+
+    assert error.status is None and error.retry_after is None
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [400, 404, 500, 503])
+def test_discord_error_carries_the_status(status: int) -> None:
+    respx.post(WEBHOOK).mock(return_value=httpx.Response(status, json={"retry_after": 9}))
+    with httpx.Client() as http, pytest.raises(NotifyError) as info:
+        DiscordWebhook(WEBHOOK, http).send("hi")
+
+    assert info.value.status == status
+    assert info.value.retry_after is None  # only a 429 asks us to wait
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("response", "retry_after"),
+    [
+        (httpx.Response(429, json={"retry_after": 2.5, "global": False}), 2.5),
+        (httpx.Response(429, headers={"Retry-After": "7"}), 7.0),
+        (httpx.Response(429, json={"retry_after": 3}, headers={"Retry-After": "4"}), 3.0),
+        (httpx.Response(429), None),
+        (httpx.Response(429, text="<html>slow down</html>"), None),
+        (httpx.Response(429, json=["retry_after", 5]), None),
+        (httpx.Response(429, json={"retry_after": True}), None),
+        (httpx.Response(429, json={"retry_after": "soon"}, headers={"Retry-After": "x"}), None),
+        (httpx.Response(429, json={"retry_after": -1}), None),
+        (httpx.Response(429, headers={"Retry-After": "nan"}), None),
+        (httpx.Response(429, headers={"Retry-After": "inf"}), None),
+        (httpx.Response(429, text='{"retry_after": 1e400}'), None),  # inf once parsed
+    ],
+)
+def test_discord_429_carries_retry_after_when_it_is_sane(
+    response: httpx.Response, retry_after: float | None
+) -> None:
+    respx.post(WEBHOOK).mock(return_value=response)
+    with httpx.Client() as http, pytest.raises(NotifyError) as info:
+        DiscordWebhook(WEBHOOK, http).send("hi")
+
+    assert info.value.status == 429
+    assert info.value.retry_after == retry_after
 
 
 def test_discord_webhook_must_be_https_discord() -> None:

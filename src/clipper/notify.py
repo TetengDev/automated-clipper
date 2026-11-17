@@ -10,6 +10,7 @@ and alert dedupe on top of the same webhooks.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from urllib.parse import urlsplit
 
@@ -27,7 +28,40 @@ Notify = Callable[[str], None]
 
 
 class NotifyError(Exception):
-    """A message was not delivered. The text never includes the webhook URL."""
+    """A message was not delivered. The text never includes the webhook URL.
+
+    `status` is the HTTP status, None when the webhook was not reached. `retry_after` is
+    the wait in seconds a 429 asked for, None when it gave no usable figure."""
+
+    def __init__(
+        self, message: str, *, status: int | None = None, retry_after: float | None = None
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    """The seconds a 429 asks us to wait: Discord's JSON `retry_after`, else the
+    `Retry-After` header. None for anything missing, malformed, negative or infinite."""
+    candidates: list[object] = []
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        candidates.append(body.get("retry_after"))
+    candidates.append(response.headers.get("Retry-After"))
+    for value in candidates:
+        if isinstance(value, bool) or not isinstance(value, int | float | str):
+            continue
+        try:
+            seconds = float(value)
+        except ValueError:
+            continue
+        if math.isfinite(seconds) and seconds >= 0:
+            return seconds
+    return None
 
 
 class DiscordWebhook:
@@ -72,7 +106,12 @@ class DiscordWebhook:
             # httpx messages can carry the request URL, which holds the webhook token.
             raise NotifyError(f"discord webhook unreachable ({type(exc).__name__})") from None
         if response.status_code >= 300:
-            raise NotifyError(f"discord webhook returned {response.status_code}")
+            status = response.status_code
+            raise NotifyError(
+                f"discord webhook returned {status}",
+                status=status,
+                retry_after=_retry_after(response) if status == 429 else None,
+            )
 
     __call__ = send
 

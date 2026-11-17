@@ -1391,6 +1391,19 @@ def test_clip_is_published_after_the_fenced_insert(
     ]  # fmt: skip
 
 
+def test_failed_publish_keeps_no_row_and_no_files(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    (media / "clips/1/v1.mp4/x").mkdir(parents=True)  # the rename of the video fails
+
+    with pytest.raises(RenderError, match="render I/O error"):
+        rc.render_clips(job, _ctx(media, conn))
+
+    assert _rows(conn) == []
+    assert sorted(p.name for p in (media / "clips/1").iterdir()) == ["source.mp4", "v1.mp4"]
+
+
 @contextlib.contextmanager
 def _slot_taken(media_root: Path, index: int) -> Iterator[None]:
     """Another worker process renders: it holds render slot `index` (an flock)."""

@@ -591,10 +591,13 @@ def _render_clips(job: Job, ctx: StageContext) -> None:
             # one; unless it failed too often, then it is left out like an invalid clip.
             reason = redact(strip_control(str(exc).splitlines()[0]))[:MAX_REASON_CHARS]
             failures += 1
-            if _record_failure(marker, failures, reason):
+            saved = _record_failure(marker, failures, reason)
+            if saved:
                 counted += 1
                 worst = max(worst, failures)
-            if failures >= MAX_RENDER_FAILURES:
+            # Only a saved failure leaves the clip out: unsaved, a later run would count
+            # one fewer and try a clip that was already given up on.
+            if saved and failures >= MAX_RENDER_FAILURES:
                 logger.warning(
                     "job %s: clip %s failed %d times, leaving it out: %s",
                     job.id, rank, failures, reason,

@@ -1727,6 +1727,31 @@ def test_unwritable_marker_without_strerror_logs_the_error_type(
     assert "secret" not in caplog.text
 
 
+def test_unsaved_third_failure_does_not_leave_the_clip_out(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLP-89: a clip is left out only once its last failure is saved; otherwise a later
+    run would find 2 saved failures for a clip that was already left out once."""
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    (media / "clips/1" / rc.FAILURES_MARKER).write_text('{"failures": 2, "error": "x"}')
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+
+    def no_write(path: Path, data: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(rc, "write_json_atomic", no_write)
+    with pytest.raises(RenderError):  # nothing counted: retried, using up an attempt
+        rc.render_clips(job, _ctx(media, conn))
+
+    assert "leaving it out" not in caplog.text
+    assert rc._failures(media / "clips/1" / rc.FAILURES_MARKER)[0] == 2
+
+
 def test_all_left_out_still_fails_when_a_marker_cannot_be_removed(
     conn: sqlite3.Connection,
     job: Job,

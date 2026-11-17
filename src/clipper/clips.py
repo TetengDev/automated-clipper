@@ -19,7 +19,14 @@ from typing import Any, Literal
 
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
-from clipper.metadata import PLATFORMS, Variant, coerce_variants, fingerprint, variants_json
+from clipper.metadata import (
+    PLATFORMS,
+    Variant,
+    coerce_variants,
+    coerce_variants_with_notes,
+    fingerprint,
+    variants_json,
+)
 from clipper.urls import InvalidSourceURL, SourceRef, canonical_url
 
 PAGE_SIZE = 24
@@ -136,6 +143,9 @@ class ClipVersion:
     variants: Mapping[str, Variant] = field(default_factory=dict)
     """Title, caption and hashtags per platform (CLP-96); derived from the single copy for
     versions stored before CLP-96."""
+    adjusted: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """Per platform, what was changed on load in stored text that a stricter rule no longer
+    accepts (CLP-118), for the reviewer to see; saving the platform text stores the result."""
 
     @property
     def duration_s(self) -> float:
@@ -144,6 +154,9 @@ class ClipVersion:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ClipVersion:
         hashtags = parse_hashtags(row["hashtags"])
+        variants, adjusted = coerce_variants_with_notes(
+            _json_or_none(row["variants"]), row["title"], row["caption"], hashtags
+        )
         return cls(
             version=row["version"],
             start_s=row["start_s"],
@@ -161,9 +174,8 @@ class ClipVersion:
             rendered_s=row["duration_s"],
             sensitive=bool(row["sensitive"]),
             gate_reasons=_reasons(row["gate_reasons"]),
-            variants=coerce_variants(
-                _json_or_none(row["variants"]), row["title"], row["caption"], hashtags
-            ),
+            variants=variants,
+            adjusted={p: tuple(notes) for p, notes in adjusted.items()},
         )
 
 

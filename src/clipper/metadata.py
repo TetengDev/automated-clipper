@@ -519,17 +519,25 @@ def _stacked(span: str) -> bool:
     return False
 
 
+def _unusable_inline(text: str) -> list[tuple[str, int, int]]:
+    """The readings of the inline hashtags that `strip_unusable_tags` takes out of `text`."""
+    return [
+        (tag, start, end)
+        for tag, start, end in _inline_tags(text)
+        if _unusable(tag) or _stacked(text[start:end])
+    ]
+
+
 def strip_unusable_tags(text: str) -> str:
     """`text` without the inline hashtags that `clean_hashtags` would drop, with any extra
     `#` or invisible character straight before them (`##ad`, ZWJ + `#fyp`)."""
     parts: list[str] = []
     last = 0
-    for tag, start, end in _inline_tags(text):
-        if _unusable(tag) or _stacked(text[start:end]):
-            while start > last and (text[start - 1] == "#" or _is_padding(text[start - 1])):
-                start -= 1
-            parts.append(text[last : max(start, last)])
-            last = max(end, last)
+    for _, start, end in _unusable_inline(text):
+        while start > last and (text[start - 1] == "#" or _is_padding(text[start - 1])):
+            start -= 1
+        parts.append(text[last : max(start, last)])
+        last = max(end, last)
     parts.append(text[last:])
     return "".join(parts)
 
@@ -538,13 +546,7 @@ def inline_unusable_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
     """Generic, malformed, mixed-script or mark-stacked hashtags written into `text` itself,
     other than `allowed` ones; disclosure-like ones are `inline_disclosure_tags`."""
     ok = {_fold(t) for t in allowed}
-    return [
-        t
-        for t, start, end in _inline_tags(text)
-        if (_unusable(t) or _stacked(text[start:end]))
-        and not is_disclosure(t)
-        and _fold(t) not in ok
-    ]
+    return [t for t, _, _ in _unusable_inline(text) if not is_disclosure(t) and _fold(t) not in ok]
 
 
 def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
@@ -612,13 +614,13 @@ class Variant(BaseModel):
 
     @field_validator("title", mode="after")
     @classmethod
-    def _clean_title(cls, value: str) -> str:
-        return clean_title(value)
+    def _clean_title(cls, value: str, info: ValidationInfo) -> str:
+        return _without_disclosure("title", value, clean_title(value), info)
 
     @field_validator("caption", mode="after")
     @classmethod
-    def _clean_caption(cls, value: str) -> str:
-        return clean_caption(value)
+    def _clean_caption(cls, value: str, info: ValidationInfo) -> str:
+        return _without_disclosure("caption", value, clean_caption(value), info)
 
     @field_validator("hashtags", mode="after")
     @classmethod
@@ -660,6 +662,21 @@ class Variant(BaseModel):
         return self
 
 
+def _without_disclosure(field: str, value: str, cleaned: str, info: ValidationInfo) -> str:
+    """`cleaned`, unless `value` or `cleaned` has a disclosure-like inline tag: only a
+    campaign adds those, so a reviewer is told rather than the tag silently dropped. A `#`
+    inside a URL is left to the link rules and the pre-flight (see `_URL`)."""
+    found = [t for text in (value, cleaned) for t, _, _ in _inline_tags(text) if is_disclosure(t)]
+    if found:
+        platform = (info.context or {}).get("platform")
+        where = f"{platform} " if platform else ""
+        raise ValueError(
+            f"{where}{field} has disclosure-like tags {' '.join(dict.fromkeys(found))};"
+            " only a campaign adds those"
+        )
+    return cleaned
+
+
 def _hashtag_line(tags: Sequence[str]) -> str:
     return " ".join(tags)
 
@@ -673,19 +690,65 @@ def caption_room(platform: str, tags: Sequence[str]) -> int:
 
 
 def _fit(platform: str, title: str, caption: str, tags: Sequence[object]) -> Variant:
+    return _refit(platform, title, caption, tags)[0]
+
+
+def _refit(
+    platform: str, title: str, caption: str, tags: Sequence[object]
+) -> tuple[Variant, list[str]]:
+    """A variant inside the platform's limits, and what was changed to get there: hashtags
+    dropped, inline tags removed, `<` and `>` removed (YouTube), text cut. Cleaning runs
+    again after the cut, since a hard cut can end mid-tag (`#adventure` -> `#ad`)."""
     limits = _limits(platform)
     hashtags = clean_hashtags(tags, limits.hashtags_max)
-    title, caption = clean_title(title), clean_caption(caption)
-    if platform == "youtube":
-        title, caption = _ANGLE.sub("", title), _ANGLE.sub("", caption)
-    return Variant.model_validate(
-        {
-            "title": truncate_words(title, limits.title_max, limits.length),
-            "caption": truncate_words(caption, caption_room(platform, hashtags), limits.length),
-            "hashtags": hashtags,
-        },
-        context={"platform": platform},
+    notes: list[str] = []
+    kept = list(hashtags)
+    dropped: list[str] = []
+    for raw in tags:
+        tag = normalize_hashtag(raw) if isinstance(raw, str) else None
+        if tag in kept:
+            kept.remove(tag)
+        elif tag is not None:
+            dropped.append(tag)
+    if dropped:
+        notes.append(f"dropped hashtags {' '.join(dropped)}")
+    fitted: dict[str, str] = {}
+    for field, text, clean, limit in (
+        ("title", title, clean_title, limits.title_max),
+        ("caption", caption, clean_caption, caption_room(platform, hashtags)),
+    ):
+        changes: list[str] = []
+        out = text
+        if platform == "youtube" and _ANGLE.search(out):
+            out = _ANGLE.sub("", out)
+            changes.append(f"removed < and > from the {field}")
+        out, removed = _clean_fully(out, clean)
+        if limits.length(out) > limit:
+            out = truncate_words(out, limit, limits.length)
+            changes.append(f"cut the {field} to fit {limit:,} {limits.unit}")
+        out, removed_after_cut = _clean_fully(out, clean)
+        changes += [f"removed {t} from the {field}" for t in [*removed, *removed_after_cut]]
+        if out != text and not changes:
+            changes.append(f"cleaned the {field}")
+        notes += changes
+        fitted[field] = out
+    variant = Variant.model_validate(
+        {**fitted, "hashtags": hashtags}, context={"platform": platform}
     )
+    return variant, notes
+
+
+def _clean_fully(text: str, clean: Callable[[str], str]) -> tuple[str, list[str]]:
+    """`text` cleaned until cleaning changes nothing (taking a tag out can join two halves
+    into a new one), and the inline tags taken out, as typed."""
+    removed: list[str] = []
+    while True:
+        spans = dict.fromkeys((start, end) for _, start, end in _unusable_inline(text))
+        removed += [text[start:end] for start, end in spans]
+        cleaned = clean(text)
+        if cleaned == text:
+            return text, removed
+        text = cleaned
 
 
 def derive_variants(
@@ -703,10 +766,20 @@ def coerce_variants(
     """Variants from untrusted JSON (model output, a stored column). An entry that is
     already valid for its platform is kept exactly (a reviewer's saved text reads back
     unchanged); another well-formed entry is cleaned into the limits; anything else is
-    derived from the single title, caption and hashtags."""
+    derived from the single title, caption and hashtags. Never raises."""
+    return coerce_variants_with_notes(raw, title, caption, hashtags)[0]
+
+
+def coerce_variants_with_notes(
+    raw: object, title: str | None, caption: str | None, hashtags: Iterable[object]
+) -> tuple[dict[str, Variant], dict[str, list[str]]]:
+    """`coerce_variants`, and per platform what was changed in a well-formed entry that no
+    longer validates (a stored variant from before a stricter rule), so the reviewer can be
+    told. A derived entry has no notes: there was no text of that platform's to change."""
     entries = raw if isinstance(raw, Mapping) else {}
     tags = list(hashtags)
     out: dict[str, Variant] = {}
+    notes: dict[str, list[str]] = {}
     for platform in PLATFORMS:
         entry = entries.get(platform)
         if not (
@@ -723,8 +796,12 @@ def coerce_variants(
                 context={"platform": platform},
             )
         except ValidationError:
-            out[platform] = _fit(platform, entry["title"], entry["caption"], entry["hashtags"])
-    return out
+            out[platform], changes = _refit(
+                platform, entry["title"], entry["caption"], entry["hashtags"]
+            )
+            if changes:
+                notes[platform] = changes
+    return out, notes
 
 
 def variants_json(variants: Mapping[str, Variant]) -> dict[str, dict[str, Any]]:

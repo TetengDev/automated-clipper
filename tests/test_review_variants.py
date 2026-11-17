@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -366,4 +367,54 @@ def test_youtube_title_cannot_be_emptied_or_hold_angle_brackets(
     assert empty.status_code == 200  # an empty field keeps the stored text
     assert blank.status_code == 422 and "cannot be empty" in blank.text
     assert angle.status_code == 422
+    assert stored(env, clip_id) == STORED
+
+
+# --- stored text re-fitted on load (CLP-118) -------------------------------------------------
+
+
+def described_by(html: str, field_id: str) -> list[str]:
+    """The ids an element's aria-describedby names."""
+    match = re.search(rf'<(?:input|textarea) id="{field_id}"[^>]*aria-describedby="([^"]*)"', html)
+    return match.group(1).split() if match else []
+
+
+def test_a_refitted_stored_variant_shows_what_changed(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    instagram = {"caption": "great clip #paidpartnership", "hashtags": ["#kai", "#collab"]}
+    store(env, clip_id, {**STORED, "instagram": {**STORED["instagram"], **instagram}})
+
+    html = client.get(f"/clip/{clip_id}").text
+
+    assert html.count("Adjusted on load") == 1
+    notice = re.search(r'<p id="instagram-adjusted"[^>]*>([^<]*)</p>', html)
+    assert notice is not None
+    assert notice.group(1) == (
+        "Adjusted on load: dropped hashtags #collab; removed #paidpartnership from the caption."
+    )
+    assert (
+        html.index('id="variant-instagram"') < notice.start() < html.index('id="variant-youtube"')
+    )
+    for field in ("instagram-title", "instagram-caption"):
+        assert "instagram-adjusted" in described_by(html, field)
+    assert "great clip</textarea>" in html
+
+
+def test_valid_or_derived_variants_show_no_adjusted_notice(client: TestClient, env: Env) -> None:
+    valid = env.clip()
+    store(env, valid, STORED)
+    derived = env.clip(title="t " * 80, hashtags=["#kai", "#viral"])  # no stored variants
+
+    for clip_id in (valid, derived):
+        assert "Adjusted on load" not in client.get(f"/clip/{clip_id}").text
+
+
+def test_a_typed_disclosure_like_tag_is_refused(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    store(env, clip_id, STORED)
+
+    response = post(client, clip_id, version=1, instagram_caption="great clip #paidpartnership")
+
+    assert response.status_code == 422
+    assert "instagram caption has disclosure-like tags #paidpartnership" in response.text
     assert stored(env, clip_id) == STORED

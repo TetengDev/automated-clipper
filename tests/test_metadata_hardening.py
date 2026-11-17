@@ -363,9 +363,10 @@ def test_review_ordinary_tags_stay_usable(tag):
 
 
 def test_review_inline_disclosure_tags_in_the_text_are_flagged_by_preflight():
-    # A variant strips them (CLP-111), so the pre-flight sees them only in text built
+    # A variant refuses them (CLP-118), so the pre-flight sees them only in text built
     # some other way.
-    assert variants(caption="great clip #paidpartnership")["tiktok"].caption == "great clip"
+    with pytest.raises(ValidationError, match="disclosure-like"):
+        variant(caption="great clip #paidpartnership")
     meta = post("great clip #paidpartnership")
     assert any("disclosure" in p for p in preflight(meta, "tiktok", 35.0))
     titled = post("C", title="t #Sponsored")

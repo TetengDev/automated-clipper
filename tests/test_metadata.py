@@ -27,6 +27,7 @@ from clipper.metadata import (
     coerce_variants,
     derive_variants,
     fingerprint,
+    is_disclosure,
     is_hashtag,
     links_or_mentions,
     preflight,
@@ -646,9 +647,18 @@ def test_rejected_inline_tags_are_stripped_from_the_title_and_caption(text):
     def words(line: str) -> str:  # the text without its tags
         return " ".join(w for w in line.split() if not w.startswith("#"))
 
-    v = variant(title=f"Big {text} moment", caption=f"Line {text} one\nLine two #kai")
-    assert v.title == words(f"Big {text} moment")
-    assert v.caption == words(f"Line {text} one") + "\nLine two #kai"
+    title, caption = f"Big {text} moment", f"Line {text} one\nLine two #kai"
+    if any(is_disclosure(w) for w in text.split()):
+        # A variant refuses a disclosure-like tag, so a reviewer is told (CLP-118); _fit
+        # strips it.
+        with pytest.raises(ValidationError, match="disclosure-like"):
+            variant(title=title)
+        with pytest.raises(ValidationError, match="disclosure-like"):
+            variant(caption=caption)
+    else:
+        v = variant(title=title, caption=caption)
+        assert v.title == words(title)
+        assert v.caption == words(f"Line {text} one") + "\nLine two #kai"
     out = coerce_variants(None, f"Big {text}", f"Cap {text}", ["#kai", "#chair", "#fall"])
     expected = (words(f"Big {text}"), words(f"Cap {text}"))
     assert all((x.title, x.caption) == expected for x in out.values())

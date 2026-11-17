@@ -22,6 +22,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from bisect import bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -38,6 +39,7 @@ from pydantic import (
 )
 
 from clipper.edl import EDL, has_ai_elements
+from clipper.hashtag_data import CONFUSABLES, MARK_SCRIPTS, SCRIPT_NAMES, SCRIPT_STARTS
 from clipper.pipeline.common import strip_control
 
 PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
@@ -86,8 +88,9 @@ DISCLOSURE_PREFIXES = (
     "#prgift",
 )
 """Tags that read as a paid-partnership disclosure, exactly or by prefix (`#sponsoredpost`),
-compared without underscores, trailing digits or digit lookalikes (`#sp0nsored_2024`): only
-a campaign may add them (as campaign tags at scheduling), never the model or a variant."""
+compared without underscores, trailing digits or digit lookalikes (`#sp0nsored_2024`) and
+by skeleton (`#ꜱponsored`): only a campaign may add them (as campaign tags at scheduling),
+never the model or a variant."""
 _LOOKALIKE_DIGITS = str.maketrans("013457", "oieast")
 _TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online|store|live|click"
 _SPOKEN_TLDS = "com|net|org|io|ly|gg|co|xyz|link|tv|app|info|biz|click"
@@ -227,13 +230,61 @@ def _fold(tag: str) -> str:
     return unicodedata.normalize("NFKC", tag).casefold().translate(_DROP_NEUTRAL)
 
 
+def _prefold(text: str) -> str:
+    """Compatibility-decomposed and case-folded, without combining marks or the neutral
+    apostrophes, so canonically equivalent text folds the same and `#àd`, `#ＡＤ` and `#ad`
+    with a dot below all read `#ad`. Must match the generator's `_prefold`."""
+    text = unicodedata.normalize("NFKD", unicodedata.normalize("NFKD", text).casefold())
+    marks = "".join(c for c in text if not unicodedata.category(c).startswith("M"))
+    return marks.translate(_DROP_NEUTRAL)
+
+
+def _skeleton(text: str) -> str:
+    """The UTS #39 skeleton of prefolded `text`, as far as ASCII letters and digits go:
+    `#ᴀᴅ`, `#аԁ` and `#ɑd` all read `#ad`. Compare only skeletons with skeletons (`m` reads
+    `rn`)."""
+    return text.translate(CONFUSABLES)
+
+
+_CJK = frozenset({"HAN", "HIRAGANA", "KATAKANA", "BOPOMOFO", "HANGUL"})
+
+
+def _readings(tag: str) -> list[str]:
+    """`tag` prefolded, and when it mixes Latin with Japanese, Chinese or Korean (allowed as
+    one writing system) also its Latin letters, digits and `_` on their own, so CJK padding
+    does not hide a tag: `#ad一` and `#fypノ` read `#ad` and `#fyp` too."""
+    folded = _prefold(tag)
+    scripts = _scripts(unicodedata.normalize("NFKC", tag))
+    if "LATIN" not in scripts or not scripts & _CJK:
+        return [folded]
+    latin = "".join(c for c in folded if c.isascii() or (c.isalpha() and _script(c) == "LATIN"))
+    return [folded, latin]
+
+
+def _disclosure_key(folded: str) -> str:
+    key = folded.replace("_", "").rstrip("0123456789").translate(_LOOKALIKE_DIGITS)
+    return _skeleton(key)
+
+
+_GENERIC_KEYS = frozenset(_skeleton(_prefold(t)) for t in GENERIC_HASHTAGS)
+_DISCLOSURE_KEYS = frozenset(_disclosure_key(_prefold(t)) for t in DISCLOSURE_HASHTAGS)
+_DISCLOSURE_PREFIX_KEYS = tuple(_disclosure_key(_prefold(t)) for t in DISCLOSURE_PREFIXES)
+
+
 def is_generic(tag: str) -> bool:
-    return _fold(tag) in GENERIC_HASHTAGS
+    """A reach tag, or a lookalike of one (`#ꜰʏᴘ`, `#vırɑl`, `#fypノ`)."""
+    return any(_skeleton(r) in _GENERIC_KEYS for r in _readings(tag))
 
 
 def is_disclosure(tag: str) -> bool:
-    key = _fold(tag).replace("_", "").rstrip("0123456789").translate(_LOOKALIKE_DIGITS)
-    return key in DISCLOSURE_HASHTAGS or key.startswith(DISCLOSURE_PREFIXES)
+    """A paid-partnership tag, or a lookalike of one (`#аԁ`, `#ꜱponsored`, `#ad一`)."""
+    keys = [_disclosure_key(r) for r in _readings(tag)]
+    return any(k in _DISCLOSURE_KEYS or k.startswith(_DISCLOSURE_PREFIX_KEYS) for k in keys)
+
+
+def _is_padding(char: str) -> bool:
+    """An invisible or format character: skipped when reading links and tags."""
+    return bool(_INVISIBLE.match(char)) or unicodedata.category(char) == "Cf"
 
 
 def _match_copy(text: str) -> tuple[str, list[int]]:
@@ -243,15 +294,11 @@ def _match_copy(text: str) -> tuple[str, list[int]]:
     origin: list[int] = []
     for i, char in enumerate(text):
         for c in unicodedata.normalize("NFKC", char):
-            if _INVISIBLE.match(c) or unicodedata.category(c) in {"Cf", "Mn", "Me"}:
+            if _is_padding(c) or unicodedata.category(c).startswith("M"):
                 continue
             chars.append(c.translate(_IDNA_DOTS))
             origin.append(i)
     return "".join(chars), origin
-
-
-def _match_text(text: str) -> str:
-    return _match_copy(text)[0]
 
 
 def _link_matches(text: str) -> list[tuple[str, str]]:
@@ -263,8 +310,6 @@ def _link_matches(text: str) -> list[tuple[str, str]]:
     ]
 
 
-_SCRIPT_ALIASES = {"CJK": "HAN", "IDEOGRAPHIC": "HAN"}
-"""First words of Unicode character names that do not spell the script."""
 _KANA_MARKS = frozenset("ー〱〲〳〴〵")
 """The prolonged sound mark ー and the kana repeat marks: part of a tag only next to kana."""
 _KANA = frozenset({"HIRAGANA", "KATAKANA"})
@@ -278,25 +323,34 @@ _SCRIPT_MIXES = (
 
 
 def _script(char: str) -> str:
-    """The script of a letter or combining mark, read from the first word of its Unicode
-    name; a mark of no one script is named COMBINING."""
-    word = unicodedata.name(char, "UNKNOWN").split(" ", 1)[0]
-    return _SCRIPT_ALIASES.get(word, word)
+    """The Unicode Script property (UAX #24) of a letter, mark or number, in capitals
+    (LATIN, CYRILLIC, TAI LE, COMMON, INHERITED)."""
+    return SCRIPT_NAMES[max(bisect_right(SCRIPT_STARTS, ord(char)) - 1, 0)]
+
+
+def _mark_fits(mark: str, base: str | None) -> bool:
+    """Whether a combining mark may sit on a letter of script `base`: a mark of that script,
+    or one whose Script_Extensions name it (the kana voiced sound mark on kana). Other
+    Inherited marks (a combining dot below) fit nothing."""
+    return base is not None and base in MARK_SCRIPTS.get(ord(mark), (_script(mark),))
 
 
 def _scripts(folded: str) -> set[str]:
-    """The scripts of the letters in an NFKC-folded tag, read from the first word of each
-    letter's Unicode name (LATIN, CYRILLIC, GREEK, ...). Digits, `_` and combining marks
-    belong to no script."""
+    """The scripts of the letters and non-ASCII digits in an NFKC-folded tag (LATIN,
+    CYRILLIC, GREEK, ...). ASCII digits, `_`, combining marks and the neutral apostrophes
+    belong to no script; other letters of no one script (a modifier prime) are COMMON."""
     scripts: set[str] = set()
     kana_marks = False
     for char in folded:
-        if char in _NEUTRAL or not unicodedata.category(char).startswith("L"):
+        category = unicodedata.category(char)
+        if char in _NEUTRAL or category[0] not in "LN" or (category[0] == "N" and char.isascii()):
             continue
         if char in _KANA_MARKS:
             kana_marks = True
             continue
-        scripts.add(_script(char))
+        script = _script(char)
+        if category[0] == "L" or script != "COMMON":
+            scripts.add(script)
     if kana_marks and not scripts & _KANA:
         scripts.add("KANA MARK")
     return scripts
@@ -318,25 +372,34 @@ def _mixed_scripts(tag: str) -> list[str]:
 
 
 _MARKS = frozenset({"Mn", "Mc"})
+_MARKS_IN_A_ROW = 4
+"""The most combining marks one letter carries (Thai stacks two; more is mark stacking)."""
 _HASHTAG_MAX = 50
 
 
 def is_hashtag(tag: str) -> bool:
     """`#` and 1-50 code points, each a letter, a digit, `_`, or a combining mark (Mn, Mc)
-    of the same script as the letter it sits on, so `#नमस्ते`, `#ที่` and `#ᜋ᜔ᜈ` pass. A mark
-    on its own, straight after `#`, `_` or a digit, or of another script or none (`#fyp`
-    with a combining dot below, `#ad` with a Devanagari virama) is rejected: it would pad a
-    Latin tag past the generic, disclosure and mixed-script checks."""
+    that fits the letter it sits on (`_mark_fits`), at most 4 in a row, so `#नमस्ते`, `#ที่`
+    and `#ᜋ᜔ᜈ` pass. A mark on its own, straight after `#`, `_` or a digit, of another script
+    or of none (`#fyp` with a combining dot below, `#ad` with a Devanagari virama), or stacked
+    past 4, is rejected: it would pad a Latin tag past the generic, disclosure and
+    mixed-script checks, or pile up over the text around it. A decomposed Latin accent
+    (`cafe` + U+0301) is a mark of no script and is rejected too; the composed `#café`
+    passes."""
     body = tag[1:]
     if not tag.startswith("#") or not 1 <= len(body) <= _HASHTAG_MAX:
         return False
     base: str | None = None  # the script of the letter the next mark would sit on
+    marks = 0
     for char in body:
         category = unicodedata.category(char)
         if category in _MARKS:
-            if _script(char) != base:
+            marks += 1
+            if marks > _MARKS_IN_A_ROW or not _mark_fits(char, base):
                 return False
-        elif category.startswith("L"):
+            continue
+        marks = 0
+        if category.startswith("L"):
             base = _script(char)
         elif category.startswith("N") or char == "_":
             base = None
@@ -350,7 +413,7 @@ def is_mixed_script(tag: str) -> bool:
     р, or a Latin tag holds a digit from another script: a mixed-script lookalike of a
     generic, disclosure or campaign tag. Japanese, Chinese and Korean mixed with Latin are
     one writing system each. A lookalike written wholly in one script (all-Cyrillic `#аԁ`)
-    is not caught here."""
+    is not caught here but by the skeleton in `is_generic` and `is_disclosure`."""
     return bool(_mixed_scripts(tag))
 
 
@@ -380,28 +443,57 @@ def _link_host(link: str) -> str | None:
     return host
 
 
-def _inline_tags(text: str) -> list[tuple[str, int, int]]:
+def _inline_tags(text: str, *, in_links: bool = False) -> list[tuple[str, int, int]]:
     """Each hashtag written into `text`, as read on the match copy (so `#fyp` padded with
     an invisible or combining character reads as `#fyp`), with its span in `text`. The
     span runs to the next character the copy kept, so the padding goes with the tag, and
-    over any marks after that."""
+    over any marks after that. A tag with an invisible character inside (`#fyp` + ZWJ +
+    `x`) is also read up to it, since a platform may end the tag there; both readings share
+    the span. A `#` inside a link (`https://site.com/page#fyp`) starts no tag unless
+    `in_links`."""
     copy, origin = _match_copy(text)
+    links = [] if in_links else [m.span() for m in LINK_OR_MENTION.finditer(copy)]
     tags: list[tuple[str, int, int]] = []
     for m in _INLINE_TAG.finditer(copy):
+        if any(a <= m.start() < b for a, b in links):
+            continue
         end = origin[m.end()] if m.end() < len(copy) else len(text)
         end = max(end, origin[m.end() - 1] + 1)
         while end < len(text) and unicodedata.category(text[end]).startswith("M"):
             end += 1
+        cut = next(
+            (
+                k
+                for k in range(m.start() + 2, m.end())
+                if any(map(_is_padding, text[origin[k - 1] + 1 : origin[k]]))
+            ),
+            None,
+        )
+        if cut is not None:
+            tags.append((copy[m.start() : cut], origin[m.start()], end))
         tags.append((m.group(0), origin[m.start()], end))
     return tags
 
 
+def _stacked(span: str) -> bool:
+    """More than 4 combining marks in a row (`#ก` under 49 tone marks)."""
+    run = 0
+    for char in span:
+        run = run + 1 if unicodedata.category(char).startswith("M") else 0
+        if run > _MARKS_IN_A_ROW:
+            return True
+    return False
+
+
 def strip_unusable_tags(text: str) -> str:
-    """`text` without the inline hashtags that `clean_hashtags` would drop."""
+    """`text` without the inline hashtags that `clean_hashtags` would drop, with any extra
+    `#` or invisible character straight before them (`##ad`, ZWJ + `#fyp`)."""
     parts: list[str] = []
     last = 0
     for tag, start, end in _inline_tags(text):
-        if _unusable(tag):
+        if _unusable(tag) or _stacked(text[start:end]):
+            while start > last and (text[start - 1] == "#" or _is_padding(text[start - 1])):
+                start -= 1
             parts.append(text[last : max(start, last)])
             last = max(end, last)
     parts.append(text[last:])
@@ -409,21 +501,27 @@ def strip_unusable_tags(text: str) -> str:
 
 
 def inline_unusable_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
-    """Generic, malformed or mixed-script hashtags written into `text` itself, other than
-    `allowed` ones; disclosure-like ones are `inline_disclosure_tags`."""
+    """Generic, malformed, mixed-script or mark-stacked hashtags written into `text` itself,
+    other than `allowed` ones; disclosure-like ones are `inline_disclosure_tags`."""
     ok = {_fold(t) for t in allowed}
     return [
         t
-        for t, _, _ in _inline_tags(text)
-        if _unusable(t) and not is_disclosure(t) and _fold(t) not in ok
+        for t, start, end in _inline_tags(text)
+        if (_unusable(t) or _stacked(text[start:end]))
+        and not is_disclosure(t)
+        and _fold(t) not in ok
     ]
 
 
 def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
-    """Disclosure-like hashtags written into `text` itself, other than `allowed` ones."""
+    """Disclosure-like hashtags written into `text` itself, other than `allowed` ones. A
+    `#` inside a link counts here too: stripping leaves links alone, so a disclosure-like
+    fragment holds the post for a person to look at."""
     ok = {_fold(t) for t in allowed}
     return [
-        t for t in _INLINE_TAG.findall(_match_text(text)) if is_disclosure(t) and _fold(t) not in ok
+        t
+        for t, _, _ in _inline_tags(text, in_links=True)
+        if is_disclosure(t) and _fold(t) not in ok
     ]
 
 
@@ -497,12 +595,12 @@ class Variant(BaseModel):
         for tag in tags:
             if not is_hashtag(tag):
                 raise ValueError(f"invalid hashtag {tag!r}")
+            if mixed := _mixed_scripts(tag):
+                raise ValueError(f"hashtag {tag} mixes scripts ({', '.join(mixed)})")
             if is_generic(tag):
                 raise ValueError(f"generic hashtag {tag} says nothing about the clip")
             if is_disclosure(tag):
                 raise ValueError(f"hashtag {tag} reads as a paid-partnership disclosure")
-            if mixed := _mixed_scripts(tag):
-                raise ValueError(f"hashtag {tag} mixes scripts ({', '.join(mixed)})")
         if len({_fold(t) for t in tags}) != len(tags):
             raise ValueError("duplicate hashtags")
         return tags
@@ -655,8 +753,9 @@ def build_post_metadata(
             raise ValueError(f"invalid campaign tag {raw!r}")
         if _fold(tag) not in {_fold(t) for t in campaign}:
             campaign.append(tag)
-    taken = {_fold(t) for t in campaign}
-    own = [t for t in variant.hashtags if _fold(t) not in taken]
+    # A model tag that reads as a campaign tag (`#ᴠyro` for `#vyro`) gives way to it.
+    taken = {_skeleton(_prefold(t)) for t in campaign}
+    own = [t for t in variant.hashtags if _skeleton(_prefold(t)) not in taken]
     own = own[: max(0, limits.post_hashtags_max - len(campaign))]
     hashtags = [*own, *campaign]
     line = _hashtag_line(hashtags)
@@ -729,7 +828,8 @@ def preflight(
 ) -> list[str]:
     """Problems that would get the post rejected by the platform or the campaign; empty
     when it is good to schedule. A `plain` post (no campaign) is not held for links,
-    mentions or too few hashtags: those are campaign rules."""
+    mentions or too few hashtags: those are campaign rules. It is held for any hashtag a
+    variant could not hold (disclosure-like, malformed or mixed-script)."""
     limits = _limits(platform)
     problems: list[str] = []
     if not limits.min_seconds <= clip_seconds <= limits.max_seconds:
@@ -750,6 +850,12 @@ def preflight(
     generic = [t for t in metadata.hashtags if is_generic(t)]
     if generic:
         problems.append(f"{platform}: generic hashtags {' '.join(generic)}")
+    # Without a campaign nothing may add a disclosure tag, so the stored list is checked
+    # again in full: it may predate a rule, or come from somewhere other than a variant.
+    if plain and (bad := [t for t in metadata.hashtags if _unusable(t) and not is_generic(t)]):
+        problems.append(
+            f"{platform}: disclosure-like, malformed or mixed-script hashtags {' '.join(bad)}"
+        )
     if platform == "youtube" and not metadata.title.strip():
         problems.append("youtube: the title is empty")
     if platform == "youtube" and _ANGLE.search(metadata.title + metadata.caption):

@@ -255,12 +255,21 @@ cannot be seen by the pipeline: the reviewer checks them before approving.
 
 A post for an account outside any campaign goes through the platform part of the same
 check, at scheduling and again just before it is published: the platform's length, title,
-caption and hashtag limits, generic hashtags, and generic, disclosure-like (`#ad`,
-`#sponsored`) or mixed-script tags written into the title or caption. A post that fails is
-held the same way. Links, mentions and too few hashtags hold only campaign posts. Such
-inline tags are also stripped from the model's titles and captions, from the per-platform
-text and from the export package, so in practice the check catches only text stored before
-that cleaning existed.
+caption and hashtag limits, generic hashtags, disclosure-like, malformed or mixed-script
+tags on its hashtag list, and generic, disclosure-like (`#ad`, `#sponsored`) or
+mixed-script tags written into the title or caption. A post that fails is held the same
+way. Links, mentions and too few hashtags hold only campaign posts. Such inline tags are
+also stripped from the model's titles and captions, from the per-platform text and from
+the export package, so in practice the check catches only text stored before that cleaning
+existed. A `#` inside a link (`https://site.com/page#fyp`) is left alone; a disclosure-like
+one still holds the post for a person to look at.
+
+Generic and disclosure tags are also caught as lookalikes written in one script, such as
+all-Cyrillic `#аԁ`, the small capitals `#ᴀᴅ` or `#ꜰʏᴘ`, accented `#àd`, or a Latin tag
+padded with Japanese or Chinese (`#ad一`). The comparison uses the Unicode confusables
+table (UTS #39) and the Unicode script data, vendored in `src/clipper/hashtag_data.py` for
+Unicode 15.0 (Python 3.12). After a Python upgrade, regenerate it with
+`uv run python scripts/gen_hashtag_data.py`; a test fails until the versions match.
 
 The worker runs the same check again just before it publishes, with the config as it is
 on disk (reloaded when `creators.yaml`, `accounts.yaml` or `campaigns.yaml` changes), so a

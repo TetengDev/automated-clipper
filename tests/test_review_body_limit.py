@@ -345,7 +345,7 @@ def test_overflow_after_the_response_started_is_reraised() -> None:
         asyncio.run(_BodySizeLimit(inner, max_bytes=10)(scope, receive, send))
 
 
-# --- CLP-110: form field cap, and a readable 413 for HTMX ----------------------------------
+# --- CLP-110: form field cap, no multipart, and readable HTMX errors ------------------------
 
 FORM = {"Content-Type": "application/x-www-form-urlencoded"}
 HTMX = {"HX-Request": "true", "HX-Target": "action-error"}
@@ -375,16 +375,16 @@ def _urlencoded(csrf: str, fields: int) -> bytes:
 BOUNDARY = "clp110boundary"
 
 
-def _multipart(csrf: str, parts: int) -> bytes:
+def _multipart(csrf: str, parts: int, boundary: str = BOUNDARY) -> bytes:
     """A multipart form of exactly `parts` parts, the CSRF token among them."""
     names = ["csrf_token", *(f"f{i}" for i in range(parts - 1))]
     out = b""
     for name in names:
         value = csrf if name == "csrf_token" else "x"
         out += (
-            f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
         ).encode()
-    return out + f"--{BOUNDARY}--\r\n".encode()
+    return out + f"--{boundary}--\r\n".encode()
 
 
 MULTIPART = {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
@@ -447,27 +447,66 @@ def test_form_one_field_over_the_limit_is_413(client: TestClient, chunk: int) ->
     assert_plain_413(response, "Too many form fields")
 
 
-@pytest.mark.parametrize("chunk", [7, 1_000_000])  # 7 splits the boundary across chunks
-def test_multipart_at_the_field_limit_reaches_the_route(client: TestClient, chunk: int) -> None:
-    body = _multipart(login(client), MAX_FORM_FIELDS)
+def assert_415(response) -> None:  # type: ignore[no-untyped-def]
+    assert response.status_code == 415
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.text == "Multipart forms are not accepted"
+    assert response.headers["connection"] == "close"
+    for name in SECURITY_HEADERS:
+        assert name in response.headers
 
-    response = client.post("/logout", content=_stream(body, chunk), headers=MULTIPART)
 
-    assert response.status_code == 303
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        'multipart/form-data; boundary=""',
+        "multipart/form-data; boundary=",
+        "Multipart/Form-Data; boundary=",
+        "multipart/form-data",
+    ],
+)
+def test_multipart_login_without_a_usable_boundary_is_415_before_parsing(
+    client: TestClient, content_type: str, fields_parsed: list[int]
+) -> None:
+    """An empty boundary once slipped past the field count while Starlette parsed parts
+    split on `--`: no route takes multipart, so it is refused outright, logged in or not."""
+    body = _multipart("x", 999, boundary="")
+
+    response = client.post("/login", content=body, headers={"Content-Type": content_type})
+
+    assert_415(response)
+    assert fields_parsed == []
 
 
 @pytest.mark.parametrize("chunk", [7, 1_000_000])
-def test_multipart_one_part_over_the_limit_is_413(
-    client: TestClient, chunk: int, fields_parsed: list[int]
+def test_multipart_to_a_form_route_is_415(
+    client: TestClient, env: Env, chunk: int, fields_parsed: list[int]
 ) -> None:
-    body = _multipart(login(client), MAX_FORM_FIELDS + 1)
+    csrf = login(client)
+    clip_id = env.clip()
+    body = _multipart(csrf, 900, boundary="")
     fields_parsed.clear()
 
-    response = client.post("/logout", content=_stream(body, chunk), headers=MULTIPART)
+    response = client.post(
+        f"/clip/{clip_id}/variants",
+        content=_stream(body, chunk),
+        headers={"Content-Type": 'multipart/form-data; boundary=""'},
+    )
 
-    assert_plain_413(response, "Too many form fields")
-    if chunk > len(body):
-        assert fields_parsed == []
+    assert_415(response)
+    assert fields_parsed == []
+    assert env.reviews(clip_id) == []
+
+
+def test_normal_multipart_form_is_415(client: TestClient, fields_parsed: list[int]) -> None:
+    csrf = login(client)
+    fields_parsed.clear()
+
+    response = client.post("/logout", content=_multipart(csrf, 2), headers=MULTIPART)
+
+    assert_415(response)
+    assert fields_parsed == []
+    assert client.get("/queue").status_code == 200  # still logged in: the route never ran
 
 
 def test_csrf_check_parses_no_more_than_the_field_limit() -> None:
@@ -592,7 +631,10 @@ def test_htmx_413_with_an_unknown_detail_shows_the_detail() -> None:
     assert b'<p class="error" role="alert">Other</p>' in response.body
 
 
-def test_htmx_config_swaps_a_413_into_the_target(client: TestClient, env: Env) -> None:
+@pytest.mark.parametrize("status", ["409", "413", "422"])
+def test_htmx_config_swaps_action_errors_into_the_target(
+    client: TestClient, env: Env, status: str
+) -> None:
     """htmx does not swap 4xx unless a responseHandling rule says so; the first rule whose
     pattern matches the status wins, as in htmx's `resolveResponseHandling`."""
     login(client)
@@ -601,7 +643,7 @@ def test_htmx_config_swaps_a_413_into_the_target(client: TestClient, env: Env) -
     assert meta
     rules = json.loads(meta.group(1))["responseHandling"]
 
-    rule = next(r for r in rules if re.search(r["code"], "413"))
+    rule = next(r for r in rules if re.search(r["code"], status))
 
     assert rule["swap"] is True
     assert rule.get("error") is False

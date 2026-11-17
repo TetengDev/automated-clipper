@@ -9,10 +9,12 @@ Security model (single reviewer, behind Caddy/HTTPS in production):
   routes should still declare `Depends(require_user)` so the requirement is explicit.
 - Every unsafe request (POST/PUT/PATCH/DELETE) must carry the session's CSRF token, as a
   `csrf_token` form field or an `X-CSRF-Token` header (`csrf_protect`, applied app-wide).
-- Every request body is capped at 256 KB and every form at 200 fields (`_BodySizeLimit`,
-  outside the session and auth layers): an oversized `Content-Length` is 413 before the app
-  runs, and a streamed body is counted as it arrives (bytes, and field separators), so no
-  form is ever parsed past either cap. An HTMX request's 413 is a readable error fragment.
+- Every request body is capped at 256 KB (`_BodySizeLimit`, outside the session and auth
+  layers): an oversized `Content-Length` is 413 before the app runs, and a streamed body is
+  counted as it arrives. A urlencoded form is also capped at 200 fields, by counting its `&`
+  separators as they arrive: the chunk that passes the cap never reaches a parser, though
+  earlier chunks may have been parsed. Multipart forms, which no route takes, are 415
+  before the app runs. An HTMX request's 413 is a readable error fragment.
 - Login attempts are throttled per client IP (the 6th failure inside a sliding minute gets
   429) with a global backstop of 30 attempts a minute. The client IP is only trustworthy
   when uvicorn trusts the proxy's X-Forwarded-For (`run-review --forwarded-allow-ips`).
@@ -86,6 +88,7 @@ _BCRYPT_HASH = re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$")
 _CONTENT_LENGTH = re.compile(r"[0-9]+")
 _BODY_TOO_LARGE = "Request body too large"
 _TOO_MANY_FIELDS = "Too many form fields"
+_NO_MULTIPART = "Multipart forms are not accepted"
 # What an HTMX request's 413 shows the reviewer, in the action's error slot.
 _TOO_LARGE_MESSAGES = {
     _BODY_TOO_LARGE: (
@@ -229,30 +232,18 @@ class _BodyTooLarge(HTTPException):
         super().__init__(status_code=413, detail=detail)
 
 
-def _field_separator(scope: Scope) -> tuple[bytes, int] | None:
-    """For a form body: the bytes that separate its fields, and what to add to their count
-    to bound the number of fields (`a&b` is 2 fields; a multipart body of n parts has n + 1
-    boundary lines). The content types are matched as Starlette's form parsing does."""
-    content_type, options = parse_options_header(Headers(scope=scope).get("content-type"))
-    if content_type == b"application/x-www-form-urlencoded":
-        return b"&", 1
-    boundary = options.get(b"boundary")
-    if content_type == b"multipart/form-data" and boundary:
-        return b"--" + boundary, -1
-    return None
-
-
 class _BodySizeLimit:
-    """ASGI middleware: request bodies over `max_bytes`, and forms over `max_fields`, get
-    413 before anything parses them.
+    """ASGI middleware: request bodies over `max_bytes`, and urlencoded forms over
+    `max_fields`, get 413; multipart forms get 415.
 
     A declared `Content-Length` over the cap is refused without calling the app; a
     malformed one is 400. The body is also counted as it streams in (chunked uploads, or a
     `Content-Length` that understates it): past the cap, `receive` raises `_BodyTooLarge`,
     which the app's exception handler turns into a 413, or this middleware does if it
-    escapes the app. A form's field separators are counted the same way, before the chunk
-    that carries them reaches a parser. Every 413 closes the connection, so the rest of the
-    body is not read.
+    escapes the app. A urlencoded form's `&` separators are counted the same way (n of them
+    allow at most n + 1 fields, the parser's split), so the chunk that passes the cap never
+    reaches a parser. No route takes multipart, so it is refused before the app runs rather
+    than counted. Every 413 and 415 closes the connection, so the rest of the body is not read.
     """
 
     def __init__(self, app: ASGIApp, *, max_bytes: int, max_fields: int = MAX_FORM_FIELDS) -> None:
@@ -273,24 +264,29 @@ class _BodySizeLimit:
             if len(declared) > len(str(self.max_bytes)) or int(declared) > self.max_bytes:
                 await _too_large(scope)(scope, receive, send)
                 return
+        # Starlette compares the parsed type as is (python-multipart lower-cases it only when
+        # there are no parameters); lower-casing refuses or counts a superset of its forms.
+        content_type = parse_options_header(Headers(scope=scope).get("content-type"))[0].lower()
+        if content_type == b"multipart/form-data":
+            refuse = PlainTextResponse(_NO_MULTIPART, 415, headers={"Connection": "close"})
+            await refuse(scope, receive, send)
+            return
 
         received = 0
         started = False
-        separator, fields = _field_separator(scope) or (b"", 0)
-        tail = b""  # a separator split across two chunks is counted once, in the second
+        count_fields = content_type == b"application/x-www-form-urlencoded"
+        fields = 1
 
         async def limited_receive() -> Message:
-            nonlocal received, fields, tail
+            nonlocal received, fields
             message = await receive()
             if message["type"] == "http.request":
                 body = message.get("body", b"")
                 received += len(body)
                 if received > self.max_bytes:
                     raise _BodyTooLarge
-                if separator:
-                    data = tail + body
-                    fields += data.count(separator)
-                    tail = data[-(len(separator) - 1) :] if len(separator) > 1 else b""
+                if count_fields:
+                    fields += body.count(b"&")
                     if fields > self.max_fields:
                         raise _BodyTooLarge(_TOO_MANY_FIELDS)
             return message
@@ -466,10 +462,12 @@ async def csrf_protect(request: Request) -> None:
     if not supplied:
         content_type = request.headers.get("content-type", "")
         if content_type.startswith(("application/x-www-form-urlencoded", "multipart/form-data")):
+            # `max_fields` only binds on routes without Form() params: FastAPI parses those
+            # before any dependency runs, with Starlette's default cap of 1000.
             try:
                 form = await request.form(max_fields=MAX_FORM_FIELDS)
             except StarletteHTTPException as exc:
-                # Starlette's own field cap is a 400; `_BodySizeLimit` normally refuses first.
+                # Unreachable over HTTP today: `_BodySizeLimit` refuses at the same cap first.
                 if exc.status_code == 400 and str(exc.detail).startswith("Too many fields"):
                     raise _BodyTooLarge(_TOO_MANY_FIELDS) from exc
                 raise

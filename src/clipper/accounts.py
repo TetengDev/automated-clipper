@@ -82,6 +82,7 @@ APP_ENV_NAMES = frozenset(
         "CLIPPER_RENDER_DIR",
         "CLIPPER_SLOW_TESTS",
         "CLIPPER_WORKER_ID",
+        "CLIPPER_YTDLP_CACHE_DIR",
         "CLIPPER_YTDLP_COOKIES",
         "CLIPPER_YTDLP_PROXY",
     }

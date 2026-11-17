@@ -56,7 +56,10 @@ ENV UV_COMPILE_BYTECODE=1 \
     # read-only; Deno 2.9.8 tolerates that silently, later versions might warn), and no
     # update check notice.
     DENO_DIR=/tmp/deno \
-    DENO_NO_UPDATE_CHECK=1
+    DENO_NO_UPDATE_CHECK=1 \
+    # yt-dlp's cache (solved player signatures) on the tmpfs too: ~/.cache is read-only.
+    # Passed as --cache-dir, not XDG_CACHE_HOME, so no other tool's cache moves.
+    CLIPPER_YTDLP_CACHE_DIR=/tmp/yt-dlp
 
 WORKDIR /app
 

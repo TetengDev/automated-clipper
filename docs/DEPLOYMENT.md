@@ -167,6 +167,8 @@ clip renders, the job fails.
   the probe does not report is counted after its download, once ffprobe has measured it.
 - Over a cap the stage waits until the next UTC midnight and does not use up an attempt. A
   single call or source larger than the whole cap can never fit, so its job is skipped.
+- Hitting a cap sends no alert yet. Alerting on it is tracked in
+  [CLP-30](https://linear.app/tengdev/issue/CLP-30).
 
 ## Janitor
 
@@ -174,8 +176,9 @@ The `monitor` runs the janitor after a poll cycle, at most once an hour. It work
 inside the media dir (`data/media`, or `--media-dir` / `CLIPPER_MEDIA_DIR`, the same as
 the worker's).
 
-- Clips still waiting for review `review_expiry_days` (default 7) after they were created
-  become `archived`.
+- Clips still waiting for review `review_expiry_days` (default 7) after their current
+  version was created become `archived`. A re-render that returns a clip to review starts
+  the wait over.
 - `clips_ready` jobs lose their source media `media_retention_hours` (default 48) after
   they became ready: `audio_16k.flac`, leftover downloads, and each clip's downloaded
   section (`clips/<rank>/source.mp4`). Rendered clips, transcripts and the other small
@@ -361,13 +364,16 @@ campaign. `clipper campaigns list` lists every submission.
   - a job reaching `failed`
   - the `DownloadBlocked` signature
   - the media dir at 80% of `disk_budget_gb` (see [Janitor](#janitor))
-  - a budget cap being hit
   - YouTube quota above 80%
   - Twitch auth failure
   - export failure
 
   Alerts are deduplicated: each alert key fires at most once per 30 minutes. The disk
   alert fires once per crossing of 80%.
+
+  A budget cap being hit sends no alert yet; the deferred job's reason is in the worker
+  log and on the job. Alerting on it is tracked in
+  [CLP-30](https://linear.app/tengdev/issue/CLP-30).
 
 ## Backups
 

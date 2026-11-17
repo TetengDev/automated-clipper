@@ -315,9 +315,11 @@ def _posting_config(conn: sqlite3.Connection, config_path: Path) -> PostingConfi
 def _notifiers(http: httpx.Client, command: str = "run-worker") -> tuple[Notify, Notify]:
     """Discord webhooks for submission pings and alerts (missed deadlines, the janitor's disk
     alert). Pings go to DISCORD_WEBHOOK_URL, alerts to DISCORD_ALERTS_WEBHOOK_URL (else the
-    ping webhook); without either, messages go to the log. A malformed URL stops `command`."""
+    ping webhook); without either, messages go to the log. A malformed URL stops run-worker;
+    run-monitor only needs the alerts, so it logs a warning and sends them to the log."""
     from clipper.notify import DiscordWebhook, log_notify
 
+    worker = command == "run-worker"
     try:
         secrets = Secrets()
     except ValidationError as exc:
@@ -329,11 +331,14 @@ def _notifiers(http: httpx.Client, command: str = "run-worker") -> tuple[Notify,
         try:
             return DiscordWebhook(value.get_secret_value().strip(), http)
         except ValueError:
-            _fail(f"{name} must be a https://discord.com/api/webhooks/... URL")
+            if worker:
+                _fail(f"{name} must be a https://discord.com/api/webhooks/... URL")
+            logger.warning("%s is not a Discord webhook URL; its messages go to the log", name)
+            return None
 
     notify = hook(secrets.discord_webhook_url, "DISCORD_WEBHOOK_URL")
     alert = hook(secrets.discord_alerts_webhook_url, "DISCORD_ALERTS_WEBHOOK_URL")
-    if notify is None:
+    if notify is None and worker:
         logger.warning("DISCORD_WEBHOOK_URL is not set: campaign submission pings go to the log")
     return notify or log_notify, alert or notify or log_notify
 

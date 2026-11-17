@@ -1257,3 +1257,29 @@ def test_cli_run_monitor_runs_the_janitor_on_the_media_dir(
 
     assert result.exit_code == 0, result.output
     assert not audio.exists()
+
+
+def test_cli_a_malformed_alerts_webhook_does_not_stop_the_monitor(
+    cli_env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The janitor's disk alert must not add a way for run-monitor to fail (CLP-38)."""
+    args, _ = cli_env
+    monkeypatch.setenv("DISCORD_ALERTS_WEBHOOK_URL", "http://example.com/not-a-webhook")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/not/a/webhook")
+
+    result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
+
+    assert result.exit_code == 0, result.output
+    assert "DISCORD_ALERTS_WEBHOOK_URL is not a Discord webhook URL" in caplog.text
+    assert "not-a-webhook" not in caplog.text and "not/a/webhook" not in caplog.text
+
+
+def test_cli_monitor_does_not_warn_about_campaign_pings(
+    cli_env, caplog: pytest.LogCaptureFixture
+) -> None:
+    args, _ = cli_env
+
+    result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
+
+    assert result.exit_code == 0, result.output
+    assert "campaign submission pings" not in caplog.text

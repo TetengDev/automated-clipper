@@ -57,7 +57,7 @@ def _retry_after(response: httpx.Response) -> float | None:
             continue
         try:
             seconds = float(value)
-        except ValueError:
+        except (ValueError, OverflowError):
             continue
         if math.isfinite(seconds) and seconds >= 0:
             return seconds

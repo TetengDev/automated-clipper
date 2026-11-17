@@ -402,7 +402,7 @@ def test_transport_errors_429_and_5xx_back_off_the_whole_webhook(
     assert all(s.notified_at is None for s in list_submissions(env.conn))
 
 
-@pytest.mark.parametrize("status", [401, 403, 404])
+@pytest.mark.parametrize("status", [301, 308, 401, 403, 404])  # 3xx: a misrouted URL
 def test_a_broken_webhook_is_backed_off_and_every_ping_kept_for_a_retry(
     env: Env, status: int, caplog: pytest.LogCaptureFixture
 ) -> None:

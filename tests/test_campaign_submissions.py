@@ -486,6 +486,7 @@ def test_discord_error_carries_the_status(status: int) -> None:
         (httpx.Response(429, headers={"Retry-After": "nan"}), None),
         (httpx.Response(429, headers={"Retry-After": "inf"}), None),
         (httpx.Response(429, text='{"retry_after": 1e400}'), None),  # inf once parsed
+        (httpx.Response(429, text='{"retry_after": 1' + "0" * 400 + "}"), None),  # overflows
     ],
 )
 def test_discord_429_carries_retry_after_when_it_is_sane(

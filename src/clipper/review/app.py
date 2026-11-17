@@ -48,6 +48,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from python_multipart.multipart import parse_options_header
 from starlette.datastructures import Headers, MutableHeaders
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -470,7 +471,13 @@ async def csrf_protect(request: Request) -> None:
     if not supplied:
         content_type = request.headers.get("content-type", "")
         if content_type.startswith(("application/x-www-form-urlencoded", "multipart/form-data")):
-            form = await request.form(max_fields=MAX_FORM_FIELDS)
+            try:
+                form = await request.form(max_fields=MAX_FORM_FIELDS)
+            except StarletteHTTPException as exc:
+                # Starlette's own field cap is a 400; `_BodySizeLimit` normally refuses first.
+                if exc.status_code == 400 and str(exc.detail).startswith("Too many fields"):
+                    raise _BodyTooLarge(_TOO_MANY_FIELDS) from exc
+                raise
             value = form.get(CSRF_FORM_FIELD)
             supplied = value if isinstance(value, str) else None
     if (

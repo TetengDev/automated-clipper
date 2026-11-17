@@ -21,6 +21,7 @@ from clipper.review.app import (
     MAX_FORM_FIELDS,
     MAX_REQUEST_BODY_BYTES,
     SECURITY_HEADERS,
+    _BodyTooLarge,
     csrf_protect,
 )
 from review_support import Env, login, make_env
@@ -484,8 +485,31 @@ def test_csrf_check_parses_no_more_than_the_field_limit() -> None:
         "session": {"csrf": "t"},
         "app": object(),
     }
-    with pytest.raises(HTTPException, match=f"Maximum number of fields is {MAX_FORM_FIELDS}"):
+    with pytest.raises(_BodyTooLarge) as raised:
         asyncio.run(csrf_protect(Request(scope, receive)))
+
+    assert raised.value.status_code == 413
+    assert raised.value.detail == "Too many form fields"
+
+
+def test_csrf_check_passes_other_form_errors_through() -> None:
+    """A malformed multipart body stays Starlette's 400; only the field cap becomes 413."""
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"garbage", "more_body": False}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/logout",
+        "headers": [(b"content-type", b"multipart/form-data")],
+        "session": {"csrf": "t"},
+        "app": object(),
+    }
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(csrf_protect(Request(scope, receive)))
+
+    assert raised.value.status_code == 400
 
 
 def _oversized_variants_edit(csrf: str) -> dict[str, str]:

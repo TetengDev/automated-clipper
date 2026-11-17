@@ -1050,6 +1050,35 @@ def test_cli_rejects_bad_first_run_value(cli_env) -> None:
     assert result.exit_code == 2
 
 
+def test_cli_boot_check_failure_alerts_and_keeps_running(
+    cli_env, failing_boot_check: list[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    args, _ = cli_env
+
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
+
+    assert result.exit_code == 0, result.output
+    assert "cycle done" in result.output  # polled anyway
+    hint = "/usr/bin/deno --version exited 1; rebuild the image (uv sync --locked)"
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == [f"run-monitor: doctor: fail deno            {hint}"]
+    assert len(failing_boot_check) == 1
+    assert "run-monitor: " in failing_boot_check[0] and hint in failing_boot_check[0]
+
+
+def test_cli_malformed_alerts_webhook_stops_the_monitor(
+    cli_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, _ = cli_env
+    monkeypatch.setenv("DISCORD_ALERTS_WEBHOOK_URL", "http://example.com/hook")
+
+    result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
+
+    assert result.exit_code == 1
+    assert "DISCORD_ALERTS_WEBHOOK_URL must be a https://discord.com/api/webhooks/" in result.stderr
+
+
 def test_cli_warns_about_unresolved_creators(cli_env) -> None:
     args, _ = cli_env
 

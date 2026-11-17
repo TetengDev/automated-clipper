@@ -342,3 +342,27 @@ def test_a_failing_prune_still_returns_the_verified_snapshot(
         snapshot = local().ensure_model()
     assert (snapshot / tr.COMPLETE_MARKER).is_file()
     assert "pruning unpinned revisions failed" in caplog.text
+
+
+def test_a_pruned_store_file_takes_its_manifest_and_lock_file_along(
+    fake_asr: FakeAsr, tmp_path: Path
+) -> None:
+    """The Hub client keeps `<hash>.refs` and `<hash>.lock` next to each store file."""
+    models = tmp_path / "models"
+    write_snapshot(models, *TINY)  # not marked yet: the next call fetches and prunes
+    write_snapshot(
+        models, "Systran/faster-whisper-retired", OLD_REVISION, arrives={"model.bin": b"old"}
+    )
+    old = _store_file(models, b"old")
+    kept = _store_file(models, FAKE_MODEL_BIN)
+    for store in (old, kept):
+        for suffix in (".refs", ".lock"):
+            store.with_name(store.name + suffix).write_text("")
+
+    local().ensure_model()
+
+    assert not old.exists()
+    assert not old.with_name(old.name + ".refs").exists()
+    assert not old.with_name(old.name + ".lock").exists()
+    assert kept.with_name(kept.name + ".refs").exists()
+    assert kept.with_name(kept.name + ".lock").exists()

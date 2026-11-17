@@ -687,7 +687,9 @@ def _drop_unused_blobs(
     for prefix in _real_dirs(root / "blobs", "??"):
         for entry in _entries(prefix):
             if _STORE_FILE.fullmatch(entry.name) and entry not in stored:
-                deleted += _delete(entry) + _delete(entry.with_name(f"{entry.name}.refs"))
+                deleted += _delete(entry)  # then its manifest and lock: we hold the store lock
+                for sidecar in (".refs", ".lock"):
+                    deleted += _delete(entry.with_name(f"{entry.name}{sidecar}"))
     return deleted
 
 

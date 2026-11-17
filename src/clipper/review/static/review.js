@@ -70,9 +70,17 @@
   // Counters (CLP-117). A field says how its platform counts (`data-count`): code points on
   // Instagram, YouTube and Facebook, where `maxlength` (UTF-16 units) would stop an emoji
   // caption at half the limit, or UTF-16 units on TikTok. The server's check still decides.
+  // The counter can over-count but never under-count: the server measures the text after
+  // cleaning it (control and invisible characters such as ZWSP, and generic or malformed
+  // inline tags, are stripped first), so a text the counter accepts is never refused for
+  // length, while one it shows a little over may still be saved.
   function measure(field) {
     var value = field.value;
     return field.getAttribute("data-count") === "code-points" ? Array.from(value).length : value.length;
+  }
+
+  function limitOf(field) {
+    return parseInt(field.getAttribute("data-limit"), 10);
   }
 
   function number(n) {
@@ -80,23 +88,42 @@
   }
 
   function countText(field) {
-    var limit = parseInt(field.getAttribute("data-limit"), 10);
+    var limit = limitOf(field);
     var used = measure(field);
     var unit = field.getAttribute("data-unit");
     if (used > limit) return number(used - limit) + " " + unit + " over the limit of " + number(limit);
     return number(used) + " of " + number(limit) + " " + unit;
   }
 
-  // One polite live region, written once typing pauses, so a screen reader is not read
-  // every keystroke.
-  var announceTimer = null;
-  function announce(text) {
+  // "under", "near" (the last 10% of the limit) or "over".
+  function zone(field) {
+    var used = measure(field);
+    var limit = limitOf(field);
+    if (used > limit) return "over";
+    return used >= limit * 0.9 ? "near" : "under";
+  }
+
+  // One polite live region for every field. It speaks only when a field's zone changes and
+  // stays changed through a typing pause (into the last 10%, past the limit, or back), so a
+  // screen reader is not read the count while the reviewer types well within the limit.
+  var spoken = {};
+  var timers = {};
+  function announce(field) {
     var status = document.getElementById("variant-count-status");
     if (!status) return;
-    window.clearTimeout(announceTimer);
-    announceTimer = window.setTimeout(function () {
-      status.textContent = text;
+    var id = field.getAttribute("data-counter");
+    window.clearTimeout(timers[id]);
+    timers[id] = window.setTimeout(function () {
+      var now = zone(field);
+      if (spoken[id] === now) return;
+      spoken[id] = now;
+      status.textContent = field.getAttribute("data-label") + ": " + countText(field);
     }, 1000);
+  }
+
+  var counted = document.querySelectorAll("[data-counter]");
+  for (var i = 0; i < counted.length; i++) {
+    spoken[counted[i].getAttribute("data-counter")] = zone(counted[i]);
   }
 
   document.addEventListener("input", function (event) {
@@ -104,9 +131,8 @@
     if (!field || !field.hasAttribute || !field.hasAttribute("data-counter")) return;
     var out = document.getElementById(field.getAttribute("data-counter"));
     if (!out) return;
-    var text = countText(field);
-    out.textContent = text;
-    out.classList.toggle("over", measure(field) > parseInt(field.getAttribute("data-limit"), 10));
-    announce(field.getAttribute("data-label") + ": " + text);
+    out.textContent = countText(field);
+    out.classList.toggle("over", measure(field) > limitOf(field));
+    announce(field);
   });
 })();

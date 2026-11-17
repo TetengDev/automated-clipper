@@ -41,7 +41,7 @@
     </details>
     {% endfor %}
   {% if can_review %}
-    {# Read out once typing pauses (review.js), not on every key. #}
+    {# Speaks only when a field enters its last 10%, passes the limit or drops back (review.js). #}
     <p id="variant-count-status" class="visually-hidden" aria-live="polite"></p>
     <button type="submit" id="save-variants-btn">Save platform text</button>
   </form>

@@ -1,10 +1,13 @@
-"""Keyboard shortcuts in static/review.js, run under node with a tiny DOM stub (CLP-20)."""
+"""Keyboard shortcuts (CLP-20) and the per-platform text counters (CLP-117) in
+static/review.js, run under node with a tiny DOM stub."""
 
 from __future__ import annotations
 
 import json
 import shutil
 import subprocess
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,6 +29,7 @@ let handler = null;
 const document = {
   getElementById: (id) => els[id] || null,
   addEventListener: (type, fn) => { if (type === "keydown") handler = fn; },
+  querySelectorAll: () => [],
 };
 const window = { location: { assign: (href) => log.push("go:" + href) } };
 vm.runInNewContext(fs.readFileSync(scriptPath, "utf8"), { document, window });
@@ -47,18 +51,21 @@ CLIP_PAGE = [
 ]
 
 
-def run(elements: list[list[object]], keys: list[list[str | None]]) -> list[str]:
+def _node(harness: str, scenario: object, script: Path = STATIC_DIR / "review.js") -> Any:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not installed")
-    scenario = json.dumps({"elements": elements, "keys": keys})
     out = subprocess.run(  # noqa: S603
-        [node, "-e", HARNESS, str(STATIC_DIR / "review.js"), scenario],
+        [node, "-e", harness, str(script), json.dumps(scenario)],
         check=True,
         capture_output=True,
         text=True,
     )
     return json.loads(out.stdout)
+
+
+def run(elements: list[list[object]], keys: list[list[str | None]]) -> list[str]:
+    return _node(HARNESS, {"elements": elements, "keys": keys})
 
 
 def test_a_approves_and_j_k_navigate() -> None:
@@ -133,3 +140,110 @@ def test_a_approves_once_the_sensitive_clip_is_confirmed() -> None:
     log = run(_sensitive_page(True), [["a", None], ["a", "confirm-sensitive"]])
 
     assert log == ["click:approve-btn", "prevent:a", "click:approve-btn", "prevent:a"]
+
+
+# --- counters (CLP-117) -------------------------------------------------------------------------
+
+COUNTER_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+const [scriptPath, scenario] = process.argv.slice(1);
+const spec = JSON.parse(scenario);
+const els = {};
+function el(id) {
+  return els[id] || (els[id] = { id, textContent: "", classes: [],
+    classList: { toggle(c, on) { const s = new Set(els[id].classes); on ? s.add(c) : s.delete(c);
+      els[id].classes = [...s]; } } });
+}
+const attrs = { "data-counter": "ig-count", "data-limit": String(spec.limit),
+  "data-count": spec.count, "data-unit": spec.unit, "data-label": "Instagram caption" };
+const field = { value: spec.initial, hasAttribute: (k) => k in attrs,
+  getAttribute: (k) => attrs[k] };
+el("variant-count-status");
+el("ig-count");
+let handler = null;
+const timers = new Map();
+let next = 1;
+const document = {
+  getElementById: (id) => els[id] || null,
+  querySelectorAll: () => [field],
+  addEventListener: (type, fn) => { if (type === "input") handler = fn; },
+};
+const window = {
+  setTimeout: (fn) => { timers.set(next, fn); return next++; },
+  clearTimeout: (t) => { timers.delete(t); },
+  location: {},
+};
+vm.runInNewContext(fs.readFileSync(scriptPath, "utf8"), { document, window });
+const log = [];
+for (const step of spec.steps) {
+  field.value = step.value;
+  handler({ target: field });
+  if (step.pause) { for (const fn of [...timers.values()]) fn(); timers.clear(); }
+  const status = els["variant-count-status"];
+  log.push({ counter: els["ig-count"].textContent, over: els["ig-count"].classes.includes("over"),
+    said: status.textContent });
+  status.textContent = "";
+}
+handler({ target: { hasAttribute: () => false } });  // other inputs are ignored
+process.stdout.write(JSON.stringify(log));
+"""
+FIRE = "\U0001f525"  # one code point, two UTF-16 units
+
+
+def count(
+    steps: list[tuple[int, bool]],
+    *,
+    limit: int = 10,
+    initial: int = 4,
+    utf16: bool = False,
+    script: Path = STATIC_DIR / "review.js",
+) -> list[dict[str, Any]]:
+    """Types `n` emoji at each step (pausing after it when the flag is set) and returns
+    what the counter and the live region show after each."""
+    scenario = {
+        "limit": limit,
+        "count": "utf16" if utf16 else "code-points",
+        "unit": "UTF-16 units" if utf16 else "characters",
+        "initial": FIRE * initial,
+        "steps": [{"value": FIRE * n, "pause": pause} for n, pause in steps],
+    }
+    return _node(COUNTER_HARNESS, scenario, script)
+
+
+def test_the_counter_counts_in_the_platforms_units() -> None:
+    (code_points,) = count([(7, False)])
+    (utf16,) = count([(4, False)], utf16=True)
+
+    assert code_points == {"counter": "7 of 10 characters", "over": False, "said": ""}
+    assert utf16 == {"counter": "8 of 10 UTF-16 units", "over": False, "said": ""}
+    (over,) = count([(12, False)])
+    assert over["counter"] == "2 characters over the limit of 10" and over["over"]
+
+
+def test_the_live_region_speaks_only_when_the_count_changes_zone() -> None:
+    """Fix round 1: silent while well within the limit, even after a pause; it speaks on
+    entering the last 10%, on passing the limit, and on dropping back out of each."""
+    steps = [(5, True), (6, True), (9, True), (10, True), (11, True), (12, True)]
+    steps += [(10, True), (3, True), (4, True)]
+
+    said = [step["said"] for step in count(steps)]
+
+    assert said == [
+        "",
+        "",
+        "Instagram caption: 9 of 10 characters",
+        "",
+        "Instagram caption: 1 characters over the limit of 10",
+        "",
+        "Instagram caption: 10 of 10 characters",
+        "Instagram caption: 3 of 10 characters",
+        "",
+    ]
+
+
+def test_crossing_into_the_last_tenth_and_back_before_a_pause_says_nothing() -> None:
+    log = count([(9, False), (2, True)])
+
+    assert [step["said"] for step in log] == ["", ""]
+    assert log[-1]["counter"] == "2 of 10 characters"  # the visible counter stays live

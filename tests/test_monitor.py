@@ -1084,23 +1084,34 @@ def test_cli_malformed_webhook_is_logged_and_the_monitor_keeps_running(
     assert "cycle done" in result.output
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert errors == [
-        f"run-monitor: {name} must be a https://discord.com/api/webhooks/... URL;"
-        " alerts go to the log"
+        f"run-monitor: {name} must be a https://discord.com/api/webhooks/... URL; ignoring it"
     ]
     assert "s3cret" not in caplog.text + result.output
 
 
 def test_monitor_alert_falls_through_a_malformed_alerts_webhook(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     from clipper.notify import DiscordWebhook
+
+    def ignored(name: str) -> str:
+        return (
+            f"run-monitor: {name} must be a https://discord.com/api/webhooks/... URL; ignoring it"
+        )
 
     monkeypatch.setenv("DISCORD_ALERTS_WEBHOOK_URL", BAD_WEBHOOK)
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/pings")
     with httpx.Client() as http:
-        assert isinstance(cli._alert_webhook(http, Secrets()), DiscordWebhook)
+        assert isinstance(cli._alert_webhook(http, Secrets()), DiscordWebhook)  # the ping hook
+        assert [r.getMessage() for r in caplog.records] == [ignored("DISCORD_ALERTS_WEBHOOK_URL")]
+        caplog.clear()
         monkeypatch.setenv("DISCORD_WEBHOOK_URL", BAD_WEBHOOK)
-        assert cli._alert_webhook(http, Secrets()) is None
+        assert cli._alert_webhook(http, Secrets()) is None  # the log only
+    assert [r.getMessage() for r in caplog.records] == [
+        ignored("DISCORD_ALERTS_WEBHOOK_URL"),
+        ignored("DISCORD_WEBHOOK_URL"),
+    ]
+    assert "s3cret" not in caplog.text
 
 
 def test_cli_warns_about_unresolved_creators(cli_env) -> None:

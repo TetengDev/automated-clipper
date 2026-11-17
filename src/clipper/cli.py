@@ -336,7 +336,7 @@ def _webhook(
         problem = f"{name} must be a https://discord.com/api/webhooks/... URL"
         if strict:
             _fail(problem)
-        logger.error("run-monitor: %s; alerts go to the log", problem)
+        logger.error("run-monitor: %s; ignoring it", problem)
         return None
 
 

@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
@@ -164,6 +165,82 @@ def test_run_worker_once(
     # detected -> fetching_audio (build_stages' real stage) -> failed; then nothing is due.
     assert len(calls) == 1 and "yt_dlp" in calls[0]
     assert "no due jobs" in runs[2].output
+
+
+def test_run_worker_boot_check_failure_alerts_and_keeps_running(
+    tmp_path: Path,
+    config_file: Path,
+    failing_boot_check: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    opts = ["--db", str(tmp_path / "state.db"), "--config", str(config_file)]
+
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "no due jobs" in result.output  # started anyway
+    hint = "/usr/bin/deno --version exited 1; rebuild the image (uv sync --locked)"
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == [f"run-worker: doctor: fail deno            {hint}"]
+    assert len(failing_boot_check) == 1
+    assert "run-worker: " in failing_boot_check[0] and hint in failing_boot_check[0]
+
+
+def test_run_worker_boot_check_failure_without_webhook_logs_once(
+    tmp_path: Path,
+    config_file: Path,
+    failing_boot_check: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("DISCORD_ALERTS_WEBHOOK_URL")  # alert falls back to log_notify
+    opts = ["--db", str(tmp_path / "state.db"), "--config", str(config_file)]
+
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    lines = [r.getMessage() for r in caplog.records if "deno" in r.getMessage()]
+    assert lines == [
+        "run-worker: doctor: fail deno            /usr/bin/deno --version exited 1;"
+        " rebuild the image (uv sync --locked)"
+    ]
+    assert failing_boot_check == []
+
+
+@pytest.mark.parametrize("failure", ["check raises", "import fails"])
+def test_run_worker_survives_a_crashing_boot_check(
+    tmp_path: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    import sys
+
+    import clipper
+    from clipper import doctor
+
+    if failure == "check raises":
+
+        def crash(service: str, alert: object) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(doctor, "startup_check", crash)
+    else:
+        monkeypatch.delattr(clipper, "doctor")
+        monkeypatch.setitem(sys.modules, "clipper.doctor", None)
+    opts = ["--db", str(tmp_path / "state.db"), "--config", str(config_file)]
+
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "no due jobs" in result.output
+    (error,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert error.getMessage() == "run-worker: the Deno solver check crashed"
+    assert error.exc_info is not None
 
 
 def test_run_worker_requires_valid_config(tmp_path: Path) -> None:

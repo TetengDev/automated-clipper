@@ -3,11 +3,14 @@
 Every check reports a status (`ok` / `warn` / `fail`) and a detail with the version and
 resolved path. Details never contain environment values or child output beyond a parsed
 version: a failed run is reported by its exit code only.
+
+run-worker and run-monitor run the yt-dlp-ejs and Deno checks once at boot (CLP-129).
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -25,7 +28,10 @@ from yt_dlp.extractor.youtube.jsc._builtin.vendor._info import VERSION as EJS_VE
 from yt_dlp.utils import version_tuple
 from yt_dlp.utils._jsruntime import DenoJsRuntime
 
+from clipper.notify import Notify, NotifyError
 from clipper.pipeline.ytdlp import CommandTimeout, RunResult, run_command
+
+logger = logging.getLogger(__name__)
 
 Status = Literal["ok", "warn", "fail"]
 Runner = Callable[..., RunResult]
@@ -218,6 +224,17 @@ def _deno(
     return Check("deno", "ok", f"{found} {path} (solver ok)")
 
 
+def _solver_checks(
+    runner: Runner, which: Which, platform: str, scripts_dir: Path | None
+) -> tuple[Check, Check]:
+    """yt-dlp-ejs, then Deno running its scripts. `scripts_dir` defaults to this Python's
+    scripts dir."""
+    scripts = Path(sysconfig.get_path("scripts")) if scripts_dir is None else scripts_dir
+    solver = _load_solver()
+    ejs = _ejs(solver)
+    return ejs, _deno(runner, which, platform, scripts, solver if ejs.status == "ok" else None)
+
+
 def _node(runner: Runner, which: Which, env: Mapping[str, str]) -> Check:
     """Only renders (Remotion) need node: a failure when CLIPPER_RENDER_DIR says renders run."""
     severity: Status = "fail" if env.get(RENDER_DIR_ENV) else "warn"
@@ -241,19 +258,48 @@ def run_checks(
     scripts_dir: Path | None = None,
 ) -> list[Check]:
     """All checks, in order. `scripts_dir` defaults to this Python's scripts dir."""
-    scripts = Path(sysconfig.get_path("scripts")) if scripts_dir is None else scripts_dir
-    solver = _load_solver()
-    ejs = _ejs(solver)
-    verified = solver if ejs.status == "ok" else None
     return [
         _ffmpeg_tool("ffmpeg", runner, which),
         _ffmpeg_tool("ffprobe", runner, which),
         _filters(runner, which),
         _ytdlp(version),
-        ejs,
-        _deno(runner, which, platform, scripts, verified),
+        *_solver_checks(runner, which, platform, scripts_dir),
         _node(runner, which, env),
     ]
+
+
+def startup_check(
+    service: str,
+    alert: Notify | None,
+    *,
+    runner: Runner = run_command,
+    which: Which = shutil.which,
+    platform: str = sys.platform,
+    scripts_dir: Path | None = None,
+) -> None:
+    """The yt-dlp-ejs and Deno checks, once at service boot. A failure is logged at ERROR
+    with doctor's hint and sent to `alert`, and the service keeps running: without the
+    solver yt-dlp still works with fewer formats, while refusing to start would crash-loop
+    the container and stop detection. Never raises."""
+    try:
+        ejs, deno = _solver_checks(runner, which, platform, scripts_dir)
+    except Exception:
+        logger.exception("%s: the Deno solver check crashed", service)
+        problem = "the Deno solver check crashed; run clipper doctor"
+    else:
+        if deno.status == "ok":
+            logger.info("%s: doctor: %s", service, format_check(deno))
+            return
+        for check in (ejs, deno):
+            if check.status != "ok":
+                logger.error("%s: doctor: %s", service, format_check(check))
+        problem = format_check(deno)
+    if alert is None:
+        return
+    try:
+        alert(f"{service}: YouTube challenge solver check failed at boot: {problem}")
+    except NotifyError as exc:
+        logger.warning("%s: boot alert not sent: %s", service, exc)
 
 
 def format_check(check: Check) -> str:

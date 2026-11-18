@@ -266,6 +266,7 @@ def run_monitor(
     stop_event = threading.Event()
     try:
         with _http_client() as http:
+            _preflight("run-monitor", _alert_webhook(http, secrets))
             try:
                 source = _youtube_source(secrets, http, stop_event)
             except YtDlpError as exc:
@@ -320,27 +321,59 @@ def _posting_config(conn: sqlite3.Connection, config_path: Path) -> PostingConfi
     return live
 
 
+def _webhook(
+    http: httpx.Client, value: SecretStr | None, name: str, *, strict: bool = True
+) -> Notify | None:
+    """The Discord webhook `name` holds, None when unset. A malformed URL stops the worker;
+    the monitor (`strict=False`) logs it, by name only, and treats it as unset."""
+    from clipper.notify import DiscordWebhook
+
+    if value is None or not value.get_secret_value().strip():
+        return None
+    try:
+        return DiscordWebhook(value.get_secret_value().strip(), http)
+    except ValueError:
+        problem = f"{name} must be a https://discord.com/api/webhooks/... URL"
+        if strict:
+            _fail(problem)
+        logger.error("run-monitor: %s; ignoring it", problem)
+        return None
+
+
+def _alert_webhook(http: httpx.Client, secrets: Secrets) -> Notify | None:
+    """The monitor's alerts: the worker's alert webhook (DISCORD_ALERTS_WEBHOOK_URL, else
+    DISCORD_WEBHOOK_URL), else None. A malformed URL never stops detection."""
+    name = "DISCORD_ALERTS_WEBHOOK_URL"
+    alerts = _webhook(http, secrets.discord_alerts_webhook_url, name, strict=False)
+    pings = secrets.discord_webhook_url
+    return alerts or _webhook(http, pings, "DISCORD_WEBHOOK_URL", strict=False)
+
+
+def _preflight(service: str, alert: Notify | None) -> None:
+    """Doctor's Deno solver check, once at boot (CLP-129): logs and alerts, never stops.
+    The log fallback (`log_notify`) counts as no alert: it would repeat the ERROR line."""
+    try:
+        from clipper import doctor
+        from clipper.notify import log_notify
+
+        doctor.startup_check(service, None if alert is log_notify else alert)
+    except Exception:
+        logger.exception("%s: the Deno solver check crashed", service)
+
+
 def _notifiers(http: httpx.Client) -> tuple[Notify, Notify]:
     """Discord webhooks for submission pings and missed-deadline alerts. Pings go to
     DISCORD_WEBHOOK_URL, alerts to DISCORD_ALERTS_WEBHOOK_URL (else the ping webhook);
     without either, messages go to the log. A malformed URL stops the worker."""
-    from clipper.notify import DiscordWebhook, log_notify
+    from clipper.notify import log_notify
 
     try:
         secrets = Secrets()
     except ValidationError as exc:
         _fail(f"run-worker: {exc}")
 
-    def hook(value: SecretStr | None, name: str) -> Notify | None:
-        if value is None or not value.get_secret_value().strip():
-            return None
-        try:
-            return DiscordWebhook(value.get_secret_value().strip(), http)
-        except ValueError:
-            _fail(f"{name} must be a https://discord.com/api/webhooks/... URL")
-
-    notify = hook(secrets.discord_webhook_url, "DISCORD_WEBHOOK_URL")
-    alert = hook(secrets.discord_alerts_webhook_url, "DISCORD_ALERTS_WEBHOOK_URL")
+    notify = _webhook(http, secrets.discord_webhook_url, "DISCORD_WEBHOOK_URL")
+    alert = _webhook(http, secrets.discord_alerts_webhook_url, "DISCORD_ALERTS_WEBHOOK_URL")
     if notify is None:
         logger.warning("DISCORD_WEBHOOK_URL is not set: campaign submission pings go to the log")
     return notify or log_notify, alert or notify or log_notify
@@ -388,6 +421,7 @@ def run_worker(
     live = _posting_config(conn, app_ctx.config_path)
     http = _http_client()
     notify, alert = _notifiers(http)
+    _preflight("run-worker", alert)
     # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
     posting = PostingStage(
         conn=conn,

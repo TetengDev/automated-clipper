@@ -1,3 +1,4 @@
+import logging
 import shutil
 import sys
 from collections.abc import Mapping, Sequence
@@ -12,8 +13,10 @@ from clipper.doctor import (
     package_version,
     parse_version,
     run_checks,
+    startup_check,
     summary,
 )
+from clipper.notify import NotifyError
 from clipper.pipeline.ytdlp import CommandTimeout, RunResult
 
 FFMPEG_5 = "ffmpeg version 5.1.9-0+deb12u1 Copyright (c) 2000-2025 the FFmpeg developers"
@@ -546,3 +549,118 @@ def test_format_check_replaces_unprintable_characters() -> None:
     check = Check("deno", "ok", "2.9.8 /opt/\x1b]0;pwned\x07bin\u202e/deno\n(solver ok)")
 
     assert format_check(check) == "ok   deno            2.9.8 /opt/?]0;pwned?bin?/deno?(solver ok)"
+
+
+# Boot preflight (CLP-129): run-worker and run-monitor run the yt-dlp-ejs and Deno checks.
+
+
+def boot(
+    responses: Mapping[tuple[str, str], RunResult | Exception] | None = None,
+    alert: object = None,
+    *,
+    platform: str = "linux",
+) -> FakeRunner:
+    runner = FakeRunner(healthy() if responses is None else responses)
+    startup_check(
+        "run-monitor",
+        alert,  # type: ignore[arg-type]
+        runner=runner,
+        which=WHICH.get,
+        platform=platform,
+        scripts_dir=NO_SCRIPTS,
+    )
+    return runner
+
+
+def records(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == level]
+
+
+def test_boot_check_ok_logs_one_info_line_and_sends_no_alert(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sent: list[str] = []
+
+    with caplog.at_level(logging.INFO):
+        runner = boot(alert=sent.append)
+
+    assert records(caplog, logging.INFO) == [
+        "run-monitor: doctor: ok   deno            2.9.8 /usr/bin/deno (solver ok)"
+    ]
+    assert records(caplog, logging.WARNING) == records(caplog, logging.ERROR) == []
+    assert sent == []
+    assert ["/usr/bin/deno", *DENO_FLAGS] in runner.calls
+    # Only the solver toolchain: no ffmpeg, ffprobe or node runs at boot.
+    assert {Path(c[0]).name for c in runner.calls} == {"deno"}
+
+
+@pytest.mark.parametrize(("platform", "hint"), [("linux", LINUX_HINT), ("darwin", "run uv sync")])
+def test_boot_check_failure_logs_error_with_doctor_hint_and_alerts_once(
+    caplog: pytest.LogCaptureFixture, platform: str, hint: str
+) -> None:
+    sent: list[str] = []
+
+    with caplog.at_level(logging.INFO):
+        boot(
+            with_response(("deno", "run"), RunResult(1, "", "boom")), sent.append, platform=platform
+        )
+
+    detail = f"/usr/bin/deno run exited 1; {hint}"
+    assert records(caplog, logging.ERROR) == [f"run-monitor: doctor: fail deno            {detail}"]
+    assert records(caplog, logging.INFO) == []
+    assert len(sent) == 1
+    assert sent[0].startswith("run-monitor: ") and detail in sent[0]
+    assert "boom" not in caplog.text + sent[0]  # child stderr never reaches logs or Discord
+
+
+def test_boot_check_logs_the_ejs_failure_too(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setitem(sys.modules, "yt_dlp_ejs.yt.solver", None)  # import fails
+    sent: list[str] = []
+
+    with caplog.at_level(logging.INFO):
+        boot(alert=sent.append)
+
+    assert records(caplog, logging.ERROR) == [
+        f"run-monitor: doctor: fail yt-dlp-ejs      {EJS_UNUSABLE}",
+        f"run-monitor: doctor: fail deno            {deno_skipped()}",
+    ]
+    assert len(sent) == 1 and deno_skipped() in sent[0]
+
+
+def test_boot_check_without_alert_only_logs(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO):
+        boot(with_response(("deno", "run"), CommandTimeout("x")), alert=None)
+
+    (error,) = records(caplog, logging.ERROR)
+    assert error.endswith(f"/usr/bin/deno run timed out; {LINUX_HINT}")
+
+
+def test_boot_check_exception_is_logged_and_never_raised(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sent: list[str] = []
+
+    with caplog.at_level(logging.INFO):
+        boot(with_response(("deno", "run"), RuntimeError("unexpected")), sent.append)
+
+    (error,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert error.getMessage() == "run-monitor: the Deno solver check crashed"
+    assert error.exc_info is not None and error.exc_info[0] is RuntimeError
+    assert len(sent) == 1 and "crashed" in sent[0] and "unexpected" not in sent[0]
+
+
+def test_boot_check_alert_failure_is_logged_and_never_raised(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def broken_webhook(text: str) -> None:
+        raise NotifyError("discord webhook returned 500")
+
+    with caplog.at_level(logging.INFO):
+        boot(with_response(("deno", "run"), RunResult(1, "", "")), broken_webhook)
+
+    assert len(records(caplog, logging.ERROR)) == 1
+    assert records(caplog, logging.WARNING) == [
+        "run-monitor: boot alert not sent: discord webhook returned 500"
+    ]

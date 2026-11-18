@@ -222,6 +222,8 @@ class Settings(_Strict):
     disk_budget_gb: int = Field(150, ge=1)
     media_retention_hours: int = Field(48, ge=1)
     review_expiry_days: int = Field(7, ge=1)
+    rejected_retention_days: int = Field(14, ge=1)
+    """Rejected and archived clips' files are deleted this long after the decision (CLP-38)."""
     reframe: Literal["auto", "blurred_fill"] = "auto"
     """auto: a face-tracked 9:16 crop when faces are found, else blurred fill (CLP-58)."""
     transcriber: Literal["local", "groq"] = "local"

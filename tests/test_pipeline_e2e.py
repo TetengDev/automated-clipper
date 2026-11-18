@@ -362,9 +362,17 @@ def _assert_clips(conn: sqlite3.Connection, media: Path) -> list[sqlite3.Row]:
 
 
 def _spend(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
-    rows = conn.execute("SELECT kind, provider, job_id, usd FROM spend ORDER BY id").fetchall()
+    """Money rows; the free `source` rows (source hours, CLP-38) are left out."""
+    rows = conn.execute(
+        "SELECT kind, provider, job_id, usd FROM spend WHERE kind != 'source' ORDER BY id"
+    ).fetchall()
     assert all(row["usd"] > 0 for row in rows)
     return [(row["kind"], row["provider"], row["job_id"]) for row in rows]
+
+
+def _source_rows(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+    rows = conn.execute("SELECT job_id, provider FROM spend WHERE kind = 'source'")
+    return [tuple(r) for r in rows]
 
 
 def test_job_walks_the_pipeline_to_clips_ready(
@@ -393,6 +401,7 @@ def test_job_walks_the_pipeline_to_clips_ready(
     _assert_clips(conn, tmp_path / "media" / YT.key)
     assert fake_render.ranks == [1, 2]
     assert _spend(conn) == [("transcribe", "groq", 1), ("llm", "anthropic", 1)]
+    assert _source_rows(conn) == [(1, "youtube")]
     assert (len(yt.of("probe")), len(yt.of("audio")), len(yt.of("section"))) == (1, 1, 2)
     assert (groq.call_count, claude.requests) == (1, 1)
 
@@ -424,7 +433,9 @@ def test_job_walks_the_pipeline_with_the_default_local_transcriber(
     assert len(transcript["words"]) == VIDEO_S - 1
     _assert_clips(conn, tmp_path / "media" / YT.key)
     assert (len(asr.fetch_calls()), len(asr.chunk_calls()), groq.call_count) == (1, 1, 0)
-    rows = conn.execute("SELECT kind, provider, usd FROM spend ORDER BY id").fetchall()
+    rows = conn.execute(
+        "SELECT kind, provider, usd FROM spend WHERE kind != 'source' ORDER BY id"
+    ).fetchall()
     assert [tuple(r) for r in rows] == [
         ("transcribe", "local", 0.0),
         ("llm", "anthropic", rows[1][2]),

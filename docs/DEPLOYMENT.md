@@ -195,6 +195,44 @@ clip renders, the job fails.
   before it fails. With a single worker, every job queued behind it waits that long too.
   Watch the worker log for repeated `clip N failed` lines across jobs.
 
+## Budgets
+
+- `daily_llm_usd_cap` and `daily_transcribe_usd_cap` cap the paid API calls per UTC day.
+- `max_source_hours_per_day` caps the source hours each creator downloads per UTC day
+  (a creator's `overrides` can change it). Each job counts its source length once, before
+  the audio download, as a free `source` row in the `spend` table. A source whose length
+  the probe does not report is counted after its download, once ffprobe has measured it.
+- Over a cap the stage waits until the next UTC midnight and does not use up an attempt. A
+  single call or source larger than the whole cap can never fit, so its job is skipped.
+- Hitting a cap sends no alert yet. Alerting on it is tracked in
+  [CLP-30](https://linear.app/tengdev/issue/CLP-30).
+
+## Janitor
+
+The `monitor` runs the janitor after a poll cycle, at most once an hour. It works only
+inside the media dir (`data/media`, or `--media-dir` / `CLIPPER_MEDIA_DIR`, the same as
+the worker's).
+
+- Clips still waiting for review `review_expiry_days` (default 7) after their current
+  version was created become `archived`. A re-render that returns a clip to review starts
+  the wait over.
+- `clips_ready` jobs lose their source media `media_retention_hours` (default 48) after
+  they became ready: `audio_16k.flac`, leftover downloads, and each clip's downloaded
+  section (`clips/<rank>/source.mp4`). Rendered clips, transcripts and the other small
+  files stay.
+- Rejected and archived clips lose their clip dir `rejected_retention_days` (default 14)
+  after the decision. Their database rows and history stay.
+- When the media dir reaches 80% of `disk_budget_gb`, an alert goes to the alerts webhook,
+  once per crossing; it is sent again only after usage drops below 80% (or after a
+  monitor restart). Above the budget, the source media of `clips_ready` jobs is deleted
+  too, oldest job first, until usage is back under the budget.
+- Never deleted: the files of `approved`, `exported`, `changes_requested` and
+  `re_rendering` clips, any file a post uses, and anything of a job that is not
+  `clips_ready` (a worker may be using it). Failed and skipped jobs keep their files;
+  `clipper retry` reuses them.
+- Nothing outside the media dir is touched. The janitor never follows a symlink and never
+  deletes one, and it removes only regular files and empty dirs.
+
 ## Sensitive clips and the review app
 
 Every clip of a `public_service` creator, of a creator without a `content_type`, or of a
@@ -412,13 +450,17 @@ campaign. `clipper campaigns list` lists every submission.
 - **Discord alerts** fire on:
   - a job reaching `failed`
   - the `DownloadBlocked` signature
-  - disk above 80%
-  - a budget cap being hit
+  - the media dir at 80% of `disk_budget_gb` (see [Janitor](#janitor))
   - YouTube quota above 80%
   - Twitch auth failure
   - export failure
 
-  Alerts are deduplicated: each alert key fires at most once per 30 minutes.
+  Alerts are deduplicated: each alert key fires at most once per 30 minutes. The disk
+  alert fires once per crossing of 80%.
+
+  A budget cap being hit sends no alert yet; the deferred job's reason is in the worker
+  log and on the job. Alerting on it is tracked in
+  [CLP-30](https://linear.app/tengdev/issue/CLP-30).
 
 ## Backups
 

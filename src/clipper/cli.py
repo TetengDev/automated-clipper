@@ -241,10 +241,16 @@ def run_monitor(
             "--first-run", help="Override first_run_mode for creators polled the first time."
         ),
     ] = None,
+    media_dir: Annotated[
+        Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Per-job media the janitor cleans.")
+    ] = jobs.DEFAULT_MEDIA_ROOT,
 ) -> None:
-    """Poll creators 24/7 and enqueue new content.
+    """Poll creators 24/7 and enqueue new content. Between polls, the janitor applies the
+    retention and disk budget settings to the media dir at most once an hour.
 
     SIGTERM/SIGINT finish the current creator's poll, then exit."""
+    from clipper.janitor import Janitor
+    from clipper.notify import log_notify
     from clipper.pipeline.ytdlp import YtDlpError
 
     app_ctx = _app(ctx)
@@ -266,12 +272,16 @@ def run_monitor(
     stop_event = threading.Event()
     try:
         with _http_client() as http:
-            _preflight("run-monitor", _alert_webhook(http, secrets))
+            monitor_alert = _alert_webhook(http, secrets)
+            _preflight("run-monitor", monitor_alert)
             try:
                 source = _youtube_source(secrets, http, stop_event)
             except YtDlpError as exc:
                 _fail(f"run-monitor: {exc}")
-            monitor = YouTubeMonitor(conn, cfg, source, first_run_mode=first_run, stop=stop_event)
+            janitor = Janitor(conn, cfg, media_dir, monitor_alert or log_notify)
+            monitor = YouTubeMonitor(
+                conn, cfg, source, first_run_mode=first_run, stop=stop_event, janitor=janitor.tick
+            )
             if once:
                 report = monitor.run_cycle(creators)
                 _print_cycle(report)

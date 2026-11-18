@@ -8,7 +8,10 @@ from typer.testing import CliRunner
 
 from clipper import cli
 from clipper.cli import app
-from clipper.db import connect
+from clipper.db import connect, migrate
+from clipper.jobs.models import utcnow
+from clipper.jobs.queue import enqueue
+from clipper.urls import SourceRef
 
 runner = CliRunner()
 
@@ -554,3 +557,30 @@ def test_doctor_prints_checks_and_exits_on_failures(
 def test_tracebacks_never_show_local_variables() -> None:
     """Old typer defaulted to printing locals (doctor's `env`, secrets) in tracebacks."""
     assert app.pretty_exceptions_show_locals is False
+
+
+def test_run_worker_skips_a_commentary_day_without_a_clip_stage(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from clipper.pipeline import ytdlp
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(ytdlp, "run_command", lambda args, timeout_s: calls.append(list(args)))
+    db = tmp_path / "state.db"
+    with closing(connect(db)) as conn:
+        migrate(conn)
+        day = SourceRef("commentary", "random_gaming_yt:2026-11-19")
+        enqueue(conn, day, utcnow(), creator="random_gaming_yt")
+    opts = ["--db", str(db), "--config", str(config_file)]
+
+    runs = [
+        runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path / "m")])
+        for _ in range(3)
+    ]
+
+    assert all(r.exit_code == 0 for r in runs), [r.output for r in runs]
+    assert "no due jobs" in runs[2].output
+    assert calls == []  # never reached fetching_audio's yt-dlp
+    with closing(connect(db)) as conn:
+        row = conn.execute("SELECT status, skip_reason FROM jobs").fetchone()
+    assert tuple(row) == ("skipped", "commentary discovery is not built yet (CLP-144)")

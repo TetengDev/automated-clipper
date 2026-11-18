@@ -29,7 +29,7 @@ from clipper.config import (
 from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version, migrate
 from clipper.export import DEFAULT_OUTPUT_DIR
 from clipper.monitor import CycleReport, FirstRun, YouTubeMonitor
-from clipper.pipeline import build_stages
+from clipper.pipeline import build_commentary_stages, build_stages
 from clipper.posting.cli import app as posts_app
 from clipper.posting.stage import HEARTBEAT_BUSY_MS, PostingStage
 from clipper.submissions_cli import app as campaigns_app
@@ -465,6 +465,7 @@ def run_worker(
         worker_id=worker_id or jobs.default_worker_id(),
         stages=build_stages(),
         media_root=media_dir,
+        commentary_stages=build_commentary_stages(),
     )
     from clipper.campaigns import LiveCampaigns
     from clipper.jobs.worker import ChainedPasses

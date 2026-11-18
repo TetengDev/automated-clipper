@@ -1,5 +1,6 @@
 """Pipeline stage registry. Each stage (CLP-13..16) lives in its own module here and is
-added to `build_stages()`; the contract is in `clipper.jobs.stages`.
+added to `build_stages()`; the contract is in `clipper.jobs.stages`. Commentary jobs
+(CLP-142) have their own map, build_commentary_stages().
 
 Artifacts, in order (each stage reads the ones before it from the job's media dir):
 fetching_audio -> audio_16k.flac (+ meta.json, signals.json), transcribing ->
@@ -29,3 +30,11 @@ def build_stages() -> Mapping[JobStatus, StageDef]:
         JobStatus.FETCHING_CLIPS: fetch_clips.STAGE,
         JobStatus.RENDERING: render_clips.STAGE,
     }
+
+
+def build_commentary_stages() -> Mapping[JobStatus, StageDef]:
+    """Commentary jobs' stages (CLP-142): `detected` enters the chain; the others are
+    `clipper.pipeline.commentary` placeholders until their stories ship."""
+    from clipper.pipeline import commentary
+
+    return {**DEFAULT_STAGES, **commentary.STAGES}

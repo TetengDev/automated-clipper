@@ -1,8 +1,9 @@
 """Stage contract: what a pipeline stage is and how it reports outcomes (CLP-13..16).
 
 - A stage is registered as `StageDef(run, artifact)` keyed by the status it processes, in
-  `clipper.pipeline.build_stages()`. `run(job, ctx)` does the work for that status;
-  returning normally advances the job.
+  its job kind's map: `clipper.pipeline.build_stages()` for clip jobs,
+  `build_commentary_stages()` for commentary jobs (CLP-142). `run(job, ctx)` does the work
+  for that status; returning normally advances the job.
 - `artifact` (relative to the job's media dir) marks the stage as done: if it already
   exists the stage is not run again, and `run` must create it, atomically (write a temp
   file, then rename), or the attempt counts as failed. This is what makes a killed worker
@@ -13,8 +14,9 @@
   backoff (status unchanged) and counts as an attempt.
 - Exception messages are stored in the DB and logged, so they must never contain secrets
   (API keys, tokens, signed URLs); `clipper.redact` scrubs known shapes only as a backstop.
-- Statuses with no registered stage are never claimed: such jobs stay put until a worker
-  that handles them runs (e.g. `waiting_vod` until the VOD poller exists).
+- A status with no registered stage in a job's kind map is never claimed for that kind:
+  such jobs stay put until a worker that handles them runs (e.g. `waiting_vod` until the
+  VOD poller exists).
 - While a stage runs, the worker's heartbeat renews the claim lease (DEFAULT_LEASE) every
   quarter lease (`clipper.jobs.heartbeat`). Only a worker that stalls for longer than the
   lease loses the job to another worker; its late result is dropped. A DB write a stage

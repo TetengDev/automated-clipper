@@ -27,11 +27,12 @@ runs:
         apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
         "${apt[@]}" update || "${apt[@]}" update
         # Every file apt would download, by the name apt stores it under in its archive dir
-        # (the second field: it carries the epoch, which the URL's file name does not). The
-        # archive dir is still empty here, so this is the full set the install needs.
+        # (the second field: it carries the epoch, which the URL's file name does not), with
+        # its SHA256 from the signed index. The archive dir is still empty here, so this is
+        # the full set the install needs.
         # shellcheck disable=SC2086
-        apt-get install -y --no-install-recommends --print-uris $PACKAGES \
-          | awk '/^'\''.*\.deb'\'' / { print $2 }' | sort > ~/apt-files.txt
+        apt-get install -y --no-install-recommends --print-uris -o Acquire::ForceHash=SHA256 $PACKAGES \
+          | awk '/^'\''.*\.deb'\'' / { sub(/^SHA256:/, "", $4); print $2, $4 }' | sort > ~/apt-files.txt
         echo "Resolved $(wc -l < ~/apt-files.txt) package files"
         . /etc/os-release
         echo "prefix=apt-${ID}-${VERSION_ID}-${RUNNER_ARCH}-" >> "$GITHUB_OUTPUT"
@@ -41,6 +42,10 @@ runs:
     - name: Restore package files
       id: restore
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # A stalled cache download gives up well inside the caller's 10-minute cap, and the
+      # install then falls back to the mirror.
+      env:
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: "3"
       with:
         path: ~/apt-archives
         key: ${{ steps.resolve.outputs.prefix }}${{ steps.resolve.outputs.hash }}
@@ -51,9 +56,16 @@ runs:
       env:
         PACKAGES: ${{ inputs.packages }}
       run: |
+        # apt checks only the size of a file already in its archive dir, not its hash, so a
+        # cached file is used only when it matches the SHA256 from the signed index. Anything
+        # else is downloaded again.
         hits=0
-        while read -r f; do
-          if [ -f ~/apt-archives/"$f" ]; then sudo cp ~/apt-archives/"$f" /var/cache/apt/archives/; hits=$((hits + 1)); fi
+        while read -r f sum; do
+          if [ -f ~/apt-archives/"$f" ] \
+            && printf '%s  %s\n' "$sum" ~/apt-archives/"$f" | sha256sum -c --quiet - >/dev/null 2>&1; then
+            sudo cp ~/apt-archives/"$f" /var/cache/apt/archives/
+            hits=$((hits + 1))
+          fi
         done < ~/apt-files.txt
         echo "Using $hits of $(wc -l < ~/apt-files.txt) package files from the cache"
         apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30
@@ -63,7 +75,7 @@ runs:
           || "${apt[@]}" install -y --no-install-recommends $PACKAGES
         # Keep exactly the files this install used, so stale versions never pile up.
         rm -rf ~/apt-archives && mkdir -p ~/apt-archives
-        while read -r f; do
+        while read -r f _; do
           if [ -f /var/cache/apt/archives/"$f" ]; then cp /var/cache/apt/archives/"$f" ~/apt-archives/; fi
         done < ~/apt-files.txt
         echo "Kept $(find ~/apt-archives -name '*.deb' | wc -l) package files for the cache"

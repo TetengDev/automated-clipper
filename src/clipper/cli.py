@@ -114,6 +114,7 @@ def check_config(ctx: typer.Context) -> None:
         typer.echo(f"  - {creator.name} [{creator.region}] {', '.join(platforms)}")
     accounts = _check_accounts(_app(ctx).config_path, cfg)
     _check_campaigns(_app(ctx).config_path, cfg, accounts)
+    _check_commentary(_app(ctx).config_path, accounts)
 
 
 def _check_campaigns(config_path: Path, cfg: AppConfig, accounts: AccountsConfig) -> None:
@@ -135,6 +136,33 @@ def _check_campaigns(config_path: Path, cfg: AppConfig, accounts: AccountsConfig
     for campaign in campaigns.campaigns:
         typer.echo(f"  - {summary(campaign)}")
     for warning in unconfigured_campaigns(accounts, campaigns):
+        typer.echo(f"warning: {warning}", err=True)
+
+
+def _check_commentary(config_path: Path, accounts: AccountsConfig) -> None:
+    """Commentary channels summary for check-config (CLP-143)."""
+    from clipper.commentary.config import (
+        commentary_path,
+        load_commentary,
+        summary,
+        unchanneled_accounts,
+        youtube_pins_note,
+    )
+
+    path = commentary_path(config_path)
+    try:
+        commentary = load_commentary(path, accounts)
+    except ConfigError as exc:
+        _fail(str(exc))
+    found = "" if path.exists() else f" ({path} not found)"
+    typer.echo(f"ok: {len(commentary.channels)} commentary channels{found}")
+    by_id = {a.id: a for a in accounts.accounts}
+    for channel in commentary.channels:
+        settings = commentary.settings_for(channel)
+        typer.echo(f"  - {summary(channel, settings, by_id[channel.account])}")
+        if (note := youtube_pins_note(channel)) is not None:
+            typer.echo(f"note: {note}")
+    for warning in unchanneled_accounts(accounts, commentary):
         typer.echo(f"warning: {warning}", err=True)
 
 

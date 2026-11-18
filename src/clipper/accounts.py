@@ -77,6 +77,7 @@ APP_ENV_NAMES = frozenset(
     {
         "CLIPPER_ACCOUNTS",
         "CLIPPER_CAMPAIGNS",
+        "CLIPPER_COMMENTARY",
         "CLIPPER_CONFIG",
         "CLIPPER_DB",
         "CLIPPER_DEV",

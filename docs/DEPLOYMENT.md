@@ -208,13 +208,22 @@ clip renders, the job fails.
 
 - Each failure is counted in `data/media/<job>/clips/<rank>/render_failures.json`. Clip
   failures use up these counts, not the job's attempts.
-- When no clip rendered, the counts are dropped, so `clipper retry <job>` tries every clip
-  again. A job that failed for another reason (e.g. its worker kept crashing) keeps them on
-  `clipper retry`. To give such a clip fresh tries, delete its `render_failures.json` first.
-- Outage worst case: when every render fails (Remotion broken, disk full), a job keeps
-  trying for up to about 3 x clips x `CLIP_WORST_CASE_S` (the worst case of one clip)
-  before it fails. With a single worker, every job queued behind it waits that long too.
+- `clipper retry <job>` deletes the job's counts, so every clip gets fresh tries. It finds
+  them under `--media-root` (default `data/media`, or `CLIPPER_MEDIA_DIR`), so pass the
+  worker's media directory if it is not the default. `clipper enqueue --retry` keeps the
+  counts: delete `render_failures.json` by hand to give a left-out clip fresh tries. When no
+  clip rendered, the job drops its counts itself.
+- Outage cap: when every render fails (Remotion broken, disk full), a job keeps trying for
+  up to about 3 x clips x `CLIP_WORST_CASE_S` (the worst case of one clip). With a single
+  worker, every job queued behind it waits too. So a job whose renders still fail 48 h
+  into an episode of failed renders fails. `.render_failing_since` in its media directory
+  holds when the episode began and its last failed render. After 48 h without a failed
+  render the episode is over, so a job picked up late by a stopped worker, or requeued
+  later, starts a new one. A run in which every render works is never stopped by the cap.
   Watch the worker log for repeated `clip N failed` lines across jobs.
+- Two workers on the same clip (one of them after losing its lease) can overwrite each
+  other's update to `render_failures.json`, so the count can come out one too low. That
+  only means an extra retry; the number of tries is still bounded.
 
 ## Budgets
 

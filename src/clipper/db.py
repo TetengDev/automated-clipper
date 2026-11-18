@@ -174,7 +174,19 @@ def migrate(conn: sqlite3.Connection, migrations: list[Migration] | None = None)
             "upgrade the application"
         )
 
+    def clash(migration: Migration, name: str) -> MigrationError:
+        return MigrationError(
+            f"migration {migration.version}: the database recorded {name!r} but this code"
+            f" has {migration.name!r}; two branches shipped the same version"
+        )
+
     done = _applied_versions(conn)
+    if done:  # a version recorded under another name is a different migration (CLP-79)
+        recorded = dict(conn.execute("SELECT version, name FROM schema_version").fetchall())
+        for migration in ordered:
+            name = recorded.get(migration.version, migration.name)
+            if name != migration.name:
+                raise clash(migration, name)
     applied: list[int] = []
     for migration, statements in plans:
         if migration.version in done:
@@ -186,8 +198,13 @@ def migrate(conn: sqlite3.Connection, migrations: list[Migration] | None = None)
                 " name TEXT NOT NULL,"
                 " applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')))"
             )
-            if migration.version in _applied_versions(conn):
-                continue  # another process applied it while we waited for the lock
+            row = conn.execute(
+                "SELECT name FROM schema_version WHERE version = ?", (migration.version,)
+            ).fetchone()
+            if row is not None:  # another process applied it while we waited for the lock
+                if row[0] != migration.name:
+                    raise clash(migration, row[0])
+                continue
             for stmt in statements:
                 conn.execute(stmt)
             conn.execute(

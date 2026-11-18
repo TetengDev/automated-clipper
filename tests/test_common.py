@@ -193,6 +193,27 @@ def test_first_seen_restarts_a_stale_marker(tmp_path: Path) -> None:
     assert first_seen(marker, later + timedelta(hours=1), max_age=timedelta(days=7)) == later
 
 
+def test_first_seen_write_does_not_follow_a_planted_symlink(tmp_path: Path) -> None:
+    marker = tmp_path / ".not_ready_since"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    marker.with_name(f"{marker.name}.tmp").symlink_to(victim)
+
+    assert first_seen(marker, T0) == T0
+
+    assert victim.read_text() == "keep me"
+    assert not marker.is_symlink() and marker.read_text() == T0.isoformat()
+
+
+def test_episode_since_keeps_an_active_episode_and_restarts_a_stale_one(tmp_path: Path) -> None:
+    marker, cap = tmp_path / "m", timedelta(hours=48)
+    assert common.episode_since(marker, T0, cap) == T0
+    assert common.episode_since(marker, T0 + timedelta(hours=40), cap) == T0
+    assert common.episode_since(marker, T0 + timedelta(hours=80), cap) == T0  # last at 40 h
+    later = T0 + timedelta(hours=129)  # 49 h after the last event
+    assert common.episode_since(marker, later, cap) == later
+
+
 def _format_error_at(marker: Path, when: datetime) -> Exception:
     """Run `deferring_no_format` over a format error at `when`; return what it raised."""
     error = ytdlp.Unavailable("Requested format is not available", ytdlp.NO_FORMAT)

@@ -581,7 +581,7 @@ def test_invalid_clip_is_skipped_others_render(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     highlights = [
-        _highlight(1, 10.0, 15.0, hook="x" * 121),  # too long for the hook card
+        _highlight(1, 10.0, 10.2),  # shorter than an EDL allows
         _highlight(2, 20.0, 25.0),
         _highlight(3, 30.0, 300.0),  # longer than an EDL allows
     ]
@@ -667,6 +667,87 @@ def test_control_and_format_characters_stripped_from_words(
 
     texts = [w.text for w in fake.calls[0]["edl"].words]
     assert texts == ["ab", "c d", "x" * 64]
+
+
+def test_combining_mark_floods_and_private_use_are_cleaned(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    """CLP-67: at most 2 combining marks per character, counted after NFC (so a
+    precomposed letter keeps its own); private-use characters go. A word with no letter,
+    number, punctuation or symbol left (only marks, a lone ZWJ or VS16) is dropped. The
+    hook is cleaned the same way."""
+    words = [
+        {"word": "a" + "\u0301" * 50 + "b", "start": 10.1, "end": 10.5},
+        {"word": "\u0301" * 5, "start": 10.6, "end": 10.9},
+        {"word": "\ue000\U000f0000", "start": 11.1, "end": 11.5},
+        {"word": "x\ue000y", "start": 12.1, "end": 12.5},
+        {"word": "p \ue000 q", "start": 12.6, "end": 12.9},
+        {"word": "o\u0301\u200b\u0301\u0301", "start": 13.1, "end": 13.5},
+        {"word": "\u200d", "start": 13.6, "end": 13.7},
+        {"word": "\ufe0f", "start": 13.8, "end": 13.9},
+    ]
+    zalgo_hook = "Wo" + "\u0336" * 40 + "w"
+    highlights = [
+        _highlight(1, 10.0, 15.0, hook=zalgo_hook),
+        _highlight(2, 20.0, 25.0, hook="\u200d\ufe0f\u0301"),
+    ]
+    _setup(media, highlights, words=words)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    edl = fake.calls[0]["edl"]
+    assert [w.text for w in edl.words] == [
+        "\u00e1\u0301\u0301b",
+        "xy",
+        "p q",
+        "\u00f3\u0301\u0301",
+    ]
+    assert edl.hook is not None and edl.hook.text == "Wo\u0336\u0336w"
+    assert fake.calls[1]["edl"].hook is None
+
+
+def test_text_that_nfc_lengthens_is_cut_to_the_edl_limits(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    """CLP-67: NFC can lengthen text (U+0958 is a composition exclusion: 2 characters in
+    NFC), so the cleaned hook and words are cut to the EDL limits afterwards."""
+    words = [{"word": "\u0958" * 40, "start": 10.1, "end": 10.5}]
+    _setup(media, [_highlight(1, 10.0, 15.0, hook="\u0958" * 100)], words=words)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    edl = fake.calls[0]["edl"]
+    assert edl.hook is not None and edl.hook.text == "\u0915\u093c" * 60
+    assert [w.text for w in edl.words] == ["\u0915\u093c" * 32]
+    assert [r["rank"] for r in _rows(conn)] == [1]
+
+
+def test_normal_text_and_emoji_survive_caption_cleaning(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    """CLP-67: accented text (NFC), Tagalog, Persian with ZWNJ and emoji are unchanged."""
+    texts = [
+        "caf\u00e9",  # precomposed
+        "Vi\u1ec7t",  # precomposed, two diacritics
+        "\u1703\u1712\u1714",  # Tagalog (Baybayin) with its virama
+        "\u0645\u06cc\u200c\u062e\u0648\u0627\u0645",  # Persian with ZWNJ
+        "\u2764\ufe0f",  # heart + VS16 (a Mn mark)
+        "1\ufe0f\u20e3",  # keycap: VS16 + enclosing mark
+        "\U0001f469\u200d\U0001f469\u200d\U0001f467",  # ZWJ family
+        "\U0001f44d\U0001f3fd",  # skin tone modifier
+        "\u1f82\u03bd",  # polytonic Greek: 3 marks in NFD, precomposed in NFC
+    ]
+    words = [
+        {"word": t, "start": 10.1 + i * 0.4, "end": 10.4 + i * 0.4} for i, t in enumerate(texts)
+    ]
+    decomposed = [{"word": "cafe\u0301", "start": 14.0, "end": 14.3}]
+    _setup(media, [_highlight(1, 10.0, 15.0, hook="Kain na \U0001f60b")], words=words + decomposed)
+
+    rc.render_clips(job, _ctx(media, conn))
+
+    edl = fake.calls[0]["edl"]
+    assert [w.text for w in edl.words] == [*texts, "caf\u00e9"]
+    assert edl.hook is not None and edl.hook.text == "Kain na \U0001f60b"
 
 
 def test_small_stage_budget_stops_before_a_clip(
@@ -852,7 +933,9 @@ def test_crop_the_edl_rejects_keeps_blurred_fill(
     monkeypatch.setattr(rc, "plan_reframe", lambda *a: (rf.Layout.FACE_TRACK, [(0.0, 1.5)]))
     rc.render_clips(job, _ctx(media, conn))
     assert fake.calls[0]["edl"].layout == "blurred_fill"
-    assert "face track rejected" in caplog.text
+    (record,) = [r for r in caplog.records if "face track rejected" in r.getMessage()]
+    message = record.getMessage()
+    assert "ValidationError" in message and "validation error" not in message
 
 
 def test_creator_can_opt_out_of_face_tracking(
@@ -1123,15 +1206,21 @@ def test_any_jump_cut_error_keeps_the_clip_whole(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    first, word = "bad cut", "secret"  # only in the message: frames show the source line
+
     def boom(*a: Any, **kw: Any) -> Any:
-        raise ValueError("bad cut")
+        raise ValueError(f"{first}\n{word}")
 
     monkeypatch.setattr(rc, "plan_cuts", boom)
     edl = _render_mode(conn, tmp_path, fake, "silences", "aaaaaaaaaaa", _gap_words())
     assert (edl.segments, edl.cuts) == (None, ())
     (record,) = [r for r in caplog.records if "jump cuts rejected" in r.getMessage()]
-    # A logic bug must not hide behind the fallback: the traceback is logged.
-    assert record.levelname == "WARNING" and record.exc_info is not None
+    # A logic bug must not hide behind the fallback: the exception type and its frames
+    # are logged, but never its message (CLP-79): it can quote a transcribed word.
+    message = record.getMessage()
+    assert record.levelname == "WARNING" and record.exc_info is None
+    assert "ValueError" in message and "in boom" in message
+    assert "bad cut" not in message and "secret" not in caplog.text
     assert len(_rows(conn)) == 1
 
 
@@ -1638,6 +1727,56 @@ def test_failure_that_cannot_be_written_does_not_stop_later_clips(
     assert any("not counting the failure" in r.getMessage() for r in caplog.records)
 
 
+def test_unwritable_marker_without_strerror_logs_the_error_type(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLP-89: an OSError built from a message has no strerror; its type is logged, never
+    its message (it can hold a path)."""
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+
+    def no_write(path: Path, data: Any) -> None:
+        raise OSError("/home/someone/secret path")
+
+    monkeypatch.setattr(rc, "write_json_atomic", no_write)
+    with pytest.raises(RenderError):  # nothing counted: uses up an attempt
+        rc.render_clips(job, _ctx(media, conn))
+
+    (record,) = [r for r in caplog.records if "not counting the failure" in r.getMessage()]
+    assert record.getMessage().endswith(": OSError")
+    assert "secret" not in caplog.text
+
+
+def test_unsaved_third_failure_does_not_leave_the_clip_out(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """CLP-89: a clip is left out only once its last failure is saved; otherwise a later
+    run would find 2 saved failures for a clip that was already left out once."""
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    (media / "clips/1" / rc.FAILURES_MARKER).write_text('{"failures": 2, "error": "x"}')
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+
+    def no_write(path: Path, data: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(rc, "write_json_atomic", no_write)
+    with pytest.raises(RenderError):  # nothing counted: retried, using up an attempt
+        rc.render_clips(job, _ctx(media, conn))
+
+    assert "leaving it out" not in caplog.text
+    assert rc._failures(media / "clips/1" / rc.FAILURES_MARKER)[0] == 2
+
+
 def test_all_left_out_still_fails_when_a_marker_cannot_be_removed(
     conn: sqlite3.Connection,
     job: Job,
@@ -1959,6 +2098,96 @@ def test_timeout_after_a_counted_failure_defers(
     with pytest.raises(Deferred, match="1 failure\\(s\\) counted"):
         rc.render_clips(job, _ctx(media, conn))
     assert _rows(conn) == []
+
+
+def _failing_every_run(
+    conn: sqlite3.Connection,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: list[datetime],
+) -> StageContext:
+    """Clip 1 fails on every run (its count cannot be written, so it is never left out),
+    and each run renders one more of clips 2-5, so every run defers."""
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2, 3, 4, 5)])
+    (media / "clips/1" / rc.FAILURES_MARKER).mkdir()
+    fake.fail_rank[1] = RenderError("remotion render failed with exit code 1")
+    _budget_for_one_clip(monkeypatch, fake)
+    return StageContext(media_dir=media, conn=conn, config=AppConfig(), clock=lambda: clock[0])
+
+
+def test_render_failures_past_the_age_cap_fail_the_job(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLP-89: renders still failing 48 h into an episode of failing runs fail the job
+    instead of deferring again (an outage cannot hold the job, and the queue, forever)."""
+    clock = [T0]
+    ctx = _failing_every_run(conn, media, fake, monkeypatch, clock)
+
+    for hours in (0, 24):
+        clock[0] = T0 + timedelta(hours=hours)
+        with pytest.raises(Deferred):
+            rc.render_clips(job, ctx)
+    assert (media / rc.FAILING_MARKER).is_file()
+    clock[0] = T0 + rc.MAX_FAILING_AGE + timedelta(hours=1)
+    with pytest.raises(PermanentError, match="48 h into a failing-render episode; giving up"):
+        rc.render_clips(job, ctx)
+
+    assert not (media / rc.FAILING_MARKER).exists()
+    assert [r["rank"] for r in _rows(conn)] == [2, 3, 4]
+
+
+def test_failing_episode_over_48_h_ago_starts_a_new_one(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLP-89: a marker whose last failure is over 48 h old (a stopped worker, a crash or
+    `enqueue --retry` leftover) is a past episode: one new failure only defers."""
+    clock = [T0]
+    ctx = _failing_every_run(conn, media, fake, monkeypatch, clock)
+    with pytest.raises(Deferred):
+        rc.render_clips(job, ctx)
+
+    clock[0] = T0 + timedelta(days=3)
+    with pytest.raises(Deferred):
+        rc.render_clips(job, ctx)
+
+    start = (media / rc.FAILING_MARKER).read_text().split()[0]
+    assert datetime.fromisoformat(start) == T0 + timedelta(days=3)
+
+
+def test_late_run_without_failures_is_not_capped_and_clears_the_marker(
+    conn: sqlite3.Connection,
+    job: Job,
+    media: Path,
+    fake: FakeRender,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLP-89: the cap only fails a run that still has a failed render (a worker stopped
+    for days resumes a healthy job); the marker goes once the stage is done."""
+    _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2, 3)])
+    _budget_for_one_clip(monkeypatch, fake)
+    fake.fail_on[1] = RenderError("remotion render failed with exit code 1")  # clip 1, once
+    clock = [T0]
+    ctx = StageContext(media_dir=media, conn=conn, config=AppConfig(), clock=lambda: clock[0])
+
+    with pytest.raises(Deferred):  # clip 1 failed, clip 2 rendered, out of budget
+        rc.render_clips(job, ctx)
+    assert (media / rc.FAILING_MARKER).is_file()
+    clock[0] = T0 + timedelta(days=3)
+    with pytest.raises(Deferred):  # clip 3 rendered, no failure: not capped
+        rc.render_clips(job, ctx)
+    rc.render_clips(job, ctx)
+
+    assert [r["rank"] for r in _rows(conn)] == [1, 2, 3]
+    assert not (media / rc.FAILING_MARKER).exists()
 
 
 def test_failure_that_cannot_be_counted_uses_an_attempt(

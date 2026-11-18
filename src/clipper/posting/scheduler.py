@@ -83,6 +83,15 @@ class AccountLike(Protocol):
     warmup_days: int  # default 14
     enabled: bool
     campaign: str | None  # campaign id from campaigns.yaml (CLP-97), or None
+    content: str  # "clips" | "commentary" (CLP-142)
+
+
+def _clip_problem(account: AccountLike) -> str | None:
+    """Why `account` takes no creator's clip, or None. A commentary account (CLP-142)
+    posts only its own Shorts; routing those to it lands with CLP-149."""
+    if account.content != "clips":
+        return f"account {account.id} posts commentary Shorts, not clips"
+    return None
 
 
 def parse_windows(windows: Sequence[str]) -> list[tuple[time, time]]:
@@ -295,14 +304,14 @@ def schedule_for_clip(
     campaigns: Mapping[str, Campaign] | None = None,
     media_root: Path | None = None,
 ) -> list[Post]:
-    """Create one post per enabled account whose creators include the clip's.
+    """Create one post per enabled clips account whose creators include the clip's.
 
     Returns the posts created; an approved clip already scheduled on an account is left as
     it is, so calling this again is safe. Nothing is scheduled for a sensitive clip (its
     stored flag, or `sensitive=True` from the creator's rule), a clip that is not approved
     or exported, or one without a rendered video. An account is skipped when the same file
     is already scheduled, posted or held on its platform, or when it has no free slot. Each
-    skip is logged with its reason.
+    skip is logged with its reason. A commentary account (CLP-142) never gets a clip.
 
     A post for a campaign account (`campaigns` by id) whose clip or metadata breaks the
     brief is created `held` with the reasons in `error`, with or without a free slot; so is
@@ -324,7 +333,12 @@ def schedule_for_clip(
         logger.warning("clip %d has no rendered video; not scheduled for posting", clip_id)
         return []
     eligible = sorted(
-        (a for a in accounts if a.enabled and clip.creator in a.creators), key=lambda a: a.id
+        (
+            a
+            for a in accounts
+            if a.enabled and _clip_problem(a) is None and clip.creator in a.creators
+        ),
+        key=lambda a: a.id,
     )
     briefs = campaigns or {}
     created: list[Post] = []
@@ -412,6 +426,8 @@ def _ineligible(
         return f"account {post.account_id} is no longer configured"
     if not account.enabled:
         return f"account {account.id} is disabled"
+    if (problem := _clip_problem(account)) is not None:
+        return problem
     if clip is None or clip.status not in SCHEDULABLE:
         return f"clip {post.clip_id} is no longer approved"
     if clip.creator not in account.creators:
@@ -512,6 +528,8 @@ def publish_problem(
     account = accounts.get(post.account_id)
     if account is None:
         return f"account {post.account_id} is no longer configured"
+    if (problem := _clip_problem(account)) is not None:
+        return problem
     version = clips.get_version(conn, post.clip_id, post.clip_version)
     clip = clips.get_clip(conn, post.clip_id)
     if version is None or clip is None:

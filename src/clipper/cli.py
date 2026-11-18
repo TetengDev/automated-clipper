@@ -163,6 +163,8 @@ def _check_accounts(config_path: Path, cfg: AppConfig) -> AccountsConfig:
             f"windows {', '.join(a.windows)} {a.timezone}; "
             f"tokens: {token_status(account_tokens(a.id, env))}"
             + (f"; campaign {a.campaign}" if a.campaign else "")
+            + (f"; content {a.content}" if a.content != "clips" else "")
+            + (f"; channel {a.channel_id}" if a.channel_id else "")
         )
     return accounts
 

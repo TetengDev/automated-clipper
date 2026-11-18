@@ -26,6 +26,7 @@ class FakeAccount:
     warmup_days: int = 14
     enabled: bool = True
     campaign: str | None = None
+    content: str = "clips"
 
 
 @dataclass

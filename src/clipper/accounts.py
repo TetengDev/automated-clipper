@@ -50,6 +50,13 @@ TOKEN_KIND_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 TOKEN_ENV_PREFIX = "CLIPPER_"  # noqa: S105 - a name prefix, not a secret
 
 Platform = Literal["tiktok", "instagram", "youtube", "facebook"]
+Content = Literal["clips", "commentary"]
+"""What an account posts: creators' clips (CLP-91) or its own commentary Shorts (CLP-142)."""
+YOUTUBE_CHANNEL_ID_PATTERN = r"^UC[A-Za-z0-9_-]{22}$"
+COMMENTARY_POSTS_PER_DAY = 1
+"""A commentary account's default posts a day: one Short a day (CLP-142)."""
+_COMMENTARY_FORBIDS = ("creators", "campaign", "licence")
+"""Keys a commentary account must not set: it posts its own Shorts, no creator's clips."""
 
 # Most posts a day an account may be configured for. Platform limits are higher or
 # unpublished; these keep a misconfigured account from looking like spam.
@@ -174,8 +181,14 @@ class Account(BaseModel):
     market: str = Field(pattern=r"^[A-Z]{2}$")
     """ISO 3166-1 alpha-2 country code, e.g. US or PH."""
     timezone: str
-    creators: list[str] = Field(min_length=1)
-    """Names from creators.yaml whose clips this account may post."""
+    content: Content = "clips"
+    """clips: approved clips of `creators`. commentary: the daily Short of the account's
+    channel in commentary.yaml (CLP-142); no creators, campaign or licence."""
+    channel_id: str | None = Field(None, pattern=YOUTUBE_CHANNEL_ID_PATTERN)
+    """YouTube only: the channel's UC... id. Required for a commentary account."""
+    creators: list[str] = Field(default_factory=list)
+    """Names from creators.yaml whose clips this account may post (clips accounts only,
+    at least one)."""
     posts_per_day: int = Field(ge=1)
     min_gap_minutes: int = Field(ge=0)
     windows: list[str] = Field(min_length=1)
@@ -192,6 +205,8 @@ class Account(BaseModel):
     def _fill_default_plan(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
+        if data.get("content") == "commentary" and data.get("posts_per_day") is None:
+            data = {**data, "posts_per_day": COMMENTARY_POSTS_PER_DAY}
         missing = [name for name in _PLAN_FIELDS if data.get(name) is None]
         if not missing:
             return data
@@ -273,6 +288,28 @@ class Account(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _content_rules(self) -> Account:
+        if self.content == "commentary":
+            if self.platform != "youtube":
+                raise ValueError(f"a commentary account must be on youtube, not {self.platform}")
+            if self.channel_id is None:
+                raise ValueError(
+                    "a commentary account needs `channel_id` (its YouTube channel, UC...)"
+                )
+            for name in _COMMENTARY_FORBIDS:
+                if name in self.model_fields_set:
+                    raise ValueError(
+                        f"a commentary account must not set `{name}`; it posts its own"
+                        " Shorts, not creators' clips"
+                    )
+            return self
+        if self.channel_id is not None and self.platform != "youtube":
+            raise ValueError("channel_id is only for youtube accounts")
+        if not self.creators:
+            raise ValueError("a clips account needs at least one name in `creators`")
+        return self
+
 
 class AccountsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -283,6 +320,7 @@ class AccountsConfig(BaseModel):
     def _unique(self) -> AccountsConfig:
         ids: set[str] = set()
         handles: set[tuple[str, str]] = set()
+        channels: set[str] = set()
         for account in self.accounts:
             if account.id in ids:
                 raise ValueError(f"duplicate account id: {account.id}")
@@ -291,6 +329,10 @@ class AccountsConfig(BaseModel):
             if key in handles:
                 raise ValueError(f"duplicate {account.platform} handle: {account.handle}")
             handles.add(key)
+            if account.channel_id is not None:
+                if account.channel_id in channels:
+                    raise ValueError(f"duplicate youtube channel_id: {account.channel_id}")
+                channels.add(account.channel_id)
         for account_id in sorted(ids):
             for other in sorted(ids):
                 if other != account_id and other.endswith(f"_{account_id}"):
@@ -345,7 +387,10 @@ def _creator_problems(account: Account, creators: AppConfig) -> list[str]:
 
 
 def _canonical(account: Account, creators: AppConfig) -> Account:
-    """The account with creator names spelled as in creators.yaml (matching ignores case)."""
+    """The account with creator names spelled as in creators.yaml (matching ignores case).
+    An account without creators (commentary) is returned as it is."""
+    if not account.creators:
+        return account
     names = [creators.creator(name).name for name in account.creators]
     return account.model_copy(update={"creators": names})
 

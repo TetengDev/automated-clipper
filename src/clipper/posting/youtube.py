@@ -49,7 +49,13 @@ from pydantic import SecretStr
 
 from clipper.accounts import account_tokens, token_env_name
 from clipper.jobs.models import Clock, utcnow
-from clipper.posting.models import Post, PostMetadata, PublishDeferred, PublishResult
+from clipper.posting.models import (
+    Post,
+    PostMetadata,
+    PublishDeferred,
+    PublishRejected,
+    PublishResult,
+)
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105 - an endpoint, not a secret
 UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
@@ -223,7 +229,7 @@ def video_resource(post: Post, metadata: PostMetadata) -> dict[str, Any]:
     """The `videos.insert` body: private, published by YouTube at `post.scheduled_at`.
     A post that needs the paid-partnership disclosure is refused: it is not set here."""
     if metadata.flags.get("paid_partnership", False):
-        raise ValueError("the YouTube publisher cannot set the paid partnership disclosure")
+        raise PublishRejected("the YouTube publisher cannot set the paid partnership disclosure")
     return {
         "snippet": {
             "title": _title(metadata),

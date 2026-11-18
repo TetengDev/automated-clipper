@@ -1,0 +1,11 @@
+{
+  "error": {
+    "message": "Application request limit reached",
+    "type": "OAuthException",
+    "code": 9,
+    "error_subcode": 2207042,
+    "is_transient": false,
+    "error_user_title": "You have reached the maximum number of posts that is allowed for the API",
+    "fbtrace_id": "AbCdEfGh789"
+  }
+}

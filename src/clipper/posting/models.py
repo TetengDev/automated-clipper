@@ -27,11 +27,14 @@ _URL_UNSAFE = frozenset("<>`\\\"'")
 def plain_https(url: str | None) -> str | None:
     """`url` if it is a plain https URL, else None. No whitespace, control characters or
     markup characters either: the URL is linked in templates and quoted in Discord
-    messages and logs, where a newline or `>` could forge text."""
+    messages and logs, where a newline or `>` could forge text. A backslash, userinfo or
+    port is refused too: browsers may resolve those to another host (CLP-94)."""
     if not url or any(c.isspace() or not c.isprintable() or c in _URL_UNSAFE for c in url):
         return None
     parts = urlsplit(url)
-    return url if parts.scheme == "https" and parts.netloc else None
+    if parts.scheme != "https" or not parts.hostname or parts.netloc != parts.hostname:
+        return None
+    return url
 
 
 class PostStatus(StrEnum):
@@ -183,6 +186,12 @@ class PublishResult:
     url: str | None = None
 
 
+class PublishRejected(Exception):  # noqa: N818 - an outcome, not an error
+    """Raised by `Publisher.publish` when the post can never go out as it is: a disclosure
+    the platform API cannot set, a caption over the platform's limits (CLP-94). The
+    posting stage marks it `post_failed` and alerts at once, without retrying."""
+
+
 class PublishDeferred(Exception):  # noqa: N818 - an outcome, not an error
     """Raised by `Publisher.publish` when the post cannot go out now for a reason that is
     not the post's fault: a platform quota or upload limit, or a paused account (CLP-93).
@@ -214,6 +223,14 @@ class Publisher(Protocol):
 
     `publish` may raise `PublishDeferred` to reschedule the post without counting an
     attempt (quota, upload limit, paused account).
+
+    Also optional, read with getattr (CLP-94):
+
+    * `publish` may raise `PublishRejected`: the post is `post_failed` at once (no retry).
+    * `lead_time: timedelta`: a post's first attempt is claimed this long before its
+      `scheduled_at`, for a platform that publishes natively at a given time (Facebook's
+      `scheduled_publish_time`). Retries still wait for their backoff, and never come
+      before the slot.
     """
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult: ...

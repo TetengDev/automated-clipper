@@ -25,7 +25,14 @@ from clipper.accounts import Account, AccountsConfig
 from clipper.config import Secrets
 from clipper.edl import parse_edl
 from clipper.metadata import Variant, build_post_metadata
-from clipper.posting.models import Post, PostMetadata, PostStatus, PublishDeferred, Publisher
+from clipper.posting.models import (
+    Post,
+    PostMetadata,
+    PostStatus,
+    PublishDeferred,
+    Publisher,
+    PublishRejected,
+)
 from clipper.posting.publishers import build_publishers
 from clipper.posting.youtube import (
     API_URL,
@@ -238,7 +245,7 @@ def test_flags_stored_at_scheduling_reach_the_upload() -> None:
     status = video_resource(make_post(), stored(edl=ai_edl))["status"]
     assert status["containsSyntheticMedia"] is True
     assert video_resource(make_post(), stored())["status"]["containsSyntheticMedia"] is False
-    with pytest.raises(ValueError, match="paid partnership"):
+    with pytest.raises(PublishRejected, match="paid partnership"):
         video_resource(make_post(), stored(paid=True))
 
 
@@ -248,7 +255,7 @@ def test_a_paid_partnership_post_is_refused_before_any_upload(
     # The publisher does not set YouTube's paid-promotion disclosure, so a campaign post
     # that needs it is never published without it.
     meta = PostMetadata(title="t", caption="c", flags={"paid_partnership": True})
-    with pytest.raises(ValueError, match="paid partnership"):
+    with pytest.raises(PublishRejected, match="paid partnership"):
         publisher(clock).publish(make_post(), video, meta)
     assert not google.calls
 

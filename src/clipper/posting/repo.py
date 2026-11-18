@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Any
@@ -21,7 +21,13 @@ from typing import Any
 from clipper.clips import get_version
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
-from clipper.metadata import PLATFORM_LIMITS, clean_caption, clean_hashtags, clean_title
+from clipper.metadata import (
+    PLATFORM_LIMITS,
+    build_post_metadata,
+    clean_caption,
+    clean_hashtags,
+    clean_title,
+)
 from clipper.posting.models import (
     InvalidPostTransition,
     Post,
@@ -388,8 +394,13 @@ def claim_due(
     *,
     platforms: Collection[str],
     limit: int = 10,
+    early: Mapping[str, timedelta] | None = None,
 ) -> list[Post]:
     """Atomically move due `scheduled` posts on `platforms` to `uploading` for this worker.
+
+    `early` maps a platform to a lead time: its posts that were never attempted are due
+    that long before `scheduled_at` (CLP-94: Facebook schedules natively). Retries are
+    due at their backoff time as on every other platform.
 
     BEGIN IMMEDIATE holds the write lock from the read to the update, so two workers can
     never claim the same post.
@@ -398,11 +409,17 @@ def claim_due(
     if not wanted:
         return []
     marks = ", ".join("?" for _ in wanted)
+    due = ["scheduled_at <= ?"]
+    params: list[Any] = [to_iso(now)]
+    for platform, lead in sorted((early or {}).items()):
+        if platform in wanted and lead > timedelta(0):
+            due.append("(platform = ? AND attempts = 0 AND scheduled_at <= ?)")
+            params += [platform, to_iso(now + lead)]
     with transaction(conn):
         rows = conn.execute(
-            f"SELECT * FROM posts WHERE status = ? AND scheduled_at <= ? AND platform IN ({marks})"  # noqa: S608 - placeholders only
-            " ORDER BY scheduled_at, id LIMIT ?",
-            (str(PostStatus.SCHEDULED), to_iso(now), *wanted, limit),
+            f"SELECT * FROM posts WHERE status = ? AND platform IN ({marks})"  # noqa: S608 - placeholders only
+            f" AND ({' OR '.join(due)}) ORDER BY scheduled_at, id LIMIT ?",
+            (str(PostStatus.SCHEDULED), *wanted, *params, limit),
         ).fetchall()
         return [_claim(conn, Post.from_row(r), worker_id, now) for r in rows]
 
@@ -495,7 +512,9 @@ def record_failure(
             target, fields = PostStatus.POST_FAILED, {}
         else:
             target = PostStatus.SCHEDULED
-            fields = {"scheduled_at": now + backoff * 2**attempts}
+            # Never before the slot: a first attempt claimed early (a publisher lead time)
+            # must not be retried, and so published, ahead of the time it was given.
+            fields = {"scheduled_at": max(now + backoff * 2**attempts, current.scheduled_at)}
         _update(
             conn,
             current,
@@ -571,7 +590,8 @@ def mark_failed(
 def metadata_for(conn: sqlite3.Connection, post: Post) -> PostMetadata:
     """What the post is published with: the metadata stored at scheduling (the clip's
     platform variant, campaign tags and flags, as the pre-flight checked them). Posts
-    scheduled before CLP-97 fall back to the clip version's single title and caption."""
+    scheduled before CLP-97 fall back to the clip version's platform variant (CLP-96,
+    without campaign tags or the AI flag), else its single title and caption."""
     row = conn.execute("SELECT metadata FROM posts WHERE id = ?", (post.id,)).fetchone()
     stored = _stored_metadata(row["metadata"] if row else None)
     if stored is not None:
@@ -579,11 +599,17 @@ def metadata_for(conn: sqlite3.Connection, post: Post) -> PostMetadata:
     version = get_version(conn, post.clip_id, post.clip_version)
     if version is None:
         raise LookupError(f"clip {post.clip_id} v{post.clip_version}")
-    # That copy was stored unchecked (CLP-111).
+    if post.platform not in version.variants:
+        # That copy was stored unchecked (CLP-111).
+        limit = PLATFORM_LIMITS[post.platform].post_hashtags_max
+        return PostMetadata(
+            title=clean_title(version.title or ""),
+            caption=clean_caption(version.caption or ""),
+            hashtags=clean_hashtags(version.hashtags, limit),
+        )
+    built = build_post_metadata(version.variants, post.platform)
     return PostMetadata(
-        title=clean_title(version.title or ""),
-        caption=clean_caption(version.caption or ""),
-        hashtags=clean_hashtags(version.hashtags, PLATFORM_LIMITS[post.platform].post_hashtags_max),
+        title=built.title, caption=built.caption, hashtags=built.hashtags, flags=built.flags
     )
 
 

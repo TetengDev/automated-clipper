@@ -10,6 +10,7 @@ from clipper.accounts import AccountsConfig
 from clipper.config import Secrets
 from clipper.posting.models import Publisher
 from clipper.posting.youtube import OAuthClient, YouTubePublisher
+from clipper.publish.meta import meta_publishers
 
 
 def _enabled(accounts: AccountsConfig, platform: str) -> tuple[str, ...]:
@@ -28,4 +29,7 @@ def build_publishers(accounts: AccountsConfig, secrets: Secrets) -> dict[str, Pu
                 client_secret=secrets.youtube_oauth_client_secret,
             ),
         )
+    # Facebook Page Reels and Instagram Reels (CLP-94); their tokens are read per
+    # account at publish time, from the same CLP-91 secrets.
+    publishers.update(meta_publishers(accounts.accounts))
     return publishers

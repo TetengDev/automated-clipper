@@ -39,7 +39,7 @@ from clipper.campaigns import (
 from clipper.clips import ClipDetail, ClipStatus
 from clipper.config import ConfigError
 from clipper.db import transaction
-from clipper.metadata import build_post_metadata, preflight
+from clipper.metadata import PLATFORM_LIMITS, build_post_metadata, preflight
 from clipper.pipeline.common import strip_control
 from clipper.posting import repo
 from clipper.posting.models import Post, PostConflict, PostMetadata, PostStatus
@@ -184,6 +184,15 @@ def pick_slot(account: AccountLike, existing: Sequence[datetime], now: datetime)
     return None
 
 
+def length_problem(platform: str, seconds: float) -> str | None:
+    """Why a clip of `seconds` cannot be posted to `platform`, or None when it can (or the
+    platform has no known limits)."""
+    limits = PLATFORM_LIMITS.get(platform)
+    if limits is None or limits.min_seconds <= seconds <= limits.max_seconds:
+        return None
+    return f"{seconds:g} s is outside {platform}'s {limits.min_seconds:g}-{limits.max_seconds:g} s"
+
+
 @dataclass(frozen=True)
 class _Plan:
     """What one account would post for a clip, and why it may not (if it may not)."""
@@ -246,8 +255,10 @@ def schedule_for_clip(
     Returns the posts created; an approved clip already scheduled on an account is left as
     it is, so calling this again is safe. Nothing is scheduled for a sensitive clip (its
     stored flag, or `sensitive=True` from the creator's rule), a clip that is not approved
-    or exported, or one without a rendered video. An account is skipped when the same file
-    is already scheduled, posted or held on its platform, or when it has no free slot.
+    or exported, or one without a rendered video. An account with no campaign is skipped
+    when the clip's length is outside its platform's limits (Facebook Reels: 3-90 s,
+    CLP-94); an account is skipped when the same file is already scheduled, posted or held
+    on its platform, or when it has no free slot. Each skip is logged with its reason.
 
     A post for a campaign account (`campaigns` by id) whose clip or metadata breaks the
     brief is created `held` with the reasons in `error`, with or without a free slot. A
@@ -274,6 +285,15 @@ def schedule_for_clip(
     with transaction(conn):
         for account in eligible:
             if repo.has_post(conn, clip_id, account.id):
+                continue
+            # A campaign post outside the length range is held by its pre-flight instead,
+            # so the reviewer sees why.
+            in_campaign = campaign_for(account, clip.creator, briefs)[0] is not None
+            problem = length_problem(account.platform, clip.current.duration_s)
+            if problem is not None and not in_campaign:
+                logger.warning(
+                    "clip %d: %s; not scheduled on account %s", clip_id, problem, account.id
+                )
                 continue
             if repo.file_on_platform(conn, account.platform, video_path):
                 logger.info(

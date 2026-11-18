@@ -7,7 +7,7 @@ they come from CLI options / env so a config edit can never point deletion jobs 
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple
@@ -32,13 +32,38 @@ MIN_SESSION_SECRET_LENGTH = 32
 CREATOR_NAME_PATTERN = r"^\w[\w .'&()-]{0,99}$"
 
 
+class PinnedFile(NamedTuple):
+    size: int
+    sha256: str
+
+
 class PinnedModel(NamedTuple):
     repo: str
     revision: str
     """Hugging Face commit the snapshot is fetched at."""
-    sha256: str
-    """SHA-256 of model.bin (its Git LFS oid at that commit)."""
+    files: Mapping[str, PinnedFile]
+    """Every file the snapshot holds (what `local_asr.ALLOW_PATTERNS` matches at that
+    commit), with its size and SHA-256."""
 
+    @property
+    def sha256(self) -> str:
+        """SHA-256 of model.bin: its Git LFS oid, so also its repo blob's name in the cache."""
+        return self.files["model.bin"].sha256
+
+
+# Files that several snapshots share, byte for byte.
+_TOKENIZER_V2 = PinnedFile(
+    2203239, "fb7b63191e9bb045082c79fd742a3106a12c99513ab30df4a0d47fa6cb6fd0ab"
+)
+_VOCABULARY_TXT = PinnedFile(
+    459861, "34ce3fe1c5041027b3f8d42912270993f986dbc4bb34cf27f951e34a1e453913"
+)
+_VOCABULARY_JSON = PinnedFile(
+    1068114, "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1"
+)
+_PREPROCESSOR_V3 = PinnedFile(
+    340, "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711"
+)
 
 # Local Whisper models, checked on the Hub API 2026-10-22. The repos are the ones
 # faster-whisper 1.2.1 maps these names to, except large-v3-turbo: faster-whisper maps it
@@ -46,36 +71,103 @@ class PinnedModel(NamedTuple):
 # dropbox-dash/faster-whisper-large-v3-turbo, so the pin names dropbox-dash directly.
 # Only these names are accepted, so a setting can never point at a local path, a URL or
 # an unpinned repo.
+#
+# File pins (CLP-75), taken 2026-11-17 from the public Hub API without a token:
+# - the file list, sizes and model.bin's SHA-256 (`lfs.oid`) from
+#   https://huggingface.co/api/models/<repo>/tree/<revision>
+# - the small files' SHA-256 by downloading
+#   https://huggingface.co/<repo>/resolve/<revision>/<file> and hashing it, after checking
+#   the bytes against the tree's size and git blob oid (sha1 of "blob <size>\0" + bytes).
 WHISPER_MODELS: dict[str, PinnedModel] = {
     "tiny": PinnedModel(
         "Systran/faster-whisper-tiny",
         "d90ca5fe260221311c53c58e660288d3deb8d356",
-        "dcb76c6586fc06cbdac6dd21f14cfd129cc4cdd9dce19bf4ffa62e59cbe6e6d1",
+        {
+            "config.json": PinnedFile(
+                2249, "a73a28cdfe1c43ccc7202fa333d1f89c202477271407ae9a7f19afa52039cac8"
+            ),
+            "model.bin": PinnedFile(
+                75538270, "dcb76c6586fc06cbdac6dd21f14cfd129cc4cdd9dce19bf4ffa62e59cbe6e6d1"
+            ),
+            "tokenizer.json": _TOKENIZER_V2,
+            "vocabulary.txt": _VOCABULARY_TXT,
+        },
     ),
     "base": PinnedModel(
         "Systran/faster-whisper-base",
         "ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66",
-        "d01c3014881c9c6f3133c182f3d2887eb6ca1c789a7538c5c007196857a0a6a9",
+        {
+            "config.json": PinnedFile(
+                2309, "56a6d8110d311f19c8f0471e562832c7527f146b567275bfca59fcf7c184da9a"
+            ),
+            "model.bin": PinnedFile(
+                145217532, "d01c3014881c9c6f3133c182f3d2887eb6ca1c789a7538c5c007196857a0a6a9"
+            ),
+            "tokenizer.json": _TOKENIZER_V2,
+            "vocabulary.txt": _VOCABULARY_TXT,
+        },
     ),
     "small": PinnedModel(
         "Systran/faster-whisper-small",
         "536b0662742c02347bc0e980a01041f333bce120",
-        "3e305921506d8872816023e4c273e75d2419fb89b24da97b4fe7bce14170d671",
+        {
+            "config.json": PinnedFile(
+                2370, "b55496ac7940a7ae47d2c01eab40edfd8701feec1229d9cce3b40014383fb828"
+            ),
+            "model.bin": PinnedFile(
+                483546902, "3e305921506d8872816023e4c273e75d2419fb89b24da97b4fe7bce14170d671"
+            ),
+            "tokenizer.json": _TOKENIZER_V2,
+            "vocabulary.txt": _VOCABULARY_TXT,
+        },
     ),
     "medium": PinnedModel(
         "Systran/faster-whisper-medium",
         "08e178d48790749d25932bbc082711ddcfdfbc4f",
-        "9b45e1009dcc4ab601eff815b61d80e60ce3fd8c74c1a14f4a282258286b51ae",
+        {
+            "config.json": PinnedFile(
+                2257, "3622a2ddc41ec0e0fd4e68c13c6830f03b90c38d89aaad184de02c8c642cf807"
+            ),
+            "model.bin": PinnedFile(
+                1527906378, "9b45e1009dcc4ab601eff815b61d80e60ce3fd8c74c1a14f4a282258286b51ae"
+            ),
+            "tokenizer.json": _TOKENIZER_V2,
+            "vocabulary.txt": _VOCABULARY_TXT,
+        },
     ),
     "large-v3": PinnedModel(
         "Systran/faster-whisper-large-v3",
         "edaa852ec7e145841d8ffdb056a99866b5f0a478",
-        "69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1",
+        {
+            "config.json": PinnedFile(
+                2394, "a9306624f5ec14270a014b647e5c316b6e03a662c369758d1b90697a7b0655b9"
+            ),
+            "model.bin": PinnedFile(
+                3087284237, "69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1"
+            ),
+            "preprocessor_config.json": _PREPROCESSOR_V3,
+            "tokenizer.json": PinnedFile(
+                2480617, "6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca"
+            ),
+            "vocabulary.json": _VOCABULARY_JSON,
+        },
     ),
     "large-v3-turbo": PinnedModel(
         "dropbox-dash/faster-whisper-large-v3-turbo",
         "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
-        "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
+        {
+            "config.json": PinnedFile(
+                2263, "b0253ea6c0d3bea6b1e19e91a02acfd3b53f4467362efcb5a3e6b16c9b3a9b7e"
+            ),
+            "model.bin": PinnedFile(
+                1617884929, "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da"
+            ),
+            "preprocessor_config.json": _PREPROCESSOR_V3,
+            "tokenizer.json": PinnedFile(
+                2710337, "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd"
+            ),
+            "vocabulary.json": _VOCABULARY_JSON,
+        },
     ),
 }
 _RCLONE_REMOTE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*:\S*$")
@@ -130,12 +222,16 @@ class Settings(_Strict):
     disk_budget_gb: int = Field(150, ge=1)
     media_retention_hours: int = Field(48, ge=1)
     review_expiry_days: int = Field(7, ge=1)
+    rejected_retention_days: int = Field(14, ge=1)
+    """Rejected and archived clips' files are deleted this long after the decision (CLP-38)."""
     reframe: Literal["auto", "blurred_fill"] = "auto"
     """auto: a face-tracked 9:16 crop when faces are found, else blurred fill (CLP-58)."""
     transcriber: Literal["local", "groq"] = "local"
     whisper_model: WhisperModelName = "large-v3-turbo"
     whisper_compute_type: ComputeType = "int8"
     whisper_cpu_threads: int = Field(4, ge=1, le=64)
+    max_concurrent_renders: int = Field(1, ge=1)
+    """Rendering stage runs at once across the workers sharing the media root (CLP-34)."""
     selector: Selector = "api"
     """How highlights are picked (CLP-81): the paid Messages API (ANTHROPIC_API_KEY), or
     the Claude Code CLI on a Claude subscription (CLAUDE_CODE_OAUTH_TOKEN or a local login)."""
@@ -331,6 +427,9 @@ class Secrets(BaseSettings):
     youtube_api_key: SecretStr | None = None
     twitch_client_id: SecretStr | None = None
     twitch_client_secret: SecretStr | None = None
+    # The Google OAuth client the YouTube publisher refreshes account tokens with (CLP-93).
+    youtube_oauth_client_id: SecretStr | None = None
+    youtube_oauth_client_secret: SecretStr | None = None
     anthropic_api_key: SecretStr | None = None
     claude_code_oauth_token: SecretStr | None = None
     groq_api_key: SecretStr | None = None

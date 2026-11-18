@@ -563,7 +563,12 @@ def test_every_app_clipper_setting_is_reserved() -> None:
     for path in sources:
         if path.is_file():
             names |= set(re.findall(r"CLIPPER_[A-Z0-9_]*[A-Z0-9]", path.read_text("utf-8")))
-    token_kinds = ("CLIPPER_ACCESS_TOKEN", "CLIPPER_REFRESH_TOKEN", "CLIPPER_CLIENT_SECRET")
+    token_kinds = (
+        "CLIPPER_ACCESS_TOKEN",
+        "CLIPPER_REFRESH_TOKEN",
+        "CLIPPER_CLIENT_SECRET",
+        "CLIPPER_META_ID",  # per-account Page / IG user id (CLP-94)
+    )
     unreserved = {n for n in names if n not in APP_ENV_NAMES and not n.startswith(token_kinds)}
 
     assert unreserved == set()

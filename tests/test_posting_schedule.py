@@ -18,9 +18,10 @@ from clipper.posting import repo
 from clipper.posting.models import (
     POST_TRANSITIONS,
     InvalidPostTransition,
+    PostMetadata,
     PostStatus,
 )
-from clipper.posting.scheduler import schedule_for_clip
+from clipper.posting.scheduler import publish_problem, recheck_held, schedule_for_clip
 from posting_support import FakeAccount
 from review_support import Env, make_env
 
@@ -278,6 +279,37 @@ def test_an_account_with_a_bad_timezone_is_skipped(
     assert "tt_bad" in caplog.text
 
 
+def test_a_clip_over_90_s_is_held_for_facebook(env: Env) -> None:
+    """The plain pre-flight holds it (CLP-111), so the reviewer sees why and `recheck`
+    can release it."""
+    fb = FakeAccount(id="fb_main", platform="facebook")
+    ig = FakeAccount(id="ig_main", platform="instagram")
+    clip_id = approved_clip(env, start_s=0.0, end_s=95.0, duration_s=91.0)
+
+    created = {p.account_id: p for p in schedule_for_clip(env.conn, clip_id, [fb, ig], NOW)}
+
+    assert created["ig_main"].status == PostStatus.SCHEDULED
+    assert created["fb_main"].status == PostStatus.HELD
+    assert created["fb_main"].error == "facebook: clip length 91 s is outside 3-90 s"
+
+
+def test_a_90_s_clip_is_scheduled_to_facebook(env: Env) -> None:
+    fb = FakeAccount(id="fb_main", platform="facebook")
+    clip_id = approved_clip(env, start_s=0.0, end_s=95.0, duration_s=90.0)
+
+    assert [p.account_id for p in schedule_for_clip(env.conn, clip_id, [fb], NOW)] == ["fb_main"]
+
+
+def test_a_clip_under_3_s_is_held_for_instagram(env: Env) -> None:
+    ig = FakeAccount(id="ig_main", platform="instagram")
+    clip_id = approved_clip(env, start_s=0.0, end_s=2.5)
+
+    (post,) = schedule_for_clip(env.conn, clip_id, [ig], NOW)
+
+    assert post.status == PostStatus.HELD
+    assert post.error == "instagram: clip length 2.5 s is outside 3-180 s"
+
+
 def test_scheduling_writes_an_audit_row(env: Env) -> None:
     clip_id = approved_clip(env)
 
@@ -325,3 +357,124 @@ def test_retry_only_requeues_failed_posts(env: Env) -> None:
 
     with pytest.raises(InvalidPostTransition):
         repo.retry(env.conn, post.id, NOW)
+
+
+# --- plain posts: hashtags and the pre-flight (CLP-111) ----------------------------------
+
+
+def test_a_plain_post_never_carries_generic_disclosure_or_lookalike_tags(env: Env) -> None:
+    clip_id = approved_clip(env, hashtags=["#fyp", "#ad", "#fyр", "#kai", "#funny", "#money"])
+
+    (post,) = schedule_for_clip(env.conn, clip_id, [FakeAccount()], NOW)
+
+    published = repo.metadata_for(env.conn, post)  # what the posting stage sends
+    assert post.status == PostStatus.SCHEDULED
+    assert published.hashtags == ["#kai", "#funny", "#money"]
+    assert published.caption == "Watch this\n\n#kai #funny #money"
+
+
+def test_a_plain_post_never_carries_rejected_inline_tags(env: Env) -> None:
+    clip_id = approved_clip(env, title="Big #fyр moment", caption="Watch this #ad #viral now")
+
+    (post,) = schedule_for_clip(env.conn, clip_id, [FakeAccount()], NOW)
+
+    published = repo.metadata_for(env.conn, post)
+    assert post.status == PostStatus.SCHEDULED
+    assert published.title == "Big moment"
+    assert published.caption == "Watch this now\n\n#funny"
+
+
+def test_a_plain_post_outside_the_platforms_length_is_held(env: Env) -> None:
+    clip_id = approved_clip(env, duration_s=200.0)  # Instagram takes 3-180 s
+
+    (post,) = schedule_for_clip(
+        env.conn, clip_id, [FakeAccount(id="ig_main", platform="instagram")], NOW
+    )
+
+    assert post.status == PostStatus.HELD
+    assert post.error == "instagram: clip length 200 s is outside 3-180 s"
+
+
+def test_recheck_releases_a_held_plain_post_only_once_it_passes(env: Env) -> None:
+    account = FakeAccount(id="ig_main", platform="instagram")
+    clip_id = approved_clip(env, duration_s=200.0)
+    (held,) = schedule_for_clip(env.conn, clip_id, [account], NOW)
+
+    def recheck():
+        return recheck_held(env.conn, [account], {}, NOW, is_sensitive=lambda _: False)
+
+    assert [p.id for p in recheck().still_held] == [held.id]
+    env.conn.execute("UPDATE clip_versions SET duration_s = 60 WHERE clip_id = ?", (clip_id,))
+    (released,) = recheck().released
+    assert released.id == held.id
+    assert released.status == PostStatus.SCHEDULED and released.error is None
+
+
+def test_a_plain_post_is_not_held_for_links_mentions_or_few_hashtags(env: Env) -> None:
+    """Those holds are campaign rules; a plain post goes out with them."""
+    clip_id = approved_clip(env, caption="Full video on mrbeast.com, thanks @kai", hashtags=["kai"])
+
+    (post,) = schedule_for_clip(env.conn, clip_id, [FakeAccount()], NOW)
+
+    assert post.status == PostStatus.SCHEDULED
+    assert post.error is None
+
+
+# --- plain posts at publish time (CLP-111 fix round 1) ---------------------------------------
+
+
+def _plain_post(env: Env, clip_id: int, platform: str, metadata: PostMetadata | None):
+    """A post scheduled before the plain pre-flight existed (or before CLP-97: no metadata)."""
+    return repo.insert_post(
+        env.conn,
+        clip_id=clip_id,
+        clip_version=1,
+        account_id=f"{platform}_main",
+        platform=platform,
+        scheduled_at=NOW,
+        video_path=f"clip_{clip_id}.mp4",
+        now=NOW,
+        metadata=metadata,
+    )
+
+
+def test_publish_holds_a_plain_post_whose_stored_metadata_fails_the_preflight(env: Env) -> None:
+    clip_id = approved_clip(env)
+    stored = PostMetadata(title="T", caption="Watch #fyp\n\n#kai", hashtags=["#kai"])
+    post = _plain_post(env, clip_id, "tiktok", stored)
+    accounts = {"tiktok_main": FakeAccount(id="tiktok_main")}
+
+    reason = publish_problem(env.conn, post, accounts, {}, NOW)
+
+    assert reason == "tiktok: generic, malformed or mixed-script tags in the text: #fyp"
+
+
+def test_publish_holds_a_plain_post_outside_the_platforms_length(env: Env) -> None:
+    clip_id = approved_clip(env, duration_s=200.0)
+    post = _plain_post(env, clip_id, "instagram", None)
+    accounts = {"instagram_main": FakeAccount(id="instagram_main", platform="instagram")}
+
+    reason = publish_problem(env.conn, post, accounts, {}, NOW)
+
+    assert reason == "instagram: clip length 200 s is outside 3-180 s"
+
+
+def test_publish_lets_a_clean_plain_post_go(env: Env) -> None:
+    clip_id = approved_clip(env)
+    (post,) = schedule_for_clip(env.conn, clip_id, [FakeAccount()], NOW)
+
+    assert publish_problem(env.conn, post, {"tt_main": FakeAccount()}, {}, NOW) is None
+
+
+def test_a_post_without_stored_metadata_is_published_with_cleaned_text(env: Env) -> None:
+    """Posts scheduled before CLP-97 fall back to the version's platform variant (CLP-96),
+    built on the single copy, which was stored unchecked: the text comes out cleaned and
+    capped, with the hashtag line the variant adds to the caption."""
+    stored = ["#fyp", "#ad", "#fyр", *[f"#t{i}" for i in range(8)]]
+    clip_id = approved_clip(env, title="Big #fyp", caption="Watch #ad this", hashtags=stored)
+    post = _plain_post(env, clip_id, "instagram", None)
+
+    metadata = repo.metadata_for(env.conn, post)
+
+    assert (metadata.title, metadata.caption) == ("Big", "Watch this\n\n#t0 #t1 #t2 #t3 #t4")
+    assert metadata.hashtags == [f"#t{i}" for i in range(5)]  # Instagram takes 5

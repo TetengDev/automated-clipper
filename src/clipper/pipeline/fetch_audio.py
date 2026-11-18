@@ -21,7 +21,12 @@ Artifacts (shared contract with later stages):
 Live / upcoming / still-processing sources raise `SourceNotReady`, a `Deferred` (+30 min,
 no attempt used); once the job is older than 48 h that becomes a `PermanentError`. The
 stream path reaches this stage only after `waiting_vod`. Sources longer than
-`max_duration_seconds` are skipped, and yt-dlp is capped with `--max-filesize`.
+`max_duration_seconds` are skipped, and yt-dlp is capped with `--max-filesize` and, for
+a muxed fallback, by AUDIO_FORMAT's height and bitrate caps.
+Each source counts toward its creator's `max_source_hours_per_day` before the download
+(`reserve_source_hours`): over the cap the stage is deferred to the next UTC midnight. A
+source whose length the probe does not report is counted once ffprobe has measured it,
+so that one is checked after its download.
 Members-only and Premium videos (yt-dlp `availability`) are skipped unless
 `allow_gated_content`.
 
@@ -36,7 +41,8 @@ If the worker is SIGKILLed mid-download, `.info.tmp.json` (probe metadata incl. 
 format URLs, which expire within hours) stays in the media dir until the next attempt
 overwrites and removes it, or retention cleanup deletes the dir.
 
-Optional env: CLIPPER_YTDLP_COOKIES (path to a cookies.txt), CLIPPER_YTDLP_PROXY.
+Optional env: CLIPPER_YTDLP_COOKIES (path to a cookies.txt), CLIPPER_YTDLP_PROXY,
+CLIPPER_YTDLP_CACHE_DIR (yt-dlp's cache dir; the image sets it to the tmpfs).
 """
 
 from __future__ import annotations
@@ -63,6 +69,7 @@ from clipper.pipeline.common import (
     deferring_no_format,
     ffprobe_duration,
     first_seen,
+    reserve_source_hours,
     run_media,
     settings_for,
     write_json_atomic,
@@ -147,6 +154,7 @@ def fetch_audio(
     duration = _positive_float(info.get("duration"))
     if duration is not None:
         _check_duration(duration, settings)
+        _admit(job, ctx, duration, settings)
 
     info_tmp = media_dir / INFO_TMP_NAME
     flac_tmp = media_dir / f".{AUDIO_NAME}.tmp"
@@ -161,6 +169,7 @@ def fetch_audio(
             timeout = deadline.timeout(PROBE_TIMEOUT_S)
             duration = ffprobe_duration(flac_tmp, runner=runner, timeout_s=timeout)
             _check_duration(duration, settings)
+            _admit(job, ctx, duration, settings)
         peaks = loudness_peaks(_momentary_loudness(runner, flac_tmp, deadline, streaming))
 
         meta = {
@@ -191,6 +200,12 @@ def _check_duration(duration: float, settings: Settings) -> None:
     maximum = settings.max_duration_seconds
     if duration > maximum:
         raise SkipJob(f"too long: {duration:.0f}s > max_duration_seconds {maximum}s")
+
+
+def _admit(job: Job, ctx: StageContext, duration: float, settings: Settings) -> None:
+    """Count the source against the creator's `max_source_hours_per_day` (CLP-38)."""
+    cap = settings.max_source_hours_per_day
+    reserve_source_hours(ctx.conn, job, duration, cap_hours=cap, now=ctx.clock())
 
 
 def _positive_float(value: Any) -> float | None:

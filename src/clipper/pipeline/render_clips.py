@@ -4,7 +4,7 @@ Input: `sections.json` (CLP-16), `highlights.json` (CLP-15) and `transcript.json
 in the job's media dir. For each section the EDL cuts the requested range out of the padded
 `clips/<rank>/source.mp4` (`[pad_start_s, pad_start_s + length]`), with the highlight's hook
 and the transcript words that overlap the clip, shifted into the section's timeline.
-`clipper.render.render_clip` writes `clips/<rank>/v1.{mp4,jpg,json}` and
+`clipper.render.stage_clip` renders `clips/<rank>/v1.{mp4,jpg,json}` into a work dir and
 `clips_repo.insert_pending_clip` records it with the highlight's title, caption, hashtags,
 per-platform variants (CLP-96), score, reason, and the prompt and playbook versions it was
 selected with. Before the EDL is final, dead air is trimmed and the clip edges are snapped
@@ -19,6 +19,14 @@ faces in most frames gets a face-tracked 9:16 crop that jumps at the same scene 
 any failure keeps the blurred fill. The rendered video then runs the quality gates
 (CLP-74, `clipper.pipeline.quality`): a failed gate stores the clip as `needs_attention`
 with its reasons; a gate that cannot run is noted but never holds the clip back.
+At most `max_concurrent_renders` runs of this stage render at once across the workers
+sharing the media root (CLP-34): each holds an flock on a slot file in `.render_slots/`
+there, and a run that finds every slot taken is `Deferred` by SLOT_RETRY without using an
+attempt. The kernel drops the lock of a worker that dies.
+
+The insert is fenced on the job's lease (CLP-66): only while this worker still holds the
+claim are the row written and the files renamed into place, in one transaction, so a
+worker that lost its lease never publishes over the new owner's clip.
 
 There is no artifact file: the `clips` row (UNIQUE (job_id, rank)) marks a clip done, so a
 rerun after a crash renders only the clips without a row. The row's start_s/end_s are the
@@ -35,9 +43,9 @@ first, then those closest to the limit, so failing clips at the front cannot spe
 run's budget before a good clip gets its turn. A clip with bad input (invalid EDL or
 metadata, `InvalidClipError` from the renderer) is left out and the others still render;
 the skipped ranks are logged once. If no clip of the job ends up rendered, the job fails
-(and the failure counts are dropped, so a requeue tries again). A requeue of a job that
-failed otherwise keeps the counts: delete `clips/<rank>/render_failures.json` to give a
-left-out clip fresh tries.
+(and the failure counts are dropped, so a requeue tries again). `clipper retry` drops
+the counts of a job that failed otherwise (`clear_failures`); `enqueue --retry` keeps
+them.
 
 A clip is only started if the stage budget still covers its worst case
 (CLIP_WORST_CASE_S), so a run never outlives the claim lease; else `StageTimeout` and the
@@ -50,12 +58,16 @@ after a render failure. That cannot loop: each clip is rendered once and counts 
 MAX_RENDER_FAILURES failures. Crashes still use up attempts (each claim is one).
 The cost of that: in an outage where every render fails (Remotion broken, disk full), a
 job runs up to about MAX_RENDER_FAILURES x clips x CLIP_WORST_CASE_S of failing renders
-before it fails, and with a single worker it holds up every job queued behind it.
+before it fails, and with a single worker it holds up every job queued behind it. So a
+run that still has a failed render MAX_FAILING_AGE (48 h) into an episode of deferrals
+with failed renders fails the job (CLP-89, FAILING_MARKER); an episode with no failed
+render for 48 h is over.
 """
 
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import math
@@ -63,7 +75,11 @@ import os
 import re
 import sqlite3
 import stat
+import traceback
+import unicodedata
+from collections.abc import Callable, Iterator
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +87,7 @@ from clipper.clips_repo import ClipMeta, insert_pending_clip
 from clipper.config import JumpCuts, always_sensitive
 from clipper.edl import EDL, FPS, MAX_CLIP_SECONDS, frames, parse_edl
 from clipper.jobs.models import Job
-from clipper.jobs.queue import MAX_ATTEMPTS, backoff
+from clipper.jobs.queue import MAX_ATTEMPTS, JobConflict, backoff, hold_lease
 from clipper.jobs.stages import Deferred, PermanentError, StageContext, StageDef
 from clipper.metadata import coerce_variants, variants_json
 from clipper.pipeline.boundaries import DETECT_TIMEOUT_S, detect_cuts, polish
@@ -80,6 +96,7 @@ from clipper.pipeline.common import (
     Deadline,
     StageTimeout,
     creator_for,
+    episode_since,
     read_json,
     settings_for,
     strip_control,
@@ -107,14 +124,18 @@ from clipper.render import (
     DEFAULT_RENDER_TIMEOUT_S,
     InvalidClipError,
     RenderError,
-    render_clip,
     resolve_source,
+    stage_clip,
 )
 
 logger = logging.getLogger(__name__)
 
 MAX_WORD_CHARS = 64
 """EDL limit for one caption word."""
+MAX_HOOK_CHARS = 120
+"""EDL limit for the hook text."""
+MAX_MARKS = 2
+"""Combining marks kept per base character in caption text (CLP-67)."""
 CLIP_WORST_CASE_S = (
     DETECT_TIMEOUT_S
     + SILENCE_TIMEOUT_S
@@ -137,6 +158,15 @@ FAILURES_MARKER = "render_failures.json"
 MAX_MARKER_BYTES = 4096
 """A larger failure marker is not ours: it counts as no failures."""
 _VERSION = re.compile(r"^[\w.-]{1,64}$")
+SLOTS_DIR = ".render_slots"
+"""Under the media root: one lock file per render slot (`max_concurrent_renders`)."""
+SLOT_RETRY = timedelta(minutes=1)
+FAILING_MARKER = ".render_failing_since"
+"""In the job's media dir: when the current episode of deferrals with a failed render
+began, and the last one (`episode_since`); removed once the stage ends."""
+MAX_FAILING_AGE = timedelta(hours=48)
+"""A run that still has a failed render this long into an episode fails the job (CLP-89);
+an episode with no failed render for this long is over."""
 
 
 def _version(value: Any) -> str | None:
@@ -159,13 +189,33 @@ def _clips(data: Any, name: str) -> list[Any]:
     return clips
 
 
+def _caption_text(text: str, max_chars: int) -> str:
+    """`strip_control`, then NFC with at most MAX_MARKS combining marks (Mn, Me) after each
+    character and no private-use (Co) or surrogate (Cs) characters: a flood of marks
+    spills over the caption box, and a private-use character renders blank. Marks are
+    counted after NFC, so a precomposed letter keeps the marks it is made of. Cut to
+    `max_chars` last (NFC can lengthen text). Empty when no letter, number, punctuation
+    or symbol is left (only marks, a lone ZWJ or VS16)."""
+    kept, marks = [], 0
+    for c in unicodedata.normalize("NFC", strip_control(text)):
+        category = unicodedata.category(c)
+        if category in ("Co", "Cs"):
+            continue
+        marks = marks + 1 if category in ("Mn", "Me") else 0
+        if marks <= MAX_MARKS:
+            kept.append(c)
+    # strip_control again: a dropped character can leave two spaces side by side.
+    text = strip_control(unicodedata.normalize("NFC", "".join(kept)))[:max_chars]
+    return text if any(unicodedata.category(c)[0] in "LNPS" for c in text) else ""
+
+
 def _words(transcript: Any, offset: float, start: float, end: float) -> list[dict[str, Any]]:
     """Transcript words overlapping [start, end], in the section's timeline (minus offset)."""
     words = []
     for w in transcript.get("words") or ():
         if w["end"] <= start or w["start"] >= end:
             continue
-        text = strip_control(str(w["word"]))[:MAX_WORD_CHARS]
+        text = _caption_text(str(w["word"]), MAX_WORD_CHARS)
         if text:
             begin = round(max(w["start"] - offset, 0.0), 3)
             words.append(
@@ -216,7 +266,9 @@ def _plan(
             {
                 "source": {"path": section["path"], "in_s": in_s, "out_s": out_s},
                 # An empty hook (also after cleaning) means no hook card.
-                "hook": {"text": hook} if (hook := strip_control(clip.get("hook") or "")) else None,
+                "hook": {"text": hook}
+                if (hook := _caption_text(clip.get("hook") or "", MAX_HOOK_CHARS))
+                else None,
                 "words": _words(transcript, offset, start, end),
             }
         )
@@ -276,13 +328,14 @@ def _polish(
     return round(a, 3), math.floor(round(b * 1000, 6)) / 1000
 
 
-def _rejected(edl: EDL, what: str, fallback: str, exc: ValueError, *, trace: bool = False) -> EDL:
-    """`edl` unchanged, with a warning that the EDL with `what` was invalid (with the
-    traceback if `trace`, so a logic bug cannot hide behind the fallback)."""
-    reason = redact(strip_control(str(exc).splitlines()[0]))[:MAX_REASON_CHARS]
+def _rejected(edl: EDL, what: str, fallback: str, exc: ValueError) -> EDL:
+    """`edl` unchanged, with a warning that the EDL with `what` was invalid: the exception
+    type and traceback frames, so a logic bug cannot hide behind the fallback, but never
+    its message, which can quote a transcribed word (CLP-79)."""
+    frames = "".join(traceback.format_tb(exc.__traceback__))
     logger.warning(
-        "clip source %s: %s rejected, %s: %s", edl.source.path, what, fallback, reason,
-        exc_info=trace,
+        "clip source %s: %s rejected, %s: %s, from:\n%s",
+        edl.source.path, what, fallback, type(exc).__name__, frames,
     )  # fmt: skip
     return edl
 
@@ -303,7 +356,7 @@ def _jump_cut(edl: EDL, mode: JumpCuts, min_s: float, media_dir: Path, deadline:
             props["segments"] = [{"in_s": a, "out_s": b} for a, b in segments]
         return parse_edl(props)
     except ValueError as exc:  # pydantic's ValidationError too
-        return _rejected(edl, "jump cuts", "no cuts", exc, trace=True)
+        return _rejected(edl, "jump cuts", "no cuts", exc)
 
 
 def _reframe(edl: EDL, cuts: list[float], media_dir: Path, deadline: Deadline) -> EDL:
@@ -366,6 +419,19 @@ def _prior_failures(section: Any, media_dir: Path) -> int:
     return _failures(_marker(media_dir, rank))[0]
 
 
+def clear_failures(media_dir: Path) -> None:
+    """Drop the job's render failure counts and FAILING_MARKER (`clipper retry`), so a
+    requeued job gives every clip fresh tries. A symlinked `clips/` or clip directory is
+    skipped: a planted link must not redirect the unlink."""
+    (media_dir / FAILING_MARKER).unlink(missing_ok=True)
+    clips = media_dir / "clips"
+    if clips.is_symlink() or not clips.is_dir():
+        return
+    for clip_dir in clips.iterdir():
+        if clip_dir.name.isdigit() and not clip_dir.is_symlink():
+            (clip_dir / FAILURES_MARKER).unlink(missing_ok=True)
+
+
 def _try_order(failures: int) -> tuple[bool, int]:
     """Clips never failed first (a run that still has a good clip renders it before its
     budget is spent on failing ones), then those closest to being left out."""
@@ -383,16 +449,69 @@ def _record_failure(marker: Path, failures: int, reason: str) -> bool:
         clip_dir.mkdir(parents=True, exist_ok=True)
         write_json_atomic(marker, {"failures": failures, "error": reason})
     except OSError as exc:  # e.g. a full disk, or a directory in the marker's place
-        logger.warning("cannot write %s, not counting the failure: %s", marker, exc.strerror)
+        error = exc.strerror or type(exc).__name__  # never str(exc): it can hold a path
+        logger.warning("cannot write %s, not counting the failure: %s", marker, error)
         return False
     return True
+
+
+def _fence(job: Job, ctx: StageContext) -> Callable[[sqlite3.Connection], None] | None:
+    """The clip insert's lease check (CLP-66); none when not run by the worker."""
+    worker_id = ctx.worker_id
+    if worker_id is None:
+        return None
+    return lambda conn: hold_lease(conn, job.id, worker_id, ctx.clock())
+
+
+@contextlib.contextmanager
+def _render_slot(media_root: Path, slots: int) -> Iterator[bool]:
+    """Hold the first free of `slots` slot files (an exclusive flock) while the block runs;
+    yields False when every slot is taken."""
+    slot_dir = media_root / SLOTS_DIR
+    slot_dir.mkdir(exist_ok=True)
+    for index in range(slots):
+        # Render children never inherit the fd (Popen's close_fds), so the lock dies with us.
+        fd = os.open(slot_dir / str(index), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
+        try:
+            yield True
+        finally:
+            os.close(fd)  # releases the lock
+        return
+    yield False
 
 
 def _left_out(rank: int, failures: int, error: str) -> str:
     return f"clip {rank}: render failed {failures} times: {error}"[:MAX_REASON_CHARS]
 
 
+def _defer(ctx: StageContext, until: datetime, reason: str, *, failing: bool) -> Exception:
+    """`Deferred` to `until`; or, like `deferring_no_format`, a `PermanentError` when a
+    render is still `failing` MAX_FAILING_AGE into an episode of deferrals with a failed
+    render (FAILING_MARKER). A run without a failed render is never capped and does not
+    extend the episode, so a job picked up late that renders fine goes on."""
+    now = ctx.clock()
+    marker = ctx.media_dir / FAILING_MARKER
+    if failing and now - episode_since(marker, now, MAX_FAILING_AGE) > MAX_FAILING_AGE:
+        marker.unlink(missing_ok=True)
+        hours = MAX_FAILING_AGE.total_seconds() / 3600
+        return PermanentError(f"{reason} ({hours:.0f} h into a failing-render episode; giving up)")
+    return Deferred(until, reason)
+
+
 def render_clips(job: Job, ctx: StageContext) -> None:
+    slots = ctx.config.settings.max_concurrent_renders
+    with _render_slot(ctx.media_dir.parent, slots) as held:
+        if not held:
+            raise Deferred(ctx.clock() + SLOT_RETRY, f"all {slots} render slot(s) are busy")
+        _render_clips(job, ctx)
+
+
+def _render_clips(job: Job, ctx: StageContext) -> None:
     deadline = Deadline()
     sections = _clips(read_json(ctx.media_dir / "sections.json"), "sections.json")
     selection = read_json(ctx.media_dir / "highlights.json")
@@ -449,7 +568,7 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 end = round(edl.source.out_s + shift, 3)
             if settings.reframe == "auto" and _detectable(section):
                 edl = _reframe(edl, cuts, ctx.media_dir, deadline)
-            result = render_clip(
+            staged = stage_clip(
                 edl,
                 ctx.media_dir,
                 ctx.media_dir / "clips" / str(rank),
@@ -457,14 +576,18 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 timeout_s=deadline.timeout(DEFAULT_RENDER_TIMEOUT_S),
                 ffmpeg_timeout_s=deadline.timeout(DEFAULT_FFMPEG_TIMEOUT_S),
             )
-            reasons = check_clip(
-                edl,
-                result.video_path,
-                language=language,
-                asr=asr,
-                deadline=deadline,
-                starts_on_cut=any(abs(c - edl.source.in_s) <= 1 / FPS for c in cuts),
-            )
+            try:
+                reasons = check_clip(
+                    edl,
+                    staged.video,
+                    language=language,
+                    asr=asr,
+                    deadline=deadline,
+                    starts_on_cut=any(abs(c - edl.source.in_s) <= 1 / FPS for c in cuts),
+                )
+            except BaseException:
+                staged.discard()
+                raise
         except PermanentError as exc:
             invalid.append(redact(strip_control(str(exc)))[:MAX_REASON_CHARS])
             continue
@@ -477,10 +600,13 @@ def render_clips(job: Job, ctx: StageContext) -> None:
             # one; unless it failed too often, then it is left out like an invalid clip.
             reason = redact(strip_control(str(exc).splitlines()[0]))[:MAX_REASON_CHARS]
             failures += 1
-            if _record_failure(marker, failures, reason):
+            saved = _record_failure(marker, failures, reason)
+            if saved:
                 counted += 1
                 worst = max(worst, failures)
-            if failures >= MAX_RENDER_FAILURES:
+            # Only a saved failure leaves the clip out: unsaved, a later run would count
+            # one fewer and try a clip that was already given up on.
+            if saved and failures >= MAX_RENDER_FAILURES:
                 logger.warning(
                     "job %s: clip %s failed %d times, leaving it out: %s",
                     job.id, rank, failures, reason,
@@ -496,19 +622,29 @@ def render_clips(job: Job, ctx: StageContext) -> None:
                 raise  # no progress: this run uses up an attempt
             # Resume right away, without using up an attempt.
             note = f"{rendered} clip(s) rendered, {counted} failure(s) counted"
-            raise Deferred(ctx.clock(), f"{exc} ({note})") from None
+            failing = retry is not None or counted > 0
+            raise _defer(ctx, ctx.clock(), f"{exc} ({note})", failing=failing) from None
         if reasons:
             logger.info("job %s: clip %s quality gates: %s", job.id, rank, ", ".join(reasons))
-        insert_pending_clip(
-            ctx.conn,
-            job_id=job.id,
-            rank=rank,
-            edl=edl,
-            result=result,
-            meta=replace(meta, gate_reasons=tuple(reasons)),
-            start_s=start,  # position in the source video, not in the padded section file
-            end_s=end,
-        )
+        try:
+            insert_pending_clip(
+                ctx.conn,
+                job_id=job.id,
+                rank=rank,
+                edl=edl,
+                result=staged.result,
+                meta=replace(meta, gate_reasons=tuple(reasons)),
+                start_s=start,  # position in the source video, not in the padded section file
+                end_s=end,
+                fence=_fence(job, ctx),
+                publish=staged.publish,
+            )
+        except JobConflict:
+            raise  # lease lost: the work dir may be the new owner's by now, so leave it
+        except BaseException:
+            staged.discard()
+            raise
+        staged.discard()
         done.add(rank)
         rendered += 1
         # A marker left on a done clip (crash before this, or not removable) is ignored.
@@ -520,7 +656,10 @@ def render_clips(job: Job, ctx: StageContext) -> None:
         # Retry with the usual backoff for the clip's failure count, without an attempt.
         reason = redact(strip_control(str(retry).splitlines()[0]))[:MAX_REASON_CHARS]
         note = f"{rendered} clip(s) rendered, {counted} failure(s) counted"
-        raise Deferred(ctx.clock() + backoff(max(worst, 1)), f"{reason} ({note})")
+        until = ctx.clock() + backoff(max(worst, 1))
+        raise _defer(ctx, until, f"{reason} ({note})", failing=True)
+    with contextlib.suppress(OSError):  # the stage is over: the next deferral starts afresh
+        (ctx.media_dir / FAILING_MARKER).unlink(missing_ok=True)
     if not done:
         for path in left_out:  # a requeued job tries these clips afresh
             with contextlib.suppress(OSError):  # never hides the PermanentError below

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from collections.abc import Iterator
@@ -13,9 +14,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from clipper import clips
+from clipper.campaigns import Campaign
 from clipper.clips import ClipStatus, InvalidTransition
+from clipper.metadata import fingerprint
 from clipper.review import routes
 from clipper.review.app import STATIC_DIR
+from posting_support import FakeAccount
 from review_support import BASE_URL, Env, generate_mp4, login, make_env
 
 NOW = datetime(2027, 1, 15, 8, 0, tzinfo=UTC)
@@ -768,3 +772,331 @@ def test_needs_attention_clip_can_be_decided(
     env.conn.execute("UPDATE clips SET status = 'needs_attention' WHERE id = ?", (video_clip,))
     post(client, f"/clip/{video_clip}/{action}", version=1, reason_tag="bad_cut")
     assert env.status(video_clip) == ("exported" if action == "approve" else "rejected")
+
+
+# --- CLP-62: j/k and "next after a decision" follow the queue view -----------------------
+
+SCORE_VIEW = clips.QueueFilter(sort="score")
+
+
+def seed_views(env: Env) -> dict[str, int]:
+    """Clips across creators and scores, with score and created_at ties."""
+    kai = env.job("Kai Cenat")
+    return {
+        "a": env.clip(score=9.0, created_at="2027-01-01T00:00:00Z"),
+        "b": env.clip(score=7.0, created_at="2027-01-02T00:00:00Z"),
+        "c": env.clip(kai, score=9.0, created_at="2027-01-03T00:00:00Z"),
+        "d": env.clip(score=9.0, created_at="2027-01-04T00:00:00Z"),
+        "e": env.clip(score=None, created_at="2027-01-05T00:00:00Z"),
+        "f": env.clip(score=7.0, created_at="2027-01-02T00:00:00Z"),  # b's time, higher id
+        "g": env.clip(status="rejected", score=8.0, created_at="2027-01-06T00:00:00Z"),
+    }
+
+
+def walk(env: Env, start: int, flt: clips.QueueFilter, *, older: bool) -> list[int]:
+    seen = [start]
+    while (nxt := clips.neighbour(env.conn, seen[-1], flt, older=older)) is not None:
+        seen.append(nxt)
+    return seen
+
+
+VIEWS = [
+    clips.QueueFilter(),
+    SCORE_VIEW,
+    clips.QueueFilter(creator="MrBeast", sort="score"),
+    clips.QueueFilter(min_score=8.0, sort="score"),
+    clips.QueueFilter(status=None, sort="score"),
+    clips.QueueFilter(status=None, creator="Kai Cenat"),
+]
+
+
+@pytest.mark.parametrize("flt", VIEWS)
+def test_neighbours_follow_the_queue_order_of_each_view(env: Env, flt: clips.QueueFilter) -> None:
+    seed_views(env)
+    order = [c.id for c in clips.list_queue(env.conn, flt, page_size=100)]
+
+    assert walk(env, order[0], flt, older=True) == order
+    assert walk(env, order[-1], flt, older=False) == order[::-1]
+
+
+def test_score_order_breaks_ties_by_time_then_id(env: Env) -> None:
+    ids = seed_views(env)
+
+    assert walk(env, ids["d"], SCORE_VIEW, older=True) == [
+        ids[k] for k in ("d", "c", "a", "f", "b", "e")
+    ]
+
+
+def test_a_clip_outside_the_view_keeps_its_place(env: Env) -> None:
+    """A clip just decided (or opened from elsewhere) still has neighbours in the view."""
+    ids = seed_views(env)
+
+    assert clips.neighbour(env.conn, ids["g"], SCORE_VIEW, older=True) == ids["f"]
+    assert clips.neighbour(env.conn, ids["g"], SCORE_VIEW, older=False) == ids["a"]
+    assert clips.neighbour(env.conn, 999, SCORE_VIEW, older=True) is None
+
+
+def test_next_after_wraps_within_the_view(env: Env) -> None:
+    ids = seed_views(env)
+    mrbeast = clips.QueueFilter(creator="MrBeast", sort="score")
+
+    assert clips.next_after(env.conn, ids["a"], mrbeast) == ids["f"]
+    assert clips.next_after(env.conn, ids["e"], mrbeast) == ids["d"]  # the end: wrap to the top
+    assert clips.next_after(env.conn, ids["c"], clips.QueueFilter(creator="Kai Cenat")) is None
+
+
+def test_queue_cards_link_to_the_clip_with_the_view(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    view = "status=pending_review&amp;sort=score&amp;creator=MrBeast&amp;min_score=1.5"
+
+    html = client.get("/queue?creator=MrBeast&sort=score&min_score=1.5").text
+
+    assert f'href="/clip/{clip_id}?{view}"' in html
+
+
+def test_load_more_cards_keep_the_view(client: TestClient, env: Env) -> None:
+    ids = [
+        env.clip(created_at=f"2027-01-{n + 1:02d}T00:00:00Z") for n in range(clips.PAGE_SIZE + 1)
+    ]
+
+    html = client.get("/queue?sort=newest&page=2", headers={"HX-Request": "true"}).text
+
+    assert f'href="/clip/{ids[0]}?status=pending_review&amp;sort=newest"' in html
+
+
+def test_clip_page_links_follow_the_view(client: TestClient, env: Env) -> None:
+    ids = seed_views(env)
+    view = "status=pending_review&amp;sort=score&amp;creator=MrBeast"
+
+    html = client.get(f"/clip/{ids['a']}?status=pending_review&sort=score&creator=MrBeast").text
+
+    assert f'id="next-clip" href="/clip/{ids["f"]}?{view}"' in html
+    assert f'id="prev-clip" href="/clip/{ids["d"]}?{view}"' in html
+    assert f'href="/queue?{view}"' in html
+    assert f'hx-post="/clip/{ids["a"]}/approve?{view}"' in html
+    assert f'hx-post="/clip/{ids["a"]}/reject?{view}"' in html
+    assert f'hx-post="/clip/{ids["a"]}/variants?{view}"' in html
+
+
+def test_clip_page_without_a_view_uses_newest_pending(client: TestClient, env: Env) -> None:
+    ids = seed_views(env)
+
+    html = client.get(f"/clip/{ids['a']}").text
+
+    assert f'id="prev-clip" href="/clip/{ids["b"]}"' in html  # newest first, ties by id
+    assert 'id="next-clip"' not in html
+    assert '<a href="/queue">' in html
+
+
+@pytest.mark.parametrize("query", ["status=bogus", "min_score=abc", "min_score=nan"])
+def test_clip_page_with_a_bad_view_is_422(client: TestClient, env: Env, query: str) -> None:
+    assert client.get(f"/clip/{env.clip()}?{query}").status_code == 422
+
+
+@pytest.mark.parametrize("htmx", [True, False])
+def test_decisions_move_on_within_the_view(client: TestClient, env: Env, htmx: bool) -> None:
+    ids = seed_views(env)
+    view = "status=pending_review&sort=score&creator=MrBeast"
+
+    approved = post(client, f"/clip/{ids['d']}/approve?{view}", htmx=htmx, version=1)
+    rejected = post(client, f"/clip/{ids['a']}/reject?{view}", htmx=htmx, reason_tag="boring")
+
+    where = "HX-Redirect" if htmx else "location"
+    assert approved.headers[where] == f"/clip/{ids['a']}?{view}"  # c is Kai Cenat: skipped
+    assert rejected.headers[where] == f"/clip/{ids['f']}?{view}"
+    assert env.status(ids["d"]) != "pending_review" and env.status(ids["a"]) == "rejected"
+
+
+def test_last_decision_in_a_view_returns_to_the_filtered_queue(
+    client: TestClient, env: Env
+) -> None:
+    clip_id = env.clip(env.job("Kai Cenat"))
+    env.clip()  # MrBeast: another view
+    view = "status=pending_review&sort=newest&creator=Kai+Cenat"
+
+    response = post(client, f"/clip/{clip_id}/reject?{view}", reason_tag="boring")
+
+    assert response.headers["HX-Redirect"] == f"/queue?{view}"
+
+
+def test_saving_the_platform_text_keeps_the_view(client: TestClient, env: Env) -> None:
+    clip_id = env.clip()
+    clip = clips.get_clip(env.conn, clip_id)
+    assert clip is not None
+    view = "status=pending_review&sort=score"
+
+    response = post(
+        client,
+        f"/clip/{clip_id}/variants?{view}",
+        version=1,
+        fingerprint=fingerprint(clip.current.variants),
+        tiktok_title="New title",
+    )
+
+    assert response.headers["HX-Redirect"] == f"/clip/{clip_id}?{view}"
+
+
+# --- CLP-114: a campaign's reviewer-only checks before approval ----------------------------
+
+CHECKS_BOX = 'type="checkbox" name="confirm_reviewer_checks" value="1"'
+
+
+def campaign(**overrides: object) -> Campaign:
+    base: dict[str, object] = {
+        "id": "vyro_mrbeast",
+        "program": "vyro",
+        "creator": "MrBeast",
+        "platforms": ["tiktok"],
+        "forbidden": ["logos", "negative_framing", "ai_content"],
+    }
+    base.update(overrides)
+    return Campaign.model_validate(base)
+
+
+def campaign_client(
+    env: Env, *found: Campaign, accounts: list[FakeAccount] | None = None
+) -> TestClient:
+    briefs = {c.id: c for c in found} if found else {"vyro_mrbeast": campaign()}
+    client = env.client(
+        accounts=accounts if accounts is not None else [FakeAccount(campaign="vyro_mrbeast")],
+        campaigns=briefs,
+    )
+    client.csrf = login(client)  # type: ignore[attr-defined]
+    return client
+
+
+def test_clip_page_shows_the_campaign_reviewer_checks(env: Env) -> None:
+    client = campaign_client(env)
+
+    html = client.get(f"/clip/{env.clip()}").text
+
+    assert 'id="reviewer-checks"' in html and "vyro_mrbeast" in html
+    assert "No logos" in html and "No negative framing" in html
+    assert "ai_content" not in html  # checked by the pipeline, not the reviewer
+    assert CHECKS_BOX in html
+
+
+def test_each_campaign_is_listed_once(env: Env) -> None:
+    reposts = campaign(id="other_mrbeast", forbidden=["reposts"])
+    accounts = [
+        FakeAccount(id="tt_main", campaign="vyro_mrbeast"),
+        FakeAccount(id="tt_two", campaign="vyro_mrbeast"),
+        FakeAccount(id="yt_main", platform="youtube", campaign="other_mrbeast"),
+    ]
+    client = campaign_client(env, campaign(), reposts, accounts=accounts)
+
+    html = client.get(f"/clip/{env.clip()}").text
+
+    assert html.count('class="campaign-id"') == 2
+    assert "Not a repost" in html
+
+
+@pytest.mark.parametrize(
+    ("accounts", "brief"),
+    [
+        ([FakeAccount(campaign="vyro_mrbeast")], campaign(forbidden=["ai_content"])),
+        ([FakeAccount(campaign="vyro_mrbeast", enabled=False)], campaign()),
+        ([FakeAccount(campaign="vyro_mrbeast", creators=["Kai Cenat"])], campaign()),
+        ([FakeAccount(campaign=None)], campaign()),
+        ([FakeAccount(campaign="unknown")], campaign()),
+        ([], campaign()),
+    ],
+    ids=["no-reviewer-checks", "account-off", "other-creator", "no-campaign", "unknown", "none"],
+)
+def test_no_checks_box_when_no_campaign_check_applies(
+    env: Env, accounts: list[FakeAccount], brief: Campaign
+) -> None:
+    client = campaign_client(env, brief, accounts=accounts)
+    clip_id = env.clip(video_path="missing.mp4")
+    forged = env.clip(video_path="missing.mp4")
+
+    html = client.get(f"/clip/{clip_id}").text
+
+    assert 'id="reviewer-checks"' not in html and CHECKS_BOX not in html
+    assert post(client, f"/clip/{clip_id}/approve", version=1).status_code == 200
+    # A confirmation the page never asked for is not recorded.
+    response = post(client, f"/clip/{forged}/approve", version=1, confirm_reviewer_checks="1")
+    assert response.status_code == 200
+    assert env.reviews(forged)[0]["payload"] is None
+
+
+def test_a_campaign_of_another_creator_does_not_apply(env: Env) -> None:
+    accounts = [FakeAccount(campaign="vyro_mrbeast", creators=["MrBeast", "Kai Cenat"])]
+    client = campaign_client(env, accounts=accounts)
+
+    html = client.get(f"/clip/{env.clip(env.job('Kai Cenat'))}").text
+
+    assert CHECKS_BOX not in html
+
+
+def test_a_disabled_campaign_still_needs_the_checks(env: Env) -> None:
+    """Fails closed: its held posts can be released later by `clipper posts recheck`."""
+    client = campaign_client(env, campaign(enabled=False))
+
+    assert CHECKS_BOX in client.get(f"/clip/{env.clip()}").text
+
+
+@pytest.mark.parametrize("htmx", [True, False])
+@pytest.mark.parametrize("confirm", [None, "", "0", "on"])
+def test_approving_without_the_campaign_checks_is_refused(
+    env: Env, htmx: bool, confirm: str | None
+) -> None:
+    client = campaign_client(env)
+    clip_id = env.clip()
+    data = {} if confirm is None else {"confirm_reviewer_checks": confirm}
+
+    response = post(client, f"/clip/{clip_id}/approve", htmx=htmx, version=1, **data)
+
+    assert response.status_code == 422
+    assert 'class="error" role="alert"' in response.text
+    assert "Confirm you checked the campaign rules" in response.text
+    assert env.status(clip_id) == "pending_review"
+    assert env.reviews(clip_id) == []
+
+
+def test_confirmed_campaign_checks_are_audited(env: Env) -> None:
+    client = campaign_client(env)
+    clip_id = env.clip(video_path="missing.mp4")
+
+    response = post(client, f"/clip/{clip_id}/approve", version=1, confirm_reviewer_checks="1")
+
+    assert response.status_code == 200
+    assert env.status(clip_id) == "approved"
+    assert json.loads(env.reviews(clip_id)[0]["payload"]) == {
+        "confirmed_reviewer_checks": {"vyro_mrbeast": ["logos", "negative_framing"]}
+    }
+
+
+def test_a_sensitive_campaign_clip_needs_both_confirmations(env: Env) -> None:
+    client = campaign_client(env)
+    clip_id = env.clip(sensitive=True, video_path="missing.mp4")
+
+    html = client.get(f"/clip/{clip_id}").text
+    faces_only = post(client, f"/clip/{clip_id}/approve", version=1, confirm_sensitive="1")
+    checks_only = post(client, f"/clip/{clip_id}/approve", version=1, confirm_reviewer_checks="1")
+    both = post(
+        client,
+        f"/clip/{clip_id}/approve",
+        version=1,
+        confirm_sensitive="1",
+        confirm_reviewer_checks="1",
+    )
+
+    assert CONFIRM_BOX in html and CHECKS_BOX in html
+    assert (faces_only.status_code, checks_only.status_code, both.status_code) == (422, 422, 200)
+    assert json.loads(env.reviews(clip_id)[0]["payload"]) == {
+        "confirmed_sensitive": True,
+        "confirmed_reviewer_checks": {"vyro_mrbeast": ["logos", "negative_framing"]},
+    }
+
+
+def test_retrying_the_export_needs_no_campaign_confirmation(env: Env) -> None:
+    client = campaign_client(env)
+    clip_id = env.clip(video_path="missing.mp4")
+    post(client, f"/clip/{clip_id}/approve", version=1, confirm_reviewer_checks="1")
+
+    page = client.get(f"/clip/{clip_id}").text
+    response = post(client, f"/clip/{clip_id}/approve")
+
+    assert "Retry export" in page and CHECKS_BOX not in page
+    assert response.status_code == 200

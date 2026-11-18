@@ -41,24 +41,31 @@ class Migration:
             raise ValueError(f"invalid migration name: {self.name!r}")
 
 
-def connect(path: Path = DEFAULT_DB_PATH, *, check_same_thread: bool = True) -> sqlite3.Connection:
+def connect(
+    path: Path = DEFAULT_DB_PATH,
+    *,
+    check_same_thread: bool = True,
+    busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+) -> sqlite3.Connection:
     """Open the DB in autocommit mode (callers own transactions via `transaction()`).
 
     One connection per thread/process; do not use it from two threads at once.
     `check_same_thread=False` is for handing it between threads sequentially (FastAPI
     runs a sync dependency and its route on different threadpool threads).
+    A shorter `busy_timeout_ms` suits writes that may simply be skipped (the posting
+    heartbeat).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(
         path,
         isolation_level=None,
-        timeout=BUSY_TIMEOUT_MS / 1000,
+        timeout=busy_timeout_ms / 1000,
         check_same_thread=check_same_thread,
     )
     try:
         conn.row_factory = sqlite3.Row
         # busy_timeout first: switching to WAL needs a lock that may be contended.
-        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS:d}")
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms:d}")
         _enable_wal(conn)
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -174,7 +181,19 @@ def migrate(conn: sqlite3.Connection, migrations: list[Migration] | None = None)
             "upgrade the application"
         )
 
+    def clash(migration: Migration, name: str) -> MigrationError:
+        return MigrationError(
+            f"migration {migration.version}: the database recorded {name!r} but this code"
+            f" has {migration.name!r}; two branches shipped the same version"
+        )
+
     done = _applied_versions(conn)
+    if done:  # a version recorded under another name is a different migration (CLP-79)
+        recorded = dict(conn.execute("SELECT version, name FROM schema_version").fetchall())
+        for migration in ordered:
+            name = recorded.get(migration.version, migration.name)
+            if name != migration.name:
+                raise clash(migration, name)
     applied: list[int] = []
     for migration, statements in plans:
         if migration.version in done:
@@ -186,8 +205,13 @@ def migrate(conn: sqlite3.Connection, migrations: list[Migration] | None = None)
                 " name TEXT NOT NULL,"
                 " applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')))"
             )
-            if migration.version in _applied_versions(conn):
-                continue  # another process applied it while we waited for the lock
+            row = conn.execute(
+                "SELECT name FROM schema_version WHERE version = ?", (migration.version,)
+            ).fetchone()
+            if row is not None:  # another process applied it while we waited for the lock
+                if row[0] != migration.name:
+                    raise clash(migration, row[0])
+                continue
             for stmt in statements:
                 conn.execute(stmt)
             conn.execute(

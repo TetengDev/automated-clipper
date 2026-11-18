@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from clipper.db import connect, migrate
-from clipper.jobs import Deferred, SkipJob
+from clipper.jobs import Deferred, Job, JobStatus, SkipJob
 from clipper.jobs.stages import PermanentError
 from clipper.pipeline import common, ytdlp
 from clipper.pipeline.common import (
@@ -18,10 +18,12 @@ from clipper.pipeline.common import (
     StageTimeout,
     first_seen,
     next_utc_midnight,
+    reserve_source_hours,
     reserve_spend,
     spend_today,
     strip_control,
 )
+from clipper.urls import SourceRef
 
 T0 = datetime(2026, 10, 21, 23, 30, tzinfo=UTC)
 
@@ -191,6 +193,27 @@ def test_first_seen_restarts_a_stale_marker(tmp_path: Path) -> None:
     assert first_seen(marker, later + timedelta(hours=1), max_age=timedelta(days=7)) == later
 
 
+def test_first_seen_write_does_not_follow_a_planted_symlink(tmp_path: Path) -> None:
+    marker = tmp_path / ".not_ready_since"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    marker.with_name(f"{marker.name}.tmp").symlink_to(victim)
+
+    assert first_seen(marker, T0) == T0
+
+    assert victim.read_text() == "keep me"
+    assert not marker.is_symlink() and marker.read_text() == T0.isoformat()
+
+
+def test_episode_since_keeps_an_active_episode_and_restarts_a_stale_one(tmp_path: Path) -> None:
+    marker, cap = tmp_path / "m", timedelta(hours=48)
+    assert common.episode_since(marker, T0, cap) == T0
+    assert common.episode_since(marker, T0 + timedelta(hours=40), cap) == T0
+    assert common.episode_since(marker, T0 + timedelta(hours=80), cap) == T0  # last at 40 h
+    later = T0 + timedelta(hours=129)  # 49 h after the last event
+    assert common.episode_since(marker, later, cap) == later
+
+
 def _format_error_at(marker: Path, when: datetime) -> Exception:
     """Run `deferring_no_format` over a format error at `when`; return what it raised."""
     error = ytdlp.Unavailable("Requested format is not available", ytdlp.NO_FORMAT)
@@ -240,6 +263,30 @@ def test_format_error_marker_from_before_the_upgrade_still_counts(tmp_path: Path
     assert type(_format_error_at(marker, T0 + timedelta(hours=49))) is PermanentError
 
 
+def test_format_error_marker_from_before_the_upgrade_fails_just_past_the_cap(
+    tmp_path: Path,
+) -> None:
+    # A one-line marker has no last-error time. Up to one retry past the cap, the episode
+    # may have been retried all along: it fails at the cap instead of starting over.
+    marker = tmp_path / ".no_format_since"
+    marker.write_text(T0.isoformat())
+
+    outcome = _format_error_at(marker, T0 + common.NO_FORMAT_MAX_AGE + timedelta(minutes=15))
+
+    assert type(outcome) is PermanentError and "giving up" in str(outcome)
+
+
+def test_format_error_marker_from_before_the_upgrade_goes_stale_after_one_retry(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / ".no_format_since"
+    marker.write_text(T0.isoformat())
+    late = T0 + common.NO_FORMAT_MAX_AGE + common.NO_FORMAT_RETRY + timedelta(minutes=1)
+
+    assert isinstance(_format_error_at(marker, late), common.NoUsableFormat)
+    assert marker.read_text().split() == [late.isoformat(), late.isoformat()]
+
+
 def test_format_error_marker_read_is_bounded(tmp_path: Path) -> None:
     # Only the start of the marker is read: whatever follows it is never looked at.
     marker = tmp_path / ".no_format_since"
@@ -279,3 +326,74 @@ def test_stderr_tail_redacts_before_cutting() -> None:
     tail = common.stderr_tail(noise + "fetch https://h/?sig=SECRET1 failed\nmore\nERROR: end\n")
     assert "SECRET1" not in tail and tail.endswith("ERROR: end")
     assert len(tail) <= common.STDERR_TAIL_CHARS
+
+
+# --- source hours per creator per UTC day (CLP-38) -----------------------------------------
+
+
+def _job(conn: sqlite3.Connection, item_id: str, creator: str = "x") -> Job:
+    job_id = conn.execute(
+        "INSERT INTO jobs (platform, item_id, creator, source_url, created_at, updated_at)"
+        " VALUES ('youtube', ?, ?, 'u', ?, ?)",
+        (item_id, creator, "2026-10-21T00:00:00Z", "2026-10-21T00:00:00Z"),
+    ).lastrowid
+    return Job(
+        id=job_id,
+        ref=SourceRef("youtube", item_id),
+        creator=creator,
+        source_url="u",
+        status=JobStatus.FETCHING_AUDIO,
+        is_stream=False,
+        attempts=1,
+    )
+
+
+def _source_hours(conn: sqlite3.Connection, job: Job, hours: float, now: datetime = T0) -> None:
+    reserve_source_hours(conn, job, hours * 3600, cap_hours=10.0, now=now)
+
+
+def test_source_hours_over_the_cap_defer_to_utc_midnight_then_resume(
+    conn: sqlite3.Connection,
+) -> None:
+    _source_hours(conn, _job(conn, "aaaaaaaaaaa"), 6)
+    late = _job(conn, "bbbbbbbbbbb")
+    with pytest.raises(Deferred, match="daily source hours reached") as exc:
+        _source_hours(conn, late, 5)
+    assert exc.value.until == datetime(2026, 10, 22, tzinfo=UTC)
+    # Nothing was recorded for the deferred job; the next UTC day it fits again.
+    _source_hours(conn, late, 5, now=exc.value.until)
+    rows = conn.execute("SELECT job_id, kind, usd, audio_seconds FROM spend ORDER BY id")
+    assert [tuple(r) for r in rows] == [
+        (2, "source", 0.0, 6 * 3600.0),
+        (3, "source", 0.0, 5 * 3600.0),
+    ]
+
+
+def test_source_hours_are_counted_once_per_job(conn: sqlite3.Connection) -> None:
+    job = _job(conn, "aaaaaaaaaaa")
+    _source_hours(conn, job, 6)
+    _source_hours(conn, job, 6)  # a retried stage (crash, not-ready) is already admitted
+    (count,) = conn.execute("SELECT COUNT(*) FROM spend WHERE kind = 'source'").fetchone()
+    assert count == 1
+
+
+def test_source_hours_are_per_creator(conn: sqlite3.Connection) -> None:
+    _source_hours(conn, _job(conn, "aaaaaaaaaaa", creator="one"), 9)
+    _source_hours(conn, _job(conn, "bbbbbbbbbbb", creator="two"), 9)
+    with pytest.raises(Deferred):
+        _source_hours(conn, _job(conn, "ccccccccccc", creator="one"), 2)
+
+
+def test_source_hours_ignore_money_spend_and_earlier_days(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO spend (job_id, provider, kind, usd, audio_seconds, created_at)"
+        " VALUES (1, 'groq', 'transcribe', 0.5, 36000, '2026-10-21T10:00:00Z'),"
+        " (1, 'youtube', 'source', 0, 36000, '2026-10-20T23:59:59Z')"
+    )
+    _source_hours(conn, _job(conn, "aaaaaaaaaaa"), 9)
+
+
+def test_source_longer_than_the_whole_cap_is_skipped(conn: sqlite3.Connection) -> None:
+    with pytest.raises(SkipJob, match="exceeds the daily max_source_hours_per_day"):
+        _source_hours(conn, _job(conn, "aaaaaaaaaaa"), 11)
+    assert _rows(conn) == []

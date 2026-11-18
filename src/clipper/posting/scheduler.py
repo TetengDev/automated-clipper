@@ -13,6 +13,11 @@ from the clip's platform variant plus, for a campaign account, the campaign's ta
 (CLP-96), checked against the campaign's brief (CLP-97, `clipper.campaigns`) and stored on
 the post. A post that breaks the brief is `held` with the reason instead of scheduled;
 `recheck_held` schedules held posts that pass after the config was fixed.
+
+CLP-106: the later scheduling paths use the same rules. `slot_problems` says which rules a
+chosen time breaks (a manual reschedule or `posts retry --at` is flagged with it), and the
+posting stage uses `pick_slot` for its retry backoff and `day_bounds` for its claim-time
+daily cap check.
 """
 
 from __future__ import annotations
@@ -39,7 +44,7 @@ from clipper.campaigns import (
 from clipper.clips import ClipDetail, ClipStatus
 from clipper.config import ConfigError
 from clipper.db import transaction
-from clipper.metadata import build_post_metadata
+from clipper.metadata import build_post_metadata, preflight
 from clipper.pipeline.common import strip_control
 from clipper.posting import repo
 from clipper.posting.models import Post, PostConflict, PostMetadata, PostStatus
@@ -56,6 +61,8 @@ PLATFORM_DAILY_CAPS: dict[str, int] = {
 }
 MAX_DAYS_AHEAD = 7
 """Today plus this many days are searched for a free slot."""
+HISTORY = timedelta(days=2)
+"""Post history the slot picker needs (it only looks at today and later, local time)."""
 
 SCHEDULABLE = (ClipStatus.APPROVED, ClipStatus.EXPORTED)
 _WINDOW = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
@@ -184,6 +191,53 @@ def pick_slot(account: AccountLike, existing: Sequence[datetime], now: datetime)
     return None
 
 
+def day_bounds(timezone: str, moment: datetime) -> tuple[datetime, datetime]:
+    """The local day (in `timezone`) holding `moment`, as [start, end) in aware UTC."""
+    tz = ZoneInfo(timezone)
+    day = moment.astimezone(tz).date()
+    start = datetime.combine(day, _MIDNIGHT, tz).astimezone(UTC)
+    end = datetime.combine(day + timedelta(days=1), _MIDNIGHT, tz).astimezone(UTC)
+    return start, end
+
+
+def _in_window(windows: Sequence[tuple[time, time]], at: time) -> bool:
+    # The end minute is inside a window, except a midnight end (pick_slot's rule).
+    return any(start <= at and (end == _MIDNIGHT or at <= end) for start, end in windows)
+
+
+def slot_problems(account: AccountLike, existing: Sequence[datetime], when: datetime) -> list[str]:
+    """The account rules `when` breaks, in words for a reviewer; empty when `pick_slot`
+    could have chosen it. `existing` holds the times of the account's other counted posts
+    (not the post being moved). Raises like `pick_slot` for a bad config."""
+    if when.tzinfo is None:
+        raise ValueError("naive datetime; pass an aware (UTC) datetime")
+    tz = ZoneInfo(account.timezone)
+    local = when.astimezone(tz)
+    day = local.date()
+    problems: list[str] = []
+    windows = parse_windows(account.windows)
+    if not _in_window(windows, local.time()):
+        problems.append(
+            f"{local:%H:%M} {account.timezone} is outside the account's posting windows"
+            f" ({', '.join(account.windows)} {account.timezone})"
+        )
+    same_day = [t for t in existing if t.astimezone(tz).date() == day]
+    gap = timedelta(minutes=max(0, account.min_gap_minutes))
+    clashes = sorted(t for t in same_day if abs(t - when) < gap)
+    if clashes:
+        problems.append(
+            f"within the {account.min_gap_minutes}-minute gap of another post that day"
+            f" (at {clashes[0].astimezone(tz):%H:%M} {account.timezone})"
+        )
+    limit = daily_limit(account, day)
+    if len(same_day) >= limit:
+        problems.append(
+            f"{day.isoformat()} already has {len(same_day)} post(s), limit {limit}"
+            " (posts per day, warm-up ramp and platform cap)"
+        )
+    return problems
+
+
 @dataclass(frozen=True)
 class _Plan:
     """What one account would post for a clip, and why it may not (if it may not)."""
@@ -215,7 +269,8 @@ def _plan(
     )
     metadata = PostMetadata(**asdict(built))
     if campaign_id is None:
-        return _Plan(None, metadata, [])
+        problems = preflight(built, account.platform, clip.current.duration_s, plain=True)
+        return _Plan(None, metadata, problems)
     if campaign is None:
         problem = f"account {account.id}: unknown campaign {campaign_id!r}; fix accounts.yaml"
         return _Plan(campaign_id, metadata, [problem])
@@ -246,10 +301,13 @@ def schedule_for_clip(
     it is, so calling this again is safe. Nothing is scheduled for a sensitive clip (its
     stored flag, or `sensitive=True` from the creator's rule), a clip that is not approved
     or exported, or one without a rendered video. An account is skipped when the same file
-    is already scheduled, posted or held on its platform, or when it has no free slot.
+    is already scheduled, posted or held on its platform, or when it has no free slot. Each
+    skip is logged with its reason.
 
     A post for a campaign account (`campaigns` by id) whose clip or metadata breaks the
-    brief is created `held` with the reasons in `error`, with or without a free slot. A
+    brief is created `held` with the reasons in `error`, with or without a free slot; so is
+    a plain post that fails the platform pre-flight, e.g. a clip outside its platform's
+    length (Facebook Reels: 3-90 s, CLP-94), so the reviewer sees why (CLP-111). A
     held post takes no slot (its `scheduled_at` is only the time it was held) but keeps
     its file reserved on the platform, so it can be released later. `media_root` locates
     the render sidecar, which says whether the clip has AI elements; without it the AI
@@ -464,11 +522,12 @@ def publish_problem(
             f"campaign changed since scheduling ({post.campaign_id or 'none'} ->"
             f" {campaign_id or 'none'}); run `clipper posts recheck` or cancel the post"
         )
+    metadata = repo.metadata_for(conn, post)
     if campaign_id is None:
-        return None
+        problems = preflight(metadata, post.platform, version.duration_s, plain=True)
+        return "; ".join(problems) if problems else None
     if campaign is None:
         return f"account {account.id}: unknown campaign {campaign_id!r}"
-    metadata = repo.metadata_for(conn, post)
     edl = render_edl(media_root, post.video_path) if media_root else None
     problems = campaign_preflight(campaign, metadata, post.platform, version.duration_s, edl, now)
     return "; ".join(problems) if problems else None

@@ -10,6 +10,11 @@ Paid API calls go through `reserve_spend`: the budget check and a reservation of
 estimated cost happen in one `BEGIN IMMEDIATE` transaction (so two workers cannot both
 pass the check), and the row is settled to the actual cost afterwards. Over the daily cap
 the stage is `Deferred` to the next UTC midnight; it never fails or skips the job.
+
+Source hours (`max_source_hours_per_day`, per creator, CLP-38) use the same ledger: one
+`source` row per job (usd 0, the source length in `audio_seconds`), written by
+`reserve_source_hours` before the download, under the same rules (deferred to the next UTC
+midnight; a source longer than the whole cap is skipped).
 """
 
 from __future__ import annotations
@@ -209,11 +214,20 @@ def first_seen(marker: Path, now: datetime, *, max_age: timedelta | None = None)
             return seen
     except (OSError, ValueError):
         pass
+    _write_marker(marker, now.astimezone(UTC).isoformat())
+    return now
+
+
+def _write_marker(marker: Path, text: str) -> None:
+    """Replace `marker` with `text` through a fresh tmp file, never through a planted
+    symlink (or a leftover) at the tmp name."""
     marker.parent.mkdir(parents=True, exist_ok=True)
     tmp = marker.with_name(f"{marker.name}.tmp")
-    tmp.write_text(now.astimezone(UTC).isoformat(), encoding="utf-8")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
     os.replace(tmp, marker)
-    return now
 
 
 NO_FORMAT_RETRY = timedelta(minutes=30)
@@ -227,34 +241,33 @@ class NoUsableFormat(Deferred):
 
 
 _MARKER_READ_BYTES = 256
-"""A format-error marker is two ISO times (about 70 bytes); nothing past this is read."""
+"""An episode marker is two ISO times (about 70 bytes); nothing past this is read."""
 
 
-def _format_errors_since(marker: Path, now: datetime) -> datetime:
-    """When the current format-error episode began. `marker` holds that start and the last
-    format error (one ISO time per line; a marker from before CLP-85 holds only the start).
-    An episode with no format error for NO_FORMAT_MAX_AGE is over, so one picked up late
-    (a busy or stopped worker) still counts from its start, not from now."""
+def episode_since(
+    marker: Path, now: datetime, max_age: timedelta, *, start_only_grace: timedelta = timedelta()
+) -> datetime:
+    """When the current episode of a recurring error (a format error, a failed render)
+    began, recording one at `now`. `marker` holds that start and the last error (one ISO
+    time per line; a marker from before CLP-85 holds only the start). An episode with no
+    error for `max_age` is over (a stopped worker, a leftover marker), so the next error
+    starts a new one; one picked up late within that still counts from its start. A
+    start-only marker gets `start_only_grace` more (format errors: one NO_FORMAT_RETRY,
+    since its episode may have been retried until now, so just past the cap it fails
+    instead of starting over)."""
     start = None
     try:
         with marker.open("rb") as f:
             words = f.read(_MARKER_READ_BYTES).decode("utf-8").split()
         first, last = datetime.fromisoformat(words[0]), datetime.fromisoformat(words[-1])
         aware = first.tzinfo is not None and last.tzinfo is not None
-        if aware and first <= now and now - last <= NO_FORMAT_MAX_AGE:
+        idle_max = max_age + (start_only_grace if len(words) == 1 else timedelta())
+        if aware and first <= now and now - last <= idle_max:
             start = first
     except (OSError, ValueError, IndexError):
         pass
     start = start or now
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    tmp = marker.with_name(f"{marker.name}.tmp")
-    stamp = "\n".join(t.astimezone(UTC).isoformat() for t in (start, now))
-    # A fresh file, never through a planted symlink (or a leftover) at the tmp name.
-    tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(stamp)
-    os.replace(tmp, marker)
+    _write_marker(marker, "\n".join(t.astimezone(UTC).isoformat() for t in (start, now)))
     return start
 
 
@@ -271,7 +284,7 @@ def deferring_no_format(marker: Path, clock: Callable[[], datetime]) -> Iterator
         if exc.reason != ytdlp.NO_FORMAT:
             raise
         now = clock()
-        since = _format_errors_since(marker, now)
+        since = episode_since(marker, now, NO_FORMAT_MAX_AGE, start_only_grace=NO_FORMAT_RETRY)
         if now - since > NO_FORMAT_MAX_AGE:
             hours = NO_FORMAT_MAX_AGE.total_seconds() / 3600
             raise PermanentError(f"{exc} (for {hours:.0f} h; giving up)") from None
@@ -296,6 +309,52 @@ def spend_today(conn: sqlite3.Connection, kind: str, now: datetime) -> float:
         (kind, start, end),
     ).fetchone()
     return float(row[0])
+
+
+SOURCE_KIND = "source"
+"""`spend.kind` of the source-hours rows; never mixed into the USD sums (those filter by kind)."""
+
+
+def reserve_source_hours(
+    conn: sqlite3.Connection, job: Job, seconds: float, *, cap_hours: float, now: datetime
+) -> None:
+    """Admit `seconds` of source for `job` against its creator's daily cap, or raise.
+
+    A job is counted once: a rerun of the stage (crash, not-ready retry) finds its row and
+    passes. Over the cap -> `Deferred` to the next UTC midnight; a source longer than the
+    whole cap can never fit -> `SkipJob`."""
+    cap_s = cap_hours * 3600
+    if seconds > cap_s:
+        raise SkipJob(
+            f"source is {seconds / 3600:.1f} h, which exceeds the daily"
+            f" max_source_hours_per_day {cap_hours:g} h"
+        )
+    start, end = _utc_day(now)
+    with transaction(conn):
+        counted = conn.execute(
+            "SELECT 1 FROM spend WHERE job_id = ? AND kind = ?", (job.id, SOURCE_KIND)
+        ).fetchone()
+        if counted is not None:
+            return
+        used = float(
+            conn.execute(
+                "SELECT COALESCE(SUM(s.audio_seconds), 0) FROM spend s"
+                " JOIN jobs j ON j.id = s.job_id"
+                " WHERE s.kind = ? AND j.creator = ? AND s.created_at >= ? AND s.created_at < ?",
+                (SOURCE_KIND, job.creator, start, end),
+            ).fetchone()[0]
+        )
+        if used + seconds > cap_s:
+            raise Deferred(
+                next_utc_midnight(now),
+                f"daily source hours reached for {job.creator} ({used / 3600:.1f} h of"
+                f" {cap_hours:g} h used, {seconds / 3600:.1f} h needed)",
+            )
+        conn.execute(
+            "INSERT INTO spend (job_id, provider, kind, usd, audio_seconds, created_at)"
+            " VALUES (?, ?, ?, 0, ?, ?)",
+            (job.id, job.ref.platform, SOURCE_KIND, round(seconds, 3), to_iso(now)),
+        )
 
 
 @dataclass

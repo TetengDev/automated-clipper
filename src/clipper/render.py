@@ -71,6 +71,8 @@ AUDIO_SAMPLE_RATE = "48000"
 DEFAULT_RENDER_TIMEOUT_S = 900.0
 DEFAULT_FFMPEG_TIMEOUT_S = 300.0
 STDERR_TAIL_CHARS = 4000
+KILL_WAIT_S = 10.0
+"""After the SIGKILL, how long to wait for the output pipes to close (CLP-66)."""
 # Below this the input is effectively silent; loudnorm cannot (and should not) boost it.
 SILENCE_LUFS = -70.0
 JOIN_FADE_S = 0.025
@@ -106,6 +108,30 @@ class RenderResult:
     render_seconds: float
 
 
+@dataclass(frozen=True)
+class StagedClip:
+    """A finished render whose files still wait in the work dir (`stage_clip`).
+
+    `publish()` renames them to `result`'s paths; `discard()` removes the work dir and
+    must always follow, also after a publish.
+    """
+
+    result: RenderResult
+    video: Path
+    """The staged video: what checks before publishing (the quality gates) look at."""
+    work_dir: Path
+    moves: tuple[tuple[Path, Path], ...]
+
+    def publish(self) -> None:
+        try:
+            _publish(self.moves)
+        except OSError as exc:
+            raise RenderError(f"render I/O error: {exc}") from exc
+
+    def discard(self) -> None:
+        shutil.rmtree(self.work_dir, ignore_errors=True)
+
+
 def default_render_dir() -> Path:
     """`render/` package location: $CLIPPER_RENDER_DIR, else the repo checkout's render/."""
     env = os.environ.get("CLIPPER_RENDER_DIR")
@@ -127,6 +153,22 @@ def _kill_group(proc: subprocess.Popen[str]) -> None:
         os.killpg(proc.pid, signal.SIGKILL)
 
 
+def _drain_killed(proc: subprocess.Popen[str]) -> tuple[Any, Any]:
+    """(stdout, stderr) of a killed group, waiting at most KILL_WAIT_S for the pipes to
+    close. A descendant that left the group (its own session) can hold them open long
+    after the kill; then close our ends and keep what was read so far."""
+    try:
+        return proc.communicate(timeout=KILL_WAIT_S)
+    except subprocess.TimeoutExpired as exc:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=1.0)  # the leader itself was killed: reaped at once
+        return exc.output, exc.stderr
+
+
 def run_process(
     argv: Sequence[str],
     *,
@@ -138,6 +180,7 @@ def run_process(
     """Run argv (no shell) in a new session; on timeout SIGKILL the whole process group.
 
     Raises subprocess.TimeoutExpired (with the captured stderr) after killing the group.
+    The wait for the killed group's output is bounded too (KILL_WAIT_S).
     """
     proc = popen(
         list(argv),
@@ -154,11 +197,11 @@ def run_process(
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_group(proc)
-        stdout, stderr = proc.communicate()
+        stdout, stderr = _drain_killed(proc)
         raise subprocess.TimeoutExpired(list(argv), timeout, output=stdout, stderr=stderr) from None
     except BaseException:  # KeyboardInterrupt etc.: never leave Chrome/ffmpeg behind
         _kill_group(proc)
-        proc.communicate()
+        _drain_killed(proc)
         raise
     # The leader exited; sweep anything it left running in its group (Chrome helpers etc.).
     # Residual risk: once every member is gone the pgid could in theory be reused by an
@@ -506,6 +549,27 @@ def render_clip(
     edl: EDL | dict[str, Any],
     media_root: Path,
     out_dir: Path,
+    **kw: Any,
+) -> RenderResult:
+    """Render `edl` to `out_dir/<basename>.{mp4,jpg,json}` (`stage_clip`, then publish).
+
+    Use a distinct basename per clip version (e.g. ``basename=f"v{version}"``) so a
+    re-render never overwrites the files an earlier clip_versions row points at.
+    If a rename fails, the files already moved are removed again (best effort).
+    Raises RenderError on any failure.
+    """
+    staged = stage_clip(edl, media_root, out_dir, **kw)
+    try:
+        staged.publish()
+    finally:
+        staged.discard()
+    return staged.result
+
+
+def stage_clip(
+    edl: EDL | dict[str, Any],
+    media_root: Path,
+    out_dir: Path,
     *,
     runner: Runner = run_process,
     timeout_s: float = DEFAULT_RENDER_TIMEOUT_S,
@@ -515,16 +579,15 @@ def render_clip(
     concurrency: int | None = None,
     node: str = "node",
     ffmpeg: str = "ffmpeg",
-) -> RenderResult:
-    """Render `edl` to `out_dir/<basename>.{mp4,jpg,json}`.
-
-    Use a distinct basename per clip version (e.g. ``basename=f"v{version}"``) so a
-    re-render never overwrites the files an earlier clip_versions row points at.
+) -> StagedClip:
+    """Render `edl` into the private work dir `out_dir/.<basename>.work`, ready to be
+    published as `out_dir/<basename>.{mp4,jpg,json}`.
 
     Validates the EDL (pydantic) before any subprocess runs; the Remotion side validates
-    the props again (ajv) before rendering a frame. Outputs are staged in a private work dir
-    and renamed into `out_dir` only after every step succeeded; if a rename fails, the
-    files already moved are removed again (best effort). Raises RenderError on any failure.
+    the props again (ajv) before rendering a frame. Nothing reaches `out_dir` until
+    `publish()`, so the caller can check the clip and record it first (the clip insert is
+    fenced on the job's lease, CLP-66). On failure the work dir is removed and RenderError
+    is raised.
     """
     if not _BASENAME.fullmatch(basename):
         raise ValueError(f"invalid basename: {basename!r}")
@@ -661,17 +724,24 @@ def render_clip(
                     "edl": edl.to_props(),
                 },
             )
-            _publish([(staged_thumb, thumb), (staged_video, video), (staged_sidecar, sidecar)])
         except (OSError, ValueError) as exc:
-            raise RenderError(f"render I/O error: {exc}") from exc
-        finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+            raise RenderError(f"render I/O error: {exc}") from exc
+        except BaseException:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise
 
         log.info("rendered %s in %.1fs", video, render_seconds)
-        return RenderResult(
-            video_path=video,
-            thumbnail_path=thumb,
-            sidecar_path=sidecar,
-            duration_s=edl.duration_s,
-            render_seconds=render_seconds,
+        return StagedClip(
+            result=RenderResult(
+                video_path=video,
+                thumbnail_path=thumb,
+                sidecar_path=sidecar,
+                duration_s=edl.duration_s,
+                render_seconds=render_seconds,
+            ),
+            video=staged_video,
+            work_dir=work_dir,
+            # Sidecar last: it implies a complete set.
+            moves=((staged_thumb, thumb), (staged_video, video), (staged_sidecar, sidecar)),
         )

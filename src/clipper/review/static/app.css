@@ -121,8 +121,12 @@ select, input[type="number"] {
 .badge.sensitive { color: var(--error); border-color: var(--error); font-weight: 600; }
 .sensitive-note { color: var(--error); font-size: 0.875rem; }
 p.sensitive-note { font-weight: 600; margin: 0 0 0.75rem; }
-.confirm-sensitive { display: flex; align-items: center; gap: 0.5rem; min-height: 44px; }
-.confirm-sensitive input { width: 1.25rem; height: 1.25rem; margin: 0; }
+.confirm-check { display: flex; align-items: center; gap: 0.5rem; min-height: 44px; }
+.confirm-check input { width: 1.25rem; height: 1.25rem; margin: 0; flex: none; }
+.reviewer-checks { min-width: 0; margin: 0 0 0.75rem; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); }
+.reviewer-checks legend { padding: 0 0.25rem; font-weight: 600; font-size: 0.875rem; }
+.reviewer-checks ul { margin: 0.25rem 0; padding-left: 1.25rem; font-size: 0.9rem; }
+.campaign-id { font-weight: 600; overflow-wrap: anywhere; }
 .gate-reasons { color: var(--error); border-left: 3px solid var(--error); margin: 0 0 0.75rem; padding-left: 1.5rem; }
 .more { grid-column: 1 / -1; }
 .clip-nav { display: flex; justify-content: space-between; margin-bottom: 1rem; }
@@ -136,6 +140,10 @@ p.sensitive-note { font-weight: 600; margin: 0 0 0.75rem; }
 .variant summary { cursor: pointer; font-weight: 600; }
 .variant label { display: block; margin-top: 0.5rem; font-size: 0.875rem; }
 .variant input, .variant textarea { width: 100%; box-sizing: border-box; }
+.char-count { color: var(--muted); font-size: 0.8rem; margin: 0.25rem 0 0; }
+.char-count.over { color: var(--error); font-weight: 600; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.variant-notice { border-left: 3px solid var(--accent); margin: 0.5rem 0; padding-left: 0.75rem; font-size: 0.875rem; }
 .actions { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; }
 .reject { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 button.danger { background: var(--error); }

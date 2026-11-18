@@ -13,7 +13,7 @@ import io
 import os
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -48,6 +48,8 @@ class FakeWhisperModel:
     instances: list[FakeWhisperModel] = []
     segments: list[SimpleNamespace] = []
     language = "tl"
+    load_error: BaseException | None = None
+    """Raised by the constructor: CTranslate2 failing to load the weights."""
 
     def __init__(
         self,
@@ -58,6 +60,8 @@ class FakeWhisperModel:
         cpu_threads: int,
         local_files_only: bool,
     ) -> None:
+        if self.load_error is not None:
+            raise self.load_error
         self.model = model_size_or_path
         self.kwargs = {
             "device": device,
@@ -93,6 +97,22 @@ class FakeWhisperModel:
 
 FAKE_MODEL_BIN = b"fake ctranslate2 weights"
 FAKE_MODEL_SHA256 = hashlib.sha256(FAKE_MODEL_BIN).hexdigest()
+FAKE_FILES = {
+    "config.json": b'{"fake": "config"}',
+    "tokenizer.json": b'{"fake": "tokenizer"}',
+    "vocabulary.txt": b"fake vocabulary\n",
+}
+FAKE_PINS = {
+    "model.bin": config.PinnedFile(len(FAKE_MODEL_BIN), FAKE_MODEL_SHA256),
+    **{n: config.PinnedFile(len(d), hashlib.sha256(d).hexdigest()) for n, d in FAKE_FILES.items()},
+}
+"""What every pinned model is pinned to while the fake hub is installed."""
+SWAPPED_TOKENIZER = b'{"evil": "tokenizer"}'
+assert len(SWAPPED_TOKENIZER) == len(FAKE_FILES["tokenizer.json"])
+
+
+def _git_oid(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()  # noqa: S324
 
 
 def write_snapshot(
@@ -100,30 +120,34 @@ def write_snapshot(
     repo: str,
     revision: str,
     *,
-    model_bin: bytes = FAKE_MODEL_BIN,
-    files: Sequence[str] = ("config.json", "tokenizer.json", "vocabulary.txt"),
+    arrives: Mapping[str, bytes] | None = None,
+    files: Sequence[str] = tuple(FAKE_FILES),
 ) -> Path:
     """What huggingface_hub 2.x `snapshot_download` leaves: snapshot links to repo blobs
-    named by the server's etag (model.bin: the LFS sha256, which the fake server always
-    reports as FAKE_MODEL_SHA256, whatever arrives), and LFS/xet blobs that are themselves
-    links into a shared store at the cache root (`<models>/blobs/<xx>/<id>`)."""
+    named by the server's etag (the pinned file's git oid; model.bin's LFS sha256), whatever
+    bytes `arrives` instead, and LFS/xet blobs that are themselves links into a shared store
+    at the cache root (`<models>/blobs/<xx>/<id>`). Like the Hub client, a blob that is
+    already there is linked again, never downloaded again or checked."""
+    arrives = arrives or {}
     repo_dir = models_dir / f"models--{repo.replace('/', '--')}"
     snap = repo_dir / "snapshots" / revision
     (repo_dir / "blobs").mkdir(parents=True, exist_ok=True)
     snap.mkdir(parents=True, exist_ok=True)
-    for name, data in [("model.bin", model_bin), *((f, b"{}") for f in files)]:
-        blob = repo_dir / "blobs" / hashlib.sha1(data).hexdigest()  # noqa: S324 - git oid
+    for name in ("model.bin", *files):
+        data = arrives.get(name, FAKE_MODEL_BIN if name == "model.bin" else FAKE_FILES[name])
         if name == "model.bin":
             blob = repo_dir / "blobs" / FAKE_MODEL_SHA256
-            store_id = hashlib.sha256(b"xet" + data).hexdigest()
-            store = models_dir / "blobs" / store_id[:2] / store_id
-            store.parent.mkdir(parents=True, exist_ok=True)
-            store.write_bytes(data)
-            if not blob.is_symlink() or not blob.exists():
+            if not blob.exists():  # follows the link into the store
+                store_id = hashlib.sha256(b"xet" + data).hexdigest()
+                store = models_dir / "blobs" / store_id[:2] / store_id
+                store.parent.mkdir(parents=True, exist_ok=True)
+                store.write_bytes(data)
                 blob.unlink(missing_ok=True)
                 os.symlink(os.path.relpath(store, blob.parent), blob)
         else:
-            blob.write_bytes(data)
+            blob = repo_dir / "blobs" / _git_oid(FAKE_FILES[name])
+            if not blob.exists():
+                blob.write_bytes(data)
         link = snap / name
         if not link.is_symlink():
             os.symlink(os.path.relpath(blob, snap), link)
@@ -134,7 +158,8 @@ class FakeAsr:
     def __init__(self, inner: Callable[..., ytdlp.RunResult]) -> None:
         self.inner = inner
         self.fetch_plan: list[str] = []
-        """Per fetch: "ok", "partial" (no tokenizer.json) or "corrupt" (model.bin hash)."""
+        """Per fetch: "ok", "partial" (no tokenizer.json), "corrupt" (short model.bin) or
+        "swapped" (a tokenizer.json of the pinned size but other bytes)."""
         self.calls: list[tuple[list[str], float]] = []
         self.active = 0
         self.max_active = 0
@@ -156,10 +181,11 @@ class FakeAsr:
                     Path(models_dir),
                     repo,
                     sha,
-                    model_bin=b"truncated" if plan == "corrupt" else FAKE_MODEL_BIN,
-                    files=("config.json", "vocabulary.txt")
-                    if plan == "partial"
-                    else ("config.json", "tokenizer.json", "vocabulary.txt"),
+                    arrives={
+                        "corrupt": {"model.bin": b"truncated"},
+                        "swapped": {"tokenizer.json": SWAPPED_TOKENIZER},
+                    }.get(plan),
+                    files=("config.json", "vocabulary.txt") if plan == "partial" else FAKE_FILES,
                 )
                 return ytdlp.RunResult(0, str(snap), "")
             time.sleep(0.02)  # let a second worker thread overlap, if there were one
@@ -181,9 +207,10 @@ def install_fake_asr(monkeypatch: pytest.MonkeyPatch, models_dir: Path) -> FakeA
     FakeWhisperModel.instances = []
     FakeWhisperModel.segments = [seg("kumusta mga lods", 0.0), seg("salamat po", 3.0)]
     FakeWhisperModel.language = "tl"
+    FakeWhisperModel.load_error = None
     monkeypatch.setenv("CLIPPER_MODELS_DIR", str(models_dir))
     for name, pin in list(config.WHISPER_MODELS.items()):  # the fake weights are "pinned"
-        monkeypatch.setitem(config.WHISPER_MODELS, name, pin._replace(sha256=FAKE_MODEL_SHA256))
+        monkeypatch.setitem(config.WHISPER_MODELS, name, pin._replace(files=FAKE_PINS))
     fake = FakeAsr(ytdlp.run_command)
     monkeypatch.setattr(ytdlp, "run_command", fake)
     return fake

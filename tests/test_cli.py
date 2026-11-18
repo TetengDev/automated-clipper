@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from clipper import cli
 from clipper.cli import app
 from clipper.db import connect
 
@@ -21,6 +23,7 @@ COMMANDS = [
     "migrate",
     "check-config",
     "bench-transcribe",
+    "doctor",
 ]
 
 
@@ -165,6 +168,103 @@ def test_run_worker_once(
     assert "no due jobs" in runs[2].output
 
 
+def test_run_worker_boot_check_failure_alerts_and_keeps_running(
+    tmp_path: Path,
+    config_file: Path,
+    failing_boot_check: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    opts = ["--db", str(tmp_path / "state.db"), "--config", str(config_file)]
+
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "no due jobs" in result.output  # started anyway
+    hint = "/usr/bin/deno --version exited 1; rebuild the image (uv sync --locked)"
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == [f"run-worker: doctor: fail deno            {hint}"]
+    assert len(failing_boot_check) == 1
+    assert "run-worker: " in failing_boot_check[0] and hint in failing_boot_check[0]
+
+
+def test_run_worker_boot_check_failure_without_webhook_logs_once(
+    tmp_path: Path,
+    config_file: Path,
+    failing_boot_check: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.delenv("DISCORD_ALERTS_WEBHOOK_URL")  # alert falls back to log_notify
+    opts = ["--db", str(tmp_path / "state.db"), "--config", str(config_file)]
+
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    lines = [r.getMessage() for r in caplog.records if "deno" in r.getMessage()]
+    assert lines == [
+        "run-worker: doctor: fail deno            /usr/bin/deno --version exited 1;"
+        " rebuild the image (uv sync --locked)"
+    ]
+    assert failing_boot_check == []
+
+
+@pytest.mark.parametrize("failure", ["check raises", "import fails"])
+def test_run_worker_survives_a_crashing_boot_check(
+    tmp_path: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    import sys
+
+    import clipper
+    from clipper import doctor
+
+    if failure == "check raises":
+
+        def crash(service: str, alert: object) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(doctor, "startup_check", crash)
+    else:
+        monkeypatch.delattr(clipper, "doctor")
+        monkeypatch.setitem(sys.modules, "clipper.doctor", None)
+    opts = ["--db", str(tmp_path / "state.db"), "--config", str(config_file)]
+
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "no due jobs" in result.output
+    (error,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert error.getMessage() == "run-worker: the Deno solver check crashed"
+    assert error.exc_info is not None
+
+
+def test_run_worker_alerts_on_a_failed_job(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLP-34: a job that reaches `failed` alerts through the worker's alert webhook."""
+    from clipper.pipeline import ytdlp
+
+    def missing(args: Sequence[str], timeout_s: float) -> ytdlp.RunResult:
+        return ytdlp.RunResult(1, "", "ERROR: [twitch:vod] 123: Video 123 does not exist")
+
+    alerts: list[str] = []
+    monkeypatch.setattr(ytdlp, "run_command", missing)
+    monkeypatch.setattr(cli, "_notifiers", lambda http: (print, alerts.append))
+    opts = ["--db", str(tmp_path / "state.db"), "--config", str(config_file)]
+    runner.invoke(app, [*opts, "enqueue", "https://www.twitch.tv/videos/123"])
+
+    for _ in range(2):
+        runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+
+    assert len(alerts) == 1 and alerts[0].startswith("Job 1 failed (twitch_123, ")
+
+
 def test_run_worker_requires_valid_config(tmp_path: Path) -> None:
     result = runner.invoke(
         app, ["--config", str(tmp_path / "missing.yaml"), "run-worker", "--once"]
@@ -253,6 +353,52 @@ def test_retry_requeues_failed_or_skipped_job(tmp_path: Path) -> None:
     assert (row["status"], row["skip_reason"]) == ("detected", None)
 
 
+def test_retry_clears_the_jobs_render_failure_counts(tmp_path: Path) -> None:
+    """CLP-89: a retried job gives every clip fresh render tries; only that job's markers
+    under --media-root go, never through a symlink."""
+    db_path, media = tmp_path / "state.db", tmp_path / "media"
+    db = ["--db", str(db_path)]
+    runner.invoke(app, [*db, "enqueue", "https://youtu.be/dQw4w9WgXcQ"])
+    with closing(connect(db_path)) as conn:
+        conn.execute("UPDATE jobs SET status = 'failed', last_error = 'no clip'")
+    job_dir, other = media / "youtube_dQw4w9WgXcQ", media / "youtube_aaaaaaaaaaa"
+    outside = tmp_path / "outside"
+    markers = [job_dir / f"clips/{rank}/render_failures.json" for rank in (1, 2)]
+    kept = [
+        other / "clips/1/render_failures.json",
+        job_dir / "clips/1/v1.json",
+        outside / "render_failures.json",
+    ]
+    for path in [*markers, *kept]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"failures": 2, "error": "x"}')
+    (job_dir / "clips/3").symlink_to(outside)
+    (job_dir / ".render_failing_since").write_text("2026-10-21T12:00:00+00:00")
+
+    result = runner.invoke(app, [*db, "retry", "1", "--media-root", str(media)])
+
+    assert result.exit_code == 0, result.output
+    assert "requeued job 1 (detected)" in result.output
+    assert not any(p.exists() for p in markers)
+    assert not (job_dir / ".render_failing_since").exists()
+    assert all(p.exists() for p in kept)
+
+
+def test_retry_still_requeues_when_counts_cannot_be_cleared(tmp_path: Path) -> None:
+    db_path, media = tmp_path / "state.db", tmp_path / "media"
+    db = ["--db", str(db_path)]
+    runner.invoke(app, [*db, "enqueue", "https://youtu.be/dQw4w9WgXcQ"])
+    with closing(connect(db_path)) as conn:
+        conn.execute("UPDATE jobs SET status = 'failed', last_error = 'no clip'")
+    (media / "youtube_dQw4w9WgXcQ/clips/1/render_failures.json").mkdir(parents=True)
+
+    result = runner.invoke(app, [*db, "retry", "1", "--media-root", str(media)])
+
+    assert result.exit_code == 0, result.output
+    assert "warning: render failure counts not cleared" in result.stderr
+    assert "requeued job 1 (detected)" in result.output
+
+
 def test_retry_missing_job_fails_cleanly(tmp_path: Path) -> None:
     result = runner.invoke(app, ["--db", str(tmp_path / "state.db"), "retry", "42"])
 
@@ -330,6 +476,27 @@ def test_bench_transcribe_rejects_bad_language_and_unreadable_audio(tmp_path: Pa
     assert unreadable.exit_code == 1 and "bench-transcribe:" in unreadable.output
 
 
+def test_bench_transcribe_never_prunes_the_model_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLP-76: an operator's checkout may pin other revisions than the worker's; its
+    bench run must not delete what the worker uses."""
+    from asr_support import install_fake_asr, write_snapshot
+    from clipper.pipeline import transcribe as tr
+
+    audio = tmp_path / "a.flac"
+    audio.write_bytes(b"fLaC")
+    monkeypatch.setattr(tr, "probe_duration", lambda audio: 30.0)
+    fake = install_fake_asr(monkeypatch, tmp_path / "models")
+    workers = write_snapshot(tmp_path / "models", "Systran/faster-whisper-tiny", "0" * 40)
+
+    result = runner.invoke(app, ["bench-transcribe", str(audio), "--models", "tiny"])
+
+    assert result.exit_code == 0, result.output
+    assert len(fake.fetch_calls()) == 1
+    assert workers.is_dir()
+
+
 def test_bench_transcribe_zero_duration_and_model_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -352,3 +519,38 @@ def test_bench_transcribe_zero_duration_and_model_errors(
     assert failed.exit_code == 1
     assert "bench-transcribe:" in failed.output and "cannot load the model" in failed.output
     assert "Traceback" not in failed.output
+
+
+@pytest.mark.parametrize(
+    ("statuses", "code", "tail"),
+    [
+        (("ok", "warn"), 0, "doctor: 1 ok, 1 warnings, 0 failed"),
+        (("ok", "fail"), 1, "doctor: 1 ok, 0 warnings, 1 failed"),
+    ],
+)
+def test_doctor_prints_checks_and_exits_on_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    statuses: tuple[str, str],
+    code: int,
+    tail: str,
+) -> None:
+    from clipper import doctor
+
+    fake = [doctor.Check("ffmpeg", statuses[0], "8.1.2 /x"), doctor.Check("node", statuses[1], "y")]
+    monkeypatch.setattr(doctor, "run_checks", lambda: fake)
+    missing = tmp_path / "missing"  # no config file, no database needed
+
+    result = runner.invoke(
+        app, ["--config", str(missing / "c.yaml"), "--db", str(missing / "s.db"), "doctor"]
+    )
+
+    assert result.exit_code == code
+    lines = result.output.splitlines()
+    assert lines == [doctor.format_check(c) for c in fake] + [tail]
+    assert not missing.exists()
+
+
+def test_tracebacks_never_show_local_variables() -> None:
+    """Old typer defaulted to printing locals (doctor's `env`, secrets) in tracebacks."""
+    assert app.pretty_exceptions_show_locals is False

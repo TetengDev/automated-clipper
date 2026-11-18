@@ -48,19 +48,33 @@ REDACT_WINDOW_CHARS = 4096
 """Only this much text (the end) is ever passed to `redact`: bounded work per error."""
 COOKIES_ENV = "CLIPPER_YTDLP_COOKIES"
 PROXY_ENV = "CLIPPER_YTDLP_PROXY"
+CACHE_DIR_ENV = "CLIPPER_YTDLP_CACHE_DIR"
+"""yt-dlp's cache dir. Unset: yt-dlp's default (~/.cache/yt-dlp). The image sets it to the
+tmpfs, as its home is on the read-only root."""
 AUDIO_MAX_FILESIZE = "4G"
-AUDIO_FORMAT = "bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none]"
+AUDIO_FALLBACK_TBR = 3000
+"""kbps: the highest bitrate of the last (smallest muxed) audio fallback. 720p30 HLS (about
+3 Mbps) usually passes, 1080p and 720p60 do not. At this rate 3 h is about
+AUDIO_MAX_FILESIZE."""
+AUDIO_FORMAT = (
+    f"bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none][tbr<=?{AUDIO_FALLBACK_TBR}]"
+)
 """Audio-only when there is one; else a muxed format of 480p at most, else the smallest
-muxed one. `--max-filesize` is checked per HTTP request, so for HLS per fragment: it does
-not bound a whole muxed download, the height cap does. `[acodec!=none]`: never a
-video-only format (plain `best` falls back to one, and ffmpeg -vn then fails). Without
-`?` it also excludes a format whose acodec is unknown: deliberately, the safe direction,
-so a video-only stream can never be picked."""
+muxed one of AUDIO_FALLBACK_TBR at most (or of unknown bitrate). `--max-filesize` is
+checked per HTTP request, so for HLS per fragment: it does not bound a whole muxed
+download, the height and bitrate caps do (bytes = bitrate x duration). Not
+`filesize_approx`: yt-dlp leaves it unset for formats from a manifest (HLS).
+`[acodec!=none]`: never a video-only format (plain `best` falls back to one, and ffmpeg
+-vn then fails). Without `?` it also excludes a format whose acodec is unknown:
+deliberately, the safe direction, so a video-only stream can never be picked."""
 CLIP_FORMAT = "bv*[height<=1080]+ba/b[height<=1080][acodec!=none]"
 """The clip download's selector (fetch_clips), and the probe's. Whatever it accepts, the
 audio selector accepts too: either `ba` exists, or a muxed format with audio does, which
-the audio fallbacks take. `[acodec!=none]`: plain `b` falls back to a video-only format
-when there is no audio at all, which would make silent clips."""
+the audio fallbacks take. One exception: a video with only muxed formats, all above 480p
+and AUDIO_FALLBACK_TBR (YouTube's HLS ladder normally has a 480p one); its audio
+download is a format error, deferred like a player breakage and failed after 48 h (about
+96 attempts, each a probe and a download). `[acodec!=none]`: plain `b` falls back to a
+video-only format when there is no audio at all, which would make silent clips."""
 SECTION_MAX_FILESIZE = "2G"
 STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
 """yt-dlp's probe JSON is often several MB; anything bigger is cut (and fails to parse)."""
@@ -394,6 +408,7 @@ class YtDlp:
     runner: Runner = run_command
     cookies: Path | None = None
     proxy: str | None = None
+    cache_dir: Path | None = None
     probe_timeout_s: float = PROBE_TIMEOUT_S
     download_timeout_s: float = DOWNLOAD_TIMEOUT_S
     cap_timeout: Callable[[float], float] = _no_cap
@@ -417,6 +432,8 @@ class YtDlp:
             args += ["--cookies", str(self.cookies)]
         if self.proxy:
             args += ["--proxy", self.proxy]
+        if self.cache_dir is not None:
+            args += ["--cache-dir", str(self.cache_dir)]
         return args
 
     def _run(self, extra: Sequence[str], url: str, timeout_s: float) -> RunResult:
@@ -472,15 +489,22 @@ class YtDlp:
         cap_timeout: Callable[[float], float] = _no_cap,
         cancel: threading.Event | None = None,
     ) -> YtDlp:
-        """Optional CLIPPER_YTDLP_COOKIES (path to a cookies.txt) and CLIPPER_YTDLP_PROXY."""
+        """Optional CLIPPER_YTDLP_COOKIES (path to a cookies.txt), CLIPPER_YTDLP_PROXY and
+        CLIPPER_YTDLP_CACHE_DIR."""
         env = os.environ if env is None else env
         cookies_raw = env.get(COOKIES_ENV, "").strip()
         cookies = Path(cookies_raw) if cookies_raw else None
         if cookies is not None and not cookies.is_file():
             raise YtDlpError(f"{COOKIES_ENV} points to a missing file")
         proxy = env.get(PROXY_ENV, "").strip() or None
+        cache_raw = env.get(CACHE_DIR_ENV, "").strip()
         return cls(
-            runner=runner, cookies=cookies, proxy=proxy, cap_timeout=cap_timeout, cancel=cancel
+            runner=runner,
+            cookies=cookies,
+            proxy=proxy,
+            cache_dir=Path(cache_raw) if cache_raw else None,
+            cap_timeout=cap_timeout,
+            cancel=cancel,
         )
 
     def download_audio(

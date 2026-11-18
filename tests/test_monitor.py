@@ -27,6 +27,7 @@ from clipper.db import connect, migrate
 from clipper.jobs.queue import enqueue
 from clipper.monitor import (
     COMPONENT,
+    MAX_FORMAT_ERRORS_WITH_SIBLINGS,
     MAX_METADATA_ATTEMPTS,
     FirstRun,
     SeenStatus,
@@ -500,6 +501,7 @@ def test_bot_check_is_retried_every_poll_and_never_gives_up(conn, cfg, source, c
 
 
 def test_format_errors_back_off_to_hourly_and_never_give_up(conn, cfg, source, clock) -> None:
+    # No other video probes fine here, so the errors never count toward giving up.
     not_first_poll(conn)
     source.feeds[BEAST] = [Upload(V1, T0)]
     source.meta[V1] = "format: Requested format is not available"
@@ -519,6 +521,61 @@ def test_format_errors_back_off_to_hourly_and_never_give_up(conn, cfg, source, c
     assert attempts_at[:6] == [0, 10, 30, 70, 130, 190]  # 10 min doubling, capped at 1 h
     assert len(attempts_at) == 4 + (24 * 60 - 130) // 60 + 1
     assert V1 not in seen(conn) and monitor.failures == {}
+
+
+def _poll_x_with_a_new_sibling_each_time(conn, cfg, source, clock, sibling):
+    """x never gets a usable format; each poll lists one new upload, `sibling(vid)`, before
+    it (so probed first). Returns the monitor and each poll's errors."""
+    x = "x" * 11
+    not_first_poll(conn)
+    source.meta[x] = "format: Requested format is not available"
+    monitor = make(conn, cfg, source, clock)
+    listed = [Upload(x, T0)]
+    errors = []
+    for vid in (V1, V2, V3):
+        listed = [Upload(vid, T0), *listed]
+        source.feeds[BEAST] = listed
+        source.meta[vid] = sibling(vid)
+        errors.append(monitor.run_cycle([cfg.creator("MrBeast")]).errors)
+        clock.now += timedelta(hours=2)  # past the longest backoff
+    return monitor, errors
+
+
+def test_format_errors_while_siblings_probe_fine_give_up_on_the_video(
+    conn, cfg, source, clock
+) -> None:
+    # The player works for this creator's other videos, so x itself has no format the clip
+    # selector accepts (e.g. a silent upload): after MAX_FORMAT_ERRORS_WITH_SIBLINGS such
+    # polls it is recorded unavailable instead of being probed hourly while listed.
+    x = "x" * 11
+    seen_after: list[str | None] = []
+
+    def sibling(vid: str) -> VideoMeta:
+        seen_after.append(seen(conn).get(x))
+        return video(vid)
+
+    monitor, errors = _poll_x_with_a_new_sibling_each_time(conn, cfg, source, clock, sibling)
+
+    assert MAX_FORMAT_ERRORS_WITH_SIBLINGS == 3
+    assert seen(conn)[x] == "unavailable" and x not in monitor.format_retries
+    assert seen_after == [None, None, None]  # not before the third such poll
+    assert [seen(conn)[v] for v in (V1, V2, V3)] == ["enqueued"] * 3
+    assert {"creator": "MrBeast", "item": x, "error": "no usable format in 3 polls where"
+            " other videos probed fine; given up"} in errors[2]  # fmt: skip
+
+
+def test_format_errors_while_siblings_are_only_upcoming_never_count(
+    conn, cfg, source, clock
+) -> None:
+    # yt-dlp fails on a scheduled stream before choosing any format: no sign the player
+    # works, so a player breakage cannot give up on x this way.
+    x = "x" * 11
+
+    monitor, _ = _poll_x_with_a_new_sibling_each_time(
+        conn, cfg, source, clock, lambda vid: video(vid, status="is_upcoming")
+    )
+
+    assert x not in seen(conn) and x in monitor.format_retries
 
 
 @pytest.mark.parametrize("interval_minutes", [60, 90])
@@ -986,6 +1043,27 @@ def test_run_forever_sleeps_the_jittered_interval_and_survives_cycle_errors(
     assert len(set(sleeps)) > 1
 
 
+def test_run_forever_calls_the_janitor_hook_after_each_cycle_until_stopped(
+    conn, cfg, source, clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    monitor = make(conn, cfg, source, clock, janitor=lambda: events.append("janitor"))
+
+    def cycle(creators):
+        events.append("cycle")
+        if len(events) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        if events.count("cycle") == 3:
+            monitor.stop.set()  # SIGTERM during the cycle: exit without the janitor
+
+    monkeypatch.setattr(monitor, "run_cycle", cycle)
+    monkeypatch.setattr(monitor.stop, "wait", lambda seconds: monitor.stop.is_set())
+
+    monitor.run_forever(cfg.creators)
+
+    assert events == ["cycle", "janitor", "cycle", "janitor", "cycle"]
+
+
 # --- CLI ----------------------------------------------------------------------------------------
 
 runner = CliRunner()
@@ -1048,6 +1126,70 @@ def test_cli_rejects_bad_first_run_value(cli_env) -> None:
     result = runner.invoke(app, [*args, "run-monitor", "--once", "--first-run", "all"])
 
     assert result.exit_code == 2
+
+
+def test_cli_boot_check_failure_alerts_and_keeps_running(
+    cli_env, failing_boot_check: list[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    args, _ = cli_env
+
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
+
+    assert result.exit_code == 0, result.output
+    assert "cycle done" in result.output  # polled anyway
+    hint = "/usr/bin/deno --version exited 1; rebuild the image (uv sync --locked)"
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == [f"run-monitor: doctor: fail deno            {hint}"]
+    assert len(failing_boot_check) == 1
+    assert "run-monitor: " in failing_boot_check[0] and hint in failing_boot_check[0]
+
+
+BAD_WEBHOOK = "http://example.com/api/webhooks/9/s3cret-token"
+
+
+@pytest.mark.parametrize("name", ["DISCORD_ALERTS_WEBHOOK_URL", "DISCORD_WEBHOOK_URL"])
+def test_cli_malformed_webhook_is_logged_and_the_monitor_keeps_running(
+    cli_env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, name: str
+) -> None:
+    args, _ = cli_env
+    monkeypatch.setenv(name, BAD_WEBHOOK)
+
+    with caplog.at_level(logging.INFO):
+        result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
+
+    assert result.exit_code == 0, result.output
+    assert "cycle done" in result.output
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == [
+        f"run-monitor: {name} must be a https://discord.com/api/webhooks/... URL; ignoring it"
+    ]
+    assert "s3cret" not in caplog.text + result.output
+
+
+def test_monitor_alert_falls_through_a_malformed_alerts_webhook(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from clipper.notify import DiscordWebhook
+
+    def ignored(name: str) -> str:
+        return (
+            f"run-monitor: {name} must be a https://discord.com/api/webhooks/... URL; ignoring it"
+        )
+
+    monkeypatch.setenv("DISCORD_ALERTS_WEBHOOK_URL", BAD_WEBHOOK)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/pings")
+    with httpx.Client() as http:
+        assert isinstance(cli._alert_webhook(http, Secrets()), DiscordWebhook)  # the ping hook
+        assert [r.getMessage() for r in caplog.records] == [ignored("DISCORD_ALERTS_WEBHOOK_URL")]
+        caplog.clear()
+        monkeypatch.setenv("DISCORD_WEBHOOK_URL", BAD_WEBHOOK)
+        assert cli._alert_webhook(http, Secrets()) is None  # the log only
+    assert [r.getMessage() for r in caplog.records] == [
+        ignored("DISCORD_ALERTS_WEBHOOK_URL"),
+        ignored("DISCORD_WEBHOOK_URL"),
+    ]
+    assert "s3cret" not in caplog.text
 
 
 def test_cli_warns_about_unresolved_creators(cli_env) -> None:
@@ -1209,3 +1351,92 @@ def test_upload_whose_id_starts_with_a_dash_is_enqueued(
     for args in probes:  # the id reaches yt-dlp only inside the canonical URL, after "--"
         assert args[-2] == "--"
         assert args[-1].startswith("https://www.youtube.com/watch?v=-")
+
+
+def test_cli_run_monitor_runs_the_janitor_on_the_media_dir(
+    cli_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, db = cli_env
+    media = tmp_path / "media"
+    audio = media / f"youtube_{V1}" / "audio_16k.flac"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"old source audio")
+    with closing(connect(db)) as c:
+        migrate(c)
+        c.execute(
+            "INSERT INTO jobs (platform, item_id, creator, source_url, status, created_at,"
+            " updated_at) VALUES ('youtube', ?, 'MrBeast', 'u', 'clips_ready', ?, ?)",
+            (V1, "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"),
+        )
+
+    def one_round(self: YouTubeMonitor, creators) -> None:
+        assert self.janitor is not None
+        self.janitor()
+
+    monkeypatch.setattr(YouTubeMonitor, "run_forever", one_round)
+    result = runner.invoke(app, [*args, "run-monitor", "--media-dir", str(media)])
+
+    assert result.exit_code == 0, result.output
+    assert not audio.exists()
+
+
+def test_cli_run_monitor_counts_the_models_dir_in_the_disk_budget(
+    cli_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, db = cli_env
+    config = Path(args[1])
+    config.write_text(CONFIG.replace("settings:\n", "settings:\n  disk_budget_gb: 1\n", 1))
+    media = tmp_path / "media"
+    audio = media / f"youtube_{V1}" / "audio_16k.flac"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"fresh source audio")
+    models = tmp_path / "models"
+    models.mkdir()
+    with (models / "model.bin").open("wb") as fh:
+        fh.truncate(2 * 10**9)  # sparse: counts 2 GB, takes no space
+    monkeypatch.setenv("CLIPPER_MODELS_DIR", str(models))
+    ready = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with closing(connect(db)) as c:
+        migrate(c)
+        c.execute(
+            "INSERT INTO jobs (platform, item_id, creator, source_url, status, created_at,"
+            " updated_at) VALUES ('youtube', ?, 'MrBeast', 'u', 'clips_ready', ?, ?)",
+            (V1, ready, ready),
+        )
+
+    def one_round(self: YouTubeMonitor, creators) -> None:
+        assert self.janitor is not None
+        self.janitor()
+
+    monkeypatch.setattr(YouTubeMonitor, "run_forever", one_round)
+    result = runner.invoke(app, [*args, "run-monitor", "--media-dir", str(media)])
+
+    assert result.exit_code == 0, result.output
+    assert not audio.exists()  # inside retention, but media and models are over budget
+    assert (models / "model.bin").stat().st_size == 2 * 10**9
+
+
+def test_cli_a_malformed_alerts_webhook_does_not_stop_the_monitor(
+    cli_env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The janitor's disk alert must not add a way for run-monitor to fail (CLP-38)."""
+    args, _ = cli_env
+    monkeypatch.setenv("DISCORD_ALERTS_WEBHOOK_URL", "http://example.com/not-a-webhook")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/not/a/webhook")
+
+    result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
+
+    assert result.exit_code == 0, result.output
+    assert "DISCORD_ALERTS_WEBHOOK_URL must be a https://discord.com/api/webhooks/" in caplog.text
+    assert "not-a-webhook" not in caplog.text and "not/a/webhook" not in caplog.text
+
+
+def test_cli_monitor_does_not_warn_about_campaign_pings(
+    cli_env, caplog: pytest.LogCaptureFixture
+) -> None:
+    args, _ = cli_env
+
+    result = runner.invoke(app, [*args, "run-monitor", "--once", "--creator", "Unresolved"])
+
+    assert result.exit_code == 0, result.output
+    assert "campaign submission pings" not in caplog.text

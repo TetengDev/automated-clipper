@@ -47,6 +47,47 @@ jobs:
       - name: Test
         run: uv run pytest --cov=clipper --cov-report=term-missing --cov-fail-under=80
 
+  # Browser tests of the review app (CLP-61): Playwright drives Chromium against the real app
+  # served by uvicorn. The default `pytest` run above leaves them out (the `e2e` marker).
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.11.31"
+          enable-cache: true
+          save-cache: false # the test job saves the same cache
+
+      # A stalled mirror once hung an apt install for over an hour (CLP-131): every apt call
+      # in this job, Playwright's included, retries and times out per request; each install
+      # also retries once as a whole, and the steps are capped.
+      - name: Configure apt retries and timeouts
+        run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\n' | sudo tee /etc/apt/apt.conf.d/99-retries
+
+      - name: Install ffmpeg
+        timeout-minutes: 10
+        run: |
+          apt_install() { sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg; }
+          apt_install || apt_install
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # Headless Chromium only, plus the system libraries it needs (installed with apt).
+      - name: Install Chromium
+        timeout-minutes: 10
+        run: |
+          install_chromium() { uv run playwright install --with-deps --only-shell chromium; }
+          install_chromium || install_chromium
+
+      - name: Browser tests
+        timeout-minutes: 3
+        run: uv run pytest tests/e2e -m e2e
 
   # Known-vulnerability gate. Required only on release/** and main (rulesets), so a
   # vulnerable dependency shows red on dev PRs but never blocks feature work;
@@ -147,6 +188,16 @@ jobs:
             echo "$out"
             echo "::warning::remotion versions passes cleanly; remove the CLP-108 zod exception here and the zod override in render/package.json"
           fi
+
+      - name: Doctor (read-only, non-root)
+        # Every external tool, including yt-dlp's Deno challenge solver, in the
+        # production sandbox; a non-zero exit fails the job. --network none also proves
+        # the solver needs no network.
+        timeout-minutes: 5
+        run: >-
+          docker run --rm --read-only --tmpfs /tmp --user 10001:10001
+          --cap-drop ALL --security-opt no-new-privileges:true
+          --network none --pids-limit 512 --memory 1g clipper:ci doctor
 
       - name: Render smoke test (read-only, non-root)
         timeout-minutes: 10

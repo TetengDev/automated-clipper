@@ -363,9 +363,13 @@ def test_review_ordinary_tags_stay_usable(tag):
 
 
 def test_review_inline_disclosure_tags_in_the_text_are_flagged_by_preflight():
-    meta = build_post_metadata(variants(caption="great clip #paidpartnership"), "tiktok")
+    # A variant refuses them (CLP-118), so the pre-flight sees them only in text built
+    # some other way.
+    with pytest.raises(ValidationError, match="disclosure-like"):
+        variant(caption="great clip #paidpartnership")
+    meta = post("great clip #paidpartnership")
     assert any("disclosure" in p for p in preflight(meta, "tiktok", 35.0))
-    titled = build_post_metadata(variants(title="t #Sponsored"), "tiktok")
+    titled = post("C", title="t #Sponsored")
     assert any("disclosure" in p for p in preflight(titled, "tiktok", 35.0))
     # A campaign's own disclosure tag on the hashtag line is still fine.
     campaign = build_post_metadata(variants(), "tiktok", campaign_tags=["#ad"])

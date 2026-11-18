@@ -1,0 +1,17 @@
+{
+  "data": {
+    "app_id": "100000000000001",
+    "type": "PAGE",
+    "application": "Clipper",
+    "data_access_expires_at": 1830000000,
+    "expires_at": 0,
+    "is_valid": true,
+    "scopes": [
+      "pages_show_list",
+      "pages_read_engagement",
+      "pages_manage_posts",
+      "instagram_basic",
+      "instagram_content_publish"
+    ]
+  }
+}

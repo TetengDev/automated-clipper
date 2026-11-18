@@ -1,6 +1,7 @@
 import logging
 import sqlite3
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import closing
@@ -24,9 +25,11 @@ from clipper.jobs import (
     enqueue,
     get_job,
 )
+from clipper.jobs import heartbeat as heartbeat_mod
 from clipper.jobs import worker as worker_mod
-from clipper.jobs.queue import DEFAULT_LEASE
+from clipper.jobs.queue import DEFAULT_LEASE, JobConflict
 from clipper.jobs.stages import DEFAULT_STAGES
+from clipper.notify import NotifyError
 from clipper.pipeline import build_stages
 from clipper.urls import SourceRef
 
@@ -249,6 +252,168 @@ def test_lease_expiry_mid_stage_drops_late_result(make_worker: MakeWorker, db: P
     assert _status(db, job.id) is JobStatus.SELECTING
 
 
+def test_stage_that_lost_its_lease_records_nothing(make_worker: MakeWorker, db: Path) -> None:
+    """CLP-66: a stage whose fenced write was refused (hold_lease) charges no attempt."""
+    pipeline = StubPipeline()
+    pipeline.fail_at[JobStatus.FETCHING_AUDIO] = JobConflict("job 1 is no longer leased to w1")
+    worker = make_worker(pipeline)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()  # detected -> fetching_audio
+
+    assert worker.run_once()
+
+    row = _row(db, job.id)
+    assert (row["status"], row["last_error"], row["next_attempt_at"]) == (
+        "fetching_audio", None, None,
+    )  # fmt: skip
+
+
+def _lease_until(db: Path, job_id: int) -> str:
+    return _row(db, job_id)["lease_until"]
+
+
+def test_heartbeat_renews_the_lease_while_the_stage_runs(make_worker: MakeWorker, db: Path) -> None:
+    """CLP-34: a stage that outlives the lease keeps its claim."""
+    pipeline = StubPipeline()
+    clock = FakeClock()
+    worker = make_worker(pipeline, clock)
+    worker.lease = timedelta(seconds=0.4)  # renewed every 0.1 s
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()  # detected -> fetching_audio
+    seen: list[str] = []
+
+    def long_stage() -> None:
+        seen.append(_lease_until(db, job.id))
+        clock.now = T0 + timedelta(hours=1)
+        time.sleep(0.5)
+        seen.append(_lease_until(db, job.id))
+
+    pipeline.hooks[JobStatus.FETCHING_AUDIO] = long_stage
+    threads = threading.active_count()
+
+    assert worker.run_once()
+
+    assert seen == ["2026-01-01T12:00:00Z", "2026-01-01T13:00:00Z"]
+    assert threading.active_count() == threads  # stopped with the stage
+    assert _status(db, job.id) is JobStatus.TRANSCRIBING
+
+
+def test_heartbeat_stops_once_another_worker_holds_the_job(
+    make_worker: MakeWorker, db: Path
+) -> None:
+    pipeline = StubPipeline()
+    clock = FakeClock()
+    worker = make_worker(pipeline, clock)
+    worker.lease = timedelta(seconds=0.4)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()
+
+    def taken_over() -> None:
+        with closing(connect(db)) as other:
+            other.execute(
+                "UPDATE jobs SET worker_id = 'other', lease_until = 'theirs' WHERE id = ?",
+                (job.id,),
+            )
+        clock.now = T0 + timedelta(hours=1)
+        time.sleep(0.3)
+
+    pipeline.hooks[JobStatus.FETCHING_AUDIO] = taken_over
+
+    assert worker.run_once()  # the late result is dropped
+
+    row = _row(db, job.id)
+    assert (row["worker_id"], row["lease_until"], row["status"]) == (
+        "other", "theirs", "fetching_audio",
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "error", [sqlite3.OperationalError("database is locked"), RuntimeError("unexpected")]
+)
+def test_heartbeat_retries_a_failed_renewal(
+    make_worker: MakeWorker,
+    db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+) -> None:
+    """Any renewal error is logged and the next beat tries again: the heartbeat only stops
+    with its stage or once the claim is gone."""
+    pipeline = StubPipeline()
+    clock = FakeClock()
+    worker = make_worker(pipeline, clock)
+    worker.lease = timedelta(seconds=0.4)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()
+    real = heartbeat_mod.renew_lease
+    calls: list[int] = []
+
+    def flaky(*args: object) -> bool:
+        calls.append(1)
+        if len(calls) == 1:
+            raise error
+        return real(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(heartbeat_mod, "renew_lease", flaky)
+
+    def long_stage() -> None:
+        clock.now = T0 + timedelta(hours=1)
+        time.sleep(0.5)
+        assert _lease_until(db, job.id) == "2026-01-01T13:00:00Z"
+
+    pipeline.hooks[JobStatus.FETCHING_AUDIO] = long_stage
+
+    assert worker.run_once()
+    assert _status(db, job.id) is JobStatus.TRANSCRIBING
+    assert f"lease renewal failed: {error}" in caplog.text
+    assert "the claim lapses at its lease_until" in caplog.text
+
+
+def test_heartbeat_stop_waits_a_bounded_time(
+    make_worker: MakeWorker,
+    db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A beat stuck on a locked DB (up to the 30 s busy timeout) does not hold up the end
+    of the stage, or Ctrl-C."""
+    monkeypatch.setattr(heartbeat_mod, "JOIN_TIMEOUT_S", 0.2)
+    pipeline = StubPipeline()
+    worker = make_worker(pipeline)
+    worker.lease = timedelta(seconds=0.4)
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.run_once()
+    stuck = threading.Event()
+    unblock = threading.Event()
+
+    def blocked(*args: object) -> bool:
+        stuck.set()
+        unblock.wait(5)
+        return True
+
+    monkeypatch.setattr(heartbeat_mod, "renew_lease", blocked)
+    pipeline.hooks[JobStatus.FETCHING_AUDIO] = lambda: stuck.wait(2)
+    started = time.monotonic()
+    try:
+        assert worker.run_once()
+        elapsed = time.monotonic() - started
+    finally:
+        unblock.set()
+
+    assert elapsed < 1.5
+    assert _status(db, job.id) is JobStatus.TRANSCRIBING
+    assert f"job {job.id}: lease heartbeat did not stop within 0.2 s" in caplog.text
+
+
+def test_no_heartbeat_for_an_in_memory_db() -> None:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        assert heartbeat_mod.database_file(conn) is None
+        threads = threading.active_count()
+        job = Job(1, YT, "manual", "https://x", JobStatus.DETECTED, False, 1)
+        with heartbeat_mod.lease_heartbeat(conn, job, "w", timedelta(seconds=1), FakeClock()):
+            assert threading.active_count() == threads
+
+
 def test_run_forever_survives_db_errors(
     make_worker: MakeWorker, db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -324,7 +489,7 @@ def test_stage_error_is_recorded_and_retried_after_backoff(
     assert failed.last_error == "RuntimeError: llm timeout"
 
     del pipeline.fail_at[JobStatus.SELECTING]
-    clock.now = T0 + timedelta(minutes=1)
+    clock.now = T0 + timedelta(minutes=1.2)  # backoff(1) plus the most jitter
     _drain(worker)
     assert _status(db, job.id) is JobStatus.CLIPS_READY
 
@@ -493,3 +658,81 @@ def test_deferred_keeps_status_reschedules_and_does_not_consume_attempts(
 def test_deferred_requires_aware_datetime() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         Deferred(datetime(2026, 1, 1), "x")
+
+
+# --- failed-job alert (CLP-34) ----------------------------------------------------------
+
+
+def test_job_out_of_attempts_sends_one_alert(make_worker: MakeWorker, db: Path) -> None:
+    pipeline = StubPipeline()
+    pipeline.fail_at[JobStatus.FETCHING_AUDIO] = RuntimeError("geo-blocked")
+    clock = FakeClock()
+    worker = make_worker(pipeline, clock)
+    alerts: list[str] = []
+    worker.alert = alerts.append
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+
+    for _ in range(10):
+        _drain(worker)
+        clock.now += timedelta(hours=1)
+
+    assert _status(db, job.id) is JobStatus.FAILED
+    assert alerts == [
+        f"Job {job.id} failed (youtube_dQw4w9WgXcQ, manual) at fetching_audio: gave up after"
+        f" 5 attempts: RuntimeError: geo-blocked. Run `clipper retry {job.id}` to try again."
+    ]
+
+
+@pytest.mark.parametrize(
+    ("exc", "alerted"), [(PermanentError("private video"), True), (SkipJob("too short"), False)]
+)
+def test_permanent_failure_alerts_and_skip_does_not(
+    make_worker: MakeWorker, exc: Exception, alerted: bool
+) -> None:
+    pipeline = StubPipeline()
+    pipeline.fail_at[JobStatus.FETCHING_AUDIO] = exc
+    worker = make_worker(pipeline)
+    alerts: list[str] = []
+    worker.alert = alerts.append
+    enqueue(worker.conn, YT, T0, creator="manual")
+
+    _drain(worker)
+
+    assert [("PermanentError: private video" in a) for a in alerts] == ([True] if alerted else [])
+
+
+def test_job_given_up_at_claim_alerts(make_worker: MakeWorker, db: Path) -> None:
+    """Its workers kept dying mid-stage: the next claim marks it failed."""
+    worker = make_worker()
+    alerts: list[str] = []
+    worker.alert = alerts.append
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+    worker.conn.execute("UPDATE jobs SET attempts = 5 WHERE id = ?", (job.id,))
+
+    assert not worker.run_once()
+
+    assert _status(db, job.id) is JobStatus.FAILED
+    assert alerts == [
+        f"Job {job.id} failed (youtube_dQw4w9WgXcQ, manual) at detected: gave up after"
+        " 5 attempts (worker died mid-stage)."
+        f" Run `clipper retry {job.id}` to try again."
+    ]
+
+
+def test_alert_that_cannot_be_sent_is_logged(
+    make_worker: MakeWorker, db: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    pipeline = StubPipeline()
+    pipeline.fail_at[JobStatus.FETCHING_AUDIO] = PermanentError("private video")
+    worker = make_worker(pipeline)
+
+    def down(text: str) -> None:
+        raise NotifyError("discord webhook returned 503")
+
+    worker.alert = down
+    job, _ = enqueue(worker.conn, YT, T0, creator="manual")
+
+    _drain(worker)
+
+    assert _status(db, job.id) is JobStatus.FAILED
+    assert f"job {job.id}: failure alert not sent: discord webhook returned 503" in caplog.text

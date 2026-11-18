@@ -82,6 +82,7 @@ APP_ENV_NAMES = frozenset(
         "CLIPPER_RENDER_DIR",
         "CLIPPER_SLOW_TESTS",
         "CLIPPER_WORKER_ID",
+        "CLIPPER_YTDLP_CACHE_DIR",
         "CLIPPER_YTDLP_COOKIES",
         "CLIPPER_YTDLP_PROXY",
     }
@@ -380,6 +381,13 @@ def load_accounts(path: Path, creators: AppConfig) -> AccountsConfig:
         details = "\n".join(f"  {p}" for p in problems)
         raise ConfigError(f"invalid accounts config {path}:\n{details}")
     return AccountsConfig(accounts=[_canonical(a, creators) for a in cfg.accounts])
+
+
+def accounts_by_id(config_path: Path, creators: AppConfig) -> dict[str, Account]:
+    """The posting accounts next to `config_path` (or `CLIPPER_ACCOUNTS`) by id, for the
+    posting stage and the posts CLI (CLP-106). No accounts file: none. Raises
+    ConfigError for an invalid one."""
+    return {a.id: a for a in load_accounts(accounts_path(config_path), creators).accounts}
 
 
 def _yaml_problem(exc: yaml.YAMLError) -> str:

@@ -22,10 +22,11 @@
 <p class="muted">No failed posts.</p>
 {% endif %}
 
-<h2>Held by the campaign pre-flight</h2>
+<h2>Held by the pre-flight</h2>
 {% if held %}
-<p class="muted">These posts break their campaign's brief and are never published. Fix the
-campaign config and run <code>clipper posts recheck</code>, or cancel the post.</p>
+<p class="muted">These posts would be rejected by their platform or break their campaign's brief,
+so they are never published as they are. Each row says why. Fix the clip's text, or the campaign
+config for a campaign post, and run <code>clipper posts recheck</code>, or cancel the post.</p>
 <ul class="posts" id="held">
   {% for post in held %}{% include "_post_row.html" %}{% endfor %}
 </ul>

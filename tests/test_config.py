@@ -289,6 +289,14 @@ def test_whisper_cpu_threads_bounded(threads: int) -> None:
         Settings(whisper_cpu_threads=threads)
 
 
+def test_max_concurrent_renders_is_at_least_one() -> None:
+    from clipper.config import Settings
+
+    assert Settings().max_concurrent_renders == 1
+    with pytest.raises(ValidationError):
+        Settings(max_concurrent_renders=0)
+
+
 @pytest.mark.parametrize("field", ["transcriber", "whisper_compute_type"])
 def test_transcriber_choices_are_closed(field: str) -> None:
     from clipper.config import Settings

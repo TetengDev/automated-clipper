@@ -3,15 +3,16 @@
 A claim is recorded as (worker_id, lease_until), where worker_id is unique per process.
 Claimed jobs are invisible to other claimers until the holder finishes them or the lease
 expires. Each claim counts as an attempt of the current stage, so a stage that keeps
-killing its worker (nothing ever recorded) still ends in `failed`. Lease renewal
-(heartbeats) and concurrency limits come later (E3-S1b).
+killing its worker (nothing ever recorded) still ends in `failed`. While a stage runs, the
+worker's heartbeat renews the lease (`renew_lease`, `clipper.jobs.heartbeat`).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import random
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 
 from clipper.db import transaction
@@ -22,6 +23,9 @@ from clipper.urls import SourceRef, canonical_url
 DEFAULT_LEASE = timedelta(hours=2)
 BACKOFF_BASE = timedelta(minutes=1)
 BACKOFF_CAP = timedelta(hours=1)
+BACKOFF_JITTER = 0.2
+"""A retry waits backoff x a random factor in [0.8, 1.2] (CLP-34), so jobs that failed
+together (an outage) do not all retry in the same poll."""
 MAX_ATTEMPTS = 5
 MAX_ERROR_CHARS = 2000
 MAX_TITLE_CHARS = 500
@@ -95,13 +99,14 @@ def claim_next(
     worker_id: str,
     statuses: Iterable[JobStatus],
     lease: timedelta = DEFAULT_LEASE,
+    gave_up: list[tuple[sqlite3.Row, str]] | None = None,
 ) -> Job | None:
     """Atomically claim the oldest due, unclaimed job whose status is in `statuses`.
 
     The claim bumps `attempts`; the returned Job carries the bumped count. Rows that
     already used up MAX_ATTEMPTS (earlier claimers died mid-stage) and rows that cannot be
     decoded into a Job (corrupt platform/id) are marked failed and passed over, so one bad
-    row cannot wedge the queue.
+    row cannot wedge the queue; each is added to `gave_up` as (row, reason).
     """
     wanted = [s.value for s in statuses if s not in TERMINAL]
     if not wanted:
@@ -121,12 +126,12 @@ def claim_next(
                 return None
             if row["attempts"] >= MAX_ATTEMPTS:
                 reason = f"gave up after {row['attempts']} attempts (worker died mid-stage)"
-                _fail_row(conn, row["id"], reason, stamp)
+                _fail_row(conn, row, reason, stamp, gave_up)
                 continue
             try:
                 job = Job.from_row(row)
             except (ValueError, TypeError) as exc:
-                _fail_row(conn, row["id"], f"undecodable job row: {exc}", stamp)
+                _fail_row(conn, row, f"undecodable job row: {exc}", stamp, gave_up)
                 continue
             conn.execute(
                 "UPDATE jobs SET worker_id = ?, lease_until = ?, attempts = attempts + 1,"
@@ -136,7 +141,16 @@ def claim_next(
             return dataclasses.replace(job, attempts=job.attempts + 1)
 
 
-def _fail_row(conn: sqlite3.Connection, job_id: int, reason: str, stamp: str) -> None:
+def _fail_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    reason: str,
+    stamp: str,
+    gave_up: list[tuple[sqlite3.Row, str]] | None,
+) -> None:
+    job_id = row["id"]
+    if gave_up is not None:
+        gave_up.append((row, reason))
     conn.execute(
         "UPDATE jobs SET status = ?, last_error = ?, next_attempt_at = NULL, worker_id = NULL,"
         " lease_until = NULL, updated_at = ? WHERE id = ?",
@@ -164,6 +178,29 @@ def release_claims(conn: sqlite3.Connection, worker_id: str, now: datetime) -> i
             (to_iso(now), worker_id),
         )
     return cur.rowcount
+
+
+def renew_lease(
+    conn: sqlite3.Connection, job: Job, worker_id: str, now: datetime, lease: timedelta
+) -> bool:
+    """Extend the claim on `job` to now + lease (the heartbeat); False if it is not ours."""
+    with transaction(conn):
+        cur = conn.execute(
+            "UPDATE jobs SET lease_until = ? WHERE id = ? AND status = ? AND worker_id = ?",
+            (to_iso(now + lease), job.id, job.status.value, worker_id),
+        )
+    return cur.rowcount == 1
+
+
+def hold_lease(conn: sqlite3.Connection, job_id: int, worker_id: str, now: datetime) -> None:
+    """Fence a stage's own writes on its claim (CLP-66): inside the caller's transaction,
+    raise JobConflict unless `worker_id` still holds an unexpired lease on the job."""
+    cur = conn.execute(
+        "UPDATE jobs SET updated_at = ? WHERE id = ? AND worker_id = ? AND lease_until > ?",
+        (to_iso(now), job_id, worker_id, to_iso(now)),
+    )
+    if cur.rowcount != 1:
+        raise JobConflict(f"job {job_id} is no longer leased to {worker_id}")
 
 
 def _finish(
@@ -216,10 +253,22 @@ def backoff(attempts: int) -> timedelta:
     return min(BACKOFF_BASE * 2 ** min(max(attempts - 1, 0), 16), BACKOFF_CAP)
 
 
+def jittered(
+    delay: timedelta, uniform: Callable[[float, float], float] = random.uniform
+) -> timedelta:
+    return delay * uniform(1 - BACKOFF_JITTER, 1 + BACKOFF_JITTER)
+
+
 def record_failure(
-    conn: sqlite3.Connection, job: Job, error: str, now: datetime, *, worker_id: str
+    conn: sqlite3.Connection,
+    job: Job,
+    error: str,
+    now: datetime,
+    *,
+    worker_id: str,
+    uniform: Callable[[float, float], float] = random.uniform,
 ) -> datetime | None:
-    """Keep the status, schedule a retry with exponential backoff.
+    """Keep the status, schedule a retry with exponential backoff and jitter.
 
     `job.attempts` already counts this attempt (claim_next bumps it). Once it reaches
     MAX_ATTEMPTS the job is marked failed; returns None.
@@ -239,7 +288,7 @@ def record_failure(
             ),
         )
         return None
-    retry_at = now + backoff(attempts)
+    retry_at = now + jittered(backoff(attempts), uniform)
     _finish(
         conn,
         job,

@@ -19,7 +19,14 @@ from typing import Any, Literal
 
 from clipper.db import transaction
 from clipper.jobs.models import to_iso
-from clipper.metadata import PLATFORMS, Variant, coerce_variants, fingerprint, variants_json
+from clipper.metadata import (
+    PLATFORMS,
+    Variant,
+    coerce_variants,
+    coerce_variants_with_notes,
+    fingerprint,
+    variants_json,
+)
 from clipper.urls import InvalidSourceURL, SourceRef, canonical_url
 
 PAGE_SIZE = 24
@@ -42,6 +49,7 @@ class ReviewAction(StrEnum):
     EXPORT = "export"
     EXPORT_FAILED = "export_failed"
     VARIANTS_EDITED = "variants_edited"
+    ARCHIVE = "archive"  # by the janitor, after review_expiry_days (CLP-38)
 
 
 REJECT_REASONS: tuple[str, ...] = (
@@ -136,6 +144,9 @@ class ClipVersion:
     variants: Mapping[str, Variant] = field(default_factory=dict)
     """Title, caption and hashtags per platform (CLP-96); derived from the single copy for
     versions stored before CLP-96."""
+    adjusted: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """Per platform, what was changed on load in stored text that a stricter rule no longer
+    accepts (CLP-118), for the reviewer to see; saving the platform text stores the result."""
 
     @property
     def duration_s(self) -> float:
@@ -144,6 +155,9 @@ class ClipVersion:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ClipVersion:
         hashtags = parse_hashtags(row["hashtags"])
+        variants, adjusted = coerce_variants_with_notes(
+            _json_or_none(row["variants"]), row["title"], row["caption"], hashtags
+        )
         return cls(
             version=row["version"],
             start_s=row["start_s"],
@@ -161,9 +175,8 @@ class ClipVersion:
             rendered_s=row["duration_s"],
             sensitive=bool(row["sensitive"]),
             gate_reasons=_reasons(row["gate_reasons"]),
-            variants=coerce_variants(
-                _json_or_none(row["variants"]), row["title"], row["caption"], hashtags
-            ),
+            variants=variants,
+            adjusted={p: tuple(notes) for p, notes in adjusted.items()},
         )
 
 
@@ -267,6 +280,11 @@ JOIN clip_versions v ON v.clip_id = c.id AND v.version = c.current_version
 
 
 def _where(flt: QueueFilter, *, with_status: bool = True) -> tuple[str, list[Any]]:
+    clauses, params = _clauses(flt, with_status=with_status)
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
+def _clauses(flt: QueueFilter, *, with_status: bool = True) -> tuple[list[str], list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
     if with_status and flt.status is not None:
@@ -278,19 +296,20 @@ def _where(flt: QueueFilter, *, with_status: bool = True) -> tuple[str, list[Any
     if flt.min_score is not None:
         clauses.append("v.score >= ?")
         params.append(flt.min_score)
-    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+    return clauses, params
+
+
+def _order(flt: QueueFilter) -> str:
+    if flt.sort == "score":
+        return "v.score IS NULL, v.score DESC, c.created_at DESC, c.id DESC"
+    return "c.created_at DESC, c.id DESC"
 
 
 def list_queue(
     conn: sqlite3.Connection, flt: QueueFilter, *, page: int = 1, page_size: int = PAGE_SIZE
 ) -> list[ClipCard]:
     where, params = _where(flt)
-    order = (
-        "v.score IS NULL, v.score DESC, c.created_at DESC, c.id DESC"
-        if flt.sort == "score"
-        else "c.created_at DESC, c.id DESC"
-    )
-    sql = f"{_CARD_SELECT}{where} ORDER BY {order} LIMIT ? OFFSET ?"  # noqa: S608 - fixed fragments
+    sql = f"{_CARD_SELECT}{where} ORDER BY {_order(flt)} LIMIT ? OFFSET ?"  # noqa: S608 - fixed fragments
     rows = conn.execute(sql, [*params, page_size, (max(page, 1) - 1) * page_size]).fetchall()
     return [
         ClipCard(
@@ -401,6 +420,34 @@ def next_pending_after(conn: sqlite3.Connection, clip_id: int) -> int | None:
         (*map(str, REVIEWABLE), clip_id),
     ).fetchone()
     return row["id"] if row else None
+
+
+def neighbour(
+    conn: sqlite3.Connection, clip_id: int, flt: QueueFilter, *, older: bool
+) -> int | None:
+    """The adjacent clip in the queue view `flt`, in the queue's order (CLP-62): `older` is
+    next (j). `clip_id` keeps its place when it is outside the view (just decided, or opened
+    from elsewhere)."""
+    clauses, params = _clauses(flt)
+    view = " AND ".join(clauses) or "1"
+    sql = (
+        f"WITH q AS (SELECT c.id, ROW_NUMBER() OVER (ORDER BY {_order(flt)}) AS n"  # noqa: S608
+        " FROM clips c JOIN jobs j ON j.id = c.job_id"
+        " JOIN clip_versions v ON v.clip_id = c.id AND v.version = c.current_version"
+        f" WHERE ({view}) OR c.id = ?)"
+        " SELECT b.id FROM q a JOIN q b ON b.n = a.n + ? WHERE a.id = ?"
+    )
+    found = conn.execute(sql, [*params, clip_id, 1 if older else -1, clip_id]).fetchone()
+    return found["id"] if found else None
+
+
+def next_after(conn: sqlite3.Connection, clip_id: int, flt: QueueFilter) -> int | None:
+    """Where to go after acting on `clip_id` in the view `flt`: the next clip, else the
+    view's first."""
+    nxt = neighbour(conn, clip_id, flt, older=True)
+    if nxt is not None:
+        return nxt
+    return next((c.id for c in list_queue(conn, flt, page_size=2) if c.id != clip_id), None)
 
 
 def record_review(

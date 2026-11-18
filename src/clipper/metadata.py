@@ -22,6 +22,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from bisect import bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -38,7 +39,15 @@ from pydantic import (
 )
 
 from clipper.edl import EDL, has_ai_elements
+from clipper.hashtag_data import (
+    CAPITAL_CONFUSABLES,
+    CONFUSABLES,
+    MARK_SCRIPTS,
+    SCRIPT_NAMES,
+    SCRIPT_STARTS,
+)
 from clipper.pipeline.common import strip_control
+from clipper.tld_data import TLDS
 
 PLATFORMS: tuple[str, ...] = ("tiktok", "instagram", "youtube", "facebook")
 GENERIC_HASHTAGS = frozenset({"#fyp", "#foryou", "#foryoupage", "#viral", "#trending", "#fy"})
@@ -86,12 +95,30 @@ DISCLOSURE_PREFIXES = (
     "#prgift",
 )
 """Tags that read as a paid-partnership disclosure, exactly or by prefix (`#sponsoredpost`),
-compared without underscores, trailing digits or digit lookalikes (`#sp0nsored_2024`): only
-a campaign may add them (as campaign tags at scheduling), never the model or a variant."""
+compared without underscores, trailing digits or digit lookalikes (`#sp0nsored_2024`) and
+by skeleton (`#ꜱponsored`): only a campaign may add them (as campaign tags at scheduling),
+never the model or a variant."""
 _LOOKALIKE_DIGITS = str.maketrans("013457", "oieast")
 _TLDS = "com|net|org|io|ly|gg|me|co|xyz|link|ph|tv|app|shop|info|biz|site|online|store|live|click"
+"""Common TLDs: only these mark another link inside an allowed URL's path (`_LINK_IN_PATH`)."""
 _SPOKEN_TLDS = "com|net|org|io|ly|gg|co|xyz|link|tv|app|info|biz|click"
-"""After a spoken "dot": only TLDs that are not everyday words ("polka dot shop")."""
+"""After a spoken "dot": only TLDs that are not everyday words ("polka dot shop"); most real
+TLDs are (`to`, `is`, `shop`, `live`, `rocks`), so "scam dot rocks" is not flagged."""
+
+
+def _tld_pattern(tlds: Iterable[str]) -> str:
+    return "|".join(re.escape(t) for t in sorted(tlds, key=lambda t: (-len(t), t)))
+
+
+_REAL_TLD = _tld_pattern(t for t in TLDS if t.isascii())
+"""An IANA root-zone TLD (`tld_data`) written in ASCII, punycode included (`xn--p1ai`), in
+any case: what a plain bare domain needs. A TLD in another script (`.рф`, `.みんな`) counts
+there only in a URL: Chinese and Japanese end a sentence with `。`, which IDNA reads as a
+dot, and words such as 中国, 在线 and みんな are TLDs, so `我爱你。中国！` would read as a
+domain."""
+_ANY_TLD = _tld_pattern(TLDS)
+"""Any IANA root-zone TLD, in any script: after a deliberately obfuscated dot (`[.]`,
+`(dot)`, `d0t`), which no one types as a sentence break."""
 # A name starts a token: never mid-word or right after a hyphen, or a dot that follows a
 # word character or hyphen, so each run of text is scanned once (no quadratic backtracking on
 # "a-a-a-..." or "a.a.a...").
@@ -99,14 +126,18 @@ _NAME = r"(?<![\w-])(?<![\w-]\.)[\w-]+"
 LINK_OR_MENTION = re.compile(
     # A URL ends before quotes, brackets and trailing punctuation.
     r"(?i:(?<![\w./:-])(?:https?://|www\.)[\w\-.~:/?#@!$&*+,;=%]*[\w\-/#=~%&+])"
-    # A domain: "name.tld" with no space around the dot. Any TLD of 2-24 letters in one
-    # case, or a common TLD in any case, so a sentence break ("the store. Me") is not one.
-    + rf"|{_NAME}(?:\.[\w-]+)*\.(?:[a-z]{{2,24}}|[A-Z]{{2,24}}|(?i:{_TLDS}))\b"
-    # An obfuscated dot: "name[.]com", "name(dot)com", "name [d0t] info", "name . com".
-    + rf"|(?i:{_NAME}[ \t]*[\[(][ \t]*(?:\.|dot|d0t)[ \t]*[\])][ \t]*[a-z]{{2,24}}\b)"
+    # A domain: "name.tld" with no space around the dot, on a real ASCII TLD in any case
+    # (`Scam.Rocks`, `scam.xn--p1ai`), so a sentence break ("the store. Me") is not one, nor
+    # a file name whose extension is no TLD (`Node.js`, `index.html`). One that is a TLD
+    # (`notes.md`, `clip.mov`) reads as a domain: it is one, and `allowed_links` admits it.
+    # So does a capitalised TLD word glued to a dot (`this.So`): the cost of `Scam.Rocks`.
+    + rf"|{_NAME}(?:\.[\w-]+)*\.(?i:{_REAL_TLD})\b"
+    # An obfuscated dot: "name[.]com", "name(dot)com", "name [d0t] info", "name . com"; the
+    # bracketed and d0t forms take a TLD in any script ("name (dot) онлайн").
+    + rf"|(?i:{_NAME}[ \t]*[\[(][ \t]*(?:\.|dot|d0t)[ \t]*[\])][ \t]*(?:{_ANY_TLD})\b)"
     + rf"|(?i:{_NAME}[ \t]+\.[ \t]+(?:{_SPOKEN_TLDS})\b)"
-    # Spelled out: "name d0t anything", or "name dot com" with a common TLD.
-    + rf"|(?i:{_NAME}[ \t]+d0t[ \t]+[a-z]{{2,24}}\b)"
+    # Spelled out: "name d0t rocks" with any real TLD, or "name dot com" with a common one.
+    + rf"|(?i:{_NAME}[ \t]+d0t[ \t]+(?:{_ANY_TLD})\b)"
     + rf"|(?i:{_NAME}[ \t]+dot[ \t]+(?:{_SPOKEN_TLDS})\b)"
     # An IPv4 address.
     + r"|(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)"
@@ -124,9 +155,13 @@ _INVISIBLE = re.compile(
 _IDNA_DOTS = str.maketrans({"\u3002": ".", "\uff61": ".", "\ufe12": ".", "\u2024": "."})
 _HOST = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+")
 _INLINE_TAG = re.compile(r"#\w+")
+_LINK_PATH = re.compile(r"(?:/\S*)?")
+"""The rest of a URL's path, where its match stopped short."""
+_URL = re.compile(r"(?i:https?://|www\.)")
+"""Only a link written as a URL carries a path a `#` can sit in; after a mention, an IP or a
+bare, spoken or obfuscated domain (`@bob/#ad`, `x.co/#ad`) a `#` starts a tag."""
 _LINK_IN_PATH = re.compile(rf"(?i:www\.|https?:|[\w-]\.(?:{_TLDS})\b)")
 """Another link inside an allowed URL's path; a file name ("download.html") is fine."""
-HASHTAG = re.compile(r"^#\w{1,50}$")
 
 
 def utf16_len(text: str) -> int:
@@ -155,6 +190,12 @@ class PlatformLimits:
     """How the platform counts `title_max` and `caption_max`: code points unless its
     documentation says otherwise."""
     unit: str = "characters"
+
+    @property
+    def counts_code_points(self) -> bool:
+        """Whether `length` counts code points. An HTML `maxlength` counts UTF-16 units, so
+        the review editor sets one only where the platform counts those too (CLP-117)."""
+        return self.length is len
 
 
 PLATFORM_LIMITS: Mapping[str, PlatformLimits] = {
@@ -191,10 +232,15 @@ def _limits(platform: str) -> PlatformLimits:
         raise ValueError(f"unknown platform: {platform!r}") from None
 
 
+def clean_title(text: str) -> str:
+    """Control and invisible characters and unusable inline hashtags stripped."""
+    return strip_control(strip_unusable_tags(text))
+
+
 def clean_caption(text: str) -> str:
-    """Control and invisible characters stripped per line; line breaks kept (at most one
-    blank line in a row)."""
-    lines = [strip_control(line) for line in text.splitlines()]
+    """Control and invisible characters and unusable inline hashtags stripped per line;
+    line breaks kept (at most one blank line in a row)."""
+    lines = [clean_title(line) for line in text.splitlines()]
     out: list[str] = []
     for line in lines:
         if not line and (not out or not out[-1]):
@@ -223,13 +269,82 @@ def _fold(tag: str) -> str:
     return unicodedata.normalize("NFKC", tag).casefold().translate(_DROP_NEUTRAL)
 
 
+def _prefold(text: str) -> str:
+    """Compatibility-decomposed and case-folded, without combining marks or the neutral
+    apostrophes, so canonically equivalent text folds the same and `#àd`, `#ＡＤ` and `#ad`
+    with a dot below all read `#ad`. Must match the generator's `_prefold`."""
+    text = unicodedata.normalize("NFKD", unicodedata.normalize("NFKD", text).casefold())
+    marks = "".join(c for c in text if not unicodedata.category(c).startswith("M"))
+    return marks.translate(_DROP_NEUTRAL)
+
+
+def _skeleton(text: str) -> str:
+    """The UTS #39 skeleton of prefolded `text`, as far as ASCII letters and digits go:
+    `#ᴀᴅ`, `#аԁ` and `#ɑd` all read `#ad`. Compare only skeletons with skeletons (`m` reads
+    `rn`)."""
+    return text.translate(CONFUSABLES)
+
+
+_CJK = frozenset({"HAN", "HIRAGANA", "KATAKANA", "BOPOMOFO", "HANGUL"})
+
+
+def _readings(tag: str) -> list[str]:
+    """`tag` prefolded; read through the capital lookalikes before folding, when that differs
+    (Greek `#ϜΥΡ` reads `#fyp`, though its small letters do not); and when it mixes Latin
+    with Japanese, Chinese or Korean (allowed as one writing system) also its Latin letters,
+    digits and `_` on their own, so CJK padding does not hide a tag: `#ad一` and `#fypノ`
+    read `#ad` and `#fyp` too. A tag matching in any reading is rejected."""
+    folded = _prefold(tag)
+    readings = [folded]
+    capitals = _prefold(unicodedata.normalize("NFKD", tag).translate(CAPITAL_CONFUSABLES))
+    if capitals != folded:
+        readings.append(capitals)
+    scripts = _scripts(unicodedata.normalize("NFKC", tag))
+    if "LATIN" in scripts and scripts & _CJK:
+        readings += [
+            "".join(c for c in r if c.isascii() or (c.isalpha() and _script(c) == "LATIN"))
+            for r in list(readings)
+        ]
+    return readings
+
+
+_ONE_LETTER = str.maketrans("l", "i")
+
+
+def _key(folded: str, *, trailing_digits: bool = False) -> str:
+    """What a prefolded reading is compared as: without `_` (and, with `trailing_digits`,
+    without digits at the end), its skeleton with the other digits read as letters, and i
+    and l as one letter, so 1 and a capital I written for either match too (`#v1ra1`,
+    `#viraI`, `#co11ab`, `#f0r_y0u`; 0 and o are already one)."""
+    key = folded.replace("_", "")
+    if trailing_digits:
+        key = key.rstrip("0123456789")
+    return _skeleton(key).translate(_LOOKALIKE_DIGITS).translate(_ONE_LETTER)
+
+
+_GENERIC_KEYS = frozenset(_key(_prefold(t)) for t in GENERIC_HASHTAGS)
+_DISCLOSURE_KEYS = frozenset(_key(_prefold(t), trailing_digits=True) for t in DISCLOSURE_HASHTAGS)
+_DISCLOSURE_PREFIX_KEYS = tuple(
+    _key(_prefold(t), trailing_digits=True) for t in DISCLOSURE_PREFIXES
+)
+
+
 def is_generic(tag: str) -> bool:
-    return _fold(tag) in GENERIC_HASHTAGS
+    """A reach tag, or a lookalike of one (`#ꜰʏᴘ`, `#vırɑl`, `#v1ral`, `#f_y_p`, `#fypノ`)."""
+    return any(_key(r) in _GENERIC_KEYS for r in _readings(tag))
 
 
 def is_disclosure(tag: str) -> bool:
-    key = _fold(tag).replace("_", "").rstrip("0123456789").translate(_LOOKALIKE_DIGITS)
-    return key in DISCLOSURE_HASHTAGS or key.startswith(DISCLOSURE_PREFIXES)
+    """A paid-partnership tag, or a lookalike of one (`#аԁ`, `#ꜱponsored`, `#co11ab`,
+    `#ad一`)."""
+    # With and without a trailing number: #ad2024 is #ad, and #prom0 ends in an o.
+    keys = [_key(r, trailing_digits=strip) for r in _readings(tag) for strip in (True, False)]
+    return any(k in _DISCLOSURE_KEYS or k.startswith(_DISCLOSURE_PREFIX_KEYS) for k in keys)
+
+
+def _is_padding(char: str) -> bool:
+    """An invisible or format character: skipped when reading links and tags."""
+    return bool(_INVISIBLE.match(char)) or unicodedata.category(char) == "Cf"
 
 
 def _match_copy(text: str) -> tuple[str, list[int]]:
@@ -239,15 +354,11 @@ def _match_copy(text: str) -> tuple[str, list[int]]:
     origin: list[int] = []
     for i, char in enumerate(text):
         for c in unicodedata.normalize("NFKC", char):
-            if _INVISIBLE.match(c) or unicodedata.category(c) in {"Cf", "Mn", "Me"}:
+            if _is_padding(c) or unicodedata.category(c).startswith("M"):
                 continue
             chars.append(c.translate(_IDNA_DOTS))
             origin.append(i)
     return "".join(chars), origin
-
-
-def _match_text(text: str) -> str:
-    return _match_copy(text)[0]
 
 
 def _link_matches(text: str) -> list[tuple[str, str]]:
@@ -259,8 +370,6 @@ def _link_matches(text: str) -> list[tuple[str, str]]:
     ]
 
 
-_SCRIPT_ALIASES = {"CJK": "HAN", "IDEOGRAPHIC": "HAN"}
-"""First words of Unicode character names that do not spell the script."""
 _KANA_MARKS = frozenset("ー〱〲〳〴〵")
 """The prolonged sound mark ー and the kana repeat marks: part of a tag only next to kana."""
 _KANA = frozenset({"HIRAGANA", "KATAKANA"})
@@ -273,20 +382,35 @@ _SCRIPT_MIXES = (
 "highly restrictive" profile (UTS #39)."""
 
 
+def _script(char: str) -> str:
+    """The Unicode Script property (UAX #24) of a letter, mark or number, in capitals
+    (LATIN, CYRILLIC, TAI LE, COMMON, INHERITED)."""
+    return SCRIPT_NAMES[max(bisect_right(SCRIPT_STARTS, ord(char)) - 1, 0)]
+
+
+def _mark_fits(mark: str, base: str | None) -> bool:
+    """Whether a combining mark may sit on a letter of script `base`: a mark of that script,
+    or one whose Script_Extensions name it (the kana voiced sound mark on kana). Other
+    Inherited marks (a combining dot below) fit nothing."""
+    return base is not None and base in MARK_SCRIPTS.get(ord(mark), (_script(mark),))
+
+
 def _scripts(folded: str) -> set[str]:
-    """The scripts of the letters in an NFKC-folded tag, read from the first word of each
-    letter's Unicode name (LATIN, CYRILLIC, GREEK, ...). Digits, `_` and combining marks
-    belong to no script."""
+    """The scripts of the letters and non-ASCII digits in an NFKC-folded tag (LATIN,
+    CYRILLIC, GREEK, ...). ASCII digits, `_`, combining marks and the neutral apostrophes
+    belong to no script; other letters of no one script (a modifier prime) are COMMON."""
     scripts: set[str] = set()
     kana_marks = False
     for char in folded:
-        if char in _NEUTRAL or not unicodedata.category(char).startswith("L"):
+        category = unicodedata.category(char)
+        if char in _NEUTRAL or category[0] not in "LN" or (category[0] == "N" and char.isascii()):
             continue
         if char in _KANA_MARKS:
             kana_marks = True
             continue
-        word = unicodedata.name(char, "UNKNOWN").split(" ", 1)[0]
-        scripts.add(_SCRIPT_ALIASES.get(word, word))
+        script = _script(char)
+        if category[0] == "L" or script != "COMMON":
+            scripts.add(script)
     if kana_marks and not scripts & _KANA:
         scripts.add("KANA MARK")
     return scripts
@@ -307,18 +431,56 @@ def _mixed_scripts(tag: str) -> list[str]:
     return []
 
 
+_MARKS = frozenset({"Mn", "Mc"})
+_MARKS_IN_A_ROW = 4
+"""The most combining marks one letter carries (Thai stacks two; more is mark stacking)."""
+_HASHTAG_MAX = 50
+
+
+def is_hashtag(tag: str) -> bool:
+    """`#` and 1-50 code points, each a letter, a digit, `_`, or a combining mark (Mn, Mc)
+    that fits the letter it sits on (`_mark_fits`), at most 4 in a row, so `#नमस्ते`, `#ที่`
+    and `#ᜋ᜔ᜈ` pass. A mark on its own, straight after `#`, `_` or a digit, of another script
+    or of none (`#fyp` with a combining dot below, `#ad` with a Devanagari virama), or stacked
+    past 4, is rejected: it would pad a Latin tag past the generic, disclosure and
+    mixed-script checks, or pile up over the text around it. A decomposed Latin accent
+    (`cafe` + U+0301) is a mark of no script and is rejected too; the composed `#café`
+    passes."""
+    body = tag[1:]
+    if not tag.startswith("#") or not 1 <= len(body) <= _HASHTAG_MAX:
+        return False
+    base: str | None = None  # the script of the letter the next mark would sit on
+    marks = 0
+    for char in body:
+        category = unicodedata.category(char)
+        if category in _MARKS:
+            marks += 1
+            if marks > _MARKS_IN_A_ROW or not _mark_fits(char, base):
+                return False
+            continue
+        marks = 0
+        if category.startswith("L"):
+            base = _script(char)
+        elif category.startswith("N") or char == "_":
+            base = None
+        else:
+            return False
+    return True
+
+
 def is_mixed_script(tag: str) -> bool:
     """True when the letters come from more than one script, as in `#fyр` with a Cyrillic
     р, or a Latin tag holds a digit from another script: a mixed-script lookalike of a
     generic, disclosure or campaign tag. Japanese, Chinese and Korean mixed with Latin are
     one writing system each. A lookalike written wholly in one script (all-Cyrillic `#аԁ`)
-    is not caught here."""
+    is not caught here but by the skeleton in `is_generic` and `is_disclosure`."""
     return bool(_mixed_scripts(tag))
 
 
 def links_or_mentions(text: str) -> list[str]:
-    """Links, domains, IPs and @mentions in `text`, in order (as matched, normalized)."""
-    return [found for found, _ in _link_matches(text)]
+    """Links, domains, IPs and @mentions in `text`, in order, as typed (`name．com`, not the
+    normalized `name.com`), so a reviewer can find them in the text."""
+    return [typed for _, typed in _link_matches(text)]
 
 
 def _link_host(link: str) -> str | None:
@@ -342,17 +504,100 @@ def _link_host(link: str) -> str | None:
     return host
 
 
-def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
-    """Disclosure-like hashtags written into `text` itself, other than `allowed` ones."""
-    ok = {_fold(t) for t in allowed}
+def _inline_tags(text: str, *, in_links: bool = False) -> list[tuple[str, int, int]]:
+    """Each hashtag written into `text`, as read on the match copy (so `#fyp` padded with
+    an invisible or combining character reads as `#fyp`), with its span in `text`. The
+    span runs to the next character the copy kept, so the padding and any marks after the
+    tag go with it (the copy keeps no marks). A tag with an invisible character inside
+    (`#fyp` + ZWJ + `x`) is also read up to it, since a platform may end the tag there; both
+    readings share the span. A `#` inside a URL (`https://site.com/page#fyp`) starts no tag
+    unless `in_links`: the link rules judge it (see `_URL`)."""
+    copy, origin = _match_copy(text)
+    links = [
+        (m.start(), _LINK_PATH.match(copy, m.end()).end() if _URL.match(m.group(0)) else m.end())
+        for m in LINK_OR_MENTION.finditer(copy)
+        if not in_links
+    ]
+    tags: list[tuple[str, int, int]] = []
+    for m in _INLINE_TAG.finditer(copy):
+        if any(a <= m.start() < b for a, b in links):
+            continue
+        end = origin[m.end()] if m.end() < len(copy) else len(text)
+        end = max(end, origin[m.end() - 1] + 1)
+        cut = next(
+            (
+                k
+                for k in range(m.start() + 2, m.end())
+                if any(map(_is_padding, text[origin[k - 1] + 1 : origin[k]]))
+            ),
+            None,
+        )
+        if cut is not None:
+            tags.append((copy[m.start() : cut], origin[m.start()], end))
+        tags.append((m.group(0), origin[m.start()], end))
+    return tags
+
+
+def _stacked(span: str) -> bool:
+    """More than 4 combining marks in a row (`#ก` under 49 tone marks)."""
+    run = 0
+    for char in span:
+        run = run + 1 if unicodedata.category(char).startswith("M") else 0
+        if run > _MARKS_IN_A_ROW:
+            return True
+    return False
+
+
+def _unusable_inline(text: str) -> list[tuple[str, int, int]]:
+    """The readings of the inline hashtags that `strip_unusable_tags` takes out of `text`."""
     return [
-        t for t in _INLINE_TAG.findall(_match_text(text)) if is_disclosure(t) and _fold(t) not in ok
+        (tag, start, end)
+        for tag, start, end in _inline_tags(text)
+        if _unusable(tag) or _stacked(text[start:end])
     ]
 
 
+def strip_unusable_tags(text: str) -> str:
+    """`text` without the inline hashtags that `clean_hashtags` would drop, with any extra
+    `#` or invisible character straight before them (`##ad`, ZWJ + `#fyp`)."""
+    parts: list[str] = []
+    last = 0
+    for _, start, end in _unusable_inline(text):
+        while start > last and (text[start - 1] == "#" or _is_padding(text[start - 1])):
+            start -= 1
+        parts.append(text[last : max(start, last)])
+        last = max(end, last)
+    parts.append(text[last:])
+    return "".join(parts)
+
+
+def inline_unusable_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
+    """Generic, malformed, mixed-script or mark-stacked hashtags written into `text` itself,
+    other than `allowed` ones; disclosure-like ones are `inline_disclosure_tags`."""
+    ok = {_fold(t) for t in allowed}
+    return [t for t, _, _ in _unusable_inline(text) if not is_disclosure(t) and _fold(t) not in ok]
+
+
+def inline_disclosure_tags(text: str, allowed: Iterable[str] = ()) -> list[str]:
+    """Disclosure-like hashtags written into `text` itself, other than `allowed` ones. A
+    `#` inside a URL counts here too (fail closed): stripping leaves URLs whole, so a
+    disclosure-like fragment holds the post for a person to look at."""
+    ok = {_fold(t) for t in allowed}
+    return [
+        t
+        for t, _, _ in _inline_tags(text, in_links=True)
+        if is_disclosure(t) and _fold(t) not in ok
+    ]
+
+
+def _unusable(tag: str) -> bool:
+    """Malformed, generic, disclosure-like or mixed-script: never a model's tag."""
+    return not is_hashtag(tag) or is_generic(tag) or is_disclosure(tag) or is_mixed_script(tag)
+
+
 def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -> list[str]:
-    """Lenient: malformed, generic, mixed-script and repeated tags are dropped, the rest cut
-    to `limit`."""
+    """Lenient: malformed, generic, disclosure-like, mixed-script and repeated tags are
+    dropped, the rest cut to `limit`."""
     out: list[str] = []
     seen: set[str] = set()
     for raw in tags:
@@ -360,13 +605,7 @@ def clean_hashtags(tags: Iterable[object], limit: int = _VARIANT_HASHTAGS_MAX) -
             continue
         tag = normalize_hashtag(raw)
         key = _fold(tag)
-        usable = (
-            HASHTAG.fullmatch(tag)
-            and not is_generic(tag)
-            and not is_disclosure(tag)
-            and not is_mixed_script(tag)
-        )
-        if usable and key not in seen:
+        if not _unusable(tag) and key not in seen:
             seen.add(key)
             out.append(tag)
     return out[:limit]
@@ -404,13 +643,13 @@ class Variant(BaseModel):
 
     @field_validator("title", mode="after")
     @classmethod
-    def _clean_title(cls, value: str) -> str:
-        return strip_control(value)
+    def _clean_title(cls, value: str, info: ValidationInfo) -> str:
+        return _without_disclosure("title", value, clean_title(value), info)
 
     @field_validator("caption", mode="after")
     @classmethod
-    def _clean_caption(cls, value: str) -> str:
-        return clean_caption(value)
+    def _clean_caption(cls, value: str, info: ValidationInfo) -> str:
+        return _without_disclosure("caption", value, clean_caption(value), info)
 
     @field_validator("hashtags", mode="after")
     @classmethod
@@ -419,14 +658,14 @@ class Variant(BaseModel):
         if len(tags) > _VARIANT_HASHTAGS_MAX:
             raise ValueError(f"at most {_VARIANT_HASHTAGS_MAX} hashtags")
         for tag in tags:
-            if not HASHTAG.fullmatch(tag):
+            if not is_hashtag(tag):
                 raise ValueError(f"invalid hashtag {tag!r}")
+            if mixed := _mixed_scripts(tag):
+                raise ValueError(f"hashtag {tag} mixes scripts ({', '.join(mixed)})")
             if is_generic(tag):
                 raise ValueError(f"generic hashtag {tag} says nothing about the clip")
             if is_disclosure(tag):
                 raise ValueError(f"hashtag {tag} reads as a paid-partnership disclosure")
-            if mixed := _mixed_scripts(tag):
-                raise ValueError(f"hashtag {tag} mixes scripts ({', '.join(mixed)})")
         if len({_fold(t) for t in tags}) != len(tags):
             raise ValueError("duplicate hashtags")
         return tags
@@ -452,6 +691,21 @@ class Variant(BaseModel):
         return self
 
 
+def _without_disclosure(field: str, value: str, cleaned: str, info: ValidationInfo) -> str:
+    """`cleaned`, unless `value` or `cleaned` has a disclosure-like inline tag: only a
+    campaign adds those, so a reviewer is told rather than the tag silently dropped. A `#`
+    inside a URL is left to the link rules and the pre-flight (see `_URL`)."""
+    found = [t for text in (value, cleaned) for t, _, _ in _inline_tags(text) if is_disclosure(t)]
+    if found:
+        platform = (info.context or {}).get("platform")
+        where = f"{platform} " if platform else ""
+        raise ValueError(
+            f"{where}{field} has disclosure-like tags {' '.join(dict.fromkeys(found))};"
+            " only a campaign adds those"
+        )
+    return cleaned
+
+
 def _hashtag_line(tags: Sequence[str]) -> str:
     return " ".join(tags)
 
@@ -465,19 +719,65 @@ def caption_room(platform: str, tags: Sequence[str]) -> int:
 
 
 def _fit(platform: str, title: str, caption: str, tags: Sequence[object]) -> Variant:
+    return _refit(platform, title, caption, tags)[0]
+
+
+def _refit(
+    platform: str, title: str, caption: str, tags: Sequence[object]
+) -> tuple[Variant, list[str]]:
+    """A variant inside the platform's limits, and what was changed to get there: hashtags
+    dropped, inline tags removed, `<` and `>` removed (YouTube), text cut. Cleaning runs
+    again after the cut, since a hard cut can end mid-tag (`#adventure` -> `#ad`)."""
     limits = _limits(platform)
     hashtags = clean_hashtags(tags, limits.hashtags_max)
-    title, caption = strip_control(title), clean_caption(caption)
-    if platform == "youtube":
-        title, caption = _ANGLE.sub("", title), _ANGLE.sub("", caption)
-    return Variant.model_validate(
-        {
-            "title": truncate_words(title, limits.title_max, limits.length),
-            "caption": truncate_words(caption, caption_room(platform, hashtags), limits.length),
-            "hashtags": hashtags,
-        },
-        context={"platform": platform},
+    notes: list[str] = []
+    kept = list(hashtags)
+    dropped: list[str] = []
+    for raw in tags:
+        tag = normalize_hashtag(raw) if isinstance(raw, str) else None
+        if tag in kept:
+            kept.remove(tag)
+        elif tag is not None:
+            dropped.append(tag)
+    if dropped:
+        notes.append(f"dropped hashtags {' '.join(dropped)}")
+    fitted: dict[str, str] = {}
+    for field, text, clean, limit in (
+        ("title", title, clean_title, limits.title_max),
+        ("caption", caption, clean_caption, caption_room(platform, hashtags)),
+    ):
+        changes: list[str] = []
+        out = text
+        if platform == "youtube" and _ANGLE.search(out):
+            out = _ANGLE.sub("", out)
+            changes.append(f"removed < and > from the {field}")
+        out, removed = _clean_fully(out, clean)
+        if limits.length(out) > limit:
+            out = truncate_words(out, limit, limits.length)
+            changes.append(f"cut the {field} to fit {limit:,} {limits.unit}")
+        out, removed_after_cut = _clean_fully(out, clean)
+        changes += [f"removed {t} from the {field}" for t in [*removed, *removed_after_cut]]
+        if out != text and not changes:
+            changes.append(f"cleaned the {field}")
+        notes += changes
+        fitted[field] = out
+    variant = Variant.model_validate(
+        {**fitted, "hashtags": hashtags}, context={"platform": platform}
     )
+    return variant, notes
+
+
+def _clean_fully(text: str, clean: Callable[[str], str]) -> tuple[str, list[str]]:
+    """`text` cleaned until cleaning changes nothing (taking a tag out can join two halves
+    into a new one), and the inline tags taken out, as typed."""
+    removed: list[str] = []
+    while True:
+        spans = dict.fromkeys((start, end) for _, start, end in _unusable_inline(text))
+        removed += [text[start:end] for start, end in spans]
+        cleaned = clean(text)
+        if cleaned == text:
+            return text, removed
+        text = cleaned
 
 
 def derive_variants(
@@ -495,10 +795,20 @@ def coerce_variants(
     """Variants from untrusted JSON (model output, a stored column). An entry that is
     already valid for its platform is kept exactly (a reviewer's saved text reads back
     unchanged); another well-formed entry is cleaned into the limits; anything else is
-    derived from the single title, caption and hashtags."""
+    derived from the single title, caption and hashtags. Never raises."""
+    return coerce_variants_with_notes(raw, title, caption, hashtags)[0]
+
+
+def coerce_variants_with_notes(
+    raw: object, title: str | None, caption: str | None, hashtags: Iterable[object]
+) -> tuple[dict[str, Variant], dict[str, list[str]]]:
+    """`coerce_variants`, and per platform what was changed in a well-formed entry that no
+    longer validates (a stored variant from before a stricter rule), so the reviewer can be
+    told. A derived entry has no notes: there was no text of that platform's to change."""
     entries = raw if isinstance(raw, Mapping) else {}
     tags = list(hashtags)
     out: dict[str, Variant] = {}
+    notes: dict[str, list[str]] = {}
     for platform in PLATFORMS:
         entry = entries.get(platform)
         if not (
@@ -515,8 +825,12 @@ def coerce_variants(
                 context={"platform": platform},
             )
         except ValidationError:
-            out[platform] = _fit(platform, entry["title"], entry["caption"], entry["hashtags"])
-    return out
+            out[platform], changes = _refit(
+                platform, entry["title"], entry["caption"], entry["hashtags"]
+            )
+            if changes:
+                notes[platform] = changes
+    return out, notes
 
 
 def variants_json(variants: Mapping[str, Variant]) -> dict[str, dict[str, Any]]:
@@ -575,12 +889,13 @@ def build_post_metadata(
     campaign: list[str] = []
     for raw in campaign_tags:
         tag = normalize_hashtag(raw)
-        if not HASHTAG.fullmatch(tag):
+        if not is_hashtag(tag):
             raise ValueError(f"invalid campaign tag {raw!r}")
         if _fold(tag) not in {_fold(t) for t in campaign}:
             campaign.append(tag)
-    taken = {_fold(t) for t in campaign}
-    own = [t for t in variant.hashtags if _fold(t) not in taken]
+    # A model tag that reads as a campaign tag (`#ᴠyro` for `#vyro`) gives way to it.
+    taken = {_skeleton(_prefold(t)) for t in campaign}
+    own = [t for t in variant.hashtags if _skeleton(_prefold(t)) not in taken]
     own = own[: max(0, limits.post_hashtags_max - len(campaign))]
     hashtags = [*own, *campaign]
     line = _hashtag_line(hashtags)
@@ -644,10 +959,17 @@ def _mentions(text: str, keyword: str) -> bool:
 
 
 def preflight(
-    metadata: PostMetadata, platform: str, clip_seconds: float, brief: Brief | None = None
+    metadata: PostMetadata,
+    platform: str,
+    clip_seconds: float,
+    brief: Brief | None = None,
+    *,
+    plain: bool = False,
 ) -> list[str]:
     """Problems that would get the post rejected by the platform or the campaign; empty
-    when it is good to schedule."""
+    when it is good to schedule. A `plain` post (no campaign) is not held for links,
+    mentions or too few hashtags: those are campaign rules. It is held for any hashtag a
+    variant could not hold (disclosure-like, malformed or mixed-script)."""
     limits = _limits(platform)
     problems: list[str] = []
     if not limits.min_seconds <= clip_seconds <= limits.max_seconds:
@@ -663,11 +985,17 @@ def preflight(
     count = len(metadata.hashtags)
     if count > limits.post_hashtags_max:
         problems.append(f"{platform}: {count} hashtags, at most {limits.post_hashtags_max}")
-    if count < limits.hashtags_min:
+    if count < limits.hashtags_min and not plain:
         problems.append(f"{platform}: {count} hashtags, use at least {limits.hashtags_min}")
     generic = [t for t in metadata.hashtags if is_generic(t)]
     if generic:
         problems.append(f"{platform}: generic hashtags {' '.join(generic)}")
+    # Without a campaign nothing may add a disclosure tag, so the stored list is checked
+    # again in full: it may predate a rule, or come from somewhere other than a variant.
+    if plain and (bad := [t for t in metadata.hashtags if _unusable(t) and not is_generic(t)]):
+        problems.append(
+            f"{platform}: disclosure-like, malformed or mixed-script hashtags {' '.join(bad)}"
+        )
     if platform == "youtube" and not metadata.title.strip():
         problems.append("youtube: the title is empty")
     if platform == "youtube" and _ANGLE.search(metadata.title + metadata.caption):
@@ -675,15 +1003,20 @@ def preflight(
     # An allowed match must also read the same as typed (up to NFKC): a combining mark in a
     # host is stripped for matching but would still be posted, to a different IDN host.
     found = [
-        f
+        typed
         for f, typed in _link_matches(f"{metadata.title}\n{metadata.caption}")
         if not (brief and brief.allows(f) and _fold(typed) == _fold(f))
     ]
-    if found:
+    if found and not plain:
         problems.append(f"{platform}: links or mentions to check: {', '.join(found)}")
     inline = inline_disclosure_tags(f"{metadata.title}\n{metadata.caption}", metadata.hashtags)
     if inline:
         problems.append(f"{platform}: disclosure-like tags in the text: {' '.join(inline)}")
+    unusable = inline_unusable_tags(f"{metadata.title}\n{metadata.caption}", metadata.hashtags)
+    if unusable:
+        problems.append(
+            f"{platform}: generic, malformed or mixed-script tags in the text: {' '.join(unusable)}"
+        )
     if limits.length(metadata.title) > limits.title_max:
         problems.append(f"{platform}: title is longer than {limits.title_max} {limits.unit}")
     if limits.length(metadata.caption) > limits.caption_max:

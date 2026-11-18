@@ -132,6 +132,18 @@ def test_too_short_clip_is_held_with_the_reason(env: Env) -> None:
     assert post.error is not None and "under the brief's 20 s" in post.error
 
 
+def test_clip_over_the_platform_length_is_held_on_a_campaign_account(env: Env) -> None:
+    """Outside the platform's length range, a campaign post is held with the reason, not
+    skipped: the reviewer sees why it was not scheduled (CLP-94 x CLP-97)."""
+    fb = account(id="fb_main", platform="facebook")
+    brief = campaign(platforms=["tiktok", "youtube", "facebook"])
+
+    [post] = schedule(env, rendered_clip(env, seconds=95), fb, vyro_mrbeast=brief)
+
+    assert post.status == PostStatus.HELD
+    assert post.error is not None and "facebook: clip length 95 s is outside 3-90 s" in post.error
+
+
 def test_missing_required_tag_is_held(env: Env) -> None:
     # A required tag the post cannot carry: Instagram caps hashtags at 5.
     tags = campaign(required_hashtags=[f"#tag{n}" for n in range(6)], platforms=["instagram"])

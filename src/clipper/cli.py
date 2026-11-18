@@ -31,16 +31,17 @@ from clipper.export import DEFAULT_OUTPUT_DIR
 from clipper.monitor import CycleReport, FirstRun, YouTubeMonitor
 from clipper.pipeline import build_stages
 from clipper.posting.cli import app as posts_app
-from clipper.posting.stage import PostingStage
+from clipper.posting.stage import HEARTBEAT_BUSY_MS, PostingStage
 from clipper.submissions_cli import app as campaigns_app
 from clipper.urls import InvalidSourceURL, parse_source_url
 
 if TYPE_CHECKING:
     import httpx
 
-    from clipper.accounts import AccountsConfig
+    from clipper.accounts import Account, AccountsConfig
     from clipper.campaigns import PostingConfig
     from clipper.notify import Notify
+    from clipper.posting.models import Publisher
     from clipper.resolve import Resolved
     from clipper.sources.youtube import MetadataProvider, YouTubeSource
 
@@ -52,6 +53,8 @@ app = typer.Typer(
     help="24/7 auto-clipper: detect, transcribe, select highlights, render, review.",
     no_args_is_help=True,
     add_completion=False,
+    # Older typer printed local variables (environment, secrets) in tracebacks by default.
+    pretty_exceptions_show_locals=False,
 )
 app.add_typer(posts_app, name="posts")
 app.add_typer(campaigns_app, name="campaigns")
@@ -164,6 +167,21 @@ def _check_accounts(config_path: Path, cfg: AppConfig) -> AccountsConfig:
     return accounts
 
 
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Check ffmpeg, ffprobe, yt-dlp, its challenge solver (Deno) and node.
+
+    Needs no config file or database. Exits 1 when any check failed."""
+    from clipper import doctor
+
+    checks = doctor.run_checks()
+    for check in checks:
+        typer.echo(doctor.format_check(check))
+    typer.echo(doctor.summary(checks))
+    if any(c.status == "fail" for c in checks):
+        raise typer.Exit(code=1)
+
+
 @app.command("migrate")
 def migrate_cmd(ctx: typer.Context) -> None:
     """Create or upgrade the SQLite schema."""
@@ -224,10 +242,18 @@ def run_monitor(
             "--first-run", help="Override first_run_mode for creators polled the first time."
         ),
     ] = None,
+    media_dir: Annotated[
+        Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Per-job media the janitor cleans.")
+    ] = jobs.DEFAULT_MEDIA_ROOT,
 ) -> None:
-    """Poll creators 24/7 and enqueue new content.
+    """Poll creators 24/7 and enqueue new content. Between polls, the janitor applies the
+    retention and disk budget settings to the media dir at most once an hour (the disk
+    budget also counts the models dir, CLIPPER_MODELS_DIR, which it only reads).
 
     SIGTERM/SIGINT finish the current creator's poll, then exit."""
+    from clipper.janitor import Janitor
+    from clipper.notify import log_notify
+    from clipper.pipeline.transcribe import models_dir
     from clipper.pipeline.ytdlp import YtDlpError
 
     app_ctx = _app(ctx)
@@ -249,11 +275,18 @@ def run_monitor(
     stop_event = threading.Event()
     try:
         with _http_client() as http:
+            monitor_alert = _alert_webhook(http, secrets)
+            _preflight("run-monitor", monitor_alert)
             try:
                 source = _youtube_source(secrets, http, stop_event)
             except YtDlpError as exc:
                 _fail(f"run-monitor: {exc}")
-            monitor = YouTubeMonitor(conn, cfg, source, first_run_mode=first_run, stop=stop_event)
+            janitor = Janitor(
+                conn, cfg, media_dir, monitor_alert or log_notify, models_dir=models_dir()
+            )
+            monitor = YouTubeMonitor(
+                conn, cfg, source, first_run_mode=first_run, stop=stop_event, janitor=janitor.tick
+            )
             if once:
                 report = monitor.run_cycle(creators)
                 _print_cycle(report)
@@ -303,27 +336,59 @@ def _posting_config(conn: sqlite3.Connection, config_path: Path) -> PostingConfi
     return live
 
 
+def _webhook(
+    http: httpx.Client, value: SecretStr | None, name: str, *, strict: bool = True
+) -> Notify | None:
+    """The Discord webhook `name` holds, None when unset. A malformed URL stops the worker;
+    the monitor (`strict=False`) logs it, by name only, and treats it as unset."""
+    from clipper.notify import DiscordWebhook
+
+    if value is None or not value.get_secret_value().strip():
+        return None
+    try:
+        return DiscordWebhook(value.get_secret_value().strip(), http)
+    except ValueError:
+        problem = f"{name} must be a https://discord.com/api/webhooks/... URL"
+        if strict:
+            _fail(problem)
+        logger.error("run-monitor: %s; ignoring it", problem)
+        return None
+
+
+def _alert_webhook(http: httpx.Client, secrets: Secrets) -> Notify | None:
+    """The monitor's alerts: the worker's alert webhook (DISCORD_ALERTS_WEBHOOK_URL, else
+    DISCORD_WEBHOOK_URL), else None. A malformed URL never stops detection."""
+    name = "DISCORD_ALERTS_WEBHOOK_URL"
+    alerts = _webhook(http, secrets.discord_alerts_webhook_url, name, strict=False)
+    pings = secrets.discord_webhook_url
+    return alerts or _webhook(http, pings, "DISCORD_WEBHOOK_URL", strict=False)
+
+
+def _preflight(service: str, alert: Notify | None) -> None:
+    """Doctor's Deno solver check, once at boot (CLP-129): logs and alerts, never stops.
+    The log fallback (`log_notify`) counts as no alert: it would repeat the ERROR line."""
+    try:
+        from clipper import doctor
+        from clipper.notify import log_notify
+
+        doctor.startup_check(service, None if alert is log_notify else alert)
+    except Exception:
+        logger.exception("%s: the Deno solver check crashed", service)
+
+
 def _notifiers(http: httpx.Client) -> tuple[Notify, Notify]:
     """Discord webhooks for submission pings and missed-deadline alerts. Pings go to
     DISCORD_WEBHOOK_URL, alerts to DISCORD_ALERTS_WEBHOOK_URL (else the ping webhook);
     without either, messages go to the log. A malformed URL stops the worker."""
-    from clipper.notify import DiscordWebhook, log_notify
+    from clipper.notify import log_notify
 
     try:
         secrets = Secrets()
     except ValidationError as exc:
         _fail(f"run-worker: {exc}")
 
-    def hook(value: SecretStr | None, name: str) -> Notify | None:
-        if value is None or not value.get_secret_value().strip():
-            return None
-        try:
-            return DiscordWebhook(value.get_secret_value().strip(), http)
-        except ValueError:
-            _fail(f"{name} must be a https://discord.com/api/webhooks/... URL")
-
-    notify = hook(secrets.discord_webhook_url, "DISCORD_WEBHOOK_URL")
-    alert = hook(secrets.discord_alerts_webhook_url, "DISCORD_ALERTS_WEBHOOK_URL")
+    notify = _webhook(http, secrets.discord_webhook_url, "DISCORD_WEBHOOK_URL")
+    alert = _webhook(http, secrets.discord_alerts_webhook_url, "DISCORD_ALERTS_WEBHOOK_URL")
     if notify is None:
         logger.warning("DISCORD_WEBHOOK_URL is not set: campaign submission pings go to the log")
     return notify or log_notify, alert or notify or log_notify
@@ -341,7 +406,9 @@ def run_worker(
     ] = None,
     recover_id: Annotated[
         str | None,
-        typer.Option(help="Release jobs claimed by this dead worker id before starting."),
+        typer.Option(
+            help="Release jobs and uploading posts claimed by this dead worker id before starting."
+        ),
     ] = None,
     poll_seconds: Annotated[float, typer.Option(min=0.1, help="Idle sleep.")] = (
         jobs.DEFAULT_POLL_SECONDS
@@ -349,9 +416,15 @@ def run_worker(
     once: Annotated[bool, typer.Option(help="Run one stage of one job, then exit.")] = False,
 ) -> None:
     """Process queued jobs through the clip pipeline."""
+    if recover_id is not None and not recover_id.isprintable():
+        _fail("run-worker: --recover-id must not contain control characters")
+    from clipper.accounts import accounts_by_id
+
     app_ctx = _app(ctx)
     try:
         cfg = load_config(app_ctx.config_path)
+        # Read once at start (CLP-106): restart the worker after editing accounts.yaml.
+        accounts = accounts_by_id(app_ctx.config_path, cfg)
     except ConfigError as exc:
         _fail(str(exc))
     _setup_logging()
@@ -371,15 +444,33 @@ def run_worker(
     live = _posting_config(conn, app_ctx.config_path)
     http = _http_client()
     notify, alert = _notifiers(http)
-    # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
+    _preflight("run-worker", alert)
+    worker.alert = alert
+    # The posting pass runs on its own thread (CLP-105), so it gets its own connection;
+    # check_same_thread=False only because `recover` uses it here before that thread starts.
+    # The guard and the submission pass run on that thread too, so they use it as well.
+    # Its upload heartbeat opens one more, per upload.
+    db_path = app_ctx.db_path
+    try:
+        posting_conn = connect(db_path, check_same_thread=False)
+    except (sqlite3.Error, OSError) as exc:
+        http.close()
+        conn.close()
+        _fail(f"cannot open database {db_path}: {exc}")
+    stop = threading.Event()
+    # Platforms without a registered publisher keep their due posts scheduled.
+    publishers = _publishers(app_ctx.config_path, cfg)
     posting = PostingStage(
-        conn=conn,
-        publishers={},
+        conn=posting_conn,
+        publishers=publishers,
         worker_id=worker.worker_id,
         media_root=media_dir,
-        guard=publish_guard(conn, live, media_dir.resolve()),
+        guard=publish_guard(posting_conn, live, media_dir.resolve()),
+        connect=lambda: connect(db_path, busy_timeout_ms=HEARTBEAT_BUSY_MS),
+        stop=stop,
+        accounts=accounts,
     )
-    submitting = SubmissionPass(conn, LiveCampaigns(live), notify, alert)
+    submitting = SubmissionPass(posting_conn, LiveCampaigns(live), notify, alert)
     worker.posting = ChainedPasses([posting, submitting])
     try:
         if recover_id:
@@ -388,14 +479,79 @@ def run_worker(
             if not worker.run_once():
                 typer.echo("no due jobs")
             return
-        stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         worker.run_forever(stop, poll_seconds=poll_seconds)
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
     finally:
-        http.close()
+        # A posting thread that outlived an interrupt may still be using its connection,
+        # the publishers and the webhook client; leave those to process exit rather than
+        # close them under the thread.
+        if not worker.posting_running:
+            for publisher in publishers.values():
+                close = getattr(publisher, "close", None)
+                if callable(close):
+                    close()
+            posting_conn.close()
+            http.close()
         conn.close()
+
+
+def _posting_accounts(config_path: Path, cfg: AppConfig) -> list[Account]:
+    """The accounts from accounts.yaml (CLP-91); none when the file is missing."""
+    from clipper.accounts import accounts_path, load_accounts
+
+    try:
+        return list(load_accounts(accounts_path(config_path), cfg).accounts)
+    except ConfigError as exc:
+        _fail(str(exc))
+
+
+@app.command("meta-tokens")
+def meta_tokens(ctx: typer.Context) -> None:
+    """Check the Facebook and Instagram account tokens: valid, and when they expire.
+
+    Exits 1 when a token is missing, invalid or expires within 7 days. Prints names and
+    dates only, never a token."""
+    from clipper.jobs.models import utcnow
+    from clipper.publish.meta import GraphClient, token_report
+
+    try:
+        cfg = load_config(_app(ctx).config_path)
+    except ConfigError as exc:
+        _fail(str(exc))
+    accounts = [
+        a
+        for a in _posting_accounts(_app(ctx).config_path, cfg)
+        if a.enabled and a.platform in ("facebook", "instagram")
+    ]
+    if not accounts:
+        typer.echo("no facebook or instagram accounts")
+        return
+    healthy = True
+    with _http_client() as http:
+        client = GraphClient(http)
+        for account in accounts:
+            ok, line = token_report(client, account.id, utcnow())
+            healthy = healthy and ok
+            typer.echo(f"{account.id} {account.platform}: {line}")
+    if not healthy:
+        raise typer.Exit(code=1)
+
+
+def _publishers(config_path: Path, cfg: AppConfig) -> dict[str, Publisher]:
+    """Publishers for the platforms the accounts config posts to (CLP-93). The worker has
+    already checked the accounts config (`_posting_config` stops it when invalid); if the
+    file turns invalid in between, posting is off rather than the worker stopping."""
+    from clipper.accounts import accounts_path, load_accounts
+    from clipper.posting.publishers import build_publishers
+
+    try:
+        accounts = load_accounts(accounts_path(config_path), cfg)
+    except ConfigError as exc:
+        logging.getLogger(__name__).error("posting is off: %s", exc)
+        return {}
+    return build_publishers(accounts, Secrets())
 
 
 def _trusts_every_client(forwarded_allow_ips: str) -> bool:
@@ -472,6 +628,7 @@ def run_review(
         config = load_config(_app(ctx).config_path)  # content types for the faces check
     except ConfigError as exc:
         _fail(f"run-review: {exc}")
+    accounts = _posting_accounts(_app(ctx).config_path, config)  # approve schedules on these
     try:
         secrets = Secrets()
         application = create_app(
@@ -483,6 +640,7 @@ def run_review(
             output_dir=output_dir.resolve(),
             rclone_remote=secrets.rclone_remote,
             config=config,
+            accounts=accounts,
         )
     except (MissingSecretError, ValidationError, ValueError) as exc:
         _fail(f"run-review: {exc}")
@@ -759,9 +917,18 @@ def status() -> None:
 
 @app.command("retry")
 def retry(
-    ctx: typer.Context, job_id: Annotated[int, typer.Argument(help="Job ID to retry.")]
+    ctx: typer.Context,
+    job_id: Annotated[int, typer.Argument(help="Job ID to retry.")],
+    media_root: Annotated[
+        Path,
+        typer.Option(
+            envvar="CLIPPER_MEDIA_DIR", help="Per-job stage artifacts (render failure counts)."
+        ),
+    ] = jobs.DEFAULT_MEDIA_ROOT,
 ) -> None:
-    """Re-queue a failed or skipped job."""
+    """Re-queue a failed or skipped job, with fresh render tries for every clip."""
+    from clipper.pipeline.render_clips import clear_failures
+
     conn = _open_db(_app(ctx).db_path)
     try:
         job = jobs.get_job(conn, job_id)
@@ -769,6 +936,11 @@ def retry(
             _fail(f"job {job_id} not found")
         if job.status not in jobs.RETRYABLE:
             _fail(f"job {job_id} is {job.status}; only failed/skipped jobs can be retried")
+        try:  # before the requeue, while no worker can touch the job
+            clear_failures(media_root.resolve() / job.ref.key)  # the key is a validated SourceRef
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+            typer.echo(f"warning: render failure counts not cleared: {reason}", err=True)
         job = jobs.requeue(conn, job_id, jobs.utcnow())
     except (sqlite3.Error, jobs.JobConflict) as exc:
         _fail(f"retry failed: {exc}")

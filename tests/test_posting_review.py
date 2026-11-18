@@ -93,6 +93,22 @@ def test_approve_schedules_one_post_per_account(client: TestClient, env: Env) ->
     assert "Scheduled 2 post(s)" in client.get("/queue").text
 
 
+def test_approve_says_a_plain_post_was_held_by_the_preflight(env: Env) -> None:
+    """CLP-111: posts outside a campaign are held by the platform pre-flight too."""
+    ig = FakeAccount(id="ig_main", platform="instagram", windows=["00:00-23:59"])
+    client = logged_in(env, accounts=(ig,))
+    clip_id = video_clip(env, duration_s=200.0)  # Instagram takes 3-180 s
+
+    post(client, f"/clip/{clip_id}/approve", version=1)
+
+    assert [p.status for p in posts_for(env, clip_id)] == [PostStatus.HELD]
+    assert "1 post(s) held by the pre-flight (ig_main)" in client.get("/queue").text
+    page = client.get("/scheduled").text
+    assert "Held by the pre-flight" in page and "campaign pre-flight" not in page
+    # CLP-112: the help text fits a plain post too.
+    assert "rejected by their platform" in page and "break their campaign's brief and" not in page
+
+
 def test_approve_without_accounts_schedules_nothing(env: Env) -> None:
     client = logged_in(env)
     clip_id = video_clip(env)

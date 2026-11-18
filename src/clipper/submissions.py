@@ -24,7 +24,7 @@ import math
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
@@ -33,13 +33,17 @@ from clipper.campaigns import Campaign
 from clipper.config import ConfigError
 from clipper.db import transaction
 from clipper.jobs.models import Clock, from_iso, to_iso, utcnow
-from clipper.notify import Notify
+from clipper.notify import Notify, NotifyError
 from clipper.posting.models import Post, PostStatus, plain_https
 from clipper.redact import redact
 
 REMIND_BEFORE = timedelta(minutes=10)
 RETRY_FIRST = timedelta(seconds=30)
 RETRY_MAX = timedelta(minutes=10)
+# Statuses that mean the webhook itself is broken (unauthorised, revoked, deleted), not
+# the message: backed off and retried like an outage until the operator fixes the URL.
+# A 3xx counts too: a redirect on a webhook POST means the URL is misrouted.
+WEBHOOK_BROKEN = frozenset({401, 403, 404})
 RPM_PLACES = Decimal("0.01")
 MAX_PAYOUT = Decimal("1000000000")
 MAX_VIEWS = 10**15
@@ -209,15 +213,27 @@ def _new_posts(conn: sqlite3.Connection) -> list[Post]:
 
 
 def create_due(
-    conn: sqlite3.Connection, campaigns: Mapping[str, Campaign], now: datetime
+    conn: sqlite3.Connection,
+    campaigns: Mapping[str, Campaign],
+    now: datetime,
+    warned: set[int] | None = None,
 ) -> list[Submission]:
     """A pending submission for every posted campaign post with a plain https URL that
-    has none yet. The deadline counts from the post time, not from now."""
+    has none yet. The deadline counts from the post time, not from now. A post whose
+    URL is not plain https is skipped with a warning, once per post id in `warned`."""
     created: list[Submission] = []
     for post in _new_posts(conn):
         url = post.safe_url
         if url is None or post.posted_at is None or post.campaign_id is None:
-            continue  # only a link we would hand out
+            # Only a link we would hand out. The URL is not logged: it may forge text.
+            if warned is None or post.id not in warned:
+                logger.warning(
+                    "post %d: its URL is not a plain https link; no submission recorded",
+                    post.id,
+                )
+                if warned is not None:
+                    warned.add(post.id)
+            continue
         campaign = campaigns.get(post.campaign_id)
         minutes = campaign.submit_within_minutes if campaign else None
         deadline = post.posted_at + timedelta(minutes=minutes) if minutes else None
@@ -423,6 +439,12 @@ Submitter = Callable[[Submission], None]
 """Submits one link to a program's documented API; raises on failure."""
 
 
+def _stamp(moment: datetime) -> str:
+    """A ping stamp, to the millisecond: `_release` clears only its own claim, so two
+    workers in one second must not write the same text. `from_iso` reads both forms."""
+    return moment.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def _when(moment: datetime | None) -> str:
     return moment.strftime("%Y-%m-%d %H:%M UTC") if moment else "-"
 
@@ -479,9 +501,14 @@ class SubmissionPass:
     """One pass per worker poll: record new submissions, ping, remind, alert.
 
     Each message is claimed in the DB before it is sent (`<column> IS NULL` -> now), so two
-    workers never send the same one; a failed send releases the claim for a retry. When a
-    webhook fails, it is backed off as a whole (30 s doubling to 10 min) and the rest of
-    the pass skips it, so a Discord outage costs one timeout per backoff, not one per row."""
+    workers never send the same one. When a webhook is unreachable, returns 429, 5xx, 3xx
+    or 401/403/404 (a broken webhook: logged as an error, the URL needs fixing), or a
+    notifier raises anything but `NotifyError`, the claim is released for a retry
+    and the webhook is backed off as a whole (30 s doubling to 10 min; a 429's wait is
+    honoured up to 10 min) and the rest of the pass skips it, so a Discord outage
+    costs one timeout per backoff, not one per row. Any other 4xx means Discord refused
+    that one message: it keeps its claim (a resend would fail the same way) and is logged;
+    the link stays on the review app's Campaigns page."""
 
     conn: sqlite3.Connection
     campaigns: Mapping[str, Campaign]
@@ -491,12 +518,13 @@ class SubmissionPass:
     submitters: Mapping[str, Submitter] = field(default_factory=dict)
     _backoff: dict[int, _Backoff] = field(default_factory=dict, init=False, repr=False)
     _down: set[int] = field(default_factory=set, init=False, repr=False)
+    _warned: set[int] = field(default_factory=set, init=False, repr=False)
 
     def run_once(self) -> int:
         now = self.clock()
         self._down = set()
         try:
-            created = create_due(self.conn, self.campaigns, now)
+            created = create_due(self.conn, self.campaigns, now, self._warned)
             fill_deadlines(self.conn, self.campaigns, now)
         except ConfigError as exc:
             # Reminders and alerts need only the stored rows: keep sending them.
@@ -580,12 +608,11 @@ class SubmissionPass:
         for column in columns:
             _ping_column(column)
         sets = ", ".join(f"{c} = COALESCE({c}, ?)" for c in columns)
-        stamp = to_iso(now)
         with transaction(self.conn):
             cur = self.conn.execute(
                 f"UPDATE campaign_submissions SET {sets}, updated_at = ?"  # noqa: S608 - checked names
                 f" WHERE id = ? AND {columns[0]} IS NULL",
-                (*([stamp] * len(columns)), stamp, submission_id),
+                (*([_stamp(now)] * len(columns)), to_iso(now), submission_id),
             )
         return cur.rowcount == 1
 
@@ -593,7 +620,7 @@ class SubmissionPass:
         for column in columns:
             _ping_column(column)
         sets = ", ".join(f"{c} = CASE WHEN {c} = ? THEN NULL ELSE {c} END" for c in columns)
-        stamp = to_iso(now)
+        stamp = _stamp(now)
         try:
             with transaction(self.conn):
                 self.conn.execute(
@@ -624,15 +651,31 @@ class SubmissionPass:
         try:
             send(text)
         except Exception as exc:
+            status = exc.status if isinstance(exc, NotifyError) else None
+            broken = status is not None and (status < 400 or status in WEBHOOK_BROKEN)
+            if status is not None and 400 <= status < 500 and status != 429 and not broken:
+                logger.error(
+                    "submission %d: %s message refused (%s); not retried, the link is on"
+                    " /campaigns",
+                    submission.id,
+                    column,
+                    redact(str(exc)),
+                )
+                return 0
             delay = min(backoff.delay * 2, RETRY_MAX) if backoff else RETRY_FIRST
+            wait = exc.retry_after if isinstance(exc, NotifyError) else None
+            if wait is not None:
+                delay = max(delay, timedelta(seconds=min(wait, RETRY_MAX.total_seconds())))
             self._backoff[key] = _Backoff(at=now + delay, delay=delay)
             self._down.add(key)
-            logger.warning(
-                "submission %d: %s message failed (%s); webhook retried in %ds",
+            logger.log(
+                logging.ERROR if broken else logging.WARNING,
+                "submission %d: %s message failed (%s); webhook retried in %ds%s",
                 submission.id,
                 column,
                 redact(str(exc)),
                 int(delay.total_seconds()),
+                "; check the webhook URL, it may be revoked or deleted" if broken else "",
             )
             self._release(submission.id, columns, now)
             return 0

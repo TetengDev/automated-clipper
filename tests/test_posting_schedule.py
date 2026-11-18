@@ -279,17 +279,18 @@ def test_an_account_with_a_bad_timezone_is_skipped(
     assert "tt_bad" in caplog.text
 
 
-def test_a_clip_over_90_s_is_not_scheduled_to_facebook(
-    env: Env, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_a_clip_over_90_s_is_held_for_facebook(env: Env) -> None:
+    """The plain pre-flight holds it (CLP-111), so the reviewer sees why and `recheck`
+    can release it."""
     fb = FakeAccount(id="fb_main", platform="facebook")
     ig = FakeAccount(id="ig_main", platform="instagram")
     clip_id = approved_clip(env, start_s=0.0, end_s=95.0, duration_s=91.0)
 
-    created = schedule_for_clip(env.conn, clip_id, [fb, ig], NOW)
+    created = {p.account_id: p for p in schedule_for_clip(env.conn, clip_id, [fb, ig], NOW)}
 
-    assert [p.account_id for p in created] == ["ig_main"]
-    assert "fb_main" in caplog.text and "91 s" in caplog.text and "3-90 s" in caplog.text
+    assert created["ig_main"].status == PostStatus.SCHEDULED
+    assert created["fb_main"].status == PostStatus.HELD
+    assert created["fb_main"].error == "facebook: clip length 91 s is outside 3-90 s"
 
 
 def test_a_90_s_clip_is_scheduled_to_facebook(env: Env) -> None:
@@ -299,14 +300,14 @@ def test_a_90_s_clip_is_scheduled_to_facebook(env: Env) -> None:
     assert [p.account_id for p in schedule_for_clip(env.conn, clip_id, [fb], NOW)] == ["fb_main"]
 
 
-def test_a_clip_under_3_s_is_not_scheduled_to_instagram(
-    env: Env, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_a_clip_under_3_s_is_held_for_instagram(env: Env) -> None:
     ig = FakeAccount(id="ig_main", platform="instagram")
     clip_id = approved_clip(env, start_s=0.0, end_s=2.5)
 
-    assert schedule_for_clip(env.conn, clip_id, [ig], NOW) == []
-    assert "ig_main" in caplog.text
+    (post,) = schedule_for_clip(env.conn, clip_id, [ig], NOW)
+
+    assert post.status == PostStatus.HELD
+    assert post.error == "instagram: clip length 2.5 s is outside 3-180 s"
 
 
 def test_scheduling_writes_an_audit_row(env: Env) -> None:
@@ -466,13 +467,14 @@ def test_publish_lets_a_clean_plain_post_go(env: Env) -> None:
 
 
 def test_a_post_without_stored_metadata_is_published_with_cleaned_text(env: Env) -> None:
-    """Posts scheduled before CLP-97 fall back to the version's single copy, which was
-    stored unchecked."""
+    """Posts scheduled before CLP-97 fall back to the version's platform variant (CLP-96),
+    built on the single copy, which was stored unchecked: the text comes out cleaned and
+    capped, with the hashtag line the variant adds to the caption."""
     stored = ["#fyp", "#ad", "#fyр", *[f"#t{i}" for i in range(8)]]
     clip_id = approved_clip(env, title="Big #fyp", caption="Watch #ad this", hashtags=stored)
     post = _plain_post(env, clip_id, "instagram", None)
 
     metadata = repo.metadata_for(env.conn, post)
 
-    assert (metadata.title, metadata.caption) == ("Big", "Watch this")
+    assert (metadata.title, metadata.caption) == ("Big", "Watch this\n\n#t0 #t1 #t2 #t3 #t4")
     assert metadata.hashtags == [f"#t{i}" for i in range(5)]  # Instagram takes 5

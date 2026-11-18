@@ -15,7 +15,8 @@ than `SCHEDULE_MIN_AHEAD` away at the finish call (a late worker, a retry), the 
 published at once instead. The post is recorded `posted` when Facebook accepts the Reel,
 which for a scheduled Reel is up to `LEAD_TIME` before it goes live.
 
-Clips longer than 90 s never get here: the scheduler skips them for Facebook (CLP-94).
+Clips longer than 90 s never get here: the pre-flight holds them for Facebook at
+scheduling and the publish-time guard checks again (CLP-94, CLP-111).
 The Reels API has no plain paid-partnership toggle (branded content needs a sponsor Page),
 so a post with `paid_partnership` set is refused rather than published undisclosed.
 """

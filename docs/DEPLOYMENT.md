@@ -472,8 +472,8 @@ cost.
 - **Facebook**: the Reel is uploaded about 25 minutes before its slot and scheduled with
   `scheduled_publish_time`, so Facebook publishes it on time. A slot less than 11
   minutes away (a late worker, a retry) is published at once. The post is marked
-  `posted` when Facebook accepts the Reel, before it goes live. Clips outside 3–90 s are
-  never scheduled to Facebook; the scheduler logs why.
+  `posted` when Facebook accepts the Reel, before it goes live. A Facebook post of a clip
+  outside 3–90 s is held with the reason, and is never uploaded.
 - **Instagram**: Instagram has no API scheduling, so the worker publishes at the slot. It
   creates a `REELS` container, uploads the file with the resumable upload, polls
   `status_code` until `FINISHED`, then calls `media_publish`. An `ERROR` or `EXPIRED`

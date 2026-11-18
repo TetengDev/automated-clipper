@@ -230,6 +230,8 @@ class Settings(_Strict):
     whisper_model: WhisperModelName = "large-v3-turbo"
     whisper_compute_type: ComputeType = "int8"
     whisper_cpu_threads: int = Field(4, ge=1, le=64)
+    max_concurrent_renders: int = Field(1, ge=1)
+    """Rendering stage runs at once across the workers sharing the media root (CLP-34)."""
     selector: Selector = "api"
     """How highlights are picked (CLP-81): the paid Messages API (ANTHROPIC_API_KEY), or
     the Claude Code CLI on a Claude subscription (CLAUDE_CODE_OAUTH_TOKEN or a local login)."""

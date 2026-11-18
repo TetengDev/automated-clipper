@@ -1,8 +1,10 @@
+import contextlib
 import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -553,6 +555,41 @@ def test_thumbnail_failure_publishes_nothing(
     assert (out / "clip.mp4").read_bytes() == b"previous"
 
 
+def test_stage_clip_publishes_only_on_publish(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    """CLP-66: the stage checks and records a clip before its files go live."""
+    out = tmp_path / "out"
+    staged = render.stage_clip(
+        EDL_DATA, media_root, out, runner=FakeRunner(), render_dir=render_dir, basename="v1"
+    )
+    assert sorted(p.name for p in out.iterdir()) == [".v1.work"]
+    assert staged.video.read_bytes() == b"out"  # the gates check this one
+    assert staged.result.video_path == out.resolve() / "v1.mp4"
+
+    staged.publish()
+    staged.discard()
+
+    assert sorted(p.name for p in out.iterdir()) == ["v1.jpg", "v1.json", "v1.mp4"]
+    assert staged.result.video_path.read_bytes() == b"out"
+
+
+def test_discarded_stage_publishes_nothing(
+    media_root: Path, render_dir: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "v1.mp4").write_bytes(b"theirs")  # e.g. the new lease owner's render
+    staged = render.stage_clip(
+        EDL_DATA, media_root, out, runner=FakeRunner(), render_dir=render_dir, basename="v1"
+    )
+
+    staged.discard()
+
+    assert sorted(p.name for p in out.iterdir()) == ["v1.mp4"]
+    assert (out / "v1.mp4").read_bytes() == b"theirs"
+
+
 def test_work_dir_symlink_is_replaced_not_followed(
     media_root: Path, render_dir: Path, tmp_path: Path
 ) -> None:
@@ -700,6 +737,60 @@ def test_run_process_real_timeout_kills_children(tmp_path: Path) -> None:
         time.sleep(0.05)
     else:
         pytest.fail("grandchild still alive after timeout")
+
+
+_ESCAPEE = (
+    "import subprocess, sys, time\n"
+    "child = subprocess.Popen(['sleep', '30'], start_new_session=True)\n"
+    "open(sys.argv[1], 'w').write(str(child.pid))\n"
+    "time.sleep(30)\n"
+)
+"""Leaves a grandchild outside the process group that still holds stdout/stderr."""
+
+
+def _reap_escapee(pidfile: Path) -> None:
+    if pidfile.exists():
+        with contextlib.suppress(ProcessLookupError, ValueError):
+            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_run_process_wait_after_kill_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt: bool
+) -> None:
+    """CLP-66: a descendant that left the group keeps the pipes open after the kill; the
+    stage gives up on its output after KILL_WAIT_S instead of blocking until it exits."""
+    monkeypatch.setattr(render, "KILL_WAIT_S", 0.5)
+    pidfile = tmp_path / "escapee.pid"
+    argv = [sys.executable, "-c", _ESCAPEE, str(pidfile)]
+    expected: type[BaseException] = subprocess.TimeoutExpired
+    popen: Any = subprocess.Popen
+    if interrupt:
+        expected = KeyboardInterrupt
+
+        def popen(*args: Any, **kw: Any) -> subprocess.Popen[str]:
+            proc = subprocess.Popen(*args, **kw)  # noqa: S603 - argv built above
+            real = proc.communicate
+
+            def communicate(timeout: float | None = None) -> Any:
+                if timeout == 5:  # the stage's own wait: interrupted once the escapee runs
+                    deadline = time.monotonic() + 10
+                    while not pidfile.exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    raise KeyboardInterrupt
+                return real(timeout=timeout)
+
+            proc.communicate = communicate  # type: ignore[method-assign]
+            return proc
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(expected):
+            render.run_process(argv, timeout=1 if not interrupt else 5, popen=popen)
+        elapsed = time.monotonic() - started
+    finally:
+        _reap_escapee(pidfile)
+    assert elapsed < 5
 
 
 def test_sigterm_handler_scoped_to_render(

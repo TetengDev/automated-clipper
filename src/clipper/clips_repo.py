@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -145,17 +145,25 @@ def insert_pending_clip(
     now: str | None = None,
     start_s: float | None = None,
     end_s: float | None = None,
+    fence: Callable[[sqlite3.Connection], None] | None = None,
+    publish: Callable[[], None] | None = None,
 ) -> ClipVersionRef:
     """Insert a new clip (version 1, `pending_review`, or `needs_attention` when
     `meta.gate_reasons` has a failed gate besides `gate_error`). Raises sqlite3.IntegrityError if
     (job_id, rank) already exists or job_id is unknown.
 
     `start_s`/`end_s` (default: the EDL's source range) are stored as the clip's position
-    in the original video, for when the EDL cuts a pre-fetched section of it."""
+    in the original video, for when the EDL cuts a pre-fetched section of it.
+
+    In the same transaction (CLP-66): `fence` runs first and raises to refuse the insert
+    (the job's lease is lost), `publish` runs last and puts the clip's files in place; if
+    it raises, the rows are rolled back."""
     stamp = now or _now()
     meta = meta or ClipMeta()
     status = _status(meta)
     with transaction(conn):
+        if fence is not None:
+            fence(conn)
         cursor = conn.execute(
             "INSERT INTO clips (job_id, rank, status, current_version, created_at, updated_at)"
             " VALUES (?, ?, ?, 1, ?, ?)",
@@ -174,6 +182,8 @@ def insert_pending_clip(
             start_s=start_s,
             end_s=end_s,
         )
+        if publish is not None:
+            publish()
     return ClipVersionRef(clip_id=clip_id, version=1)
 
 

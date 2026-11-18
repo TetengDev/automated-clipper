@@ -1,15 +1,17 @@
 """RENDERING stage (CLP-63): sections.json -> rendered `pending_review` clips.
 
-`render_clip` is faked (it writes the three output files and records the EDL); the real
+`stage_clip` is faked (it stages the three output files and records the EDL); the real
 Remotion render is covered by tests/test_render_integration.py and the e2e test.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,7 +30,13 @@ from clipper.pipeline import build_stages
 from clipper.pipeline import reframe as rf
 from clipper.pipeline import render_clips as rc
 from clipper.pipeline.common import Deadline, StageTimeout
-from clipper.render import InvalidClipError, RenderError, RenderResult, segment_props
+from clipper.render import (
+    InvalidClipError,
+    RenderError,
+    RenderResult,
+    StagedClip,
+    segment_props,
+)
 from clipper.urls import SourceRef
 
 T0 = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
@@ -47,20 +55,30 @@ class FakeRender:
 
     def __call__(
         self, edl: EDL, media_root: Path, out_dir: Path, *, basename: str, **kw: Any
-    ) -> RenderResult:
+    ) -> StagedClip:
         self.calls.append({"edl": edl, "media_root": media_root, "out_dir": out_dir, **kw})
         if len(self.calls) in self.fail_on:
             raise self.fail_on[len(self.calls)]
         if int(out_dir.name) in self.fail_rank:
             raise self.fail_rank[int(out_dir.name)]
         assert (media_root / edl.source.path).is_file()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        paths = [out_dir / f"{basename}.{ext}" for ext in ("mp4", "jpg", "json")]
-        for path in paths:
-            path.write_bytes(b"x")
-        for hook in self.after:
-            hook()
-        return RenderResult(*paths, duration_s=edl.duration_s, render_seconds=1.0)
+        return _staged(out_dir, basename, edl, self.after)
+
+
+def _staged(
+    out_dir: Path, basename: str, edl: EDL, after: Sequence[Callable[[], None]] = ()
+) -> StagedClip:
+    """What `stage_clip` leaves behind: the three files in the work dir, not yet published."""
+    work = out_dir / f".{basename}.work"
+    work.mkdir(parents=True, exist_ok=True)
+    finals = [out_dir / f"{basename}.{ext}" for ext in ("mp4", "jpg", "json")]
+    staged = [work / name for name in ("final.mp4", "thumb.jpg", "sidecar.json")]
+    for path in staged:
+        path.write_bytes(b"x")
+    for hook in after:
+        hook()
+    result = RenderResult(*finals, duration_s=edl.duration_s, render_seconds=1.0)
+    return StagedClip(result, staged[0], work, tuple(zip(staged, finals, strict=True)))
 
 
 def _highlight(rank: int, start: float, end: float, **kw: Any) -> dict[str, Any]:
@@ -206,7 +224,7 @@ def gates(monkeypatch: pytest.MonkeyPatch) -> FakeGates:
 @pytest.fixture
 def fake(monkeypatch: pytest.MonkeyPatch) -> FakeRender:
     render = FakeRender()
-    monkeypatch.setattr(rc, "render_clip", render)
+    monkeypatch.setattr(rc, "stage_clip", render)
     return render
 
 
@@ -1225,7 +1243,7 @@ def test_rendered_clip_is_gated_on_its_video(
     _setup(media, [_highlight(1, 10.0, 40.0)])
     rc.render_clips(job, _ctx(media, conn))
     (call,) = gates.calls
-    assert call["video"] == media / "clips/1/v1.mp4"
+    assert call["video"] == media / "clips/1/.v1.work/final.mp4"  # checked before publishing
     assert call["edl"] == fake.calls[0]["edl"]
     row = _rows(conn)[0]
     assert (row["status"], json.loads(row["gate_reasons"])) == ("pending_review", [])
@@ -1324,6 +1342,117 @@ def _drain(worker: Worker, conn: sqlite3.Connection, job: Job, clock: list[datet
         clock[0] += timedelta(hours=2)
         worker.run_once()
     raise AssertionError("job never finished")
+
+
+def test_lost_lease_publishes_and_records_nothing(
+    conn: sqlite3.Connection, job: Job, tmp_path: Path, fake: FakeRender
+) -> None:
+    """CLP-66: the lease ran out mid-render and another worker claimed the job. The late
+    insert is refused and the new owner's files at the same paths are left alone."""
+    media = _worker_media(conn, job, tmp_path)
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    theirs = media / "clips/1/v1.mp4"
+    theirs.write_bytes(b"theirs")
+    clock = [T0]
+    taken_until = to_iso(T0 + timedelta(hours=4))
+
+    def taken_over() -> None:
+        conn.execute(
+            "UPDATE jobs SET worker_id = 'other', lease_until = ? WHERE id = ?",
+            (taken_until, job.id),
+        )
+
+    fake.after.append(taken_over)
+
+    assert _render_worker(conn, tmp_path, clock).run_once()
+
+    assert _rows(conn) == []
+    assert theirs.read_bytes() == b"theirs"
+    # Nothing published; the work dir stays, as it may be the new owner's by now.
+    assert sorted(p.name for p in theirs.parent.iterdir()) == [".v1.work", "source.mp4", "v1.mp4"]
+    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job.id,)).fetchone()
+    assert (row["worker_id"], row["lease_until"], row["status"]) == (
+        "other", taken_until, "rendering",
+    )  # fmt: skip
+
+
+def test_clip_is_published_after_the_fenced_insert(
+    conn: sqlite3.Connection, job: Job, tmp_path: Path, fake: FakeRender
+) -> None:
+    media = _worker_media(conn, job, tmp_path)
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+
+    assert _render_worker(conn, tmp_path, [T0]).run_once()
+
+    assert [r["rank"] for r in _rows(conn)] == [1]
+    clip_dir = media / "clips/1"
+    assert sorted(p.name for p in clip_dir.iterdir()) == [
+        "source.mp4", "v1.jpg", "v1.json", "v1.mp4",
+    ]  # fmt: skip
+
+
+def test_failed_publish_keeps_no_row_and_no_files(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    (media / "clips/1/v1.mp4/x").mkdir(parents=True)  # the rename of the video fails
+
+    with pytest.raises(RenderError, match="render I/O error"):
+        rc.render_clips(job, _ctx(media, conn))
+
+    assert _rows(conn) == []
+    assert sorted(p.name for p in (media / "clips/1").iterdir()) == ["source.mp4", "v1.mp4"]
+
+
+@contextlib.contextmanager
+def _slot_taken(media_root: Path, index: int) -> Iterator[None]:
+    """Another worker process renders: it holds render slot `index` (an flock)."""
+    slots = media_root / ".render_slots"
+    slots.mkdir(exist_ok=True)
+    with open(slots / str(index), "a") as fh:  # its own open file, as another process has
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def test_busy_render_slots_defer_without_using_an_attempt(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    """CLP-34: at most max_concurrent_renders (default 1) render runs across the workers
+    sharing the media root; the others wait for a slot without using an attempt."""
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    ctx = StageContext(media_dir=media, conn=conn, config=AppConfig(), clock=lambda: T0)
+
+    with _slot_taken(media.parent, 0), pytest.raises(Deferred) as deferred:
+        rc.render_clips(job, ctx)
+
+    assert deferred.value.until == T0 + timedelta(minutes=1)
+    assert "all 1 render slot(s) are busy" in deferred.value.reason
+    assert fake.calls == [] and _rows(conn) == []
+    rc.render_clips(job, ctx)  # slot free again
+    assert [r["rank"] for r in _rows(conn)] == [1]
+    with _slot_taken(media.parent, 0):
+        pass  # the stage let go of its slot
+
+
+def test_render_runs_in_any_free_slot(
+    conn: sqlite3.Connection, job: Job, media: Path, fake: FakeRender
+) -> None:
+    _setup(media, [_highlight(1, 10.0, 15.0)])
+    config = AppConfig(settings=Settings(max_concurrent_renders=2))
+    held: list[bool] = []
+
+    def second_slot_is_ours() -> None:
+        with pytest.raises(BlockingIOError), _slot_taken(media.parent, 1):
+            pass
+        held.append(True)
+
+    fake.after.append(second_slot_is_ours)
+
+    with _slot_taken(media.parent, 0):
+        rc.render_clips(job, StageContext(media_dir=media, conn=conn, config=config))
+
+    assert held == [True]
+    assert [r["rank"] for r in _rows(conn)] == [1]
 
 
 def test_quarantine_limit_is_below_the_attempt_limit() -> None:
@@ -1629,7 +1758,7 @@ def test_gates_timeout_after_progress_defers(
     _setup(media, [_highlight(r, 10.0 * r, 10.0 * r + 5) for r in (1, 2)])
 
     def check(edl: EDL, video: Path, **kw: Any) -> list[str]:
-        if video.parent.name == "2":
+        if video.parent.parent.name == "2":  # clips/2/.v1.work/final.mp4
             raise StageTimeout("stage exceeded its 100 min budget")
         return []
 
@@ -1820,11 +1949,11 @@ def test_timeout_after_a_counted_failure_defers(
         rc, "Deadline", lambda: Deadline(budget_s=rc.CLIP_WORST_CASE_S + 10, clock=lambda: now[0])
     )
 
-    def slow(*args: Any, **kw: Any) -> RenderResult:
+    def slow(*args: Any, **kw: Any) -> StagedClip:
         now[0] += 20
         return fake(*args, **kw)
 
-    monkeypatch.setattr(rc, "render_clip", slow)
+    monkeypatch.setattr(rc, "stage_clip", slow)
 
     # The failure was counted (bounded per clip), so no attempt is used.
     with pytest.raises(Deferred, match="1 failure\\(s\\) counted"):
@@ -1872,12 +2001,12 @@ def test_worker_failing_ranks_in_front_of_good_ones_still_reach_clips_ready(
         runs.append(now)
         return Deadline(budget_s=rc.CLIP_WORST_CASE_S + 41, clock=lambda: now[0])
 
-    def slow(*args: Any, **kw: Any) -> RenderResult:
+    def slow(*args: Any, **kw: Any) -> StagedClip:
         runs[-1][0] += 20
         return fake(*args, **kw)
 
     monkeypatch.setattr(rc, "Deadline", deadline)
-    monkeypatch.setattr(rc, "render_clip", slow)
+    monkeypatch.setattr(rc, "stage_clip", slow)
     clock = [T0]
 
     done = _drain(_render_worker(conn, tmp_path, clock), conn, job, clock)

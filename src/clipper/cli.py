@@ -436,6 +436,7 @@ def run_worker(
     http = _http_client()
     notify, alert = _notifiers(http)
     _preflight("run-worker", alert)
+    worker.alert = alert
     # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
     posting = PostingStage(
         conn=conn,

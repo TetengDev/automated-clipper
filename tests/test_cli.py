@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from clipper import cli
 from clipper.cli import app
 from clipper.db import connect
 
@@ -241,6 +242,27 @@ def test_run_worker_survives_a_crashing_boot_check(
     (error,) = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert error.getMessage() == "run-worker: the Deno solver check crashed"
     assert error.exc_info is not None
+
+
+def test_run_worker_alerts_on_a_failed_job(
+    tmp_path: Path, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLP-34: a job that reaches `failed` alerts through the worker's alert webhook."""
+    from clipper.pipeline import ytdlp
+
+    def missing(args: Sequence[str], timeout_s: float) -> ytdlp.RunResult:
+        return ytdlp.RunResult(1, "", "ERROR: [twitch:vod] 123: Video 123 does not exist")
+
+    alerts: list[str] = []
+    monkeypatch.setattr(ytdlp, "run_command", missing)
+    monkeypatch.setattr(cli, "_notifiers", lambda http: (print, alerts.append))
+    opts = ["--db", str(tmp_path / "state.db"), "--config", str(config_file)]
+    runner.invoke(app, [*opts, "enqueue", "https://www.twitch.tv/videos/123"])
+
+    for _ in range(2):
+        runner.invoke(app, [*opts, "run-worker", "--once", "--media-dir", str(tmp_path)])
+
+    assert len(alerts) == 1 and alerts[0].startswith("Job 1 failed (twitch_123, ")
 
 
 def test_run_worker_requires_valid_config(tmp_path: Path) -> None:

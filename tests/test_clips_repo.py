@@ -336,3 +336,70 @@ def test_unreadable_stored_variants_do_not_break_a_re_render(
         "SELECT variants FROM clip_versions WHERE clip_id = ? AND version = 2", (ref.clip_id,)
     ).fetchone()
     assert row[0] is None
+
+
+class LeaseLost(Exception):
+    pass
+
+
+def _count(conn: sqlite3.Connection, table: str) -> int:
+    return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+
+
+def test_fence_runs_first_and_publish_last_in_the_insert_transaction(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """CLP-66: the files are published only after the fence and the rows, in one
+    transaction, so a refused or failed insert publishes nothing and keeps no row."""
+    edl = parse_edl(EDL_DATA)
+    seen: list[str] = []
+
+    def fence(c: sqlite3.Connection) -> None:
+        assert c.in_transaction
+        seen.append(f"fence clips={_count(c, 'clips')}")
+
+    def publish() -> None:
+        assert conn.in_transaction
+        seen.append(f"publish clips={_count(conn, 'clips')}")
+
+    insert_pending_clip(
+        conn, job_id=1, rank=1, edl=edl, result=_result(tmp_path), fence=fence, publish=publish
+    )
+
+    assert seen == ["fence clips=0", "publish clips=1"]
+
+
+def test_refused_fence_inserts_and_publishes_nothing(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    published: list[bool] = []
+
+    def fence(c: sqlite3.Connection) -> None:
+        raise LeaseLost
+
+    with pytest.raises(LeaseLost):
+        insert_pending_clip(
+            conn,
+            job_id=1,
+            rank=1,
+            edl=parse_edl(EDL_DATA),
+            result=_result(tmp_path),
+            fence=fence,
+            publish=lambda: published.append(True),
+        )
+
+    assert published == []
+    assert (_count(conn, "clips"), _count(conn, "clip_versions")) == (0, 0)
+
+
+def test_failed_publish_rolls_the_rows_back(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    def publish() -> None:
+        raise OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        insert_pending_clip(
+            conn, job_id=1, rank=1, edl=parse_edl(EDL_DATA), result=_result(tmp_path),
+            publish=publish,
+        )  # fmt: skip
+
+    assert (_count(conn, "clips"), _count(conn, "clip_versions")) == (0, 0)

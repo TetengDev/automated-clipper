@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from clipper.accounts import AccountsConfig
     from clipper.campaigns import PostingConfig
     from clipper.notify import Notify
+    from clipper.posting.models import Publisher
     from clipper.resolve import Resolved
     from clipper.sources.youtube import MetadataProvider, YouTubeSource
 
@@ -437,10 +438,11 @@ def run_worker(
     notify, alert = _notifiers(http)
     _preflight("run-worker", alert)
     worker.alert = alert
-    # No publishers yet (CLP-93/94/95 register them): due posts stay scheduled.
+    # Platforms without a registered publisher keep their due posts scheduled.
+    publishers = _publishers(app_ctx.config_path, cfg)
     posting = PostingStage(
         conn=conn,
-        publishers={},
+        publishers=publishers,
         worker_id=worker.worker_id,
         media_root=media_dir,
         guard=publish_guard(conn, live, media_dir.resolve()),
@@ -460,8 +462,27 @@ def run_worker(
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
     finally:
+        for publisher in publishers.values():
+            close = getattr(publisher, "close", None)
+            if callable(close):
+                close()
         http.close()
         conn.close()
+
+
+def _publishers(config_path: Path, cfg: AppConfig) -> dict[str, Publisher]:
+    """Publishers for the platforms the accounts config posts to (CLP-93). The worker has
+    already checked the accounts config (`_posting_config` stops it when invalid); if the
+    file turns invalid in between, posting is off rather than the worker stopping."""
+    from clipper.accounts import accounts_path, load_accounts
+    from clipper.posting.publishers import build_publishers
+
+    try:
+        accounts = load_accounts(accounts_path(config_path), cfg)
+    except ConfigError as exc:
+        logging.getLogger(__name__).error("posting is off: %s", exc)
+        return {}
+    return build_publishers(accounts, Secrets())
 
 
 def _trusts_every_client(forwarded_allow_ips: str) -> bool:

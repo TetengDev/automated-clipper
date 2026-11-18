@@ -22,6 +22,8 @@ _PATTERNS: tuple[tuple[re.Pattern[str], _Replacement], ...] = (
     (re.compile(r"(authorization['\"]?\s*[:=]\s*['\"]?)[^'\"\r\n]+", re.IGNORECASE), rf"\1{MASK}"),
     (re.compile(r"(\bbearer\s+)[\w.~+/=-]+", re.IGNORECASE), rf"\1{MASK}"),
     (re.compile(r"(?<![A-Za-z0-9])(?:sk-|gsk_)[\w-]{8,}"), MASK),
+    # Bare Google OAuth values: access tokens, refresh tokens, client secrets (CLP-93).
+    (re.compile(r"(?<![A-Za-z0-9])(?:ya29\.[\w.-]{16,}|1//[\w-]{16,}|GOCSPX-[\w-]{8,})"), MASK),
     # user:password@ in any URL (proxies, remotes); keeps the scheme and host.
     # Scheme length is bounded and anchored by a lookbehind so the scan stays linear.
     (

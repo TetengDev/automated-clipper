@@ -240,6 +240,30 @@ def test_format_error_marker_from_before_the_upgrade_still_counts(tmp_path: Path
     assert type(_format_error_at(marker, T0 + timedelta(hours=49))) is PermanentError
 
 
+def test_format_error_marker_from_before_the_upgrade_fails_just_past_the_cap(
+    tmp_path: Path,
+) -> None:
+    # A one-line marker has no last-error time. Up to one retry past the cap, the episode
+    # may have been retried all along: it fails at the cap instead of starting over.
+    marker = tmp_path / ".no_format_since"
+    marker.write_text(T0.isoformat())
+
+    outcome = _format_error_at(marker, T0 + common.NO_FORMAT_MAX_AGE + timedelta(minutes=15))
+
+    assert type(outcome) is PermanentError and "giving up" in str(outcome)
+
+
+def test_format_error_marker_from_before_the_upgrade_goes_stale_after_one_retry(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / ".no_format_since"
+    marker.write_text(T0.isoformat())
+    late = T0 + common.NO_FORMAT_MAX_AGE + common.NO_FORMAT_RETRY + timedelta(minutes=1)
+
+    assert isinstance(_format_error_at(marker, late), common.NoUsableFormat)
+    assert marker.read_text().split() == [late.isoformat(), late.isoformat()]
+
+
 def test_format_error_marker_read_is_bounded(tmp_path: Path) -> None:
     # Only the start of the marker is read: whatever follows it is never looked at.
     marker = tmp_path / ".no_format_since"

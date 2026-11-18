@@ -20,6 +20,8 @@ Per creator:
   whose VOD is still processing -> `waiting_vod`, not enqueued (the S3 live-VOD work,
   CLP-26, rechecks these); shorter than min_duration_seconds (Shorts) -> `skipped_short`;
   private/removed, or members-only/Premium unless `allow_gated_content` -> `unavailable`;
+  so is an item with format errors in MAX_FORMAT_ERRORS_WITH_SIBLINGS polls where other
+  videos of the creator probed fine;
   anything else is enqueued.
 - An item's seen_items row and its job are written in one transaction, so it is enqueued
   exactly once, across crashes and restarts too. A failed metadata lookup leaves the item
@@ -69,9 +71,16 @@ and format errors (a YouTube player breakage) are not counted: they say nothing 
 video. Blocks are retried every poll, format errors after FORMAT_RETRY_MAX at most."""
 FORMAT_RETRY_MAX = timedelta(hours=1)
 """A video hit by a format error is retried after 10, 20, 40, then every 60 minutes until a
-yt-dlp update fixes the player; never given up. So a video that has no usable format at all
-(e.g. no audio, or no video) stays in the retries for as long as it is listed; probing the
-least recently tried first keeps it from starving the other retries."""
+yt-dlp update fixes the player. Probing the least recently tried first keeps one that stays
+broken from starving the other retries."""
+MAX_FORMAT_ERRORS_WITH_SIBLINGS = 3
+"""A format error in a poll where another of the creator's videos probed fine means the
+player works: this video has no format the clip selector accepts (e.g. no audio, or no
+video). After this many such polls it is recorded `unavailable`. A player breakage that
+hits every video fails the first one probed, which stops the batch, so it never counts.
+Limits: the count is kept in memory only, so a monitor restart (a deploy) sets it back
+to 0. A sibling counts only when it is new (unseen) and probed in the same poll, so the
+count grows with the creator's upload rate: about 3 weeks for a weekly uploader."""
 
 
 class FirstRun(StrEnum):
@@ -115,6 +124,8 @@ class _Failure:
     creator: str
     attempts: int
     retry_at: datetime
+    with_siblings: int = 0
+    """Format errors only: those in polls where another video of the creator probed fine."""
 
 
 @dataclass
@@ -145,7 +156,8 @@ class YouTubeMonitor:
     the backoff, it cannot enqueue anything twice."""
     format_retries: dict[str, _Failure] = field(default_factory=dict)
     """Videos whose last lookup was a format error, by id (`attempts`: the streak). Kept
-    apart from `failures` because these never count toward giving up."""
+    apart from `failures`: only format errors while other videos probe fine count toward
+    giving up (MAX_FORMAT_ERRORS_WITH_SIBLINGS)."""
 
     def run_forever(self, creators: Sequence[Creator]) -> None:
         """Poll every interval (with jitter) until `stop` is set. A failing cycle (e.g. the
@@ -262,9 +274,11 @@ class YouTubeMonitor:
         # A retried item was counted on its first look.
         looked = meta.videos.keys() | meta.unavailable | meta.errors.keys()
         poll.new += len((set(due) - retried) & looked)
+        # yt-dlp fails on an upcoming video before choosing a format: no sign either way.
+        player_works = any(m.live_status != "is_upcoming" for m in meta.videos.values())
         for video_id in due:
             if video_id in meta.format_errors:
-                self._format_failed(creator.name, video_id, now)
+                self._format_failed(creator.name, video_id, now, player_works, poll)
             elif video_id in meta.unavailable | meta.errors.keys() | meta.videos.keys():
                 self.format_retries.pop(video_id, None)
             if video_id in meta.unavailable:
@@ -296,9 +310,23 @@ class YouTubeMonitor:
             for retries in (self.failures, self.format_retries)
         )
 
-    def _format_failed(self, creator: str, video_id: str, now: datetime) -> None:
+    def _format_failed(
+        self, creator: str, video_id: str, now: datetime, player_works: bool, poll: CreatorPoll
+    ) -> None:
         failure = self.format_retries.get(video_id) or _Failure(creator, 0, now)
         failure.attempts += 1
+        if player_works:
+            failure.with_siblings += 1
+        if failure.with_siblings >= MAX_FORMAT_ERRORS_WITH_SIBLINGS:
+            self.format_retries.pop(video_id, None)
+            error = (
+                f"no usable format in {failure.with_siblings} polls where other videos"
+                " probed fine; given up"
+            )
+            logger.warning("%s: %s: %s (enqueue it by hand if wanted)", creator, video_id, error)
+            self._record(creator, video_id, SeenStatus.UNAVAILABLE, now)
+            poll.errors.append({"creator": creator, "item": video_id, "error": error})
+            return
         delay = METADATA_RETRY_BASE * 2 ** min(failure.attempts - 1, 6)
         failure.retry_at = now + min(delay, FORMAT_RETRY_MAX)
         self.format_retries[video_id] = failure

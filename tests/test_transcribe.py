@@ -19,14 +19,17 @@ import pytest
 import respx
 
 from asr_support import (
+    FAKE_FILES,
+    FAKE_MODEL_BIN,
     FAKE_MODEL_SHA256,
+    SWAPPED_TOKENIZER,
     FakeAsr,
     FakeWhisperModel,
     install_fake_asr,
     seg,
     write_snapshot,
 )
-from clipper.config import AppConfig, load_config
+from clipper.config import AppConfig, PinnedModel, load_config
 from clipper.db import connect, migrate
 from clipper.jobs import Deferred, Job, PermanentError, SkipJob, StageContext, enqueue
 from clipper.jobs.models import JobStatus
@@ -908,9 +911,10 @@ def test_child_missing_model_files_are_permanent(model_dir: Path, missing: str) 
     [
         (ImportError("no faster_whisper"), local_asr.EXIT_MODEL),
         (ValueError("Requested float16 compute type, but the target device"), local_asr.EXIT_MODEL),
-        (MemoryError(), local_asr.EXIT_RETRY),
-        (RuntimeError("aligned_alloc: failed to allocate memory"), local_asr.EXIT_RETRY),
-        (OSError("No space left on device"), local_asr.EXIT_RETRY),
+        (MemoryError(), local_asr.EXIT_LOAD),
+        (RuntimeError("aligned_alloc: failed to allocate memory"), local_asr.EXIT_LOAD),
+        (RuntimeError("Unable to load model.bin: unexpected end of file"), local_asr.EXIT_LOAD),
+        (OSError("No space left on device"), local_asr.EXIT_LOAD),
     ],
 )
 def test_child_load_failure_mapping(model_dir: Path, error: BaseException, code: int) -> None:
@@ -919,6 +923,19 @@ def test_child_load_failure_mapping(model_dir: Path, error: BaseException, code:
 
     argv = [str(model_dir), "int8", "1", "en", "c.flac"]
     assert local_asr.main(argv, out=io.StringIO(), model_class=broken) == code
+
+
+def test_child_load_failure_has_its_own_exit_code(model_dir: Path) -> None:
+    """A crash after the load exits 1 (Python's code for an uncaught exception), so the
+    parent can tell a failed load (which may be damaged weights) apart from it."""
+    assert local_asr.EXIT_LOAD not in {0, 1, local_asr.EXIT_USAGE, local_asr.EXIT_MODEL}
+
+    class Crashes(FakeWhisperModel):
+        def transcribe(self, *a, **kw):
+            raise RuntimeError("decoding failed")
+
+    with pytest.raises(RuntimeError, match="decoding failed"):  # the real child exits 1
+        local_asr.main([str(model_dir), "int8", "1", "en", "c.flac"], io.StringIO(), Crashes)
 
 
 def test_child_without_faster_whisper_is_permanent(
@@ -985,7 +1002,12 @@ def test_backend_child_timeout_is_retryable(monkeypatch: pytest.MonkeyPatch, tmp
 
 @pytest.mark.parametrize(
     ("returncode", "permanent"),
-    [(local_asr.EXIT_MODEL, True), (local_asr.EXIT_USAGE, True), (local_asr.EXIT_RETRY, False)],
+    [
+        (local_asr.EXIT_MODEL, True),
+        (local_asr.EXIT_USAGE, True),
+        (local_asr.EXIT_RETRY, False),
+        (local_asr.EXIT_LOAD, False),
+    ],
 )
 def test_backend_maps_child_exit_codes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int, permanent: bool
@@ -1076,7 +1098,7 @@ def test_incomplete_fetch_is_retried_once(fake_asr: FakeAsr, tmp_path: Path) -> 
 
 def test_hash_mismatch_is_never_marked_complete(fake_asr: FakeAsr, tmp_path: Path) -> None:
     fake_asr.fetch_plan = ["corrupt", "corrupt"]
-    with pytest.raises(MediaError, match="sha256") as exc:
+    with pytest.raises(MediaError, match="model.bin size 9") as exc:
         local().ensure_model()
     assert not isinstance(exc.value, PermanentError)  # retryable: the next run fetches again
     assert len(fake_asr.fetch_calls()) == 2
@@ -1108,6 +1130,204 @@ def test_marker_check_follows_only_the_snapshot_link(fake_asr: FakeAsr, tmp_path
     for _ in range(3):
         assert local().ensure_model() == snapshot
     assert len(fake_asr.fetch_calls()) == 1
+
+
+def _fake_pin() -> PinnedModel:
+    return tr.WHISPER_MODELS["tiny"]  # pinned to the fake files by `fake_asr`
+
+
+def test_snapshot_problems_none_for_the_pinned_files(fake_asr: FakeAsr, tmp_path: Path):
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {}
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {}
+
+
+def test_snapshot_problems_swapped_tokenizer(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    snapshot = write_snapshot(
+        tmp_path / "models", *TINY, arrives={"tokenizer.json": SWAPPED_TOKENIZER}
+    )
+    problem = tr.FileProblem("sha256 mismatch", bad_content=True)
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {"tokenizer.json": problem}
+    # Small files are hashed on every check, also when model.bin is not.
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {
+        "tokenizer.json": problem
+    }
+
+
+@pytest.mark.parametrize("hash_model", [True, False])
+def test_snapshot_problems_truncated_model_bin(
+    fake_asr: FakeAsr, tmp_path: Path, hash_model: bool
+) -> None:
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    (snapshot / "model.bin").resolve().write_bytes(FAKE_MODEL_BIN[:5])  # two hops, then cut
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=hash_model) == {
+        "model.bin": tr.FileProblem(f"size 5, pinned {len(FAKE_MODEL_BIN)}", bad_content=True)
+    }
+
+
+def test_snapshot_problems_model_bin_hash_only_when_asked(fake_asr: FakeAsr, tmp_path: Path):
+    same_size = bytes(len(FAKE_MODEL_BIN))
+    snapshot = write_snapshot(tmp_path / "models", *TINY, arrives={"model.bin": same_size})
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {
+        "model.bin": tr.FileProblem("sha256 mismatch", bad_content=True)
+    }
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {}  # the cheap path
+
+
+def test_snapshot_problems_missing_and_relinked_files(fake_asr: FakeAsr, tmp_path: Path):
+    snapshot = write_snapshot(tmp_path / "models", *TINY, files=("config.json",))
+    other = snapshot.parents[1] / "blobs" / ("0" * 64)
+    other.write_bytes(FAKE_MODEL_BIN)  # right size and bytes, but not the pinned blob
+    (snapshot / "model.bin").unlink()
+    os.symlink(os.path.relpath(other, snapshot), snapshot / "model.bin")
+    missing = tr.FileProblem("missing", bad_content=False)
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {
+        "model.bin": tr.FileProblem(f"links to blob {'0' * 64}", bad_content=False),
+        "tokenizer.json": missing,
+        "vocabulary.txt": missing,
+    }
+    assert tr.snapshot_problems(tmp_path / "nowhere", _fake_pin()) == dict.fromkeys(
+        ["model.bin", *FAKE_FILES], missing
+    )
+
+
+def test_snapshot_problems_unpinned_files(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    """faster-whisper reads preprocessor_config.json whenever it is there, and the small
+    models pin none: a planted one (or anything else unpinned) is a problem."""
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    (snapshot / tr.COMPLETE_MARKER).write_text("x")
+    (snapshot / f"{tr.COMPLETE_MARKER}.tmp").write_text("x")
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {}  # the marker files are ours
+    (snapshot / "preprocessor_config.json").write_text("{}")
+    (snapshot / "extra").mkdir()
+    unpinned = tr.FileProblem("not pinned", bad_content=False)
+    assert tr.snapshot_problems(snapshot, _fake_pin(), hash_model=False) == {
+        "extra": unpinned,
+        "preprocessor_config.json": unpinned,
+    }
+
+
+def test_snapshot_problems_link_outside_the_models_dir(fake_asr: FakeAsr, tmp_path: Path):
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    outside = tmp_path / "tokenizer.json"
+    outside.write_bytes(FAKE_FILES["tokenizer.json"])  # the pinned bytes, elsewhere
+    (snapshot / "tokenizer.json").unlink()
+    os.symlink(outside, snapshot / "tokenizer.json")
+    assert tr.snapshot_problems(snapshot, _fake_pin()) == {
+        "tokenizer.json": tr.FileProblem("links outside the models dir", bad_content=False)
+    }
+
+
+def test_planted_file_under_marker_is_fetched_again(fake_asr: FakeAsr, tmp_path: Path):
+    snapshot = local().ensure_model()
+    (snapshot / "preprocessor_config.json").write_text('{"feature_size": 1}')
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2
+    assert not (snapshot / "preprocessor_config.json").exists()
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+
+
+@pytest.mark.parametrize("name", ["model.bin", "tokenizer.json"])
+def test_truncated_blob_under_marker_is_fetched_again(
+    fake_asr: FakeAsr, tmp_path: Path, name: str
+) -> None:
+    """CLP-75: a marked snapshot whose blob was cut short (disk error, partial restore)."""
+    snapshot = local().ensure_model()
+    (snapshot / name).resolve().write_bytes(b"cut")
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2
+    # The damaged blob was dropped, so the Hub client fetched it instead of relinking it.
+    want = FAKE_MODEL_BIN if name == "model.bin" else FAKE_FILES[name]
+    assert (snapshot / name).read_bytes() == want
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+
+
+def test_damaged_link_outside_the_models_dir_is_never_deleted(
+    fake_asr: FakeAsr, tmp_path: Path
+) -> None:
+    """A marked snapshot whose model.bin links out of the models dir to a file of the wrong
+    size: the snapshot is fetched again, but nothing outside the models dir is deleted."""
+    snapshot = local().ensure_model()
+    outside = tmp_path / "elsewhere" / "model.bin"
+    outside.parent.mkdir()
+    outside.write_bytes(b"not the weights")
+    (snapshot / "model.bin").unlink()
+    os.symlink(outside, snapshot / "model.bin")
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2
+    assert outside.read_bytes() == b"not the weights"
+    assert (snapshot / "model.bin").read_bytes() == FAKE_MODEL_BIN
+
+
+def test_discard_deletes_nothing_outside_the_models_dir(fake_asr: FakeAsr, tmp_path: Path):
+    """The guard on its own, behind `snapshot_problems` (which already reports such a link
+    without bad_content): even a content problem never deletes outside the models dir."""
+    snapshot = write_snapshot(tmp_path / "models", *TINY)
+    outside = tmp_path / "elsewhere.bin"
+    outside.write_bytes(b"x")
+    (snapshot / "model.bin").unlink()
+    os.symlink(outside, snapshot / "model.bin")
+    local()._discard(snapshot, {"model.bin": tr.FileProblem("size 1", bad_content=True)})
+    assert outside.read_bytes() == b"x"
+    assert not snapshot.exists()
+
+
+def test_swapped_tokenizer_fails_verification(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    """CLP-75: tokenizer.json is pinned by sha256, not only by the commit and TLS."""
+    fake_asr.fetch_plan = ["swapped", "swapped"]
+    with pytest.raises(MediaError, match="tokenizer.json sha256 mismatch") as exc:
+        local().ensure_model()
+    assert not isinstance(exc.value, PermanentError)
+    snapshot = _snapshot(tmp_path / "models")
+    assert not (snapshot / tr.COMPLETE_MARKER).exists()
+    fake_asr.fetch_plan = ["ok"]
+    assert local().ensure_model() == snapshot  # the swapped blob was dropped, not relinked
+    assert (snapshot / "tokenizer.json").read_bytes() == FAKE_FILES["tokenizer.json"]
+
+
+def test_model_load_failure_drops_the_marker(fake_asr: FakeAsr, tmp_path: Path) -> None:
+    """CLP-75: weights damaged in a way the cheap check misses fail the load; the next
+    attempt then fetches and fully verifies the snapshot instead of failing again."""
+    snapshot = local().ensure_model()
+    FakeWhisperModel.load_error = RuntimeError("Unable to load model.bin: unexpected end of file")
+    with pytest.raises(MediaError, match="model load failed") as exc:
+        local().transcribe(tmp_path / "c.flac", language="en")
+    assert not isinstance(exc.value, PermanentError)
+    assert not (snapshot / tr.COMPLETE_MARKER).exists()
+    FakeWhisperModel.load_error = None
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2  # fetched and fully verified again
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+
+
+def test_model_that_can_never_load_keeps_the_marker(fake_asr: FakeAsr, tmp_path: Path):
+    """A configuration the CPU cannot run (permanent) says nothing about the files: no
+    re-fetch and full hash on every job. A corrupt config.json is caught by the per-job
+    small-file hash instead."""
+    snapshot = local().ensure_model()
+    FakeWhisperModel.load_error = ValueError("Requested float16 compute type, but the target")
+    with pytest.raises(PermanentError, match="cannot load the model"):
+        local().transcribe(tmp_path / "c.flac", language="en")
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
+    FakeWhisperModel.load_error = None
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 1
+
+
+@pytest.mark.parametrize(
+    "returncode", [local_asr.EXIT_MODEL, local_asr.EXIT_RETRY, local_asr.EXIT_USAGE, -9]
+)
+def test_other_child_failures_keep_the_marker(
+    fake_asr: FakeAsr, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int
+) -> None:
+    snapshot = local().ensure_model()
+    result = ytdlp.RunResult(returncode, "", "Killed")
+    monkeypatch.setattr(ytdlp, "run_command", lambda a, t, **kw: result)
+    with pytest.raises((MediaError, PermanentError)):
+        local().transcribe(tmp_path / "c.flac", language="en")
+    assert (snapshot / tr.COMPLETE_MARKER).is_file()
 
 
 def test_ensure_model_fetch_failure_is_retryable(
@@ -1146,12 +1366,24 @@ def test_whisper_model_allowlist_is_pinned() -> None:
     from clipper.config import WHISPER_MODELS
 
     assert {"large-v3-turbo", "large-v3", "medium", "tiny"} <= set(WHISPER_MODELS)
-    for repo, revision, sha256 in WHISPER_MODELS.values():
-        assert re.fullmatch(r"[\w.-]+/[\w.-]+", repo)
-        assert re.fullmatch(r"[0-9a-f]{40}", revision) and re.fullmatch(r"[0-9a-f]{64}", sha256)
-    assert WHISPER_MODELS["tiny"][:2] == TINY
-    assert WHISPER_MODELS["large-v3-turbo"].sha256 == (
-        "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da"
+    for pin in WHISPER_MODELS.values():
+        assert re.fullmatch(r"[\w.-]+/[\w.-]+", pin.repo)
+        assert re.fullmatch(r"[0-9a-f]{40}", pin.revision)
+        assert {"config.json", "model.bin", "tokenizer.json"} <= set(pin.files)
+        assert any(name.startswith("vocabulary.") for name in pin.files)
+        for size, sha256 in pin.files.values():  # every file of the snapshot is pinned
+            assert size > 0 and re.fullmatch(r"[0-9a-f]{64}", sha256)
+        assert pin.sha256 == pin.files["model.bin"].sha256
+        assert pin.files["model.bin"].size > 50_000_000
+    assert (WHISPER_MODELS["tiny"].repo, WHISPER_MODELS["tiny"].revision) == TINY
+    turbo = WHISPER_MODELS["large-v3-turbo"].files
+    assert turbo["model.bin"] == (
+        1617884929,
+        "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da",
+    )
+    assert turbo["tokenizer.json"] == (
+        2710337,
+        "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd",
     )
     with pytest.raises(ValueError, match="unknown whisper model"):
         tr.FasterWhisperTranscriber(model="../../etc")

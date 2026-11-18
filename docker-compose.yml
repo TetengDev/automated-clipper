@@ -1,8 +1,10 @@
 # Production-shaped stack. Local tweaks live in docker-compose.override.yml.
 # caddy (HTTPS + basic_auth) is added in S6 (CLP-40).
 #
-# Host dirs ./data and ./output must be writable by uid 10001 (the image user):
-#   sudo chown -R 10001:10001 data output
+# Host dirs ./data, ./data/models and ./output must exist and be writable by uid 10001
+# (the image user). Create data/models before the first start: it is bind-mounted into
+# review and monitor, and Docker would create a missing one owned by root.
+#   mkdir -p data/models output && sudo chown -R 10001:10001 data output
 # Bcrypt hashes contain '$'. Compose interpolates unquoted env_file values, so wrap them
 # in single quotes in .env: REVIEW_PASSWORD_HASH='$2b$12$...'
 
@@ -43,6 +45,14 @@ x-after-migrate: &after-migrate
     migrate:
       condition: service_completed_successfully
 
+# For services that never fetch models: only the worker writes the model store (CLP-75).
+x-models-read-only: &models-read-only
+  volumes:
+    - ./config:/app/config:ro
+    - ./data:/app/data
+    - ./output:/app/output
+    - ./data/models:/app/data/models:ro
+
 services:
   migrate:
     <<: *clipper
@@ -50,7 +60,7 @@ services:
     restart: "no"
 
   monitor:
-    <<: [*clipper, *after-migrate]
+    <<: [*models-read-only, *clipper, *after-migrate]
     command: ["run-monitor"]
     # Each yt-dlp probe runs Deno for YouTube's challenges: ~320 MB RSS on top of yt-dlp's
     # ~100 MB (CLP-127). At 512m a probe thrashed from 2 s to 12 s.
@@ -66,7 +76,7 @@ services:
     cpus: 6
 
   review:
-    <<: [*clipper, *after-migrate]
+    <<: [*models-read-only, *clipper, *after-migrate]
     command: ["run-review"]
     mem_limit: 512m
     cpus: 1

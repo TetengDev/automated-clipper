@@ -189,6 +189,7 @@ def test_commentary_ref_has_a_safe_key_and_no_source_url() -> None:
         "../rg:2026-11-19",
         "rg:2026-1-9",
         "rg:2026-11-19:x",
+        "rg:\uff12\uff10\uff12\uff16-11-19",
     ],
 )
 def test_commentary_ids_are_strict(item_id: str) -> None:

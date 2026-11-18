@@ -27,7 +27,7 @@ MAX_URL_LENGTH = 2048
 _ITEM_ID = {
     "youtube": re.compile(r"[A-Za-z0-9_-]{11}"),
     "twitch": re.compile(r"[1-9][0-9]{0,19}"),
-    COMMENTARY: re.compile(r"[a-z0-9_]{1,64}:\d{4}-\d{2}-\d{2}"),
+    COMMENTARY: re.compile(r"[a-z0-9_]{1,64}:[0-9]{4}-[0-9]{2}-[0-9]{2}"),
 }
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
 _TWITCH_HOSTS = {"twitch.tv", "www.twitch.tv", "m.twitch.tv"}

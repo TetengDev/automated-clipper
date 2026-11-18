@@ -355,17 +355,23 @@ logins or YouTube handles never used, even when trending) and optional `override
 channel. It refuses a channel without a game, a pinned streamer with both or neither of
 Twitch and YouTube, duplicate games, logins, handles or channel ids, an invalid Twitch
 login, and a streamer who is both pinned and excluded. It notes YouTube pins, which are not
-scanned until [CLP-152](https://linear.app/tengdev/issue/CLP-152) ships. The monitor reads
-both files at start (restart it after editing them) and makes one job per channel per local
-day once the channel's `run_at` has passed in the account's timezone: `platform`
-`commentary`, item `<account_id>:<YYYY-MM-DD>`. Restarts and DST changes never make a second
-job for a day; a day the monitor is down from `run_at` until midnight gets none. A channel
-whose account has `enabled: false` gets no job. Until the commentary stages ship
-([CLP-144](https://linear.app/tengdev/issue/CLP-144) to
+scanned until [CLP-152](https://linear.app/tengdev/issue/CLP-152) ships. The monitor makes
+one job per channel per local day once the channel's `run_at` has passed in the account's
+timezone: `platform` `commentary`, item `<account_id>:<YYYY-MM-DD>`. Restarts and DST
+changes never make a second job for a day; a day the monitor is down from `run_at` until
+midnight gets none. A channel whose account has `enabled: false` gets no job.
+Until the commentary stages ship ([CLP-144](https://linear.app/tengdev/issue/CLP-144) to
 [CLP-148](https://linear.app/tengdev/issue/CLP-148)), the worker ends each day's job as
 `skipped` with the reason, for example `commentary discovery is not built yet (CLP-144)`.
 The full commentary channel setup follows in
 [CLP-150](https://linear.app/tengdev/issue/CLP-150).
+
+`run-monitor` reads `accounts.yaml` and `commentary.yaml` once, when it starts, so restart
+it after editing either file. If either file is invalid it exits without starting, so run
+`clipper check-config` after every edit. Deploy the worker and the monitor together from one
+image (`docker compose up -d`): an older worker cannot read a commentary job, so it fails
+that day's job with one alert. Recover with `clipper retry <job id>` once the new worker is
+running.
 
 The tokens sit in `.env` like the other keys. Encrypting refresh tokens at rest is a
 planned follow-up.

@@ -227,6 +227,7 @@ SECOND_YOUTUBE_PIN = '      - name: Speed Two\n        youtube:\n          handl
         ),
         ("aliases: [GTA 6, GTA VI]", "aliases: [GTA 6, gta 6]", "duplicate game name or alias"),
         (GTA_ALIASES, GTA_ALIASES + '        game_id: "GTA"\n', r"games\.0\.game_id"),
+        (GTA_ALIASES, GTA_ALIASES + '        game_id: "1\u0662\u0663"\n', r"games\.0\.game_id"),
         ("      - name: Grand Theft Auto VI\n", '      - name: ""\n', r"games\.0\.name"),
         ("aliases: [GTA 6, GTA VI]", 'aliases: [GTA 6, " GTA VI"]', r"games\.0\.aliases\.1"),
         (
@@ -244,6 +245,11 @@ SECOND_YOUTUBE_PIN = '      - name: Speed Two\n        youtube:\n          handl
         ),
         (SPEED_ID, SPEED_ID + "        twitch: ishowspeed\n", "set exactly one of `twitch`"),
         (SPEED_ID, SPEED_ID + '        user_id: "123"\n', "user_id is a Twitch id"),
+        (
+            "        twitch: kaicenat\n",
+            '        twitch: kaicenat\n        user_id: "1\u0662\u0663"\n',
+            r"streamers\.0\.user_id",
+        ),
         ("channel_id: UCWsDFcIhY2DBi3GB5uykGXA", "channel_id: UCshort", r"youtube\.channel_id"),
         ('handle: "@IShowSpeed"', "handle: IShowSpeed", r"streamers\.2\.youtube\.handle"),
         (
@@ -279,6 +285,11 @@ SECOND_YOUTUBE_PIN = '      - name: Speed Two\n        youtube:\n          handl
         ("max_streamers_scanned: 50", "max_streamers_scanned: 0", r"max_streamers_scanned"),
         ("pinned_boost: 0.5", "pinned_boost: -1", r"defaults\.pinned_boost"),
         ("excluded_game_ids: []", 'excluded_game_ids: ["slots"]', "'slots' is not a Twitch game"),
+        (
+            "excluded_game_ids: []",
+            'excluded_game_ids: ["1\u0662\u0663"]',
+            "is not a Twitch game id",
+        ),
         ("music_dir: null", "music_dir: music", "music_dir must be an absolute path"),
         ("voice: am_michael", "voice: Michael", r"defaults\.voice"),
         ("prompt: commentary_gaming_v1", "prompt: ../secrets", r"channels\.0\.prompt"),

@@ -1,7 +1,8 @@
 """Which platform publishers the worker registers, from the accounts config (CLP-93).
 
 A platform gets a publisher only when at least one enabled account posts to it; due posts
-on any other platform stay `scheduled` (the posting stage logs that once).
+on any other platform stay `scheduled` (the posting stage logs that once). Commentary
+accounts (CLP-142) never get a clip, so the YouTube clip publisher leaves them out.
 """
 
 from __future__ import annotations
@@ -13,13 +14,17 @@ from clipper.posting.youtube import OAuthClient, YouTubePublisher
 from clipper.publish.meta import meta_publishers
 
 
-def _enabled(accounts: AccountsConfig, platform: str) -> tuple[str, ...]:
-    return tuple(a.id for a in accounts.accounts if a.platform == platform and a.enabled)
+def _clip_accounts(accounts: AccountsConfig, platform: str) -> tuple[str, ...]:
+    return tuple(
+        a.id
+        for a in accounts.accounts
+        if a.platform == platform and a.enabled and a.content == "clips"
+    )
 
 
 def build_publishers(accounts: AccountsConfig, secrets: Secrets) -> dict[str, Publisher]:
     publishers: dict[str, Publisher] = {}
-    youtube = _enabled(accounts, "youtube")
+    youtube = _clip_accounts(accounts, "youtube")
     if youtube:
         client_id = secrets.youtube_oauth_client_id
         publishers["youtube"] = YouTubePublisher(

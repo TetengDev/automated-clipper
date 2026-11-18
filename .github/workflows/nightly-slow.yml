@@ -35,15 +35,16 @@ jobs:
           enable-cache: true
           save-cache: ${{ github.ref == 'refs/heads/dev' }}
 
-      # A stalled mirror once hung this step for over an hour (CLP-131): apt retries
-      # and times out per request, the whole install retries once, and the step is capped.
+      # A stalled mirror once hung this step for over an hour (CLP-131), and a slow one can
+      # take minutes for the package files (CLP-140). The files come from the Actions cache;
+      # only runs on dev (the nightly schedule, a dispatch from dev) save it.
       # libegl1/libgles2: mediapipe links the GL loader stubs even on its CPU path (as in the Dockerfile).
       - name: Install ffmpeg and libEGL
         timeout-minutes: 10
-        run: |
-          apt=(sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
-          apt_install() { "${apt[@]}" update && "${apt[@]}" install -y --no-install-recommends ffmpeg libegl1 libgles2; }
-          apt_install || apt_install
+        uses: ./.github/actions/apt-install
+        with:
+          packages: ffmpeg libegl1 libgles2
+          save: ${{ github.ref == 'refs/heads/dev' }}
 
       - name: Install dependencies
         run: uv sync --locked

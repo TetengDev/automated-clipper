@@ -45,7 +45,7 @@ re-reads YouTube's Help Center monetization policies before applying for the Par
 | Candidate filters | Skip a clip that: was used in an earlier commentary Short (any account); is shorter than 5 s; has `language` other than `en`; comes from a channel whose classification labels include `SexualThemes` or `Gambling`, or whose `game_id` is in `excluded_game_ids` (gambling categories such as Slots by default). | Lowers the risk of age-restricted or advertiser-unfriendly Shorts, and keeps the channel from repeating itself. |
 | Fetching excerpts | yt-dlp (its Twitch clips extractor) through the hardened runner in `clipper.pipeline.ytdlp`, video and audio, for the candidates only. | The runner already handles timeouts, environment allowlist and format errors. |
 | Transcripts | Local faster-whisper on each candidate's audio, word timestamps, same model settings as clips. | Free; the script may only state what the transcript or metadata shows. |
-| Script | One `claude -p` call per day (selector `claude_cli`, the owner's subscription; never `ANTHROPIC_API_KEY`) with a new prompt `prompts/commentary_v1.md`. It returns up to `stories_per_day` (default 3) stories as JSON validated against a pydantic schema: `hook` (≤ 12 words), `script` (60–120 words), `title` (≤ 70 characters, names the streamer and the game), `description`, `hashtags` (3–5), and `excerpts`: an ordered list of `{clip_id, start_s, end_s, after_sentence}`. | One call keeps the subscription use small and lets Claude pick the best stories across all candidates. |
+| Script | One `claude -p` call per day (selector `claude_cli`, the owner's subscription; never `ANTHROPIC_API_KEY`) with the channel's prompt (the first one is `prompts/commentary_gaming_v1.md`). It returns up to `stories_per_day` (default 3) stories as JSON validated against a pydantic schema: `hook` (≤ 12 words), `script` (60–120 words), `title` (≤ 70 characters, names the streamer and the game), `description`, `hashtags` (3–5), and `excerpts`: an ordered list of `{clip_id, start_s, end_s, after_sentence}`. | One call keeps the subscription use small and lets Claude pick the best stories across all candidates. |
 | Transformation guardrails | Enforced in code after the script call; a story that breaks one is dropped with the reason logged: at most 3 excerpts, each ≤ 6 s, total excerpt time ≤ 40 % of the Short's runtime, narration covers ≥ 60 % of the runtime, runtime 20–55 s, every streamer and game name in the script appears in a candidate's transcript, title or metadata. The reviewer checks the remaining claims. | Makes "commentary, not a repost" a property the code checks on every Short, not a hope. |
 | Attribution | On screen: "Clip: twitch.tv/&lt;login&gt;" during each excerpt. In the description: one credit line per excerpt with the clip URL. | Credits the streamer; helps a reviewer at YouTube see the commentary format. |
 | Voice | **Kokoro-82M** through the `kokoro-onnx` package (onnxruntime, which faster-whisper already brings), one fixed stock English voice (`voice`, default `am_michael`), speed 1.0. Model and voice files are fetched by `clipper.pipeline.tts fetch` and pinned by SHA256 in code, like `local_asr fetch` and `reframe.MODEL_SHA256`. `clipper doctor` checks they are present. | Apache-2.0 model, commercial use allowed, CPU real-time factor around 0.5–0.7, so a 45 s narration takes well under a minute. No account, no per-character cost. Its phonemiser loads espeak-ng (GPL-3) as a library; the image is not distributed, so this is noted, not blocking. |
@@ -56,27 +56,53 @@ re-reads YouTube's Help Center monetization policies before applying for the Par
 | Storage | Each story becomes a `clips` row under the day's job (`rank` 1..3) with its version in `clip_versions` (`start_s = 0`, `end_s` = runtime). A new `commentary_stories` table holds the version's script, excerpt plan and guardrail figures. A new `story_candidates` table holds every discovered Twitch clip (unique on the Twitch clip id) with its score and the clip id of the Short that used it. Migration `0011`. | The review app, export, janitor and posting all key on `clips`; they work with no new path. |
 | Review | The clip page for a commentary clip shows the script, each excerpt with a link to its Twitch clip, the guardrail figures, and a checklist (facts match the clips, nothing sensitive, credit lines right). Approve, reject and "regenerate with note" work as for clips; regenerate re-runs `scripting` for that one story with the note. One Discord ping per day: "N commentary candidates ready". | One tap a day from the phone. |
 | Posting | `accounts.yaml` gets `content: clips | commentary` (default `clips`). A commentary account has no `creators:` and no `campaign:`. `schedule_for_clip` schedules a commentary clip only to commentary accounts and a clip only to clip accounts. Default plan for the account: `posts_per_day: 1`, the US YouTube windows, and the usual warm-up. | Keeps campaign rules (no AI content) away from this channel, and this channel's TTS away from campaign accounts. |
+| Channel check | `accounts.yaml` gets an optional `channel_id` for YouTube accounts (set for every commentary account). Before an upload, the publisher compares it with the channel the refresh token belongs to (`channels.list mine=true`, which the duplicate check already calls; 1 quota unit, cached with the access token). A mismatch pauses the account with one alert, like a rejected token. | With several channels under one Google account, the OAuth Playground makes it easy to authorise the wrong channel; this stops a Short from going to the wrong channel. |
 | Failure | Twitch errors defer the job with backoff. No candidate that passes the filters, or no story that passes the guardrails, skips the job with the reason and sends one alert ("no commentary Short today: …"). TTS or render failures fail the job after the usual retries. | The owner learns about a missed day the same morning. |
 
 ## Config
 
+The first channel is **Random Gaming** (`UCcMYw3Ae2crqXE2yzFBSUig`). The owner will add more
+channels with other content later, so every commentary setting is per channel.
+
+The channel's entry in `config/accounts.yaml`:
+
+```yaml
+  - id: random_gaming_yt
+    platform: youtube
+    content: commentary
+    channel_id: UCcMYw3Ae2crqXE2yzFBSUig
+    handle: "@<channel handle>"
+    market: US
+    timezone: America/New_York
+```
+
 A new file, `config/commentary.yaml`, validated by `clipper check-config`:
 
 ```yaml
-settings:
-  run_at: "06:00"            # local time of each account
+defaults:                    # apply to every channel unless the channel overrides them
+  run_at: "06:00"            # local time of the channel's account
   candidates_per_day: 12
   stories_per_day: 3
   trending_boost: 0.5
   excluded_game_ids: []      # added to the gambling categories the code always excludes
   voice: am_michael
   music_dir: null            # e.g. /data/music; null = no music
-streamers:
-  - name: Kai Cenat
-    twitch: kaicenat         # login; user_id filled in by `clipper resolve`
-  - name: Jynxzi
-    twitch: jynxzi
+channels:
+  - account: random_gaming_yt   # an accounts.yaml id with content: commentary
+    source: twitch_clips        # discovery source; the only one in this epic
+    prompt: commentary_gaming_v1
+    streamers:
+      - name: Kai Cenat
+        twitch: kaicenat        # login; user_id filled in by `clipper resolve`
+      - name: Jynxzi
+        twitch: jynxzi
 ```
+
+Each channel names its account, its discovery `source`, its script `prompt` and its own
+inputs (for `twitch_clips`, the streamer list), and may override any default (for example
+another `voice` or `run_at`). A new channel with other content is a new `channels` entry and,
+if it needs one, a new source or prompt; the stages stay the same. check-config rejects a
+channel whose account is missing, is not `content: commentary`, or is used by two channels.
 
 The starting streamer list is the owner's call; the ones above are examples. Discovery reads
 Twitch only, so a streamer must stream on Twitch: YouTube-only streamers such as IShowSpeed
@@ -109,7 +135,7 @@ asks to be left out is removed from the list, and their unused candidates are dr
 
 Build order: S1, then S2 to S4 in sequence; S5 can run in parallel after S1; S6 needs S4 and S5; then S7 and S8.
 
-1. **Config, accounts and storage.** [CLP-143](https://linear.app/tengdev/issue/CLP-143): `config/commentary.yaml`, `content:` in `accounts.yaml`,
+1. **Config, accounts and storage.** [CLP-143](https://linear.app/tengdev/issue/CLP-143): `config/commentary.yaml` (per channel), `content:` and `channel_id` in `accounts.yaml`,
    migration `0011` (`story_candidates`, `commentary_stories`), the new job statuses, and the
    monitor creating the daily job.
 2. **Twitch discovery.** [CLP-144](https://linear.app/tengdev/issue/CLP-144): the `discovering` stage: Get Clips, Get Top Games, Get Channel
@@ -117,19 +143,21 @@ Build order: S1, then S2 to S4 in sequence; S5 can run in parallel after S1; S6 
    streamer list.
 3. **Fetch and transcribe candidates.** [CLP-145](https://linear.app/tengdev/issue/CLP-145): the `fetching_sources` and `transcribing` stages for
    commentary jobs.
-4. **Script stage.** [CLP-146](https://linear.app/tengdev/issue/CLP-146): `prompts/commentary_v1.md`, the JSON schema, the guardrail checks, and
+4. **Script stage.** [CLP-146](https://linear.app/tengdev/issue/CLP-146): `prompts/commentary_gaming_v1.md` (prompt per channel), the JSON schema, the guardrail checks, and
    `commentary_stories` rows.
 5. **Local TTS.** [CLP-147](https://linear.app/tengdev/issue/CLP-147): `clipper.pipeline.tts` with Kokoro ONNX, `tts fetch` with pinned hashes, the
    `clipper doctor` check, the `voicing` stage and word alignment. Dockerfile and macOS setup.
 6. **CommentaryShort render.** [CLP-148](https://linear.app/tengdev/issue/CLP-148): the Remotion composition, music ducking, loudness, and the
    `rendering` stage for commentary jobs.
 7. **Review and posting.** [CLP-149](https://linear.app/tengdev/issue/CLP-149): the commentary clip page, checklist, daily Discord ping,
-   regenerate-with-note for one story, and `schedule_for_clip` routing by `content`.
+   regenerate-with-note for one story, `schedule_for_clip` routing by `content`, and the
+   publisher's channel check.
 8. **Setup guide and live run.** [CLP-150](https://linear.app/tengdev/issue/CLP-150): the "Commentary channel" section of `docs/DEPLOYMENT.md`
    (accounts below), the nightly slow test, and the first live day.
 
 ## Owner setup
 
+The channel is Random Gaming (`UCcMYw3Ae2crqXE2yzFBSUig`), owned through lbfilao@gmail.com.
 Values go into `.env` on the worker host (or the local `.env` for a dev run), never into YAML
 or chat.
 
@@ -138,7 +166,8 @@ or chat.
 2. **Google Cloud project.** YouTube Data API v3 enabled; OAuth consent screen published to
    **Production** (a Testing app's refresh tokens expire after 7 days); a Web application OAuth
    client: `YOUTUBE_OAUTH_CLIENT_ID`, `YOUTUBE_OAUTH_CLIENT_SECRET`. A refresh token for the
-   channel from the OAuth Playground: `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>`. Steps:
+   channel from the OAuth Playground: `CLIPPER_REFRESH_TOKEN_RANDOM_GAMING_YT`. One OAuth client
+   serves every channel; each channel has its own refresh token. Steps:
    `docs/DEPLOYMENT.md`, "YouTube publishing".
 3. **Twitch developer application** at <https://dev.twitch.tv/console> (the Twitch account
    needs two-factor authentication): `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`.

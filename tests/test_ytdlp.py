@@ -1,6 +1,7 @@
 import importlib.metadata
 import json
 import os
+import re
 import sys
 import sysconfig
 import threading
@@ -444,6 +445,49 @@ def test_from_env_passes_cancel() -> None:
 
     cancel = threading.Event()
     assert YtDlp.from_env(run_command, {}, cancel=cancel).cancel is cancel
+
+
+def _ytdlp_cache_root(args: Sequence[str]) -> Path:
+    """Where the yt-dlp that `args` would start writes its cache (parsed by yt-dlp itself)."""
+    from yt_dlp import parse_options
+
+    assert list(args[1:3]) == ["-m", "yt_dlp"]
+    with YoutubeDL(parse_options(list(args[3:])).ydl_opts) as ydl:
+        return Path(ydl.cache._get_root_dir())
+
+
+def test_cache_dir_setting_sets_ytdlps_cache_dir(tmp_path: Path) -> None:
+    # The image's root is read-only: the cache (solved player signatures) goes on the tmpfs.
+    cache = tmp_path / "yt-dlp"
+    runner = Recorder(ok(json.dumps({"id": "x"})))
+    yt = YtDlp.from_env(runner, {"CLIPPER_YTDLP_CACHE_DIR": str(cache)})
+
+    yt.probe(URL)
+
+    [(args, _)] = runner.calls
+    assert args[args.index("--cache-dir") + 1] == str(cache)
+    assert _ytdlp_cache_root(args) == cache
+
+
+def test_without_cache_dir_setting_ytdlp_keeps_its_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # macOS and dev: yt-dlp's own default (~/.cache/yt-dlp), which is writable there.
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    args = YtDlp.from_env(run_command, {}).base_args()
+
+    assert "--cache-dir" not in args
+    assert _ytdlp_cache_root(args) == Path.home() / ".cache" / "yt-dlp"
+
+
+def test_image_puts_the_ytdlp_cache_on_the_tmpfs() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    dockerfile = (repo / "Dockerfile").read_text("utf-8")
+    compose = (repo / "docker-compose.yml").read_text("utf-8")
+
+    assert re.search(r"^\s*CLIPPER_YTDLP_CACHE_DIR=/tmp/yt-dlp\b", dockerfile, re.M)
+    assert re.search(r"^\s*tmpfs:\s*\n\s*- /tmp\s*$", compose, re.M)
+    assert re.search(r"^\s*read_only: true\s*$", compose, re.M)
 
 
 @pytest.mark.parametrize(

@@ -81,6 +81,22 @@ stops the update check and its notice. CI runs Deno in the read-only container a
 on any stderr. Both names are on the child-process allowlist in
 `pipeline/ytdlp.py`; no other `DENO_*` variable reaches yt-dlp or Deno.
 
+yt-dlp's own cache defaults to `~/.cache/yt-dlp`, which is read-only in the container, so
+every write failed there. The image sets `CLIPPER_YTDLP_CACHE_DIR=/tmp/yt-dlp`, which
+becomes `--cache-dir` on every yt-dlp call: the cache lives on the tmpfs, is empty after a
+restart, and never touches the data volume. Unset (macOS, dev), yt-dlp keeps its default.
+It is a flag rather than `XDG_CACHE_HOME` because that variable would also move the caches
+of Hugging Face, matplotlib, fontconfig and the Claude CLI, in the main process and its
+children.
+
+What the cache buys with yt-dlp 2026.10.21 is small. Only solved signature functions
+(`youtube-sigfuncs`, about 450 bytes each, keyed by player and signature length) are
+stored on disk. The `n` challenge results are kept in memory for one call only, and
+yt-dlp has turned off its on-disk player cache, so Deno still runs once per probe and per
+download ([CLP-130](https://linear.app/tengdev/issue/CLP-130)). A cache hit only drops the
+signature part of that Deno run. Check with `-v`: `Loading youtube-sigfuncs... from cache`
+followed by `Solving JS challenges using deno`.
+
 Optional settings in `.env`:
 
 - `CLIPPER_YTDLP_COOKIES`: path to a `cookies.txt` for members-only or age-gated videos

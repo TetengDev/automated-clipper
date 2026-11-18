@@ -36,7 +36,8 @@ If the worker is SIGKILLed mid-download, `.info.tmp.json` (probe metadata incl. 
 format URLs, which expire within hours) stays in the media dir until the next attempt
 overwrites and removes it, or retention cleanup deletes the dir.
 
-Optional env: CLIPPER_YTDLP_COOKIES (path to a cookies.txt), CLIPPER_YTDLP_PROXY.
+Optional env: CLIPPER_YTDLP_COOKIES (path to a cookies.txt), CLIPPER_YTDLP_PROXY,
+CLIPPER_YTDLP_CACHE_DIR (yt-dlp's cache dir; the image sets it to the tmpfs).
 """
 
 from __future__ import annotations

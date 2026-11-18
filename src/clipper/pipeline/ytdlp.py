@@ -48,6 +48,9 @@ REDACT_WINDOW_CHARS = 4096
 """Only this much text (the end) is ever passed to `redact`: bounded work per error."""
 COOKIES_ENV = "CLIPPER_YTDLP_COOKIES"
 PROXY_ENV = "CLIPPER_YTDLP_PROXY"
+CACHE_DIR_ENV = "CLIPPER_YTDLP_CACHE_DIR"
+"""yt-dlp's cache dir. Unset: yt-dlp's default (~/.cache/yt-dlp). The image sets it to the
+tmpfs, as its home is on the read-only root."""
 AUDIO_MAX_FILESIZE = "4G"
 AUDIO_FORMAT = "bestaudio/best[height<=480][acodec!=none]/worst[acodec!=none]"
 """Audio-only when there is one; else a muxed format of 480p at most, else the smallest
@@ -394,6 +397,7 @@ class YtDlp:
     runner: Runner = run_command
     cookies: Path | None = None
     proxy: str | None = None
+    cache_dir: Path | None = None
     probe_timeout_s: float = PROBE_TIMEOUT_S
     download_timeout_s: float = DOWNLOAD_TIMEOUT_S
     cap_timeout: Callable[[float], float] = _no_cap
@@ -417,6 +421,8 @@ class YtDlp:
             args += ["--cookies", str(self.cookies)]
         if self.proxy:
             args += ["--proxy", self.proxy]
+        if self.cache_dir is not None:
+            args += ["--cache-dir", str(self.cache_dir)]
         return args
 
     def _run(self, extra: Sequence[str], url: str, timeout_s: float) -> RunResult:
@@ -472,15 +478,22 @@ class YtDlp:
         cap_timeout: Callable[[float], float] = _no_cap,
         cancel: threading.Event | None = None,
     ) -> YtDlp:
-        """Optional CLIPPER_YTDLP_COOKIES (path to a cookies.txt) and CLIPPER_YTDLP_PROXY."""
+        """Optional CLIPPER_YTDLP_COOKIES (path to a cookies.txt), CLIPPER_YTDLP_PROXY and
+        CLIPPER_YTDLP_CACHE_DIR."""
         env = os.environ if env is None else env
         cookies_raw = env.get(COOKIES_ENV, "").strip()
         cookies = Path(cookies_raw) if cookies_raw else None
         if cookies is not None and not cookies.is_file():
             raise YtDlpError(f"{COOKIES_ENV} points to a missing file")
         proxy = env.get(PROXY_ENV, "").strip() or None
+        cache_raw = env.get(CACHE_DIR_ENV, "").strip()
         return cls(
-            runner=runner, cookies=cookies, proxy=proxy, cap_timeout=cap_timeout, cancel=cancel
+            runner=runner,
+            cookies=cookies,
+            proxy=proxy,
+            cache_dir=Path(cache_raw) if cache_raw else None,
+            cap_timeout=cap_timeout,
+            cancel=cancel,
         )
 
     def download_audio(

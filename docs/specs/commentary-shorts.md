@@ -167,14 +167,14 @@ Build order: S1, then S2 to S4 in sequence; S9 after S2; S5 can run in parallel 
 2. **Twitch discovery.** [CLP-144](https://linear.app/tengdev/issue/CLP-144): the `discovering` stage: the game scan (Get Clips by `game_id`), pinned Twitch streamers' clips of the channel's games, the trending-streamer ranking, Get Top Games, Get Channel Information, velocity scoring and filters, `story_candidates` and `streamer_rankings` rows. Extends `clipper resolve` to the channels' games and pinned streamers.
 3. **Fetch and transcribe candidates.** [CLP-145](https://linear.app/tengdev/issue/CLP-145): the `fetching_sources` and `transcribing` stages for
    commentary jobs.
-4. **Script stage.** [CLP-146](https://linear.app/tengdev/issue/CLP-146): `prompts/commentary_gaming_v1.md` (prompt per channel), the JSON schema, the guardrail checks, and
-   `commentary_stories` rows, and the profanity gate.
+4. **Script stage.** [CLP-146](https://linear.app/tengdev/issue/CLP-146): `prompts/commentary_gaming_v1.md` (prompt per channel), the JSON schema, the guardrail checks,
+   `commentary_stories` rows and the profanity gate.
 5. **Local TTS.** [CLP-147](https://linear.app/tengdev/issue/CLP-147): `clipper.pipeline.tts` with Kokoro ONNX, `tts fetch` with pinned hashes, the
    `clipper doctor` check, the `voicing` stage and word timings from `create_timed` (faster-whisper as fallback), pinned to the `model-files-v1.1` files. Dockerfile and macOS setup.
 6. **CommentaryShort render.** [CLP-148](https://linear.app/tengdev/issue/CLP-148): the Remotion composition, music ducking, loudness, and the
    `rendering` stage for commentary jobs.
 7. **Review and posting.** [CLP-149](https://linear.app/tengdev/issue/CLP-149): the commentary clip page, checklist, daily Discord ping,
-   regenerate-with-note for one story, `schedule_for_clip` routing by `content`, and the
+   regenerate-with-note for one story, `schedule_for_clip` routing by `content`, the
    publisher's channel check, and the nudity, near-duplicate and YouTube metadata gates.
 8. **Setup guide and live run.** [CLP-150](https://linear.app/tengdev/issue/CLP-150): the "Commentary channel" section of `docs/DEPLOYMENT.md`
    (accounts below), the nightly slow test, and the first live day.
@@ -182,7 +182,7 @@ Build order: S1, then S2 to S4 in sequence; S9 after S2; S5 can run in parallel 
    discovery for pinned YouTube streamers through the existing YouTube source (RSS and yt-dlp
    metadata), game matching on titles and descriptions with the games' aliases, "most
    replayed" heatmap peaks as moments, excerpts from the existing section download, the
-   "Clip: youtube.com/@<handle>" credit, and their storage.
+   "Clip: youtube.com/@&lt;handle&gt;" credit, and their storage.
 
 ## Owner setup
 

@@ -13,6 +13,7 @@
 # unless the account sets `licence: <reference to the signed licence>`. One licence covers
 # one creator. Windows hold posts from start through end, and the plan must fit in them.
 # Quote country codes YAML could misread, e.g. market: "NO".
+# `content` is clips (the default) or commentary; see the commentary account below.
 #
 # Raffy Tulfo in Action, Ivana Alawi and Cong TV are paused until licensed (CLP-90): do
 # not add accounts for them before a licence is signed.
@@ -65,6 +66,20 @@ accounts:
     windows: ["10:00-15:00"]
     warmup_start: 2026-11-01
     campaign: vyro_mrbeast
+
+  # Commentary Shorts (CLP-142): the Random Gaming channel posts one narrated Short a day,
+  # made from its channel in config/commentary.yaml. A commentary account has no creators,
+  # campaign or licence, and never gets a creator's clip. channel_id is the channel its
+  # refresh token must belong to. YouTube needs only CLIPPER_REFRESH_TOKEN_RANDOM_GAMING_YT.
+  # The plan defaults to 1 post a day in the US YouTube windows; warmup_start is set at
+  # go-live (CLP-150).
+  - id: random_gaming_yt
+    platform: youtube
+    content: commentary
+    channel_id: UCcMYw3Ae2crqXE2yzFBSUig
+    handle: "@RandomGaming-f3w"
+    market: US
+    timezone: America/New_York
 
 # Example: a PH account for a creator that needs a licence. Uncomment only once the
 # licence is signed, and put its reference in `licence:`. The plan fields are left out,

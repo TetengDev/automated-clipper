@@ -415,3 +415,58 @@ def test_check_config_warns_about_a_commentary_account_without_a_channel(
         "warning: commentary account 'random_gaming_yt' has no channel in commentary.yaml"
         in result.stderr
     )
+
+
+# --- shipped config and docs --------------------------------------------------------------
+
+
+def test_shipped_commentary_yaml_validates_against_shipped_accounts() -> None:
+    creators = load_config(REPO / "config" / "creators.yaml")
+    accounts = load_accounts(REPO / "config" / "accounts.yaml", creators)
+
+    cfg = load_commentary(REPO / "config" / "commentary.yaml", accounts)
+
+    (channel,) = cfg.channels
+    assert (channel.account, channel.source, channel.prompt) == (
+        "random_gaming_yt",
+        "twitch_clips",
+        "commentary_gaming_v1",
+    )
+    (game,) = channel.games
+    assert game.name == "Grand Theft Auto VI"
+    assert game.game_id is None or game.game_id.isdigit()
+    assert channel.streamers, "the owner's pinned streamers ship with the channel"
+    assert all((s.twitch is None) != (s.youtube is None) for s in channel.streamers)
+    pinned = {s.twitch for s in channel.streamers if s.twitch}
+    pinned |= {s.youtube.handle.casefold() for s in channel.streamers if s.youtube}
+    assert not pinned & {e.casefold() for e in channel.exclude_streamers}
+    settings = cfg.settings_for(channel)
+    assert settings.run_at == "06:00"
+    assert (settings.candidates_per_day, settings.stories_per_day) == (12, 3)
+    assert (settings.trending_boost, settings.pinned_boost) == (0.5, 0.5)
+    assert (settings.min_clip_views, settings.max_streamers_scanned) == (1000, 50)
+    assert (settings.voice, settings.music_dir) == ("am_michael", None)
+
+
+def test_deployment_docs_explain_commentary_accounts() -> None:
+    text = (REPO / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    section = text.split("## Posting accounts", 1)[1].split("\n## ", 1)[0]
+
+    for needle in (
+        "content: commentary",
+        "channel_id",
+        "config/commentary.yaml",
+        "CLIPPER_COMMENTARY",
+        "run_at",
+        "games",
+        "exclude_streamers",
+        "CLP-152",
+        "CLIPPER_REFRESH_TOKEN_RANDOM_GAMING_YT",
+    ):
+        assert needle in section
+
+
+def test_env_example_lists_the_commentary_token() -> None:
+    text = (REPO / ".env.example").read_text(encoding="utf-8")
+
+    assert "# CLIPPER_REFRESH_TOKEN_RANDOM_GAMING_YT=" in text

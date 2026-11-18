@@ -1,0 +1,69 @@
+# Commentary channels (CLP-142, CLP-143): one narrated Short a day per channel.
+# Validate with: uv run clipper check-config
+#
+# `defaults` apply to every channel. A channel's `overrides` may change any of them, for
+# example another `voice` or `run_at`; an override replaces the default value. Each
+# channel names its accounts.yaml account (content: commentary, one channel per account),
+# its discovery `source` (only twitch_clips so far) and its script `prompt`
+# (prompts/<prompt>.md). For twitch_clips it also names:
+#   games              Twitch categories to scan every day for trending and viral
+#                      streamers, at least one. `aliases` are other names YouTube titles
+#                      use (CLP-152); `clipper resolve` fills in or confirms game_id.
+#   streamers          pinned streamers, each with a Twitch login or a YouTube channel:
+#                      always scanned and boosted by pinned_boost. Only their clips of the
+#                      games above count: pinning boosts, it does not widen the focus.
+#   exclude_streamers  Twitch logins or YouTube handles never used, even when trending.
+# A streamer who asks to be left out goes into exclude_streamers.
+#
+# The monitor makes each channel's job once a day, from run_at in the account's timezone.
+# Set CLIPPER_COMMENTARY to read this file from somewhere else. Quote times: YAML reads an
+# unquoted 16:30 as a number.
+
+defaults:
+  run_at: "06:00"
+  candidates_per_day: 12
+  stories_per_day: 3
+  trending_boost: 0.5        # the clip's game is in Twitch's top 20 today
+  pinned_boost: 0.5          # the clip's streamer is pinned
+  min_clip_views: 1000       # skip clips with fewer views
+  max_streamers_scanned: 50  # trending streamers kept from each day's scan
+  excluded_game_ids: []      # added to the gambling categories the code always excludes
+  voice: am_michael
+  music_dir: null            # e.g. /data/music; null = no music
+
+channels:
+  - account: random_gaming_yt   # Random Gaming, UCcMYw3Ae2crqXE2yzFBSUig
+    source: twitch_clips
+    prompt: commentary_gaming_v1
+    games:
+      - name: Grand Theft Auto VI
+        aliases: [GTA 6, GTA VI]
+        game_id: "1867279146"   # from TwitchTracker; `clipper resolve` confirms it (CLP-144)
+    # The owner's pinned streamers (2026-11-19): the top ten on Twitch, then IShowSpeed on
+    # YouTube. YouTube pins are scanned once CLP-152 ships.
+    streamers:
+      - name: Kai Cenat
+        twitch: kaicenat
+      - name: TheBurntPeanut
+        twitch: theburntpeanut
+      - name: Stable Ronaldo
+        twitch: stableronaldo
+      - name: Jasontheween
+        twitch: jasontheween
+      - name: Lacy
+        twitch: lacy
+      - name: xQc
+        twitch: xqc
+      - name: Ludwig
+        twitch: ludwig
+      - name: summit1g
+        twitch: summit1g
+      - name: Clix
+        twitch: clix
+      - name: CaseOh
+        twitch: caseoh_
+      - name: IShowSpeed
+        youtube:
+          handle: "@IShowSpeed"
+          channel_id: UCWsDFcIhY2DBi3GB5uykGXA
+    exclude_streamers: []

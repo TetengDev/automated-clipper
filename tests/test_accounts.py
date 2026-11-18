@@ -524,9 +524,10 @@ def test_shipped_accounts_yaml_validates_against_shipped_creators() -> None:
         "mrbeast_clips_yt",
         "mrbeast_clips_ig",
         "mrbeast_clips_fb",
+        "random_gaming_yt",
     }
     assert {a.platform for a in cfg.accounts} == {"tiktok", "youtube", "instagram", "facebook"}
-    for account in cfg.accounts:
+    for account in (a for a in cfg.accounts if a.content == "clips"):
         assert account.market == "US"
         assert account.timezone == "America/New_York"
         assert account.creators == ["MrBeast"]
@@ -534,6 +535,15 @@ def test_shipped_accounts_yaml_validates_against_shipped_creators() -> None:
         assert account.campaign == "vyro_mrbeast"
     paused = {"raffy tulfo in action", "ivana alawi", "cong tv"}
     assert not any(c.casefold() in paused for a in cfg.accounts for c in a.creators)
+    rg = ids["random_gaming_yt"]
+    assert (rg.platform, rg.content, rg.channel_id, rg.handle) == (
+        "youtube",
+        "commentary",
+        "UCcMYw3Ae2crqXE2yzFBSUig",
+        "@RandomGaming-f3w",
+    )
+    assert (rg.market, rg.timezone, rg.posts_per_day) == ("US", "America/New_York", 1)
+    assert rg.creators == [] and rg.campaign is None and rg.enabled
 
 
 def test_check_config_summarises_accounts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

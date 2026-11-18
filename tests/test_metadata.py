@@ -4,11 +4,14 @@ flags from the EDL, and the scheduling pre-flight. Everything here is pure."""
 from __future__ import annotations
 
 import dataclasses
+import re
+import unicodedata
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
+from clipper import hashtag_data, metadata
 from clipper.edl import has_ai_elements, parse_edl
 from clipper.metadata import (
     GENERIC_HASHTAGS,
@@ -620,17 +623,13 @@ def test_plain_preflight_skips_only_the_campaign_rules():
 
 # --- inline tags in the title and caption (CLP-111 fix round 1) -----------------------------
 
-SMALL_CAPS = pytest.param(
-    "#ꜱponsored",
-    marks=pytest.mark.xfail(strict=True, reason="single-script Latin lookalike, CLP-112"),
-)
 REJECTED_INLINE = [
     "Watch #fyp #viral",
     "Watch #аd",  # Cyrillic а
     "#fyр",  # Cyrillic р
     "#ѕponsored",  # Cyrillic dze
     "#sponѕored",
-    SMALL_CAPS,
+    "#ꜱponsored",  # Latin small capital s: one script, caught by the skeleton (CLP-112)
 ]
 
 
@@ -677,3 +676,246 @@ def test_inline_tag_stripping_is_idempotent(text):
     once = clean_caption(text)
     assert clean_caption(once) == once
     assert variant(caption=once).caption == once
+
+
+# --- confusable (lookalike) hashtags and CJK padding (CLP-112) ------------------------------
+
+CONFUSABLE = [
+    "#аԁ",  # all Cyrillic
+    "#аԁѕ",
+    "#ᴀᴅ",  # Latin small capitals
+    "#ꜰʏᴘ",
+    "#ꜱponsored",
+    "#ɑd",  # Latin alpha
+    "#vırɑl",  # dotless i
+    "#àd",  # a precomposed accent is dropped for the comparison
+    "#fÿp",
+    "#ᴘʀᴏᴍᴏ",
+    "#aﬀiliate",  # a compatibility ligature
+    "#ad一",  # a CJK character does not hide the Latin tag (CJK padding)
+    "#fypノ",
+    "#一fyp",
+    "#ad東京",
+    "#ᴀᴅ一",
+    # Digit and underscore lookalikes (CLP-112 fix round 1).
+    "#v1ral",
+    "#trend1ng",
+    "#tr3nding",
+    "#f_y_p",
+    "#fyp_",
+    "#f0r_y0u",
+    "#co11ab",
+    "#col1ab",
+    "#ϜΥΡ",  # Greek capitals: digamma, upsilon, rho (the small letters read #ϝup)
+    # i, l, 1 and I are one letter, and o and 0 (CLP-112 fix round 2).
+    "#aff11iate",
+    "#v1ra1",
+    "#viraI",
+    "#coIIab",
+    "#AÐ一",  # the capitals reading, padded with CJK
+    "#PAIÐ一",
+    "#prom0",  # a final 0 for o is not a trailing number
+    "#pr0m0",
+    "#ad2024",  # a trailing number still does not hide #ad
+    "#ad1",
+]
+
+
+@pytest.mark.parametrize("tag", CONFUSABLE)
+def test_confusable_tags_are_rejected_in_a_variant(tag):
+    with pytest.raises(ValidationError, match="generic|disclosure"):
+        variant(hashtags=["#mrbeast", tag, "#island"])
+
+
+@pytest.mark.parametrize("tag", [*CONFUSABLE, "#fypー"])
+def test_confusable_tags_are_dropped_from_model_output(tag):
+    assert clean_hashtags(["#mrbeast", tag, "#island"]) == ["#mrbeast", "#island"]
+    reply = {"title": "T", "caption": "C", "hashtags": ["#mrbeast", tag, "#island", "#money"]}
+    out = coerce_variants({p: reply for p in PLATFORMS}, None, None, [])
+    assert all(v.hashtags == ["#mrbeast", "#island", "#money"] for v in out.values())
+
+
+@pytest.mark.parametrize("tag", CONFUSABLE)
+def test_confusable_inline_tags_are_stripped_and_held(tag):
+    assert clean_caption(f"Watch {tag} now") == "Watch now"
+    meta = PostMetadata(title="T", caption=f"Watch {tag}", hashtags=["#a1"], flags={})
+    assert preflight(meta, "tiktok", 35.0, plain=True) != []
+
+
+KEPT = [
+    "#Москва",
+    "#東京タワー",
+    "#Hawaiʻi",
+    "#adventure",
+    "#advice",
+    "#нагрузка",
+    "#नमस्ते",
+    "#_ok",
+    "#iPhone買った",
+    "#BTS콘서트",
+    "#mrbeast",
+    "#promotion_free",  # not a prefix of a disclosure tag: #promoted is
+    "#ア\u3099",  # the kana voiced sound mark on kana (CLP-112: was rejected as COMBINING)
+    "#б\u0483",  # a Cyrillic titlo on Cyrillic
+    "#α\u0342",  # a Greek perispomeni on Greek
+]
+
+
+@pytest.mark.parametrize("tag", KEPT)
+def test_ordinary_tags_are_kept(tag):
+    assert variant(hashtags=["#mrbeast2", tag, "#island"]).hashtags[1] == tag
+    assert clean_hashtags(["#mrbeast2", tag]) == ["#mrbeast2", tag]
+
+
+def test_ordinary_inline_text_is_kept():
+    text = "Watch #adventure, #advice, C# and issue #12 #_ok #東京タワー #Москва"
+    assert clean_caption(text) == text
+
+
+@pytest.mark.parametrize(
+    ("tag", "error"),
+    [
+        ("#ᥐ\u1a60", "invalid hashtag"),  # a Tai Tham mark on a Tai Le letter (both "TAI ...")
+        ("#ра၀", "CYRILLIC, MYANMAR"),  # a lookalike digit from another script
+    ],
+)
+def test_scripts_come_from_the_unicode_script_property(tag, error):
+    assert not clean_hashtags([tag])
+    with pytest.raises(ValidationError, match=error):
+        variant(hashtags=["#mrbeast", tag, "#island"])
+
+
+def test_marks_stacked_on_one_letter_are_capped():
+    assert is_hashtag("#ที่")
+    assert is_hashtag("#ก" + "\u0e48" * 4)
+    assert not is_hashtag("#ก" + "\u0e48" * 5)
+    assert not is_hashtag("#ก" + "\u0e48" * 49)
+    assert clean_caption("a #ก" + "\u0e48" * 49 + " b") == "a b"
+
+
+def test_a_campaign_tag_lookalike_from_the_model_gives_way_to_the_campaign_tag():
+    meta = build_post_metadata(
+        variants(hashtags=["#ᴠyro", "#kai", "#chair"]), "tiktok", campaign_tags=["#vyro"]
+    )
+    assert meta.hashtags == ["#kai", "#chair", "#vyro"]
+
+
+@pytest.mark.parametrize("tag", ["#ad", "#аd", "#ᴀᴅ", "#ad\u094d"])
+def test_plain_preflight_rechecks_the_stored_hashtag_list(tag):
+    meta = PostMetadata(title="T", caption="C", hashtags=["#kai", tag], flags={})
+    assert any(tag in p for p in preflight(meta, "tiktok", 35.0, plain=True))
+    # A campaign may put its own disclosure tag on the list.
+    campaign = Brief(name="vyro", required_tags=["#ad"])
+    if tag == "#ad":
+        assert preflight(meta, "tiktok", 35.0, campaign) == ["tiktok: 2 hashtags, use at least 3"]
+
+
+@pytest.mark.parametrize(
+    ("text", "cleaned"),
+    [
+        ("##ad x", "x"),
+        ("x\u200d#fyp y", "x y"),
+        ("#fyp\u200dx y", "y"),  # a platform may end the tag at the joiner
+        ("#a\u093ed y", "y"),  # a spacing mark after Latin is not a word break
+        ("#ad\u0301 y", "y"),
+    ],
+)
+def test_inline_tag_edge_cases(text, cleaned):
+    assert clean_caption(text) == cleaned
+
+
+BYPASS_CORPUS = [
+    *CONFUSABLE,
+    "##ad",
+    "x\u200d#fyp",
+    "#fyp\u200dx",
+    "#a\u093ed",
+    "#ก" + "\u0e48" * 49,
+    "https://site.com/page#fyp",
+    "#ꜱponsored#ad#kai",
+    "#\u200d#ad",
+]
+
+
+@pytest.mark.parametrize("raw", BYPASS_CORPUS)
+def test_cleaning_the_bypass_corpus_is_idempotent_and_leaves_nothing_unusable(raw):
+    text = f"a {raw} b"
+    once = clean_caption(text)
+    assert clean_caption(once) == once
+    assert variant(caption=once).caption == once
+    meta = PostMetadata(title="T", caption=once, hashtags=["#a1", "#b1", "#c1"], flags={})
+    assert preflight(meta, "tiktok", 35.0, plain=True) == []
+    tags = clean_hashtags([raw, "#kai"])
+    assert clean_hashtags(tags) == tags
+
+
+def _plain_problems(text: str) -> list[str]:
+    meta = PostMetadata(title="T", caption=text, hashtags=["#a1", "#b1", "#c1"], flags={})
+    return preflight(meta, "tiktok", 35.0, plain=True)
+
+
+def test_a_generic_tag_inside_a_url_is_left_to_the_link_rules():
+    text = "see https://site.com/page#fyp now"
+    assert clean_caption(text) == text
+    assert _plain_problems(text) == []
+    meta = PostMetadata(title="T", caption=text, hashtags=["#a1", "#b1", "#c1"], flags={})
+    assert any("links or mentions" in p for p in preflight(meta, "tiktok", 35.0))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Only a URL (https://, www.) carries a path a tag can sit in (CLP-112 fix round 2).
+        "@bob/#ad hi",
+        "lol.ok/#ad hi",
+        "1.2.3.4/#ad",
+        "name dot com/#ad",
+        "name[.]com/#ad",
+        "x.co/#ad#fyp#viral",
+        "@bob/#fyp hi",
+        "site.com/page#fyp",
+        # Caught before, still caught.
+        "word.#ad",
+        "x.co#ad",
+        "see.it#ad",
+        "e.g/#ad",
+        "and/or #ad",
+    ],
+)
+def test_a_tag_after_a_mention_or_bare_domain_is_read_as_a_tag(text):
+    assert _plain_problems(text) != []
+    once = clean_caption(text)
+    assert not any(t in once for t in ("#ad", "#fyp", "#viral"))
+    assert _plain_problems(once) == []
+
+
+@pytest.mark.parametrize(
+    "url", ["https://x.co/#ad", "www.x.co/page#sponsored", "https://x.co/p#аd"]
+)
+def test_a_disclosure_like_tag_inside_a_url_is_kept_but_holds_a_plain_post(url):
+    text = f"see {url} now"
+    assert clean_caption(text) == text  # the URL is never cut
+    assert any("disclosure-like" in p for p in _plain_problems(text))
+
+
+def test_the_vendored_tables_hold_their_invariants():
+    for cp, target in hashtag_data.CONFUSABLES.items():
+        char = chr(cp)
+        assert metadata._prefold(char) == char and unicodedata.category(char)[0] in "LN"
+        assert re.fullmatch(r"[a-z0-9_]+", target), hex(cp)
+        assert target.translate(hashtag_data.CONFUSABLES) == target  # one pass is enough
+    for cp, target in hashtag_data.CAPITAL_CONFUSABLES.items():
+        char = chr(cp)
+        assert not char.isascii() and unicodedata.category(char) in {"Lu", "Lt"}
+        assert unicodedata.normalize("NFKD", char) == char
+        assert re.fullmatch(r"[a-z0-9_]+", target), hex(cp)
+    starts = hashtag_data.SCRIPT_STARTS
+    assert list(starts) == sorted(set(starts)) and len(starts) == len(hashtag_data.SCRIPT_NAMES)
+    assert "UNKNOWN" not in hashtag_data.SCRIPT_NAMES
+
+
+def test_the_vendored_unicode_data_matches_the_runtime():
+    """The generated tables are Unicode 15.0 (Python 3.12): a newer Python needs them
+    regenerated (scripts/gen_hashtag_data.py), or new letters would have no script."""
+    assert unicodedata.unidata_version == hashtag_data.UNICODE_VERSION
+    assert "UNKNOWN" not in hashtag_data.SCRIPT_NAMES  # every letter, mark and number has one

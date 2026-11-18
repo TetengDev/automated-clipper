@@ -286,12 +286,24 @@ account posts the creator for (a disabled campaign included), and the reviewer m
 
 A post for an account outside any campaign goes through the platform part of the same
 check, at scheduling and again just before it is published: the platform's length, title,
-caption and hashtag limits, generic hashtags, and generic, disclosure-like (`#ad`,
-`#sponsored`) or mixed-script tags written into the title or caption. A post that fails is
-held the same way. Links, mentions and too few hashtags hold only campaign posts. Such
-inline tags are also stripped from the model's titles and captions, from the per-platform
-text and from the export package, so in practice the check catches only text stored before
-that cleaning existed.
+caption and hashtag limits, generic hashtags, disclosure-like, malformed or mixed-script
+tags on its hashtag list, and generic, disclosure-like (`#ad`, `#sponsored`) or
+mixed-script tags written into the title or caption. A post that fails is held the same
+way. Links, mentions and too few hashtags hold only campaign posts. Such inline tags are
+also stripped from the model's titles and captions, from the per-platform text and from
+the export package, so in practice the check catches only text stored before that cleaning
+existed. A `#` inside a URL (`https://site.com/page#fyp`) is not stripped: the URL is left
+whole and judged by the link rules, which hold campaign posts only, but a disclosure-like
+one (`https://site.com/page#ad`) still holds a plain post for a person to look at. After a
+mention or a bare domain (`@bob/#ad`, `site.com/#ad`) a `#` starts a tag as usual.
+
+Generic and disclosure tags are also caught as lookalikes written in one script, such as
+all-Cyrillic `#аԁ`, the small capitals `#ᴀᴅ` or `#ꜰʏᴘ`, Greek capitals `#ϜΥΡ`, accented
+`#àd`, digits, underscores or a capital I (`#v1ral`, `#co11ab`, `#f_y_p`, `#viraI`), or a
+Latin tag padded with Japanese or Chinese (`#ad一`). The comparison uses the Unicode
+confusables table (UTS #39) and the Unicode script data, vendored in `src/clipper/hashtag_data.py` for
+Unicode 15.0 (Python 3.12). After a Python upgrade, regenerate it with
+`uv run python scripts/gen_hashtag_data.py`; a test fails until the versions match.
 
 The worker runs the same check again just before it publishes, with the config as it is
 on disk (reloaded when `creators.yaml`, `accounts.yaml` or `campaigns.yaml` changes), so a

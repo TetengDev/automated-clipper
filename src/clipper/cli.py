@@ -31,7 +31,7 @@ from clipper.export import DEFAULT_OUTPUT_DIR
 from clipper.monitor import CycleReport, FirstRun, YouTubeMonitor
 from clipper.pipeline import build_stages
 from clipper.posting.cli import app as posts_app
-from clipper.posting.stage import PostingStage
+from clipper.posting.stage import HEARTBEAT_BUSY_MS, PostingStage
 from clipper.submissions_cli import app as campaigns_app
 from clipper.urls import InvalidSourceURL, parse_source_url
 
@@ -406,7 +406,9 @@ def run_worker(
     ] = None,
     recover_id: Annotated[
         str | None,
-        typer.Option(help="Release jobs claimed by this dead worker id before starting."),
+        typer.Option(
+            help="Release jobs and uploading posts claimed by this dead worker id before starting."
+        ),
     ] = None,
     poll_seconds: Annotated[float, typer.Option(min=0.1, help="Idle sleep.")] = (
         jobs.DEFAULT_POLL_SECONDS
@@ -414,6 +416,8 @@ def run_worker(
     once: Annotated[bool, typer.Option(help="Run one stage of one job, then exit.")] = False,
 ) -> None:
     """Process queued jobs through the clip pipeline."""
+    if recover_id is not None and not recover_id.isprintable():
+        _fail("run-worker: --recover-id must not contain control characters")
     app_ctx = _app(ctx)
     try:
         cfg = load_config(app_ctx.config_path)
@@ -438,16 +442,30 @@ def run_worker(
     notify, alert = _notifiers(http)
     _preflight("run-worker", alert)
     worker.alert = alert
+    # The posting pass runs on its own thread (CLP-105), so it gets its own connection;
+    # check_same_thread=False only because `recover` uses it here before that thread starts.
+    # The guard and the submission pass run on that thread too, so they use it as well.
+    # Its upload heartbeat opens one more, per upload.
+    db_path = app_ctx.db_path
+    try:
+        posting_conn = connect(db_path, check_same_thread=False)
+    except (sqlite3.Error, OSError) as exc:
+        http.close()
+        conn.close()
+        _fail(f"cannot open database {db_path}: {exc}")
+    stop = threading.Event()
     # Platforms without a registered publisher keep their due posts scheduled.
     publishers = _publishers(app_ctx.config_path, cfg)
     posting = PostingStage(
-        conn=conn,
+        conn=posting_conn,
         publishers=publishers,
         worker_id=worker.worker_id,
         media_root=media_dir,
-        guard=publish_guard(conn, live, media_dir.resolve()),
+        guard=publish_guard(posting_conn, live, media_dir.resolve()),
+        connect=lambda: connect(db_path, busy_timeout_ms=HEARTBEAT_BUSY_MS),
+        stop=stop,
     )
-    submitting = SubmissionPass(conn, LiveCampaigns(live), notify, alert)
+    submitting = SubmissionPass(posting_conn, LiveCampaigns(live), notify, alert)
     worker.posting = ChainedPasses([posting, submitting])
     try:
         if recover_id:
@@ -456,17 +474,21 @@ def run_worker(
             if not worker.run_once():
                 typer.echo("no due jobs")
             return
-        stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         worker.run_forever(stop, poll_seconds=poll_seconds)
     except KeyboardInterrupt:
         raise typer.Exit(code=130) from None
     finally:
-        for publisher in publishers.values():
-            close = getattr(publisher, "close", None)
-            if callable(close):
-                close()
-        http.close()
+        # A posting thread that outlived an interrupt may still be using its connection,
+        # the publishers and the webhook client; leave those to process exit rather than
+        # close them under the thread.
+        if not worker.posting_running:
+            for publisher in publishers.values():
+                close = getattr(publisher, "close", None)
+                if callable(close):
+                    close()
+            posting_conn.close()
+            http.close()
         conn.close()
 
 

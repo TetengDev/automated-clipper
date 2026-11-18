@@ -11,7 +11,10 @@ Security model (single reviewer, behind Caddy/HTTPS in production):
   `csrf_token` form field or an `X-CSRF-Token` header (`csrf_protect`, applied app-wide).
 - Every request body is capped at 256 KB (`_BodySizeLimit`, outside the session and auth
   layers): an oversized `Content-Length` is 413 before the app runs, and a streamed body is
-  counted as it arrives, so no form is ever parsed past the cap.
+  counted as it arrives. A urlencoded form is also capped at 200 fields, by counting its `&`
+  separators as they arrive: the chunk that passes the cap never reaches a parser, though
+  earlier chunks may have been parsed. Multipart forms, which no route takes, are 415
+  before the app runs. An HTMX request's 413 is a readable error fragment.
 - Login attempts are throttled per client IP (the 6th failure inside a sliding minute gets
   429) with a global backstop of 30 attempts a minute. The client IP is only trustworthy
   when uvicorn trusts the proxy's X-Forwarded-For (`run-review --forwarded-allow-ips`).
@@ -36,6 +39,8 @@ from urllib.parse import quote, urlsplit
 
 import bcrypt
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -45,7 +50,9 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from python_multipart.multipart import parse_options_header
 from starlette.datastructures import Headers, MutableHeaders
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -73,12 +80,28 @@ BCRYPT_MAX_BYTES = 72
 # Largest legitimate form (CLP-96 variants: every title and caption at its platform limit,
 # in 4-byte characters percent-encoded) is about 140 KB.
 MAX_REQUEST_BODY_BYTES = 256 * 1024
+# Largest legitimate form (variants again) has 11 fields.
+MAX_FORM_FIELDS = 200
 CSRF_FORM_FIELD = "csrf_token"
 CSRF_HEADER = "X-CSRF-Token"
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _PUBLIC_PATHS = frozenset({"/login", "/healthz"})
 _BCRYPT_HASH = re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$")
 _CONTENT_LENGTH = re.compile(r"[0-9]+")
+_BODY_TOO_LARGE = "Request body too large"
+_TOO_MANY_FIELDS = "Too many form fields"
+_NO_MULTIPART = "Multipart forms are not accepted"
+# An HTMX request's 422 from FastAPI's own validation: htmx swaps 422s into the page, and the
+# default JSON body reflects the submitted values, so the reviewer gets this fixed text.
+_INVALID_FORM = "Not saved: a field is missing or invalid. Reload the page and try again."
+# What an HTMX request's 413 shows the reviewer, in the action's error slot.
+_TOO_LARGE_MESSAGES = {
+    _BODY_TOO_LARGE: (
+        f"Not saved: the form is over {MAX_REQUEST_BODY_BYTES // 1024} KB. "
+        "Shorten the text and try again."
+    ),
+    _TOO_MANY_FIELDS: "Not saved: the form has too many fields.",
+}
 _UNSAFE_NEXT_CHARS = re.compile(r"[\x00-\x20\x7f\\]")
 
 SECURITY_HEADERS = {
@@ -206,27 +229,32 @@ class _AuthGate:
 
 
 class _BodyTooLarge(HTTPException):
-    """Raised from the wrapped `receive` once a body passes the cap. An HTTPException, so
+    """Raised from the wrapped `receive` once a body passes a cap. An HTTPException, so
     FastAPI's body parsing re-raises it as-is (any other error becomes a 400); the app's
     handler for it answers with the same `_too_large()` response as the middleware."""
 
-    def __init__(self) -> None:
-        super().__init__(status_code=413, detail="Request body too large")
+    def __init__(self, detail: str = _BODY_TOO_LARGE) -> None:
+        super().__init__(status_code=413, detail=detail)
 
 
 class _BodySizeLimit:
-    """ASGI middleware: request bodies over `max_bytes` get 413 before anything parses them.
+    """ASGI middleware: request bodies over `max_bytes`, and urlencoded forms over
+    `max_fields`, get 413; multipart forms get 415.
 
     A declared `Content-Length` over the cap is refused without calling the app; a
     malformed one is 400. The body is also counted as it streams in (chunked uploads, or a
     `Content-Length` that understates it): past the cap, `receive` raises `_BodyTooLarge`,
     which the app's exception handler turns into a 413, or this middleware does if it
-    escapes the app. Every 413 closes the connection, so the rest of the body is not read.
+    escapes the app. A urlencoded form's `&` separators are counted the same way (n of them
+    allow at most n + 1 fields, the parser's split), so the chunk that passes the cap never
+    reaches a parser. No route takes multipart, so it is refused before the app runs rather
+    than counted. Every 413 and 415 closes the connection, so the rest of the body is not read.
     """
 
-    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+    def __init__(self, app: ASGIApp, *, max_bytes: int, max_fields: int = MAX_FORM_FIELDS) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        self.max_fields = max_fields
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -239,19 +267,33 @@ class _BodySizeLimit:
                 return
             # Length check first: int() refuses strings over 4300 digits.
             if len(declared) > len(str(self.max_bytes)) or int(declared) > self.max_bytes:
-                await _too_large()(scope, receive, send)
+                await _too_large(scope)(scope, receive, send)
                 return
+        # Starlette compares the parsed type as is (python-multipart lower-cases it only when
+        # there are no parameters); lower-casing refuses or counts a superset of its forms.
+        content_type = parse_options_header(Headers(scope=scope).get("content-type"))[0].lower()
+        if content_type == b"multipart/form-data":
+            refuse = PlainTextResponse(_NO_MULTIPART, 415, headers={"Connection": "close"})
+            await refuse(scope, receive, send)
+            return
 
         received = 0
         started = False
+        count_fields = content_type == b"application/x-www-form-urlencoded"
+        fields = 1
 
         async def limited_receive() -> Message:
-            nonlocal received
+            nonlocal received, fields
             message = await receive()
             if message["type"] == "http.request":
-                received += len(message.get("body", b""))
+                body = message.get("body", b"")
+                received += len(body)
                 if received > self.max_bytes:
                     raise _BodyTooLarge
+                if count_fields:
+                    fields += body.count(b"&")
+                    if fields > self.max_fields:
+                        raise _BodyTooLarge(_TOO_MANY_FIELDS)
             return message
 
         async def tracking_send(message: Message) -> None:
@@ -262,14 +304,22 @@ class _BodySizeLimit:
 
         try:
             await self.app(scope, limited_receive, tracking_send)
-        except _BodyTooLarge:
+        except _BodyTooLarge as exc:
             if started:
                 raise
-            await _too_large()(scope, receive, send)
+            await _too_large(scope, exc.detail)(scope, receive, send)
 
 
-def _too_large() -> Response:
-    return PlainTextResponse("Request body too large", 413, headers={"Connection": "close"})
+def _too_large(scope: Scope, detail: str = _BODY_TOO_LARGE) -> Response:
+    """The 413: plain text, or for HTMX the `_action_error.html` fragment, which htmx swaps
+    into the action's error slot (its `hx-target`; base.html lets 413s swap). Rendered
+    without `render()`: the middleware runs outside the session."""
+    headers = {"Connection": "close"}
+    if Headers(scope=scope).get("hx-request") != "true":
+        return PlainTextResponse(detail, 413, headers=headers)
+    message = _TOO_LARGE_MESSAGES.get(detail, detail)
+    html = templates.get_template("_action_error.html").render(message=message)
+    return HTMLResponse(html, 413, headers=headers)
 
 
 class _SecurityHeaders:
@@ -417,7 +467,15 @@ async def csrf_protect(request: Request) -> None:
     if not supplied:
         content_type = request.headers.get("content-type", "")
         if content_type.startswith(("application/x-www-form-urlencoded", "multipart/form-data")):
-            form = await request.form()
+            # `max_fields` only binds on routes without Form() params: FastAPI parses those
+            # before any dependency runs, with Starlette's default cap of 1000.
+            try:
+                form = await request.form(max_fields=MAX_FORM_FIELDS)
+            except StarletteHTTPException as exc:
+                # Unreachable over HTTP today: `_BodySizeLimit` refuses at the same cap first.
+                if exc.status_code == 400 and str(exc.detail).startswith("Too many fields"):
+                    raise _BodyTooLarge(_TOO_MANY_FIELDS) from exc
+                raise
             value = form.get(CSRF_FORM_FIELD)
             supplied = value if isinstance(value, str) else None
     if (
@@ -563,8 +621,16 @@ def create_app(
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.exception_handler(_BodyTooLarge)
-    async def _body_too_large(_request: Request, _exc: _BodyTooLarge) -> Response:
-        return _too_large()
+    async def _body_too_large(request: Request, exc: _BodyTooLarge) -> Response:
+        return _too_large(request.scope, exc.detail)
+
+    @app.exception_handler(RequestValidationError)
+    async def _invalid_request(request: Request, exc: RequestValidationError) -> Response:
+        if request.headers.get("HX-Request") == "true":
+            return render(
+                request, "_action_error.html", {"message": _INVALID_FORM}, status_code=422
+            )
+        return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(LoginRequired)
     async def _login_required(request: Request, _exc: LoginRequired) -> Response:

@@ -34,7 +34,7 @@ jobs:
         uses: ./.github/actions/apt-install
         with:
           packages: ffmpeg
-          save: "true"  # TEMPORARY (CLP-140): lets a PR re-run show a cache hit; reverted next commit
+          save: ${{ github.ref == 'refs/heads/dev' }}
 
       - name: Install dependencies
         run: uv sync --locked

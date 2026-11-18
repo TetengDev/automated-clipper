@@ -456,9 +456,11 @@ def test_model_read_error_never_fails_the_clip(
     def eio(fd: int) -> Any:
         raise OSError(5, "Input/output error")
 
-    monkeypatch.setattr(rf.os, "fstat", eio)
-    assert rf.read_model(tmp_path / rf.MODEL_NAME) is None
-    assert rf.ensure_model(tmp_path, fetch=lambda u, t: b"tampered") is None  # no raise
+    # Scoped so os.fstat is restored before pytest's capture teardown calls it.
+    with monkeypatch.context() as m:
+        m.setattr(rf.os, "fstat", eio)
+        assert rf.read_model(tmp_path / rf.MODEL_NAME) is None
+        assert rf.ensure_model(tmp_path, fetch=lambda u, t: b"tampered") is None  # no raise
 
 
 def test_model_read_refuses_symlinks_and_fifos(tmp_path: Path, pinned: str) -> None:

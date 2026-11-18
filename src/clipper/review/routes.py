@@ -397,7 +397,7 @@ def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.Clip
         # The reasons are on the Scheduled page; the flash says where to look.
         flash(
             request,
-            f"Clip {clip.id}: {len(held)} post(s) held by the campaign pre-flight"
+            f"Clip {clip.id}: {len(held)} post(s) held by the pre-flight"
             f" ({', '.join(p.account_id for p in held)}); see Scheduled for the reasons.",
         )
 

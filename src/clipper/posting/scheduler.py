@@ -39,7 +39,7 @@ from clipper.campaigns import (
 from clipper.clips import ClipDetail, ClipStatus
 from clipper.config import ConfigError
 from clipper.db import transaction
-from clipper.metadata import build_post_metadata
+from clipper.metadata import build_post_metadata, preflight
 from clipper.pipeline.common import strip_control
 from clipper.posting import repo
 from clipper.posting.models import Post, PostConflict, PostMetadata, PostStatus
@@ -215,7 +215,8 @@ def _plan(
     )
     metadata = PostMetadata(**asdict(built))
     if campaign_id is None:
-        return _Plan(None, metadata, [])
+        problems = preflight(built, account.platform, clip.current.duration_s, plain=True)
+        return _Plan(None, metadata, problems)
     if campaign is None:
         problem = f"account {account.id}: unknown campaign {campaign_id!r}; fix accounts.yaml"
         return _Plan(campaign_id, metadata, [problem])
@@ -464,11 +465,12 @@ def publish_problem(
             f"campaign changed since scheduling ({post.campaign_id or 'none'} ->"
             f" {campaign_id or 'none'}); run `clipper posts recheck` or cancel the post"
         )
+    metadata = repo.metadata_for(conn, post)
     if campaign_id is None:
-        return None
+        problems = preflight(metadata, post.platform, version.duration_s, plain=True)
+        return "; ".join(problems) if problems else None
     if campaign is None:
         return f"account {account.id}: unknown campaign {campaign_id!r}"
-    metadata = repo.metadata_for(conn, post)
     edl = render_edl(media_root, post.video_path) if media_root else None
     problems = campaign_preflight(campaign, metadata, post.platform, version.duration_s, edl, now)
     return "; ".join(problems) if problems else None

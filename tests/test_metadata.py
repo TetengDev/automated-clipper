@@ -19,10 +19,12 @@ from clipper.metadata import (
     Variant,
     build_post_metadata,
     caption_room,
+    clean_caption,
     clean_hashtags,
     coerce_variants,
     derive_variants,
     fingerprint,
+    is_hashtag,
     links_or_mentions,
     preflight,
     truncate_words,
@@ -539,3 +541,139 @@ def test_mixed_script_hashtags_are_dropped_from_model_output(tag):
 def test_single_script_and_cjk_tags_still_pass(tag):
     assert variant(hashtags=["#mrbeast", tag, "#island"]).hashtags[1] == tag
     assert clean_hashtags(["#mrbeast", tag]) == ["#mrbeast", tag]
+
+
+# --- combining marks (CLP-113) --------------------------------------------------------------
+
+MARKED = [
+    "#नमस्ते",  # Devanagari: virama and vowel sign (Mn)
+    "#हिन्दी",  # Devanagari: spacing vowel signs (Mc)
+    "#ราตรี",  # Thai vowel sign
+    "#ที่",  # Thai: a tone mark stacked on a vowel sign
+    "#தமிழ்",  # Tamil: spacing vowel sign and virama
+    "#ᜋ᜔ᜈ",  # Baybayin with the virama
+]
+
+
+@pytest.mark.parametrize("tag", MARKED)
+def test_tags_with_combining_marks_pass(tag):
+    assert is_hashtag(tag)
+    assert variant(hashtags=["#mrbeast", tag, "#island"]).hashtags[1] == tag
+    assert clean_hashtags(["#mrbeast", tag]) == ["#mrbeast", tag]
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "#\u094d",  # a mark on its own
+        "#\u094dनमस",  # a mark straight after #
+        "#\u0e35abc",
+        "#_\u094d",  # a mark after an underscore or a digit has no letter to sit on
+        "#2\u0e35",
+        "#fyp\u0323",  # a Latin tag padded with a combining mark is still #fyp
+        "#ad\u094d",  # ... or with another script's mark
+        "#fyp\u0e35",
+        "#ad\u200d",  # a joiner is not a mark
+    ],
+)
+def test_marks_without_a_same_script_letter_before_them_are_rejected(tag):
+    assert not is_hashtag(tag)
+    assert clean_hashtags(["#mrbeast", tag]) == ["#mrbeast"]
+    with pytest.raises(ValidationError, match="invalid hashtag"):
+        variant(hashtags=["#mrbeast", tag, "#island"])
+
+
+def test_the_50_limit_counts_code_points_marks_included():
+    assert is_hashtag("#" + "न\u094d" * 25)
+    assert not is_hashtag("#" + "न\u094d" * 25 + "न")
+    assert is_hashtag("#" + "a" * 50)
+    assert not is_hashtag("#" + "a" * 51)
+    assert not is_hashtag("#")
+    assert not is_hashtag("nohash")
+
+
+# --- the pre-flight for a post outside any campaign (CLP-111) -------------------------------
+
+
+def test_plain_preflight_skips_only_the_campaign_rules():
+    few = PostMetadata(title="T", caption="see mrbeast.com @kai", hashtags=["#a"], flags={})
+    assert preflight(few, "tiktok", 35.0, plain=True) == []
+    assert len(preflight(few, "tiktok", 35.0)) == 2  # too few hashtags; a link and a mention
+    bad = PostMetadata(
+        title="<b>" + "t" * 100,
+        caption="Paid #ad",
+        hashtags=["#FYP", *[f"#t{i}" for i in range(15)]],
+        flags={},
+    )
+    problems = preflight(bad, "youtube", 200.0, plain=True)
+    expected = [
+        "clip length 200 s",
+        "16 hashtags, at most 15",
+        "generic hashtags #FYP",
+        "contains < or >",
+        "disclosure-like tags in the text: #ad",
+        "title is longer than 100",
+    ]
+    assert len(problems) == len(expected)
+    assert all(any(e in p for p in problems) for e in expected), problems
+
+
+# --- inline tags in the title and caption (CLP-111 fix round 1) -----------------------------
+
+SMALL_CAPS = pytest.param(
+    "#ꜱponsored",
+    marks=pytest.mark.xfail(strict=True, reason="single-script Latin lookalike, CLP-112"),
+)
+REJECTED_INLINE = [
+    "Watch #fyp #viral",
+    "Watch #аd",  # Cyrillic а
+    "#fyр",  # Cyrillic р
+    "#ѕponsored",  # Cyrillic dze
+    "#sponѕored",
+    SMALL_CAPS,
+]
+
+
+@pytest.mark.parametrize("text", REJECTED_INLINE)
+def test_plain_preflight_holds_rejected_inline_tags(text):
+    meta = PostMetadata(title="T", caption=text, hashtags=["#a1", "#b1", "#c1"], flags={})
+    assert preflight(meta, "tiktok", 35.0, plain=True) != []
+    titled = dataclasses.replace(meta, title=text, caption="C")
+    assert preflight(titled, "tiktok", 35.0, plain=True) != []
+
+
+@pytest.mark.parametrize("text", REJECTED_INLINE)
+def test_rejected_inline_tags_are_stripped_from_the_title_and_caption(text):
+    def words(line: str) -> str:  # the text without its tags
+        return " ".join(w for w in line.split() if not w.startswith("#"))
+
+    v = variant(title=f"Big {text} moment", caption=f"Line {text} one\nLine two #kai")
+    assert v.title == words(f"Big {text} moment")
+    assert v.caption == words(f"Line {text} one") + "\nLine two #kai"
+    out = coerce_variants(None, f"Big {text}", f"Cap {text}", ["#kai", "#chair", "#fall"])
+    expected = (words(f"Big {text}"), words(f"Cap {text}"))
+    assert all((x.title, x.caption) == expected for x in out.values())
+
+
+def test_inline_tag_stripping_takes_padding_and_disclosure_tags_too():
+    assert clean_caption("a #ad b #fyp\u0323 c #f\u200byp d #Sponsored_2024") == "a b c d"
+    assert clean_caption("#fyp#ad") == ""
+
+
+def test_usable_inline_tags_are_kept():
+    text = "Watch #नमस्ते #kai #東京タワー and C# code, #1 fan"
+    assert clean_caption(text) == text
+    meta = PostMetadata(title="T", caption=text, hashtags=["#a1", "#b1", "#c1"], flags={})
+    assert preflight(meta, "tiktok", 35.0, plain=True) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["##ad x", "#a#fyp#b", "x#fyp\u0301y #ad\u094d!", "#\u2060fyp #fyp\x07", "½#fy\ufe0fp"],
+)
+def test_inline_tag_stripping_is_idempotent(text):
+    """Stored variants are validated on every load: a second pass must change nothing, or
+    the fingerprint drifts and every edit reads as stale."""
+    once = clean_caption(text)
+    assert clean_caption(once) == once
+    assert variant(caption=once).caption == once

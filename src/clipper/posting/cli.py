@@ -1,5 +1,5 @@
 """`clipper posts`: list, cancel, reschedule and retry scheduled posts (CLP-92), and
-recheck posts held by the campaign pre-flight (CLP-97)."""
+recheck posts held by the pre-flight (CLP-97, CLP-111)."""
 
 from __future__ import annotations
 
@@ -149,7 +149,7 @@ def recheck_cmd(
         Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Rendered clips and sidecars.")
     ] = DEFAULT_MEDIA_ROOT,
 ) -> None:
-    """Re-run the campaign pre-flight on held posts; schedule the ones that now pass."""
+    """Re-run the pre-flight on held posts; schedule the ones that now pass."""
     from clipper.accounts import accounts_path, load_accounts
     from clipper.campaigns import campaigns_path, load_campaigns
     from clipper.config import ConfigError, always_sensitive, load_config

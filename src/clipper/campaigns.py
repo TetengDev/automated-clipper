@@ -51,7 +51,7 @@ from clipper.accounts import (
 from clipper.clips import resolve_media_path
 from clipper.config import AppConfig, ConfigError, _format_errors, _UniqueKeyLoader, load_config
 from clipper.edl import EDL, has_ai_elements, parse_edl
-from clipper.metadata import HASHTAG, Brief, PostMetadata, preflight
+from clipper.metadata import Brief, PostMetadata, is_hashtag, preflight
 
 CAMPAIGNS_ENV = "CLIPPER_CAMPAIGNS"
 CAMPAIGNS_FILENAME = "campaigns.yaml"
@@ -93,7 +93,7 @@ def _campaign_tag(raw: object) -> str:
         raise ValueError(f"invalid hashtag {raw!r}")
     tag = raw.strip()
     tag = tag if tag.startswith("#") else f"#{tag}"
-    if not HASHTAG.fullmatch(tag):
+    if not is_hashtag(tag):
         raise ValueError(f"invalid hashtag {raw!r}: one word after #, at most 50 characters")
     return tag
 

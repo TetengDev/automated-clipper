@@ -75,7 +75,13 @@ from clipper.config import (
 )
 from clipper.jobs.models import Job
 from clipper.jobs.stages import Deferred, PermanentError, SkipJob, StageContext, StageDef
-from clipper.metadata import PLATFORMS, coerce_variants, variants_json
+from clipper.metadata import (
+    PLATFORMS,
+    clean_hashtags,
+    clean_title,
+    coerce_variants,
+    variants_json,
+)
 from clipper.pipeline import common
 from clipper.pipeline.common import read_json, strip_control, write_json_atomic
 from clipper.pipeline.ytdlp import CommandTimeout, RunResult
@@ -123,7 +129,6 @@ CACHE_DIR = ".select"
 PAYOFF_OUTSIDE = "payoff_outside"
 FIELD_LIMITS = {"hook": 120, "title": 100, "caption": 2200, "reason": 500, "open_question": 200}
 MAX_HASHTAGS = 10
-_HASHTAG = re.compile(r"^#\w{1,50}$")
 _RESET_EPOCH = re.compile(r"\|(\d{9,11})\b")
 _USAGE_LIMIT = re.compile(r"usage limit|hit your limit|limit reached|rate.?limit", re.IGNORECASE)
 _LOGIN = re.compile(r"/login|not logged in|invalid api key|authenticat|oauth token", re.IGNORECASE)
@@ -235,19 +240,17 @@ class Candidate(BaseModel):
     @classmethod
     def _clean_text(cls, value: str, info: Any) -> str:
         """Control characters stripped, then cut to the field's limit (not rejected: the
-        call was already paid for)."""
-        return strip_control(value)[: FIELD_LIMITS[info.field_name]]
+        call was already paid for). The title and caption also lose unusable inline tags
+        (CLP-111)."""
+        clean = clean_title if info.field_name in ("title", "caption") else strip_control
+        return clean(value)[: FIELD_LIMITS[info.field_name]]
 
     @field_validator("hashtags", mode="after")
     @classmethod
     def _clean_hashtags(cls, value: list[str]) -> list[str]:
-        tags: list[str] = []
-        for raw in value:
-            tag = strip_control(raw).replace(" ", "")
-            tag = tag if tag.startswith("#") else f"#{tag}"
-            if _HASHTAG.fullmatch(tag) and tag not in tags:
-                tags.append(tag)
-        return tags[:MAX_HASHTAGS]
+        """The variants' checks: malformed, generic, disclosure-like, mixed-script and
+        repeated tags dropped (CLP-111)."""
+        return clean_hashtags(value, MAX_HASHTAGS)
 
     @model_validator(mode="after")
     def _ordered(self) -> Candidate:

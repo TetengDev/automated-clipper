@@ -256,7 +256,7 @@ def local_asr(
     monkeypatch.setattr(
         transcribe.FasterWhisperTranscriber,
         "ensure_model",
-        lambda self, timeout_s=0: self.snapshot_dir,
+        lambda self, timeout_s=0, *, prune=False: self.snapshot_dir,
     )
     return transcribe.FasterWhisperTranscriber(models_dir=tmp_path / "models"), rec
 

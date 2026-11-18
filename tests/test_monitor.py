@@ -1380,6 +1380,42 @@ def test_cli_run_monitor_runs_the_janitor_on_the_media_dir(
     assert not audio.exists()
 
 
+def test_cli_run_monitor_counts_the_models_dir_in_the_disk_budget(
+    cli_env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args, db = cli_env
+    config = Path(args[1])
+    config.write_text(CONFIG.replace("settings:\n", "settings:\n  disk_budget_gb: 1\n", 1))
+    media = tmp_path / "media"
+    audio = media / f"youtube_{V1}" / "audio_16k.flac"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"fresh source audio")
+    models = tmp_path / "models"
+    models.mkdir()
+    with (models / "model.bin").open("wb") as fh:
+        fh.truncate(2 * 10**9)  # sparse: counts 2 GB, takes no space
+    monkeypatch.setenv("CLIPPER_MODELS_DIR", str(models))
+    ready = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with closing(connect(db)) as c:
+        migrate(c)
+        c.execute(
+            "INSERT INTO jobs (platform, item_id, creator, source_url, status, created_at,"
+            " updated_at) VALUES ('youtube', ?, 'MrBeast', 'u', 'clips_ready', ?, ?)",
+            (V1, ready, ready),
+        )
+
+    def one_round(self: YouTubeMonitor, creators) -> None:
+        assert self.janitor is not None
+        self.janitor()
+
+    monkeypatch.setattr(YouTubeMonitor, "run_forever", one_round)
+    result = runner.invoke(app, [*args, "run-monitor", "--media-dir", str(media)])
+
+    assert result.exit_code == 0, result.output
+    assert not audio.exists()  # inside retention, but media and models are over budget
+    assert (models / "model.bin").stat().st_size == 2 * 10**9
+
+
 def test_cli_a_malformed_alerts_webhook_does_not_stop_the_monitor(
     cli_env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

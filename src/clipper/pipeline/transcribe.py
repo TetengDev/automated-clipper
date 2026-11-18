@@ -17,6 +17,7 @@ transcript.json (shared contract with CLP-15/16):
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -24,12 +25,14 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
@@ -107,6 +110,14 @@ MODEL_FETCH_TIMEOUT_S = 30 * 60.0
 """Budget for fetching one model, including the one retry after a failed verification."""
 COMPLETE_MARKER = ".clipper-complete"
 """Written into a snapshot once every pinned file's size and sha256 were verified."""
+_MARKER_TMP = re.compile(rf"{re.escape(COMPLETE_MARKER)}(\.\d+)?\.tmp")
+"""The marker's temp file, named per process (before CLP-76 without the pid); one left
+behind by a killed process is harmless."""
+STORE_LOCK = ".lock"
+"""`flock`ed in the models dir while a process checks, fetches, heals, marks or prunes."""
+STORE_LOCK_POLL_S = 0.2
+_STORE_FILE = re.compile(r"[0-9a-f]{64}")
+"""A file in the Hub client's shared store (`<models>/blobs/<xx>/<hash>`)."""
 LOCAL_RTF_BUDGET = 3
 """A local chunk may take up to 3x its length (large-v3 on a slow VPS CPU), never less
 than CHUNK_CALL_TIMEOUT_S; the stage deadline still caps it."""
@@ -386,7 +397,7 @@ def _run_asr(
 ) -> RunResult:
     """Run the ASR child like ffmpeg (`run_media`), but tell a model that cannot be loaded
     (permanent) apart from a crash, OOM kill or timeout (retryable). `on_load_failure`
-    runs first when loading the model failed in a way damaged files cause (`EXIT_LOAD`);
+    runs first when loading the model failed in a way damaged or missing files cause (`EXIT_LOAD`);
     not for `EXIT_MODEL`, a setup that can never load (e.g. an unsupported compute type),
     which would otherwise cost a re-fetch and full hash on every job. A corrupt small file
     such as config.json is caught by the per-job small-file hash instead."""
@@ -436,72 +447,110 @@ class FasterWhisperTranscriber:
             self.models_dir / f"models--{pin.repo.replace('/', '--')}" / "snapshots" / pin.revision
         )
 
-    def ensure_model(self, timeout_s: float = MODEL_FETCH_TIMEOUT_S) -> Path:
+    def ensure_model(
+        self, timeout_s: float = MODEL_FETCH_TIMEOUT_S, *, prune: bool = False
+    ) -> Path:
         """The verified snapshot dir. A snapshot counts only with its completion marker and
         passing the cheap `snapshot_problems` check (every size, the small files' hashes,
         model.bin's blob name; model.bin's full hash runs at fetch). Otherwise it is
         fetched (in a child, all within `timeout_s`), fully verified and marked; a snapshot
         that fails verification is discarded and fetched once more, then this raises a
-        retryable `MediaError`."""
+        retryable `MediaError`.
+
+        All of it runs under the store lock, so two processes (the worker and an operator's
+        `bench-transcribe`) never fetch or discard under each other: the second waits, then
+        finds the marker. With `prune`, a fetch also deletes the revisions no pin names any
+        more. Only the transcribe stage asks: `bench-transcribe` or the quality gate run
+        from another checkout (other pins) must never delete the worker's revision."""
         pin = WHISPER_MODELS[self.model]
         snapshot = self.snapshot_dir
         marker = snapshot / COMPLETE_MARKER
-        if marker.is_file():
-            problems = snapshot_problems(snapshot, pin, hash_model=False)
-            if not problems:
-                return snapshot
-            logger.warning(
-                "whisper model %s: marked snapshot damaged (%s); fetching it again",
-                self.model,
-                _describe(problems),
-            )
-            self._discard(snapshot, problems)
-        self.models_dir.mkdir(parents=True, exist_ok=True)
-        args = [*ASR_COMMAND, "fetch", pin.repo, pin.revision, str(self.models_dir)]
         what = f"downloading whisper model {self.model}"
         started = time.monotonic()
-        problems: dict[str, FileProblem] = {}
-        for _ in range(2):
-            left = timeout_s - (time.monotonic() - started)
-            if left <= 1.0:
-                break
-            _run_asr(args, left, what)
-            problems = snapshot_problems(snapshot, pin)
-            if not problems:
-                tmp = marker.with_name(f"{marker.name}.tmp")
-                tmp.write_text(pin.sha256, encoding="utf-8")
-                os.replace(tmp, marker)
-                return snapshot
-            logger.warning(
-                "whisper model %s: snapshot rejected (%s)", self.model, _describe(problems)
-            )
-            self._discard(snapshot, problems)
-        raise MediaError(f"{what}: {_describe(problems) or 'out of time'}")
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        with _store_lock(self.models_dir, timeout_s, what):
+            if marker.is_file():
+                problems = snapshot_problems(snapshot, pin, hash_model=False)
+                if not problems:
+                    return snapshot
+                logger.warning(
+                    "whisper model %s: marked snapshot damaged (%s); fetching it again",
+                    self.model,
+                    _describe(problems),
+                )
+                self._discard(snapshot, problems)
+            args = [*ASR_COMMAND, "fetch", pin.repo, pin.revision, str(self.models_dir)]
+            problems: dict[str, FileProblem] = {}
+            for _ in range(2):
+                left = timeout_s - (time.monotonic() - started)
+                if left <= 1.0:
+                    break
+                _run_asr(args, left, what)
+                problems = snapshot_problems(snapshot, pin)
+                if not problems:
+                    tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+                    tmp.write_text(pin.sha256, encoding="utf-8")
+                    os.replace(tmp, marker)
+                    try:  # the snapshot is verified: a prune failure must not fail the job
+                        if prune:
+                            prune_unpinned(self.models_dir)
+                    except Exception:
+                        logger.exception("whisper models: pruning unpinned revisions failed")
+                    return snapshot
+                logger.warning(
+                    "whisper model %s: snapshot rejected (%s)", self.model, _describe(problems)
+                )
+                self._discard(snapshot, problems)
+            raise MediaError(f"{what}: {_describe(problems) or 'out of time'}")
 
     def _discard(self, snapshot: Path, problems: dict[str, FileProblem]) -> None:
         """Drop the snapshot links; for each file whose content is wrong also its repo blob
-        and the stored file behind it, or the Hub client would link the same bytes again."""
+        and the stored file behind it, or the Hub client would link the same bytes again.
+        A shared-store file takes its `.refs` manifest and `.lock` file along, as in
+        `prune_unpinned`."""
         root = self.models_dir.resolve()
         for name, problem in problems.items():
             link = snapshot / name
             if problem.bad_content and link.is_symlink():
                 target = link.parent / os.readlink(link)
                 repo_blob = target.parent.resolve() / target.name
-                for path in (link.resolve(), repo_blob):  # content first, then the link to it
+                content = link.resolve()
+                for path in (content, repo_blob):  # content first, then the link to it
                     if path.is_relative_to(root):
                         path.unlink(missing_ok=True)
+                if content.parent.parent == root / "blobs":  # we hold the store lock
+                    for sidecar in (".refs", ".lock"):
+                        content.with_name(f"{content.name}{sidecar}").unlink(missing_ok=True)
         shutil.rmtree(snapshot, ignore_errors=True)
 
     def drop_marker(self) -> None:
         """Make the next `ensure_model` fetch and fully verify the snapshot again: the
         model failed to load, and the cheap check before each job misses damage inside
-        model.bin's bytes."""
+        model.bin's bytes. Only with the store lock, never waiting for it: a process that
+        holds it may be checking or healing this snapshot, and the next failed load drops
+        the marker instead."""
         marker = self.snapshot_dir / COMPLETE_MARKER
-        if marker.is_file():
+        if not marker.is_file():
+            return
+        try:
+            fd = _open_store_lock(self.models_dir, f"whisper model {self.model}")
+        except (MediaError, OSError) as exc:
+            logger.warning("whisper model %s: marker kept, no store lock: %s", self.model, exc)
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                logger.warning(
+                    "whisper model %s: load failed; model store busy; marker kept", self.model
+                )
+                return
             logger.warning(
                 "whisper model %s: load failed; snapshot to be verified again", self.model
             )
             marker.unlink(missing_ok=True)
+        finally:
+            os.close(fd)
 
     def transcribe(
         self, audio: Path, *, language: str | None, timeout_s: float | None = None
@@ -554,11 +603,12 @@ def snapshot_problems(
     with `hash_model=False` model.bin only gets its size and blob name checked, since
     hashing gigabytes before every job is too slow."""
     root = snapshot.parents[2].resolve()  # <models>/models--<repo>/snapshots/<revision>
-    ours = {*pin.files, COMPLETE_MARKER, f"{COMPLETE_MARKER}.tmp"}
+    ours = {*pin.files, COMPLETE_MARKER}
     problems: dict[str, FileProblem] = {}
     if snapshot.is_dir():
         for extra in sorted(set(os.listdir(snapshot)) - ours):
-            problems[extra] = FileProblem("not pinned", bad_content=False)
+            if not _MARKER_TMP.fullmatch(extra):
+                problems[extra] = FileProblem("not pinned", bad_content=False)
     for name, want in pin.files.items():
         path = snapshot / name
         if not path.is_file():
@@ -580,6 +630,180 @@ def snapshot_problems(
 
 def _describe(problems: dict[str, FileProblem]) -> str:
     return "; ".join(f"{name} {p.reason}" for name, p in problems.items())
+
+
+def _open_store_lock(models_dir: Path, what: str) -> int:
+    """An fd on the models dir's lock file, for `flock`. Read-only (`flock` needs no write
+    access) and shared with every uid (0o666, as the Hub client does), so a lock file
+    `bench-transcribe` created as another user still works. Non-blocking, so a FIFO
+    planted there cannot hang the open; anything but a regular file is refused with a
+    retryable `MediaError`. The fd is not inherited (PEP 446): a child never holds it."""
+    lock = models_dir / STORE_LOCK
+    flags = os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(lock, flags, 0o666)
+    except IsADirectoryError as exc:  # Linux refuses O_CREAT on a dir; macOS opens it
+        raise MediaError(f"{what}: {lock} is not a regular file") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise MediaError(f"{what}: {lock} is not a regular file")
+        if info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) != 0o666:
+            with suppress(OSError):
+                os.fchmod(fd, 0o666)  # the umask narrowed it
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextmanager
+def _store_lock(models_dir: Path, timeout_s: float, what: str) -> Iterator[None]:
+    """Hold `fcntl.flock` on the models dir's lock file; a retryable `MediaError` when
+    another process holds it for all of `timeout_s` (e.g. a long fetch)."""
+    fd = _open_store_lock(models_dir, what)
+    try:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise MediaError(f"{what}: model store busy (another process)") from None
+                time.sleep(STORE_LOCK_POLL_S)
+        yield
+    finally:
+        os.close(fd)  # releases the lock
+
+
+def prune_unpinned(models_dir: Path) -> int:
+    """Delete the model revisions no `WHISPER_MODELS` pin names (left behind when a pin
+    moves on), then the repo blobs and shared-store files no remaining snapshot uses;
+    returns the entries deleted. The caller holds the store lock.
+
+    Only `models--*` repo dirs and the shared store `blobs/<xx>/` are looked at, and only
+    through real dirs: a link is removed itself, never followed, so nothing outside the
+    models dir goes. A path that cannot be deleted is logged and skipped. A dir that
+    cannot be read stops the blob cleanup: what links a blob may be inside it."""
+    root = models_dir.resolve()
+    pinned = {
+        root / f"models--{p.repo.replace('/', '--')}" / "snapshots" / p.revision
+        for p in WHISPER_MODELS.values()
+    }
+    unreadable: list[Path] = []
+    repos = _real_dirs(root, "models--*", unreadable)
+    deleted = 0
+    for repo in repos:
+        for revision in _real_dirs(repo / "snapshots", "*", unreadable):
+            if revision not in pinned:
+                deleted += _delete(revision)
+    left = {repo: _real_dirs(repo / "snapshots", "*", unreadable) for repo in repos}
+    used = {
+        _link_target(path)
+        for revisions in left.values()
+        for revision in revisions
+        for path in _tree(revision, unreadable)
+    }
+    if not unreadable:
+        deleted += _drop_unused_blobs(root, left, used, unreadable)
+    if unreadable:
+        logger.warning("whisper models: blobs not cleaned up, %s could not be read", unreadable[0])
+    if deleted:
+        logger.info("whisper models: pruned %d unpinned file(s) and dir(s)", deleted)
+    return deleted
+
+
+def _drop_unused_blobs(
+    root: Path, left: dict[Path, list[Path]], used: set[Path | None], unreadable: list[Path]
+) -> int:
+    """Delete repo dirs with no revision `left`, the repo blobs no snapshot link `used`,
+    then the shared-store files no repo blob links to (unless a blobs dir is unreadable)."""
+    deleted = 0
+    for repo, revisions in left.items():
+        if not revisions:
+            deleted += _delete(repo)  # no revision left: refs, blobs and all
+            continue
+        for blob in _entries(repo / "blobs"):
+            if blob not in used:
+                deleted += _delete(blob)
+    stored = {
+        _link_target(blob)
+        for repo, revisions in left.items()
+        if revisions
+        for blob in _entries(repo / "blobs", unreadable)
+    }
+    if unreadable:
+        return deleted
+    for prefix in _real_dirs(root / "blobs", "??"):
+        for entry in _entries(prefix):
+            if _STORE_FILE.fullmatch(entry.name) and entry not in stored:
+                deleted += _delete(entry)  # then its manifest and lock: we hold the store lock
+                for sidecar in (".refs", ".lock"):
+                    deleted += _delete(entry.with_name(f"{entry.name}{sidecar}"))
+    return deleted
+
+
+def _entries(directory: Path, unreadable: list[Path] | None = None) -> list[Path]:
+    """What a real dir holds; nothing for a link, a file or a miss. A dir that cannot be
+    read is logged and added to `unreadable`."""
+    if not _is_real_dir(directory):
+        return []
+    try:
+        return sorted(directory.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        logger.warning("whisper models: cannot read %s: %s", directory, type(exc).__name__)
+        if unreadable is not None:
+            unreadable.append(directory)
+        return []
+
+
+def _real_dirs(directory: Path, pattern: str, unreadable: list[Path] | None = None) -> list[Path]:
+    """The real dirs (not links to one) in `directory` whose name matches `pattern`."""
+    entries = _entries(directory, unreadable)
+    return [p for p in entries if p.match(pattern) and _is_real_dir(p)]
+
+
+def _is_real_dir(path: Path) -> bool:
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _tree(directory: Path, unreadable: list[Path]) -> Iterator[Path]:
+    """Every entry under a real dir, without entering links."""
+    for entry in _entries(directory, unreadable):
+        yield entry
+        yield from _tree(entry, unreadable)
+
+
+def _link_target(path: Path) -> Path | None:
+    """Where a link points (one hop, not followed further); None for anything else."""
+    try:
+        return Path(os.path.normpath(path.parent / os.readlink(path)))
+    except OSError:
+        return None
+
+
+def _delete(path: Path) -> int:
+    """Remove a file or link (never what a link points to), or a real dir bottom-up;
+    returns the entries deleted. Anything that cannot go is logged and skipped."""
+    is_dir = _is_real_dir(path)
+    deleted = sum(_delete(child) for child in _entries(path)) if is_dir else 0
+    try:
+        if is_dir:
+            path.rmdir()
+        else:
+            path.unlink()
+    except FileNotFoundError:
+        return deleted
+    except OSError as exc:
+        logger.warning("whisper models: cannot delete %s: %s", path, type(exc).__name__)
+        return deleted
+    return deleted + 1
 
 
 def call_timeout(backend: Transcriber, chunk_seconds: float) -> float:
@@ -829,7 +1053,7 @@ def transcribe(
     results: dict[int, ChunkTranscript] = {i: r for i, r in cached.items() if r is not None}
     if todo:
         if local:  # outside the per-chunk timeouts, inside the stage budget
-            backend.ensure_model(deadline.timeout(MODEL_FETCH_TIMEOUT_S))
+            backend.ensure_model(deadline.timeout(MODEL_FETCH_TIMEOUT_S), prune=True)
         _transcribe_chunks(
             job,
             ctx,

@@ -246,11 +246,13 @@ def run_monitor(
     ] = jobs.DEFAULT_MEDIA_ROOT,
 ) -> None:
     """Poll creators 24/7 and enqueue new content. Between polls, the janitor applies the
-    retention and disk budget settings to the media dir at most once an hour.
+    retention and disk budget settings to the media dir at most once an hour (the disk
+    budget also counts the models dir, CLIPPER_MODELS_DIR, which it only reads).
 
     SIGTERM/SIGINT finish the current creator's poll, then exit."""
     from clipper.janitor import Janitor
     from clipper.notify import log_notify
+    from clipper.pipeline.transcribe import models_dir
     from clipper.pipeline.ytdlp import YtDlpError
 
     app_ctx = _app(ctx)
@@ -278,7 +280,9 @@ def run_monitor(
                 source = _youtube_source(secrets, http, stop_event)
             except YtDlpError as exc:
                 _fail(f"run-monitor: {exc}")
-            janitor = Janitor(conn, cfg, media_dir, monitor_alert or log_notify)
+            janitor = Janitor(
+                conn, cfg, media_dir, monitor_alert or log_notify, models_dir=models_dir()
+            )
             monitor = YouTubeMonitor(
                 conn, cfg, source, first_run_mode=first_run, stop=stop_event, janitor=janitor.tick
             )

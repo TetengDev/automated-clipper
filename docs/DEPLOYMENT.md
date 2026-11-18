@@ -174,7 +174,28 @@ The worker transcribes with faster-whisper on CPU (`transcriber: local`, the def
   models dir), so a truncated blob or a planted file is fetched again. If CTranslate2
   still fails to load the weights, the worker removes the marker and the next attempt
   fetches and fully hashes the snapshot. A setup that can never load (such as a compute
-  type the CPU lacks) fails the job without touching the marker.
+  type the CPU lacks) fails the job without touching the marker. Model files that are
+  missing when a chunk starts are retried the same way.
+- **One process at a time**: checking, fetching, healing and marking a snapshot run under
+  an exclusive `flock` on `<models dir>/.lock`, so the worker and an operator's
+  `clipper bench-transcribe` never fetch or delete under each other. The second one waits
+  (up to its fetch budget, then the job retries later) and then finds the snapshot ready.
+  `flock` only works on a local filesystem: keep the models dir on a local disk (or a
+  Docker volume or bind mount of one), never on NFS shared across hosts.
+- **Old revisions are pruned**: when a pin moves to a new commit, the first job after the
+  deploy fetches it and, still under the lock, deletes every snapshot no pin names, then
+  the blobs only those snapshots used. Pruning runs in the worker's transcribe stage, after
+  a verified fetch, not in the janitor: the monitor mounts the models dir read-only, so
+  only the worker can write it. `bench-transcribe` and the quality gate never prune, so a
+  run from a checkout with other pins cannot delete the worker's model. A model dropped
+  from `WHISPER_MODELS` stays on disk until the next fetch of any model. Pruning never
+  follows a symlink, never touches anything
+  outside the models dir, and logs and skips a path it cannot delete. If it cannot read a
+  snapshot or blobs dir, it deletes no blobs that run.
+- **Needs symlinks**: the snapshot files are symlinks into the Hub client's blob store, and
+  the cheap check relies on them. Keep the models dir on a filesystem with symlinks (ext4,
+  APFS, a Docker volume or bind mount of one). Without them the Hub client copies the
+  files, the check never passes, and every job downloads the model again.
 - **Image**: faster-whisper and its native wheels (CTranslate2, onnxruntime, PyAV) add
   about 320 MB to the image.
 
@@ -209,7 +230,7 @@ clip renders, the job fails.
 
 ## Janitor
 
-The `monitor` runs the janitor after a poll cycle, at most once an hour. It works only
+The `monitor` runs the janitor after a poll cycle, at most once an hour. It deletes only
 inside the media dir (`data/media`, or `--media-dir` / `CLIPPER_MEDIA_DIR`, the same as
 the worker's).
 
@@ -222,7 +243,13 @@ the worker's).
   files stay.
 - Rejected and archived clips lose their clip dir `rejected_retention_days` (default 14)
   after the decision. Their database rows and history stay.
-- When the media dir reaches 80% of `disk_budget_gb`, an alert goes to the alerts webhook,
+- The disk budget counts the media dir plus the models dir (`CLIPPER_MODELS_DIR`), so set
+  `disk_budget_gb` with room for the models too (large-v3 is about 3 GB, large-v3-turbo
+  about 1.6 GB). The janitor only reads the models dir (compose mounts it read-only in
+  `monitor`) and never deletes models; the worker prunes old model revisions (see
+  [Local transcription](#local-transcription)).
+- When the media dir and models dir together reach 80% of `disk_budget_gb`, an alert goes
+  to the alerts webhook,
   once per crossing; it is sent again only after usage drops below 80% (or after a
   monitor restart). Above the budget, the source media of `clips_ready` jobs is deleted
   too, oldest job first, until usage is back under the budget.
@@ -230,7 +257,7 @@ the worker's).
   `re_rendering` clips, any file a post uses, and anything of a job that is not
   `clips_ready` (a worker may be using it). Failed and skipped jobs keep their files;
   `clipper retry` reuses them.
-- Nothing outside the media dir is touched. The janitor never follows a symlink and never
+- Nothing outside the media dir is deleted. The janitor never follows a symlink and never
   deletes one, and it removes only regular files and empty dirs.
 
 ## Sensitive clips and the review app
@@ -450,7 +477,7 @@ campaign. `clipper campaigns list` lists every submission.
 - **Discord alerts** fire on:
   - a job reaching `failed`
   - the `DownloadBlocked` signature
-  - the media dir at 80% of `disk_budget_gb` (see [Janitor](#janitor))
+  - the media and models dirs at 80% of `disk_budget_gb` (see [Janitor](#janitor))
   - YouTube quota above 80%
   - Twitch auth failure
   - export failure

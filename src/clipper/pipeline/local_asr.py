@@ -61,11 +61,12 @@ EXIT_RETRY = 1
 EXIT_USAGE = 2
 """Bad arguments: a bug in the parent, so the parent fails the job (permanent)."""
 EXIT_MODEL = 3
-"""The model can never load as configured: faster-whisper not installed, model files
-missing, or a ValueError (e.g. a compute type the CPU cannot run). Permanent."""
+"""The model can never load as configured: faster-whisper not installed, or a ValueError
+(e.g. a compute type the CPU cannot run). Permanent."""
 EXIT_LOAD = 4
 """Loading the model failed with out of memory, a CTranslate2 runtime error (which damaged
-weights also cause) or I/O trouble: retryable."""
+weights also cause), I/O trouble, or model files missing (e.g. removed while another
+process healed the store): retryable, and the next `ensure_model` fetches them again."""
 
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 _REPO = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
@@ -181,7 +182,7 @@ def main(argv: Sequence[str], out: IO[str] = sys.stdout, model_class: Any = None
         return _usage(f"bad language {language!r}")
     if missing := missing_model_files(model_dir):
         print(f"model files missing: {', '.join(missing)}", file=sys.stderr)
-        return EXIT_MODEL
+        return EXIT_LOAD
     try:
         if model_class is None:
             from faster_whisper import WhisperModel as model_class

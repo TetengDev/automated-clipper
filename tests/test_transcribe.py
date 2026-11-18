@@ -895,11 +895,13 @@ def test_child_main_rejects_bad_arguments(argv: list[str]) -> None:
 @pytest.mark.parametrize(
     "missing", ["model.bin", "config.json", "tokenizer.json", "vocabulary.txt"]
 )
-def test_child_missing_model_files_are_permanent(model_dir: Path, missing: str) -> None:
+def test_child_missing_model_files_are_retryable(model_dir: Path, missing: str) -> None:
+    """CLP-76: another process may be healing the store; the next attempt's
+    `ensure_model` fetches what is missing."""
     (model_dir / missing).unlink()
     argv = [str(model_dir), "int8", "1", "en", "c.flac"]
     assert local_asr.main(argv, out=io.StringIO(), model_class=FakeWhisperModel) == (
-        local_asr.EXIT_MODEL
+        local_asr.EXIT_LOAD
     )
     assert FakeWhisperModel.instances == [] or all(
         m.model != str(model_dir) for m in FakeWhisperModel.instances
@@ -1060,11 +1062,12 @@ def test_backend_child_crash_is_retryable_and_redacted(
     assert KEY not in str(exc.value)
 
 
-def test_real_child_with_missing_model_is_permanent(tmp_path: Path, audio_30s: Path) -> None:
+def test_real_child_with_missing_model_is_retryable(tmp_path: Path, audio_30s: Path) -> None:
     """Runs the real child process (no download: the snapshot dir does not exist)."""
     pytest.importorskip("faster_whisper")
-    with pytest.raises(PermanentError, match="cannot load the model"):
+    with pytest.raises(MediaError, match="model files missing") as exc:
         local(models_dir=tmp_path).transcribe(audio_30s, language="en", timeout_s=120)
+    assert not isinstance(exc.value, PermanentError)
 
 
 def _snapshot(models: Path) -> Path:
@@ -1197,6 +1200,7 @@ def test_snapshot_problems_unpinned_files(fake_asr: FakeAsr, tmp_path: Path) -> 
     snapshot = write_snapshot(tmp_path / "models", *TINY)
     (snapshot / tr.COMPLETE_MARKER).write_text("x")
     (snapshot / f"{tr.COMPLETE_MARKER}.tmp").write_text("x")
+    (snapshot / f"{tr.COMPLETE_MARKER}.4242.tmp").write_text("x")
     assert tr.snapshot_problems(snapshot, _fake_pin()) == {}  # the marker files are ours
     (snapshot / "preprocessor_config.json").write_text("{}")
     (snapshot / "extra").mkdir()
@@ -1300,6 +1304,21 @@ def test_model_load_failure_drops_the_marker(fake_asr: FakeAsr, tmp_path: Path) 
     assert local().ensure_model() == snapshot
     assert len(fake_asr.fetch_calls()) == 2  # fetched and fully verified again
     assert (snapshot / tr.COMPLETE_MARKER).is_file()
+
+
+def test_model_files_gone_before_a_chunk_heal_on_the_next_attempt(
+    fake_asr: FakeAsr, tmp_path: Path
+) -> None:
+    """CLP-76: files removed under a running job (e.g. another process healing the store)
+    give a retryable error, and the retry's `ensure_model` fetches them again."""
+    snapshot = local().ensure_model()
+    (snapshot / "tokenizer.json").unlink()
+    with pytest.raises(MediaError, match="model load failed") as exc:
+        local().transcribe(tmp_path / "c.flac", language="en")
+    assert not isinstance(exc.value, PermanentError)
+    assert local().ensure_model() == snapshot
+    assert len(fake_asr.fetch_calls()) == 2
+    assert local().transcribe(tmp_path / "c.flac", language="en").words
 
 
 def test_model_that_can_never_load_keeps_the_marker(fake_asr: FakeAsr, tmp_path: Path):
@@ -1470,6 +1489,17 @@ def test_stage_uses_creator_transcriber_override(ctx: StageContext, fake_asr: Fa
     other, _ = enqueue(ctx.conn, SourceRef("youtube", "aaaaaaaaaaa"), T0, creator="MrBeast")
     tr.transcribe(other, groq_ctx)  # no override: still local
     assert fake_asr.chunk_calls()
+
+
+@needs_ffmpeg
+def test_stage_local_prunes_revisions_no_pin_names(
+    ctx: StageContext, fake_asr: FakeAsr, tmp_path: Path
+) -> None:
+    """CLP-76: the transcribe stage is the one caller that prunes after its fetch."""
+    stale = write_snapshot(tmp_path / "models", "Systran/faster-whisper-retired", "0" * 40)
+    tr.transcribe(make_job(ctx.conn), ctx, chunk_s=10.0, overlap_s=2.0)
+    assert len(fake_asr.fetch_calls()) == 1
+    assert not stale.parents[1].exists()
 
 
 @needs_ffmpeg

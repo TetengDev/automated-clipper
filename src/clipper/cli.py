@@ -418,9 +418,13 @@ def run_worker(
     """Process queued jobs through the clip pipeline."""
     if recover_id is not None and not recover_id.isprintable():
         _fail("run-worker: --recover-id must not contain control characters")
+    from clipper.accounts import accounts_by_id
+
     app_ctx = _app(ctx)
     try:
         cfg = load_config(app_ctx.config_path)
+        # Read once at start (CLP-106): restart the worker after editing accounts.yaml.
+        accounts = accounts_by_id(app_ctx.config_path, cfg)
     except ConfigError as exc:
         _fail(str(exc))
     _setup_logging()
@@ -464,6 +468,7 @@ def run_worker(
         guard=publish_guard(posting_conn, live, media_dir.resolve()),
         connect=lambda: connect(db_path, busy_timeout_ms=HEARTBEAT_BUSY_MS),
         stop=stop,
+        accounts=accounts,
     )
     submitting = SubmissionPass(posting_conn, LiveCampaigns(live), notify, alert)
     worker.posting = ChainedPasses([posting, submitting])

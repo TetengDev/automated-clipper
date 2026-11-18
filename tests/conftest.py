@@ -6,33 +6,10 @@ import pytest
 
 from clipper import cli, doctor
 from clipper.pipeline.ytdlp import RunResult
+from config_support import VALID_YAML
 
 STARTUP_CHECK = doctor.startup_check
 ALERTS_WEBHOOK = "https://discord.com/api/webhooks/2/alerts-token"
-
-VALID_YAML = """\
-settings:
-  min_duration_seconds: 300
-  max_clips_per_source: 3
-creators:
-  - name: MrBeast
-    region: global
-    youtube:
-      handle: "@MrBeast"
-  - name: Kai Cenat
-    region: global
-    twitch:
-      login: kaicenat
-    youtube:
-      handle: "@KaiCenat"
-  - name: Raffy Tulfo in Action
-    region: ph
-    language: tl
-    youtube:
-      handle: "@RaffyTulfoInAction"
-    overrides:
-      min_duration_seconds: 600
-"""
 
 
 @pytest.fixture

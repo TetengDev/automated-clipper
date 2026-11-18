@@ -13,6 +13,11 @@ from the clip's platform variant plus, for a campaign account, the campaign's ta
 (CLP-96), checked against the campaign's brief (CLP-97, `clipper.campaigns`) and stored on
 the post. A post that breaks the brief is `held` with the reason instead of scheduled;
 `recheck_held` schedules held posts that pass after the config was fixed.
+
+CLP-106: the later scheduling paths use the same rules. `slot_problems` says which rules a
+chosen time breaks (a manual reschedule or `posts retry --at` is flagged with it), and the
+posting stage uses `pick_slot` for its retry backoff and `day_bounds` for its claim-time
+daily cap check.
 """
 
 from __future__ import annotations
@@ -56,6 +61,8 @@ PLATFORM_DAILY_CAPS: dict[str, int] = {
 }
 MAX_DAYS_AHEAD = 7
 """Today plus this many days are searched for a free slot."""
+HISTORY = timedelta(days=2)
+"""Post history the slot picker needs (it only looks at today and later, local time)."""
 
 SCHEDULABLE = (ClipStatus.APPROVED, ClipStatus.EXPORTED)
 _WINDOW = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
@@ -191,6 +198,53 @@ def length_problem(platform: str, seconds: float) -> str | None:
     if limits is None or limits.min_seconds <= seconds <= limits.max_seconds:
         return None
     return f"{seconds:g} s is outside {platform}'s {limits.min_seconds:g}-{limits.max_seconds:g} s"
+
+
+def day_bounds(timezone: str, moment: datetime) -> tuple[datetime, datetime]:
+    """The local day (in `timezone`) holding `moment`, as [start, end) in aware UTC."""
+    tz = ZoneInfo(timezone)
+    day = moment.astimezone(tz).date()
+    start = datetime.combine(day, _MIDNIGHT, tz).astimezone(UTC)
+    end = datetime.combine(day + timedelta(days=1), _MIDNIGHT, tz).astimezone(UTC)
+    return start, end
+
+
+def _in_window(windows: Sequence[tuple[time, time]], at: time) -> bool:
+    # The end minute is inside a window, except a midnight end (pick_slot's rule).
+    return any(start <= at and (end == _MIDNIGHT or at <= end) for start, end in windows)
+
+
+def slot_problems(account: AccountLike, existing: Sequence[datetime], when: datetime) -> list[str]:
+    """The account rules `when` breaks, in words for a reviewer; empty when `pick_slot`
+    could have chosen it. `existing` holds the times of the account's other counted posts
+    (not the post being moved). Raises like `pick_slot` for a bad config."""
+    if when.tzinfo is None:
+        raise ValueError("naive datetime; pass an aware (UTC) datetime")
+    tz = ZoneInfo(account.timezone)
+    local = when.astimezone(tz)
+    day = local.date()
+    problems: list[str] = []
+    windows = parse_windows(account.windows)
+    if not _in_window(windows, local.time()):
+        problems.append(
+            f"{local:%H:%M} {account.timezone} is outside the account's posting windows"
+            f" ({', '.join(account.windows)} {account.timezone})"
+        )
+    same_day = [t for t in existing if t.astimezone(tz).date() == day]
+    gap = timedelta(minutes=max(0, account.min_gap_minutes))
+    clashes = sorted(t for t in same_day if abs(t - when) < gap)
+    if clashes:
+        problems.append(
+            f"within the {account.min_gap_minutes}-minute gap of another post that day"
+            f" (at {clashes[0].astimezone(tz):%H:%M} {account.timezone})"
+        )
+    limit = daily_limit(account, day)
+    if len(same_day) >= limit:
+        problems.append(
+            f"{day.isoformat()} already has {len(same_day)} post(s), limit {limit}"
+            " (posts per day, warm-up ramp and platform cap)"
+        )
+    return problems
 
 
 @dataclass(frozen=True)

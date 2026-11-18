@@ -3,13 +3,14 @@ name: Nightly slow tests
 # The `slow` and `render` tests skip in CI: a real `tiny` Whisper model, real scene and face
 # detection, and real Remotion renders. This runs them against dev every night (CLP-72); a
 # failure shows up as GitHub's failed-run notification. `schedule` only fires from the
-# default branch's copy of this file. A PR that changes this file runs it on its own code.
+# default branch's copy of this file. A PR that changes this file or the apt-install action
+# runs it on its own code.
 on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
   pull_request:
-    paths: [".github/workflows/nightly-slow.yml"]
+    paths: [".github/workflows/nightly-slow.yml", ".github/actions/apt-install/**"]
 
 permissions:
   contents: read

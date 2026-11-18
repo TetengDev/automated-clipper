@@ -74,11 +74,13 @@ settings:
 streamers:
   - name: Kai Cenat
     twitch: kaicenat         # login; user_id filled in by `clipper resolve`
-  - name: IShowSpeed
-    twitch: ishowspeed
+  - name: Jynxzi
+    twitch: jynxzi
 ```
 
-The starting streamer list is the owner's call; the ones above are examples. A streamer who
+The starting streamer list is the owner's call; the ones above are examples. Discovery reads
+Twitch only, so a streamer must stream on Twitch: YouTube-only streamers such as IShowSpeed
+are not found until a YouTube discovery source is added (out of scope here). A streamer who
 asks to be left out is removed from the list, and their unused candidates are dropped.
 
 ## Out of scope

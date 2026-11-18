@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Node LTS for the Remotion renderer (render/). Only the node binary + bundled npm are
 # copied into the Python image below.
-FROM node:24.22.0-bookworm-slim@sha256:91acba91b842bec0bf7ea6f5e09c644c7ccad72c4996ed9616d861d1c7cd60d4 AS node
+FROM node:24.22.2-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9 AS node
 
 FROM node AS render-deps
 WORKDIR /app/render
@@ -24,7 +24,7 @@ RUN npm install --prefix /cli --ignore-scripts --no-audit --no-fund \
     && cp "/cli/node_modules/@anthropic-ai/claude-code-linux-$(node -p process.arch)/claude" /claude \
     && /claude --version
 
-FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
+FROM python:3.15-slim-bookworm@sha256:96599df822d0e1c6bb700014a05c7f3c8cabc6e0f7ff3c4f9f69cee033b4b5d9
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.31@sha256:ecd4de2f060c64bea0ff8ecb182ddf46ba3fcccdc8a60cfdbaf20d1a047d7437 /uv /usr/local/bin/uv
 

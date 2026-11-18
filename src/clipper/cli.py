@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
     from clipper.accounts import Account, AccountsConfig
     from clipper.campaigns import PostingConfig
+    from clipper.commentary.daily import DailyTarget
     from clipper.notify import Notify
     from clipper.posting.models import Publisher
     from clipper.resolve import Resolved
@@ -247,6 +248,8 @@ def _print_cycle(report: CycleReport) -> None:
         typer.echo(f"{poll.creator}: {poll.new} new{first}")
         for job_id, video_id, title in poll.enqueued:
             typer.echo(f"  enqueued job {job_id}: {video_id} {strip_control(title or '')}")
+    for job_id, item_id in report.commentary:
+        typer.echo(f"commentary: enqueued job {job_id}: {item_id}")
     for name in report.unresolved:
         typer.echo(f"{name}: no channel_id; run `clipper resolve`")
     for error in report.errors:
@@ -256,6 +259,18 @@ def _print_cycle(report: CycleReport) -> None:
         f"cycle done: {report.items_new} job(s) enqueued, {report.quota_units} quota unit(s),"
         f" {len(report.errors)} error(s)"
     )
+
+
+def _commentary_targets(config_path: Path, cfg: AppConfig) -> list[DailyTarget]:
+    """The commentary channels the monitor makes a daily job for (CLP-143). Read once at
+    start: restart the monitor after editing accounts.yaml or commentary.yaml. Raises
+    ConfigError for an invalid file."""
+    from clipper.accounts import accounts_path, load_accounts
+    from clipper.commentary.config import commentary_path, load_commentary
+    from clipper.commentary.daily import daily_targets
+
+    accounts = load_accounts(accounts_path(config_path), cfg)
+    return daily_targets(load_commentary(commentary_path(config_path), accounts), accounts)
 
 
 @app.command("run-monitor")
@@ -276,9 +291,11 @@ def run_monitor(
         Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Per-job media the janitor cleans.")
     ] = jobs.DEFAULT_MEDIA_ROOT,
 ) -> None:
-    """Poll creators 24/7 and enqueue new content. Between polls, the janitor applies the
-    retention and disk budget settings to the media dir at most once an hour (the disk
-    budget also counts the models dir, CLIPPER_MODELS_DIR, which it only reads).
+    """Poll creators 24/7 and enqueue new content. Each cycle also makes the day's job of
+    each commentary channel (commentary.yaml) once its run_at has passed. Between polls, the
+    janitor applies the retention and disk budget settings to the media dir at most once an
+    hour (the disk budget also counts the models dir, CLIPPER_MODELS_DIR, which it only
+    reads).
 
     SIGTERM/SIGINT finish the current creator's poll, then exit."""
     from clipper.janitor import Janitor
@@ -290,6 +307,7 @@ def run_monitor(
     try:
         cfg = load_config(app_ctx.config_path)
         secrets = Secrets()
+        targets = _commentary_targets(app_ctx.config_path, cfg)
     except ConfigError as exc:
         _fail(str(exc))
     except ValidationError as exc:
@@ -315,7 +333,13 @@ def run_monitor(
                 conn, cfg, media_dir, monitor_alert or log_notify, models_dir=models_dir()
             )
             monitor = YouTubeMonitor(
-                conn, cfg, source, first_run_mode=first_run, stop=stop_event, janitor=janitor.tick
+                conn,
+                cfg,
+                source,
+                first_run_mode=first_run,
+                stop=stop_event,
+                janitor=janitor.tick,
+                commentary=targets,
             )
             if once:
                 report = monitor.run_cycle(creators)

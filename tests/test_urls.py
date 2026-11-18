@@ -1,6 +1,13 @@
 import pytest
 
-from clipper.urls import InvalidSourceURL, SourceRef, canonical_url, parse_source_url
+from clipper.urls import (
+    COMMENTARY,
+    InvalidSourceURL,
+    SourceRef,
+    canonical_url,
+    job_source_url,
+    parse_source_url,
+)
 
 VID = "dQw4w9WgXcQ"
 
@@ -156,3 +163,35 @@ def test_source_ref_still_rejects_bad_youtube_ids(vid: str) -> None:
 def test_twitch_ids_stay_numeric(vid: str) -> None:
     with pytest.raises(InvalidSourceURL):
         SourceRef("twitch", vid)
+
+
+# --- CLP-143: commentary jobs ---------------------------------------------------------------
+
+
+def test_commentary_ref_has_a_safe_key_and_no_source_url() -> None:
+    ref = SourceRef(COMMENTARY, "random_gaming_yt:2026-11-19")
+
+    assert ref.key == "commentary_random_gaming_yt_2026-11-19"
+    assert job_source_url(ref) == ""
+    with pytest.raises(InvalidSourceURL, match="no source URL"):
+        canonical_url(ref)
+    assert job_source_url(SourceRef("twitch", "123")) == "https://www.twitch.tv/videos/123"
+
+
+@pytest.mark.parametrize(
+    "item_id",
+    [
+        "random_gaming_yt",
+        "Random_Gaming:2026-11-19",
+        "rg:2026-13-01",
+        "rg:2026-02-30",
+        "rg:2026-11-19\n",
+        "../rg:2026-11-19",
+        "rg:2026-1-9",
+        "rg:2026-11-19:x",
+        "rg:\uff12\uff10\uff12\uff16-11-19",
+    ],
+)
+def test_commentary_ids_are_strict(item_id: str) -> None:
+    with pytest.raises(InvalidSourceURL):
+        SourceRef(COMMENTARY, item_id)

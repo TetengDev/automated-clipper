@@ -29,7 +29,7 @@ from clipper.config import (
 from clipper.db import DEFAULT_DB_PATH, MigrationError, connect, current_version, migrate
 from clipper.export import DEFAULT_OUTPUT_DIR
 from clipper.monitor import CycleReport, FirstRun, YouTubeMonitor
-from clipper.pipeline import build_stages
+from clipper.pipeline import build_commentary_stages, build_stages
 from clipper.posting.cli import app as posts_app
 from clipper.posting.stage import HEARTBEAT_BUSY_MS, PostingStage
 from clipper.submissions_cli import app as campaigns_app
@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
     from clipper.accounts import Account, AccountsConfig
     from clipper.campaigns import PostingConfig
+    from clipper.commentary.daily import DailyTarget
     from clipper.notify import Notify
     from clipper.posting.models import Publisher
     from clipper.resolve import Resolved
@@ -114,6 +115,7 @@ def check_config(ctx: typer.Context) -> None:
         typer.echo(f"  - {creator.name} [{creator.region}] {', '.join(platforms)}")
     accounts = _check_accounts(_app(ctx).config_path, cfg)
     _check_campaigns(_app(ctx).config_path, cfg, accounts)
+    _check_commentary(_app(ctx).config_path, accounts)
 
 
 def _check_campaigns(config_path: Path, cfg: AppConfig, accounts: AccountsConfig) -> None:
@@ -135,6 +137,33 @@ def _check_campaigns(config_path: Path, cfg: AppConfig, accounts: AccountsConfig
     for campaign in campaigns.campaigns:
         typer.echo(f"  - {summary(campaign)}")
     for warning in unconfigured_campaigns(accounts, campaigns):
+        typer.echo(f"warning: {warning}", err=True)
+
+
+def _check_commentary(config_path: Path, accounts: AccountsConfig) -> None:
+    """Commentary channels summary for check-config (CLP-143)."""
+    from clipper.commentary.config import (
+        commentary_path,
+        load_commentary,
+        summary,
+        unchanneled_accounts,
+        youtube_pins_note,
+    )
+
+    path = commentary_path(config_path)
+    try:
+        commentary = load_commentary(path, accounts)
+    except ConfigError as exc:
+        _fail(str(exc))
+    found = "" if path.exists() else f" ({path} not found)"
+    typer.echo(f"ok: {len(commentary.channels)} commentary channels{found}")
+    by_id = {a.id: a for a in accounts.accounts}
+    for channel in commentary.channels:
+        settings = commentary.settings_for(channel)
+        typer.echo(f"  - {summary(channel, settings, by_id[channel.account])}")
+        if (note := youtube_pins_note(channel)) is not None:
+            typer.echo(f"note: {note}")
+    for warning in unchanneled_accounts(accounts, commentary):
         typer.echo(f"warning: {warning}", err=True)
 
 
@@ -163,6 +192,8 @@ def _check_accounts(config_path: Path, cfg: AppConfig) -> AccountsConfig:
             f"windows {', '.join(a.windows)} {a.timezone}; "
             f"tokens: {token_status(account_tokens(a.id, env))}"
             + (f"; campaign {a.campaign}" if a.campaign else "")
+            + (f"; content {a.content}" if a.content != "clips" else "")
+            + (f"; channel {a.channel_id}" if a.channel_id else "")
         )
     return accounts
 
@@ -217,6 +248,8 @@ def _print_cycle(report: CycleReport) -> None:
         typer.echo(f"{poll.creator}: {poll.new} new{first}")
         for job_id, video_id, title in poll.enqueued:
             typer.echo(f"  enqueued job {job_id}: {video_id} {strip_control(title or '')}")
+    for job_id, item_id in report.commentary:
+        typer.echo(f"commentary: enqueued job {job_id}: {item_id}")
     for name in report.unresolved:
         typer.echo(f"{name}: no channel_id; run `clipper resolve`")
     for error in report.errors:
@@ -226,6 +259,18 @@ def _print_cycle(report: CycleReport) -> None:
         f"cycle done: {report.items_new} job(s) enqueued, {report.quota_units} quota unit(s),"
         f" {len(report.errors)} error(s)"
     )
+
+
+def _commentary_targets(config_path: Path, cfg: AppConfig) -> list[DailyTarget]:
+    """The commentary channels the monitor makes a daily job for (CLP-143). Read once at
+    start: restart the monitor after editing accounts.yaml or commentary.yaml. Raises
+    ConfigError for an invalid file."""
+    from clipper.accounts import accounts_path, load_accounts
+    from clipper.commentary.config import commentary_path, load_commentary
+    from clipper.commentary.daily import daily_targets
+
+    accounts = load_accounts(accounts_path(config_path), cfg)
+    return daily_targets(load_commentary(commentary_path(config_path), accounts), accounts)
 
 
 @app.command("run-monitor")
@@ -246,9 +291,11 @@ def run_monitor(
         Path, typer.Option(envvar="CLIPPER_MEDIA_DIR", help="Per-job media the janitor cleans.")
     ] = jobs.DEFAULT_MEDIA_ROOT,
 ) -> None:
-    """Poll creators 24/7 and enqueue new content. Between polls, the janitor applies the
-    retention and disk budget settings to the media dir at most once an hour (the disk
-    budget also counts the models dir, CLIPPER_MODELS_DIR, which it only reads).
+    """Poll creators 24/7 and enqueue new content. Each cycle also makes the day's job of
+    each commentary channel (commentary.yaml) once its run_at has passed. Between polls, the
+    janitor applies the retention and disk budget settings to the media dir at most once an
+    hour (the disk budget also counts the models dir, CLIPPER_MODELS_DIR, which it only
+    reads).
 
     SIGTERM/SIGINT finish the current creator's poll, then exit."""
     from clipper.janitor import Janitor
@@ -260,6 +307,7 @@ def run_monitor(
     try:
         cfg = load_config(app_ctx.config_path)
         secrets = Secrets()
+        targets = _commentary_targets(app_ctx.config_path, cfg)
     except ConfigError as exc:
         _fail(str(exc))
     except ValidationError as exc:
@@ -285,7 +333,13 @@ def run_monitor(
                 conn, cfg, media_dir, monitor_alert or log_notify, models_dir=models_dir()
             )
             monitor = YouTubeMonitor(
-                conn, cfg, source, first_run_mode=first_run, stop=stop_event, janitor=janitor.tick
+                conn,
+                cfg,
+                source,
+                first_run_mode=first_run,
+                stop=stop_event,
+                janitor=janitor.tick,
+                commentary=targets,
             )
             if once:
                 report = monitor.run_cycle(creators)
@@ -435,6 +489,7 @@ def run_worker(
         worker_id=worker_id or jobs.default_worker_id(),
         stages=build_stages(),
         media_root=media_dir,
+        commentary_stages=build_commentary_stages(),
     )
     from clipper.campaigns import LiveCampaigns
     from clipper.jobs.worker import ChainedPasses

@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from clipper.db import transaction
 from clipper.jobs.models import TERMINAL, Job, JobStatus, to_iso
 from clipper.redact import redact
-from clipper.urls import SourceRef, canonical_url
+from clipper.urls import COMMENTARY, SourceRef, job_source_url
 
 DEFAULT_LEASE = timedelta(hours=2)
 BACKOFF_BASE = timedelta(minutes=1)
@@ -75,7 +75,7 @@ def insert_job(
             ref.platform,
             ref.item_id,
             creator,
-            canonical_url(ref),
+            job_source_url(ref),
             title[:MAX_TITLE_CHARS] if title else None,
             duration_seconds,
             int(is_stream),
@@ -98,29 +98,42 @@ def claim_next(
     *,
     worker_id: str,
     statuses: Iterable[JobStatus],
+    commentary_statuses: Iterable[JobStatus] = (),
     lease: timedelta = DEFAULT_LEASE,
     gave_up: list[tuple[sqlite3.Row, str]] | None = None,
 ) -> Job | None:
-    """Atomically claim the oldest due, unclaimed job whose status is in `statuses`.
+    """Atomically claim the oldest due, unclaimed job: a clip job whose status is in
+    `statuses`, or a commentary job (CLP-142) whose status is in `commentary_statuses`.
+    The lists are kept apart so a commentary job never reaches a clip stage, nor a clip
+    job a commentary one.
 
     The claim bumps `attempts`; the returned Job carries the bumped count. Rows that
     already used up MAX_ATTEMPTS (earlier claimers died mid-stage) and rows that cannot be
     decoded into a Job (corrupt platform/id) are marked failed and passed over, so one bad
     row cannot wedge the queue; each is added to `gave_up` as (row, reason).
     """
-    wanted = [s.value for s in statuses if s not in TERMINAL]
-    if not wanted:
+    clip = [s.value for s in statuses if s not in TERMINAL]
+    commentary = [s.value for s in commentary_statuses if s not in TERMINAL]
+    clauses: list[str] = []
+    params: list[str] = []
+    if clip:
+        clauses.append(f"(platform != ? AND status IN ({', '.join('?' * len(clip))}))")
+        params += [COMMENTARY, *clip]
+    if commentary:
+        clauses.append(f"(platform = ? AND status IN ({', '.join('?' * len(commentary))}))")
+        params += [COMMENTARY, *commentary]
+    if not clauses:
         return None
+    wanted = " OR ".join(clauses)
     stamp = to_iso(now)
-    marks = ", ".join("?" * len(wanted))
     with transaction(conn):
         while True:
             row = conn.execute(
-                f"SELECT * FROM jobs WHERE status IN ({marks})"  # noqa: S608 - placeholders only
+                f"SELECT * FROM jobs WHERE ({wanted})"  # noqa: S608 - placeholders only
                 " AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
                 " AND (worker_id IS NULL OR lease_until IS NULL OR lease_until <= ?)"
                 " ORDER BY COALESCE(next_attempt_at, created_at), id LIMIT 1",
-                (*wanted, stamp, stamp),
+                (*params, stamp, stamp),
             ).fetchone()
             if row is None:
                 return None

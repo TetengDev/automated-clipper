@@ -29,7 +29,7 @@ from typing import Protocol, runtime_checkable
 
 from clipper.config import AppConfig
 from clipper.jobs.heartbeat import lease_heartbeat
-from clipper.jobs.models import TERMINAL, Clock, Job, JobStatus, utcnow
+from clipper.jobs.models import TERMINAL, Clock, Job, JobKind, JobStatus, chain_for, utcnow
 from clipper.jobs.queue import (
     DEFAULT_LEASE,
     JobConflict,
@@ -137,6 +137,7 @@ class Worker:
     config: AppConfig
     worker_id: str
     stages: Mapping[JobStatus, StageDef] = field(default_factory=lambda: dict(DEFAULT_STAGES))
+    """Clip jobs' stages by status (`clipper.pipeline.build_stages`)."""
     media_root: Path = DEFAULT_MEDIA_ROOT
     alert: Notify | None = None
     """Told when a job reaches `failed` (CLP-34); run-worker passes the alerts webhook."""
@@ -145,6 +146,9 @@ class Worker:
     posting: PeriodicPass | None = None
     """Posting pass (`clipper.posting.stage.PostingStage`), run once per poll on its own
     thread by `run_forever`."""
+    commentary_stages: Mapping[JobStatus, StageDef] = field(default_factory=dict)
+    """Commentary jobs' stages by status (`clipper.pipeline.build_commentary_stages`,
+    CLP-142). Empty: this worker never claims a commentary job."""
     _posting_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _posting_restarts: int = field(default=0, init=False, repr=False)
     _posting_restart_at: float | None = field(default=None, init=False, repr=False)
@@ -175,6 +179,7 @@ class Worker:
                 self.clock(),
                 worker_id=self.worker_id,
                 statuses=self.stages.keys(),
+                commentary_statuses=self.commentary_stages.keys(),
                 lease=self.lease,
                 gave_up=gave_up,
             )
@@ -194,7 +199,7 @@ class Worker:
         return True
 
     def _run_stage(self, job: Job) -> None:
-        stage = self.stages[job.status]
+        stage = self._stages_for(job)[job.status]
         media_dir = self.media_root / job.ref.key
         artifact = media_dir / stage.artifact if stage.artifact else None
         log = f"job {job.id} ({job.ref.key}) {job.status}"
@@ -202,6 +207,22 @@ class Worker:
             self._run_and_record(job, stage, media_dir, artifact, log)
         except JobConflict as exc:
             logger.warning("%s: result dropped: %s", log, exc)
+
+    def _stages_for(self, job: Job) -> Mapping[JobStatus, StageDef]:
+        """The stage map of the job's kind; `claim_next` only hands out a job whose status
+        that map holds."""
+        return self.commentary_stages if job.kind is JobKind.COMMENTARY else self.stages
+
+    def _unhandled(self) -> str:
+        """Statuses of each kind's chain that no stage handles, for the start log."""
+        parts = []
+        for kind, stages in (
+            (JobKind.CLIP, self.stages),
+            (JobKind.COMMENTARY, self.commentary_stages),
+        ):
+            missing = [s.value for s in chain_for(kind) if s not in stages and s not in TERMINAL]
+            parts.append(f"{kind}: {', '.join(missing) or 'none'}")
+        return "; ".join(parts)
 
     def _run_and_record(
         self, job: Job, stage: StageDef, media_dir: Path, artifact: Path | None, log: str
@@ -273,8 +294,7 @@ class Worker:
         The posting pass runs on its own thread, once per `poll_seconds`, and stops with
         the loop.
         """
-        unhandled = [s.value for s in JobStatus if s not in self.stages and s not in TERMINAL]
-        logger.info("worker %s started; not handling: %s", self.worker_id, ", ".join(unhandled))
+        logger.info("worker %s started; not handling %s", self.worker_id, self._unhandled())
         self._start_posting(stop_event, poll_seconds)
         try:
             while not stop_event.is_set():

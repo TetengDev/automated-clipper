@@ -9,6 +9,10 @@ Every cycle writes one `runs` row (component `monitor:youtube`): jobs enqueued
 (items_new), Data API quota units spent, and errors as JSON. One creator failing is
 logged and recorded there; the others are still polled.
 
+Commentary (CLP-143): each cycle also makes each commentary channel's job for the day
+once its `run_at` has passed (`clipper.commentary.daily`). Those jobs count in the cycle's
+items_new; a channel that fails is recorded in its errors like a creator.
+
 Per creator:
 - First poll (no seen_items for the creator yet): `baseline` marks every listed item as
   seen without any metadata call; `emit` handles items published within `lookback_days`
@@ -41,6 +45,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
 
+from clipper.commentary.daily import DailyTarget, enqueue_daily
 from clipper.config import AppConfig, Creator, Settings
 from clipper.db import transaction
 from clipper.jobs.models import Clock, from_iso, to_iso, utcnow
@@ -135,10 +140,12 @@ class CycleReport:
     """Creators with a YouTube handle but no channel_id yet."""
     errors: list[dict[str, str]] = field(default_factory=list)
     quota_units: int = 0
+    commentary: list[tuple[int, str]] = field(default_factory=list)
+    """(job id, item id) per daily commentary job created (CLP-143)."""
 
     @property
     def items_new(self) -> int:
-        return sum(len(p.enqueued) for p in self.polls)
+        return sum(len(p.enqueued) for p in self.polls) + len(self.commentary)
 
 
 @dataclass
@@ -160,12 +167,19 @@ class YouTubeMonitor:
     giving up (MAX_FORMAT_ERRORS_WITH_SIBLINGS)."""
     janitor: Callable[[], object] | None = None
     """Called after each cycle unless stopping (`Janitor.tick`, CLP-38; never raises)."""
+    commentary: Sequence[DailyTarget] = ()
+    """Commentary channels that get a job a day (CLP-143)."""
 
     def run_forever(self, creators: Sequence[Creator]) -> None:
         """Poll every interval (with jitter) until `stop` is set. A failing cycle (e.g. the
         DB is locked while writing the runs row) is logged; the next one runs as usual."""
         interval_s = self.config.settings.poll_interval_youtube_minutes * 60
-        logger.info("monitor started: %d creator(s), every ~%d s", len(creators), interval_s)
+        logger.info(
+            "monitor started: %d creator(s), %d commentary channel(s), every ~%d s",
+            len(creators),
+            len(self.commentary),
+            interval_s,
+        )
         while not self.stop.is_set():
             try:
                 self.run_cycle(creators)
@@ -184,6 +198,7 @@ class YouTubeMonitor:
                 "INSERT INTO runs (component, started_at) VALUES (?, ?)",
                 (COMPONENT, to_iso(self.clock())),
             ).lastrowid
+        self._daily_commentary(report)
         for creator in creators:
             if self.stop.is_set():
                 logger.info("stop requested; ending the cycle before %s", creator.name)
@@ -222,6 +237,21 @@ class YouTubeMonitor:
                 ),
             )
         return report
+
+    def _daily_commentary(self, report: CycleReport) -> None:
+        """Make each commentary channel's job for today once its `run_at` has passed. One
+        channel failing is recorded; the others still run."""
+        for target in self.commentary:
+            try:
+                created = enqueue_daily(self.conn, target, self.clock())
+            except Exception as exc:
+                error = redact(f"{type(exc).__name__}: {exc}")
+                logger.error("%s: daily commentary job failed: %s", target.account_id, error)
+                report.errors.append({"creator": target.account_id, "error": error})
+                continue
+            if created is not None:
+                report.commentary.append(created)
+                logger.info("%s: enqueued commentary job %d for %s", target.account_id, *created)
 
     def _poll(self, creator: Creator, channel_id: str, poll: CreatorPoll) -> None:
         settings = self.config.effective_settings(creator.name)

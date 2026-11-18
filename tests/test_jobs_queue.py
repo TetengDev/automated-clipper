@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from clipper.db import connect, migrate, transaction
-from clipper.jobs.models import PIPELINE, TERMINAL, JobStatus
+from clipper.jobs.models import (
+    COMMENTARY_PIPELINE,
+    PIPELINE,
+    TERMINAL,
+    Job,
+    JobKind,
+    JobStatus,
+)
 from clipper.jobs.queue import (
     BACKOFF_CAP,
     DEFAULT_LEASE,
@@ -31,6 +38,7 @@ from clipper.urls import SourceRef
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 ALL = [s for s in JobStatus if s not in TERMINAL]
 YT = SourceRef("youtube", "dQw4w9WgXcQ")
+DAY = SourceRef("commentary", "random_gaming_yt:2026-11-19")
 
 
 @pytest.fixture
@@ -323,3 +331,88 @@ def test_retry_delays_spread_out() -> None:
     delays = {jittered(backoff(3)) for _ in range(50)}
     assert len(delays) > 1
     assert all(timedelta(seconds=192) <= d <= timedelta(seconds=288) for d in delays)
+
+
+# --- CLP-143: commentary jobs have their own chain and claims ---------------------------------
+
+
+def test_clip_jobs_keep_their_chain() -> None:
+    assert PIPELINE == (
+        JobStatus.DETECTED,
+        JobStatus.WAITING_VOD,
+        JobStatus.FETCHING_AUDIO,
+        JobStatus.TRANSCRIBING,
+        JobStatus.SELECTING,
+        JobStatus.FETCHING_CLIPS,
+        JobStatus.RENDERING,
+        JobStatus.CLIPS_READY,
+    )
+    assert COMMENTARY_PIPELINE == (
+        JobStatus.DETECTED,
+        JobStatus.DISCOVERING,
+        JobStatus.FETCHING_SOURCES,
+        JobStatus.TRANSCRIBING,
+        JobStatus.SCRIPTING,
+        JobStatus.VOICING,
+        JobStatus.RENDERING,
+        JobStatus.CLIPS_READY,
+    )
+    assert {"discovering", "fetching_sources", "scripting", "voicing"} <= {
+        s.value for s in JobStatus
+    }
+
+
+def test_a_commentary_job_is_its_own_kind_with_no_source_url(conn: sqlite3.Connection) -> None:
+    job, created = enqueue(conn, DAY, T0, creator="random_gaming_yt")
+
+    assert created
+    assert job.kind is JobKind.COMMENTARY
+    assert job.source_url == ""
+    assert job.creator == "random_gaming_yt"
+    assert job.ref.key == "commentary_random_gaming_yt_2026-11-19"
+    assert enqueue(conn, YT, T0, creator="manual")[0].kind is JobKind.CLIP
+
+
+def test_clip_statuses_never_claim_a_commentary_job(conn: sqlite3.Connection) -> None:
+    enqueue(conn, DAY, T0, creator="random_gaming_yt")
+
+    assert claim_next(conn, T0, worker_id="w", statuses=ALL) is None
+    claimed = claim_next(
+        conn, T0, worker_id="w", statuses=ALL, commentary_statuses=[JobStatus.DETECTED]
+    )
+    assert claimed is not None and claimed.ref == DAY
+
+
+def test_commentary_statuses_never_claim_a_clip_job(conn: sqlite3.Connection) -> None:
+    enqueue(conn, YT, T0, creator="manual")
+
+    assert claim_next(conn, T0, worker_id="w", statuses=[], commentary_statuses=ALL) is None
+
+
+def test_a_commentary_job_walks_its_own_chain(conn: sqlite3.Connection) -> None:
+    enqueue(conn, DAY, T0, creator="random_gaming_yt")
+    seen = []
+    while (
+        job := claim_next(conn, T0, worker_id="w", statuses=[], commentary_statuses=ALL)
+    ) is not None:
+        seen.append(job.status)
+        advance(conn, job, T0, worker_id="w")
+
+    assert seen == list(COMMENTARY_PIPELINE[:-1])
+    final = get_job(conn, job_id=1)
+    assert final is not None and final.status is JobStatus.CLIPS_READY
+
+
+def test_a_clip_job_has_no_successor_at_a_commentary_status() -> None:
+    job = Job(
+        id=1,
+        ref=YT,
+        creator="m",
+        source_url="",
+        status=JobStatus.SCRIPTING,
+        is_stream=False,
+        attempts=0,
+    )
+
+    with pytest.raises(ValueError, match="no stage after scripting"):
+        _ = job.next_status

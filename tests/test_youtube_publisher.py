@@ -969,6 +969,31 @@ def test_no_youtube_accounts_means_no_youtube_publisher() -> None:
     assert build_publishers(_accounts(("tt_main", "tiktok", True)), Secrets()) == {}
 
 
+def _commentary(account_id: str) -> Account:
+    return Account.model_construct(
+        id=account_id, platform="youtube", content="commentary", enabled=True
+    )
+
+
+def test_commentary_accounts_get_no_youtube_clip_publisher() -> None:
+    """A commentary channel never gets a clip (CLP-142): looking up clip uploads on it is
+    pointless, and its missing token would defer every clip account's lookup."""
+    accounts = _accounts(("yt_main", "youtube", True))
+    accounts.accounts.append(_commentary("random_gaming_yt"))
+
+    yt = build_publishers(accounts, Secrets())["youtube"]
+
+    assert isinstance(yt, YouTubePublisher)
+    assert yt.account_ids == ("yt_main",)
+
+
+def test_only_commentary_youtube_accounts_means_no_youtube_publisher() -> None:
+    accounts = _accounts(("yt_off", "youtube", False))
+    accounts.accounts.append(_commentary("random_gaming_yt"))
+
+    assert "youtube" not in build_publishers(accounts, Secrets())
+
+
 def test_refresh_tokens_are_read_from_the_account_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

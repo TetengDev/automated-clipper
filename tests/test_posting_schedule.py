@@ -478,3 +478,43 @@ def test_a_post_without_stored_metadata_is_published_with_cleaned_text(env: Env)
 
     assert (metadata.title, metadata.caption) == ("Big", "Watch this\n\n#t0 #t1 #t2 #t3 #t4")
     assert metadata.hashtags == [f"#t{i}" for i in range(5)]  # Instagram takes 5
+
+
+# --- CLP-143: never a clip to a commentary account ----------------------------------------
+
+
+def test_a_commentary_account_never_gets_a_clip(env: Env) -> None:
+    clip_id = approved_clip(env)
+    accounts = [
+        FakeAccount(id="tt_main"),
+        # Even one that (wrongly) lists the clip's creator.
+        FakeAccount(id="rg_yt", platform="youtube", content="commentary", windows=["00:00-23:59"]),
+    ]
+
+    created = schedule_for_clip(env.conn, clip_id, accounts, NOW)
+
+    assert [p.account_id for p in created] == ["tt_main"]
+
+
+def test_recheck_keeps_holding_a_post_whose_account_turned_commentary(env: Env) -> None:
+    account = FakeAccount(id="ig_main", platform="instagram")
+    clip_id = approved_clip(env, duration_s=200.0)
+    (held,) = schedule_for_clip(env.conn, clip_id, [account], NOW)
+    env.conn.execute("UPDATE clip_versions SET duration_s = 60 WHERE clip_id = ?", (clip_id,))
+    account.content = "commentary"
+
+    result = recheck_held(env.conn, [account], {}, NOW, is_sensitive=lambda _: False)
+
+    assert result.released == []
+    (still,) = result.still_held
+    assert still.id == held.id
+    assert still.error == "account ig_main posts commentary Shorts, not clips"
+
+
+def test_publish_guard_holds_a_clip_for_an_account_that_turned_commentary(env: Env) -> None:
+    (post,) = schedule_for_clip(env.conn, approved_clip(env), [FakeAccount()], NOW)
+    accounts = {"tt_main": FakeAccount(content="commentary")}
+
+    problem = publish_problem(env.conn, post, accounts, {}, NOW)
+
+    assert problem == "account tt_main posts commentary Shorts, not clips"

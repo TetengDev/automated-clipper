@@ -27,14 +27,16 @@ from clipper.jobs import (
 )
 from clipper.jobs import heartbeat as heartbeat_mod
 from clipper.jobs import worker as worker_mod
+from clipper.jobs.models import COMMENTARY_PIPELINE, TERMINAL
 from clipper.jobs.queue import DEFAULT_LEASE, JobConflict
 from clipper.jobs.stages import DEFAULT_STAGES
 from clipper.notify import NotifyError
-from clipper.pipeline import build_stages
+from clipper.pipeline import build_commentary_stages, build_stages
 from clipper.urls import SourceRef
 
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 YT = SourceRef("youtube", "dQw4w9WgXcQ")
+DAY = SourceRef("commentary", "random_gaming_yt:2026-11-19")
 # Real artifact names (clipper.pipeline.build_stages); rendering is CLP-17's, still a stub.
 ARTIFACTS = {
     JobStatus.FETCHING_AUDIO: "audio_16k.flac",
@@ -736,3 +738,85 @@ def test_alert_that_cannot_be_sent_is_logged(
 
     assert _status(db, job.id) is JobStatus.FAILED
     assert f"job {job.id}: failure alert not sent: discord webhook returned 503" in caplog.text
+
+
+# --- CLP-143: stages by job kind ----------------------------------------------------------------
+
+
+def test_a_worker_without_commentary_stages_never_touches_a_commentary_job(
+    make_worker: MakeWorker, db: Path
+) -> None:
+    pipeline = StubPipeline()
+    worker = make_worker(pipeline)
+    with closing(connect(db)) as conn:
+        job, _ = enqueue(conn, DAY, T0, creator="random_gaming_yt")
+
+    assert worker.run_once() is False
+    assert _status(db, job.id) is JobStatus.DETECTED
+    assert sum(pipeline.calls.values()) == 0
+
+
+def test_a_commentary_day_is_skipped_at_discovery_until_clp_144(
+    make_worker: MakeWorker, db: Path
+) -> None:
+    pipeline = StubPipeline()
+    worker = make_worker(pipeline)
+    worker.commentary_stages = build_commentary_stages()
+    alerts: list[str] = []
+    worker.alert = alerts.append
+    with closing(connect(db)) as conn:
+        job, _ = enqueue(conn, DAY, T0, creator="random_gaming_yt")
+
+    assert _drain(worker) == 2  # detected -> discovering, then the placeholder skips
+
+    row = _row(db, job.id)
+    assert row["status"] == "skipped"
+    assert row["skip_reason"] == "commentary discovery is not built yet (CLP-144)"
+    assert sum(pipeline.calls.values()) == 0  # no clip stage ran
+    assert alerts == []  # a skip is not a failure
+
+
+@pytest.mark.parametrize(
+    "status", [s for s in COMMENTARY_PIPELINE if s not in TERMINAL and s is not JobStatus.DETECTED]
+)
+def test_every_commentary_status_has_a_placeholder_that_skips(
+    make_worker: MakeWorker, db: Path, status: JobStatus
+) -> None:
+    pipeline = StubPipeline()
+    worker = make_worker(pipeline)
+    worker.commentary_stages = build_commentary_stages()
+    with closing(connect(db)) as conn:
+        job, _ = enqueue(conn, DAY, T0, creator="random_gaming_yt")
+        conn.execute("UPDATE jobs SET status = ? WHERE id = ?", (status.value, job.id))
+
+    assert worker.run_once()
+
+    row = _row(db, job.id)
+    assert row["status"] == "skipped"
+    assert row["skip_reason"].startswith("commentary ")
+    assert "is not built yet (CLP-14" in row["skip_reason"]
+    assert sum(pipeline.calls.values()) == 0  # transcribing/rendering: not the clip stage
+
+
+def test_build_commentary_stages_covers_the_commentary_chain_only() -> None:
+    stages = build_commentary_stages()
+
+    assert set(stages) == set(COMMENTARY_PIPELINE) - TERMINAL
+    assert stages[JobStatus.DETECTED].artifact is None
+    assert stages[JobStatus.TRANSCRIBING] is not build_stages()[JobStatus.TRANSCRIBING]
+
+
+def test_start_log_lists_unhandled_statuses_per_kind(
+    make_worker: MakeWorker, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    worker = make_worker(StubPipeline())
+    stop = threading.Event()
+    stop.set()
+
+    worker.run_forever(stop, poll_seconds=0.01)
+
+    assert (
+        "not handling clip: waiting_vod; commentary: detected, discovering, fetching_sources,"
+        " transcribing, scripting, voicing, rendering"
+    ) in caplog.text

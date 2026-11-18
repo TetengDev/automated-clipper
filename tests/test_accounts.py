@@ -255,6 +255,146 @@ def test_plan_that_cannot_fit_is_refused() -> None:
         )
 
 
+# --- CLP-143: content (clips | commentary) and channel_id ---------------------------------
+
+COMMENTARY_ACCOUNT: dict[str, object] = {
+    "id": "random_gaming_yt",
+    "platform": "youtube",
+    "content": "commentary",
+    "channel_id": "UCcMYw3Ae2crqXE2yzFBSUig",
+    "handle": "@randomgaming",
+    "market": "US",
+    "timezone": "America/New_York",
+}
+
+COMMENTARY_ACCOUNTS_YAML = """\
+accounts:
+  - id: random_gaming_yt
+    platform: youtube
+    content: commentary
+    channel_id: UCcMYw3Ae2crqXE2yzFBSUig
+    handle: "@randomgaming"
+    market: US
+    timezone: America/New_York
+"""
+
+
+def _commentary(**overrides: object) -> dict[str, object]:
+    """A commentary account; an override of None removes that key."""
+    base = {**COMMENTARY_ACCOUNT, **overrides}
+    return {k: v for k, v in base.items() if v is not None}
+
+
+def test_accounts_post_clips_by_default() -> None:
+    account = Account.model_validate(_account())
+
+    assert account.content == "clips"
+    assert account.channel_id is None
+
+
+def test_commentary_account_posts_once_a_day_in_the_us_youtube_windows() -> None:
+    account = Account.model_validate(_commentary())
+
+    assert account.content == "commentary"
+    assert account.channel_id == "UCcMYw3Ae2crqXE2yzFBSUig"
+    assert account.creators == []
+    assert account.campaign is None
+    assert account.posts_per_day == 1
+    assert account.min_gap_minutes == 240
+    assert account.windows == ["10:00-11:00", "13:00-14:00"]
+
+
+def test_a_handle_may_hold_a_hyphen() -> None:
+    account = Account.model_validate(_commentary(handle="@RandomGaming-f3w"))
+
+    assert account.handle == "@RandomGaming-f3w"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"creators": ["MrBeast"]}, "must not set `creators`"),
+        ({"creators": []}, "must not set `creators`"),
+        ({"campaign": "vyro_mrbeast"}, "must not set `campaign`"),
+        ({"licence": "RTIA clip licence 2026-12"}, "must not set `licence`"),
+        ({"channel_id": None}, "needs `channel_id`"),
+        ({"platform": "tiktok", "channel_id": None}, "must be on youtube, not tiktok"),
+        ({"channel_id": "UCshort"}, "channel_id"),
+        ({"content": "reposts"}, "content"),
+        ({"surprise": 1}, "surprise"),
+    ],
+)
+def test_commentary_account_validation(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        Account.model_validate(_commentary(**overrides))
+
+
+def test_channel_id_is_only_for_youtube_accounts() -> None:
+    channel = "UCX6OQ3DkcsbYNE6H8uQQuVA"
+    youtube = Account.model_validate(_account(platform="youtube", channel_id=channel))
+
+    assert youtube.channel_id == channel
+    with pytest.raises(ValidationError, match="channel_id is only for youtube accounts"):
+        Account.model_validate(_account(channel_id=channel))
+
+
+def test_two_accounts_on_one_youtube_channel_are_refused() -> None:
+    twin = _commentary(id="random_gaming_two", handle="@other")
+    message = "duplicate youtube channel_id: UCcMYw3Ae2crqXE2yzFBSUig"
+
+    with pytest.raises(ValidationError, match=message):
+        AccountsConfig.model_validate({"accounts": [_commentary(), twin]})
+
+
+def test_commentary_account_loads_without_creators(tmp_path: Path, creators_cfg: AppConfig) -> None:
+    cfg = load_accounts(_write(tmp_path, COMMENTARY_ACCOUNTS_YAML), creators_cfg)
+
+    (account,) = cfg.accounts
+    assert (account.id, account.content, account.creators) == (
+        "random_gaming_yt",
+        "commentary",
+        [],
+    )
+
+
+def test_check_config_shows_a_commentary_account(tmp_path: Path) -> None:
+    creators = _write(tmp_path, CREATORS_YAML, "creators.yaml")
+    _write(tmp_path, COMMENTARY_ACCOUNTS_YAML)
+
+    result = runner.invoke(app, ["--config", str(creators), "check-config"])
+
+    assert result.exit_code == 0, result.output
+    (line,) = [x for x in result.output.splitlines() if "  - random_gaming_yt" in x]
+    for part in (
+        "youtube",
+        "@randomgaming",
+        "1/day",
+        "content commentary",
+        "channel UCcMYw3Ae2crqXE2yzFBSUig",
+    ):
+        assert part in line
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ("    creators: [MrBeast]\n", "must not set `creators`"),
+        ("    campaign: vyro_mrbeast\n", "must not set `campaign`"),
+        ("    surprise: 1\n", "accounts.0.surprise: Extra inputs are not permitted"),
+    ],
+)
+def test_check_config_rejects_a_bad_commentary_account(
+    tmp_path: Path, extra: str, message: str
+) -> None:
+    creators = _write(tmp_path, CREATORS_YAML, "creators.yaml")
+    _write(tmp_path, COMMENTARY_ACCOUNTS_YAML + extra)
+
+    result = runner.invoke(app, ["--config", str(creators), "check-config"])
+
+    assert result.exit_code == 1
+    assert message in result.stderr
+
+
 def test_shipped_and_default_plans_fit() -> None:
     for market in ("US", "PH"):
         for platform in PLATFORM_DAILY_CAPS:
@@ -384,9 +524,10 @@ def test_shipped_accounts_yaml_validates_against_shipped_creators() -> None:
         "mrbeast_clips_yt",
         "mrbeast_clips_ig",
         "mrbeast_clips_fb",
+        "random_gaming_yt",
     }
     assert {a.platform for a in cfg.accounts} == {"tiktok", "youtube", "instagram", "facebook"}
-    for account in cfg.accounts:
+    for account in (a for a in cfg.accounts if a.content == "clips"):
         assert account.market == "US"
         assert account.timezone == "America/New_York"
         assert account.creators == ["MrBeast"]
@@ -394,6 +535,15 @@ def test_shipped_accounts_yaml_validates_against_shipped_creators() -> None:
         assert account.campaign == "vyro_mrbeast"
     paused = {"raffy tulfo in action", "ivana alawi", "cong tv"}
     assert not any(c.casefold() in paused for a in cfg.accounts for c in a.creators)
+    rg = ids["random_gaming_yt"]
+    assert (rg.platform, rg.content, rg.channel_id, rg.handle) == (
+        "youtube",
+        "commentary",
+        "UCcMYw3Ae2crqXE2yzFBSUig",
+        "@RandomGaming-f3w",
+    )
+    assert (rg.market, rg.timezone, rg.posts_per_day) == ("US", "America/New_York", 1)
+    assert rg.creators == [] and rg.campaign is None and rg.enabled
 
 
 def test_check_config_summarises_accounts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

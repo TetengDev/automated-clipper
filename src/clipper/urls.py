@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from datetime import date
+from typing import Final, Literal
 from urllib.parse import urlsplit
 
 Platform = Literal["youtube", "twitch"]
+"""Where a source video comes from (what `parse_source_url` accepts)."""
+JobPlatform = Literal["youtube", "twitch", "commentary"]
+"""A job's platform: a source platform, or `commentary` for a commentary channel's daily
+job (CLP-142), whose item id is `<account_id>:<YYYY-MM-DD>` (the account's local date)."""
+COMMENTARY: Final = "commentary"
 
 MAX_URL_LENGTH = 2048
 # A YouTube id may start with "-" (e.g. "-4mo8fGTST0", CLP-84). Such an id never sits in
@@ -21,6 +27,7 @@ MAX_URL_LENGTH = 2048
 _ITEM_ID = {
     "youtube": re.compile(r"[A-Za-z0-9_-]{11}"),
     "twitch": re.compile(r"[1-9][0-9]{0,19}"),
+    COMMENTARY: re.compile(r"[a-z0-9_]{1,64}:\d{4}-\d{2}-\d{2}"),
 }
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
 _TWITCH_HOSTS = {"twitch.tv", "www.twitch.tv", "m.twitch.tv"}
@@ -32,26 +39,51 @@ class InvalidSourceURL(ValueError):
 
 @dataclass(frozen=True)
 class SourceRef:
-    platform: Platform
+    platform: JobPlatform
     item_id: str
     """May start with "-": never use it as a bare file name or argv value; use `key` (paths)
     or `canonical_url(ref)` (after "--") instead."""
 
     def __post_init__(self) -> None:
         pattern = _ITEM_ID.get(self.platform)
-        if pattern is None or not pattern.fullmatch(self.item_id):
+        if (
+            pattern is None
+            or not pattern.fullmatch(self.item_id)
+            or not _real_day(self.platform, self.item_id)
+        ):
             raise InvalidSourceURL(f"invalid {self.platform} id: {self.item_id!r}")
 
     @property
     def key(self) -> str:
-        """Filesystem-safe identity, e.g. `youtube_dQw4w9WgXcQ` (media dir name)."""
-        return f"{self.platform}_{self.item_id}"
+        """Filesystem-safe identity, e.g. `youtube_dQw4w9WgXcQ` (media dir name). A
+        commentary day's `:` becomes `_` (`commentary_random_gaming_yt_2026-11-19`); account
+        ids hold no `-` and dates no `_`, so keys stay unique."""
+        return f"{self.platform}_{self.item_id.replace(':', '_')}"
+
+
+def _real_day(platform: str, item_id: str) -> bool:
+    """A commentary id's date must exist (its pattern alone takes 2026-13-45)."""
+    if platform != COMMENTARY:
+        return True
+    try:
+        date.fromisoformat(item_id.rpartition(":")[2])
+    except ValueError:
+        return False
+    return True
 
 
 def canonical_url(ref: SourceRef) -> str:
     if ref.platform == "youtube":
         return f"https://www.youtube.com/watch?v={ref.item_id}"
-    return f"https://www.twitch.tv/videos/{ref.item_id}"
+    if ref.platform == "twitch":
+        return f"https://www.twitch.tv/videos/{ref.item_id}"
+    raise InvalidSourceURL(f"a {ref.platform} job has no source URL")
+
+
+def job_source_url(ref: SourceRef) -> str:
+    """The `jobs.source_url` value: the canonical URL, or "" for a commentary job, which
+    has no single source (its Twitch clips are `story_candidates` rows, CLP-144)."""
+    return "" if ref.platform == COMMENTARY else canonical_url(ref)
 
 
 def parse_source_url(url: str) -> SourceRef:

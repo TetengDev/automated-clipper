@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from clipper.urls import SourceRef
+from clipper.urls import COMMENTARY, SourceRef
 
 Clock = Callable[[], datetime]
 _ISO = "%Y-%m-%dT%H:%M:%SZ"
@@ -25,6 +25,20 @@ class JobStatus(StrEnum):
     CLIPS_READY = "clips_ready"
     FAILED = "failed"
     SKIPPED = "skipped"
+    # Commentary jobs only (CLP-142). They share detected, transcribing, rendering and the
+    # terminal statuses with clip jobs.
+    DISCOVERING = "discovering"
+    FETCHING_SOURCES = "fetching_sources"
+    SCRIPTING = "scripting"
+    VOICING = "voicing"
+
+
+class JobKind(StrEnum):
+    """What a job makes: clips of a creator's video, or a commentary channel's daily
+    Shorts (CLP-142, `platform = 'commentary'`)."""
+
+    CLIP = "clip"
+    COMMENTARY = "commentary"
 
 
 PIPELINE: tuple[JobStatus, ...] = (
@@ -37,7 +51,23 @@ PIPELINE: tuple[JobStatus, ...] = (
     JobStatus.RENDERING,
     JobStatus.CLIPS_READY,
 )
+"""A clip job's chain."""
+COMMENTARY_PIPELINE: tuple[JobStatus, ...] = (
+    JobStatus.DETECTED,
+    JobStatus.DISCOVERING,
+    JobStatus.FETCHING_SOURCES,
+    JobStatus.TRANSCRIBING,
+    JobStatus.SCRIPTING,
+    JobStatus.VOICING,
+    JobStatus.RENDERING,
+    JobStatus.CLIPS_READY,
+)
+"""A commentary job's chain (CLP-142)."""
 TERMINAL = frozenset({JobStatus.CLIPS_READY, JobStatus.FAILED, JobStatus.SKIPPED})
+
+
+def chain_for(kind: JobKind) -> tuple[JobStatus, ...]:
+    return COMMENTARY_PIPELINE if kind is JobKind.COMMENTARY else PIPELINE
 
 
 def utcnow() -> datetime:
@@ -90,10 +120,18 @@ class Job:
         )
 
     @property
+    def kind(self) -> JobKind:
+        return JobKind.COMMENTARY if self.ref.platform == COMMENTARY else JobKind.CLIP
+
+    @property
     def next_status(self) -> JobStatus:
-        """Pipeline successor. Only stream jobs wait for a VOD; an enqueued URL is already one."""
+        """Successor in the job's own chain. Only stream clip jobs wait for a VOD; an
+        enqueued URL is already one."""
         if self.status in TERMINAL:
             raise ValueError(f"job {self.id} is terminal ({self.status})")
-        if self.status is JobStatus.DETECTED and not self.is_stream:
+        if self.kind is JobKind.CLIP and self.status is JobStatus.DETECTED and not self.is_stream:
             return JobStatus.FETCHING_AUDIO
-        return PIPELINE[PIPELINE.index(self.status) + 1]
+        chain = chain_for(self.kind)
+        if self.status not in chain:
+            raise ValueError(f"job {self.id} ({self.kind}) has no stage after {self.status}")
+        return chain[chain.index(self.status) + 1]

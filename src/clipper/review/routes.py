@@ -21,6 +21,7 @@ from pydantic import ValidationError
 from starlette.datastructures import State
 
 from clipper import clips
+from clipper.campaigns import campaign_for
 from clipper.clips import (
     GATE_REASON_LABELS,
     REJECT_REASONS,
@@ -66,6 +67,15 @@ SENSITIVE_UNCONFIRMED = (
     "Confirm you checked faces of minors and victims (tick the box) before approving this"
     " sensitive clip."
 )
+CHECKS_UNCONFIRMED = (
+    "Confirm you checked the campaign rules (tick the box) before approving this clip."
+)
+REVIEWER_CHECK_LABELS = {
+    "logos": "No logos",
+    "negative_framing": "No negative framing",
+    "reposts": "Not a repost",
+}
+"""Review-page text for `Campaign.reviewer_checks` (CLP-114)."""
 
 
 def _now(request: Request) -> datetime:
@@ -115,6 +125,28 @@ def _query(flt: QueueFilter, **extra: object) -> str:
     return urlencode(params)
 
 
+def _clip_view(
+    status: Annotated[str | None, Query(max_length=32)] = None,
+    creator: Annotated[str | None, Query(max_length=200)] = None,
+    min_score: Annotated[str | None, Query(max_length=32)] = None,
+    sort: Annotated[str | None, Query(max_length=16)] = None,
+) -> QueueFilter | None:
+    """The queue view a clip page was opened from (CLP-62), carried on clip URLs as the
+    queue's query string. None (no params) is the newest-pending default."""
+    if status is None and creator is None and min_score is None and sort is None:
+        return None
+    return _parse_filter(
+        status or ClipStatus.PENDING_REVIEW.value, creator, min_score, sort or "newest"
+    )
+
+
+View = Annotated[QueueFilter | None, Depends(_clip_view)]
+
+
+def _view_query(view: QueueFilter | None) -> str:
+    return f"?{_query(view)}" if view else ""
+
+
 @router.get("/", response_class=HTMLResponse)
 @router.get("/queue", response_class=HTMLResponse)
 def queue(
@@ -139,6 +171,7 @@ def queue(
         "total": total,
         "flt": flt,
         "page": page,
+        "clip_query": _query(flt),
         "next_page_url": f"/queue?{_query(flt, page=page + 1)}" if has_more else None,
     }
     if _is_htmx(request) and page > 1:
@@ -172,12 +205,27 @@ def _sensitive(request: Request, creator: str, flagged: bool) -> bool:
     return always_sensitive(found)
 
 
+def _reviewer_checks(request: Request, creator: str) -> dict[str, list[str]]:
+    """The reviewer-only checks (CLP-114) of each campaign an enabled account posts this
+    creator's clips for, by campaign id. The pipeline cannot see logos, negative framing or
+    reposts in the video, so the reviewer confirms them. A disabled campaign still counts:
+    its held posts can be released later (fails closed)."""
+    found: dict[str, list[str]] = {}
+    for account in request.app.state.accounts:
+        if not account.enabled or creator not in account.creators:
+            continue
+        _, campaign = campaign_for(account, creator, request.app.state.campaigns)
+        if campaign is not None and campaign.reviewer_checks:
+            found[campaign.id] = campaign.reviewer_checks
+    return dict(sorted(found.items()))
+
+
 def _with_status(flt: QueueFilter, status: ClipStatus | None) -> QueueFilter:
     return QueueFilter(status=status, creator=flt.creator, min_score=flt.min_score, sort=flt.sort)
 
 
 @router.get("/clip/{clip_id}", response_class=HTMLResponse)
-def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn) -> Response:
+def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn, view: View) -> Response:
     clip = clips.get_clip(conn, clip_id)
     if clip is None:
         raise HTTPException(status_code=404, detail="clip not found")
@@ -189,16 +237,25 @@ def clip_detail(request: Request, clip_id: ClipId, _user: User, conn: Conn) -> R
             # Error class only; the full (redacted) detail stays in the server logs.
             error = str(json.loads(last["payload"]).get("error") or "")
             last_export_error = error.partition(":")[0].strip() or "unknown error"
+    if view is None:
+        next_id = clips.neighbour_pending(conn, clip_id, older=True)
+        prev_id = clips.neighbour_pending(conn, clip_id, older=False)
+    else:
+        next_id = clips.neighbour(conn, clip_id, view, older=True)
+        prev_id = clips.neighbour(conn, clip_id, view, older=False)
     return render(
         request,
         "clip.html",
         {
             "clip": clip,
             "sensitive": _sensitive(request, clip.creator, clip.current.sensitive),
+            "reviewer_checks": _reviewer_checks(request, clip.creator),
+            "check_labels": REVIEWER_CHECK_LABELS,
             "reviews": reviews,
             "last_export_error": last_export_error,
-            "next_id": clips.neighbour_pending(conn, clip_id, older=True),
-            "prev_id": clips.neighbour_pending(conn, clip_id, older=False),
+            "next_id": next_id,
+            "prev_id": prev_id,
+            "view_query": _view_query(view),
             "reasons": REJECT_REASONS,
             "can_review": clip.status in REVIEWABLE,
             "gate_labels": GATE_REASON_LABELS,
@@ -218,9 +275,17 @@ def _action_error(request: Request, message: str, status_code: int) -> Response:
     return render(request, "_action_error.html", {"message": message}, status_code=status_code)
 
 
-def _move_on(request: Request, conn: sqlite3.Connection, clip_id: int) -> Response:
-    nxt = clips.next_pending_after(conn, clip_id)
-    location = f"/clip/{nxt}" if nxt is not None else "/queue"
+def _move_on(
+    request: Request, conn: sqlite3.Connection, clip_id: int, view: QueueFilter | None
+) -> Response:
+    """Go to the next clip in the view the clip was opened from (CLP-62), else the queue."""
+    nxt = (
+        clips.next_pending_after(conn, clip_id)
+        if view is None
+        else clips.next_after(conn, clip_id, view)
+    )
+    query = _view_query(view)
+    location = f"/clip/{nxt}{query}" if nxt is not None else f"/queue{query}"
     if _is_htmx(request):
         return Response(status_code=200, headers={"HX-Redirect": location})
     return RedirectResponse(location, status_code=303)
@@ -233,22 +298,34 @@ def approve_clip(
     _user: User,
     conn: Conn,
     background: BackgroundTasks,
+    view: View,
     version: FormVersion = None,
     confirm_sensitive: Annotated[str, Form(max_length=8)] = "",
+    confirm_reviewer_checks: Annotated[str, Form(max_length=8)] = "",
 ) -> Response:
     """Commit the approval (+ audit row) and return; the export runs after the response.
     Approving an already-approved clip (the "Retry export" button) re-schedules the export.
     A sensitive clip is approved only with `confirm_sensitive=1` (CLP-87): the model cannot
-    see the video, so the reviewer confirms the faces check; the audit row records it."""
+    see the video, so the reviewer confirms the faces check; the audit row records it. A clip
+    with campaign reviewer checks likewise needs `confirm_reviewer_checks=1` (CLP-114)."""
     clip = clips.get_clip(conn, clip_id)
     if clip is None:
         raise HTTPException(status_code=404, detail="clip not found")
     if version is not None and version != clip.current_version:  # a stale page: reload first
         current = f"{clip.status} (version {clip.current_version})"
         return _action_error(request, f"Cannot approve: clip is {current}.", 409)
-    check = clip.status in REVIEWABLE and _sensitive(request, clip.creator, clip.current.sensitive)
+    reviewable = clip.status in REVIEWABLE
+    check = reviewable and _sensitive(request, clip.creator, clip.current.sensitive)
     if check and confirm_sensitive != "1":
         return _action_error(request, SENSITIVE_UNCONFIRMED, 422)
+    checks = _reviewer_checks(request, clip.creator) if reviewable else {}
+    if checks and confirm_reviewer_checks != "1":
+        return _action_error(request, CHECKS_UNCONFIRMED, 422)
+    payload: dict[str, object] = {}
+    if check:
+        payload["confirmed_sensitive"] = True
+    if checks:
+        payload["confirmed_reviewer_checks"] = checks
     try:
         # Pinned to the version checked above, so a newer one cannot slip in unconfirmed.
         result = clips.approve(
@@ -256,7 +333,7 @@ def approve_clip(
             clip_id,
             _now(request),
             expected_version=clip.current_version,
-            payload={"confirmed_sensitive": True} if check else None,
+            payload=payload or None,
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="clip not found") from None
@@ -266,7 +343,7 @@ def approve_clip(
     if result.status == ClipStatus.APPROVED:
         if request.app.state.export_locks.busy(clip_id):
             flash(request, f"Export already in progress for clip {clip_id}.")
-            return _move_on(request, conn, clip_id)
+            return _move_on(request, conn, clip_id, view)
         background.add_task(export_in_background, request.app.state, clip_id)
         flash(
             request,
@@ -274,7 +351,7 @@ def approve_clip(
             if result.changed
             else f"Retrying export of clip {clip_id}.",
         )
-    return _move_on(request, conn, clip_id)
+    return _move_on(request, conn, clip_id, view)
 
 
 def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.ClipDetail) -> None:
@@ -359,6 +436,7 @@ def reject_clip(
     clip_id: ClipId,
     _user: User,
     conn: Conn,
+    view: View,
     reason_tag: Annotated[str, Form(max_length=32)] = "",
     version: FormVersion = None,
 ) -> Response:
@@ -372,7 +450,7 @@ def reject_clip(
         return _action_error(request, f"Cannot reject: clip is {exc.current}.", 409)
     if result.changed:
         flash(request, f"Clip {clip_id} rejected ({reason_tag}).")
-    return _move_on(request, conn, clip_id)
+    return _move_on(request, conn, clip_id, view)
 
 
 @router.get("/media/clip/{clip_id}/{version}/{kind}")
@@ -415,6 +493,7 @@ def edit_variants(
     clip_id: ClipId,
     _user: User,
     conn: Conn,
+    view: View,
     version: Annotated[int, Form(ge=1, le=MAX_ID)],
     fingerprint_seen: Annotated[str, Form(alias="fingerprint", max_length=64)],
     tiktok_title: VariantTitle = None,
@@ -487,7 +566,7 @@ def edit_variants(
         except InvalidTransition as exc:
             return _action_error(request, f"Cannot edit: clip is {exc.current}.", 409)
         flash(request, f"Saved the platform text for clip {clip_id}.")
-    location = f"/clip/{clip_id}"
+    location = f"/clip/{clip_id}{_view_query(view)}"
     if _is_htmx(request):
         return Response(status_code=200, headers={"HX-Redirect": location})
     return RedirectResponse(location, status_code=303)

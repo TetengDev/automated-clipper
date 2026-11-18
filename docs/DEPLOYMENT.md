@@ -280,7 +280,9 @@ AI content when the brief forbids it. AI content is read from the render sidecar
 without one is held under an AI ban, because nothing shows it is free of AI. A post that
 fails is `held` with the reason on the review app's Scheduled page and in
 `clipper posts list`, and it is never published. Logos, negative framing and reposts
-cannot be seen by the pipeline: the reviewer checks them before approving.
+cannot be seen by the pipeline: the clip page lists them for each campaign an enabled
+account posts the creator for (a disabled campaign included), and the reviewer must tick
+"I checked these in the video" before approving. The approval's history row records them.
 
 The worker runs the same check again just before it publishes, with the config as it is
 on disk (reloaded when `creators.yaml`, `accounts.yaml` or `campaigns.yaml` changes), so a

@@ -121,8 +121,12 @@ select, input[type="number"] {
 .badge.sensitive { color: var(--error); border-color: var(--error); font-weight: 600; }
 .sensitive-note { color: var(--error); font-size: 0.875rem; }
 p.sensitive-note { font-weight: 600; margin: 0 0 0.75rem; }
-.confirm-sensitive { display: flex; align-items: center; gap: 0.5rem; min-height: 44px; }
-.confirm-sensitive input { width: 1.25rem; height: 1.25rem; margin: 0; }
+.confirm-check { display: flex; align-items: center; gap: 0.5rem; min-height: 44px; }
+.confirm-check input { width: 1.25rem; height: 1.25rem; margin: 0; flex: none; }
+.reviewer-checks { min-width: 0; margin: 0 0 0.75rem; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); }
+.reviewer-checks legend { padding: 0 0.25rem; font-weight: 600; font-size: 0.875rem; }
+.reviewer-checks ul { margin: 0.25rem 0; padding-left: 1.25rem; font-size: 0.9rem; }
+.campaign-id { font-weight: 600; overflow-wrap: anywhere; }
 .gate-reasons { color: var(--error); border-left: 3px solid var(--error); margin: 0 0 0.75rem; padding-left: 1.5rem; }
 .more { grid-column: 1 / -1; }
 .clip-nav { display: flex; justify-content: space-between; margin-bottom: 1rem; }

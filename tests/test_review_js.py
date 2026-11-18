@@ -133,3 +133,35 @@ def test_a_approves_once_the_sensitive_clip_is_confirmed() -> None:
     log = run(_sensitive_page(True), [["a", None], ["a", "confirm-sensitive"]])
 
     assert log == ["click:approve-btn", "prevent:a", "click:approve-btn", "prevent:a"]
+
+
+def _checks_page(sensitive: bool | None, checks: bool) -> list[list[object]]:
+    box = ["confirm-reviewer-checks", "INPUT", {"type": "checkbox", "checked": checks}]
+    page = CLIP_PAGE if sensitive is None else _sensitive_page(sensitive)
+    return [*page, box]
+
+
+@pytest.mark.parametrize(
+    ("sensitive", "checks", "expected"),
+    [
+        (None, False, "focus:confirm-reviewer-checks"),
+        (None, True, "click:approve-btn"),
+        (False, False, "focus:confirm-sensitive"),
+        (True, False, "focus:confirm-reviewer-checks"),
+        (False, True, "focus:confirm-sensitive"),
+        (True, True, "click:approve-btn"),
+    ],
+)
+def test_a_needs_every_confirm_box_ticked(
+    sensitive: bool | None, checks: bool, expected: str
+) -> None:
+    """CLP-114: `a` focuses the first unticked box (faces, then campaign checks)."""
+    assert run(_checks_page(sensitive, checks), [["a", None]]) == [expected, "prevent:a"]
+
+
+def test_shortcuts_still_work_with_focus_on_the_campaign_checks_box() -> None:
+    keys = [["j", "confirm-reviewer-checks"], ["r", "confirm-reviewer-checks"]]
+
+    log = run(_checks_page(None, False), keys)
+
+    assert log == ["go:/clip/2", "prevent:j", "focus:reason-tag", "prevent:r"]

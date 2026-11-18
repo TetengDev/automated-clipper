@@ -8,6 +8,7 @@ fake that records argv; no real binaries run.
 
 from __future__ import annotations
 
+import ast
 import json
 import sqlite3
 from collections.abc import Iterator, Sequence
@@ -20,11 +21,11 @@ import pytest
 from clipper import render
 from clipper.config import AppConfig
 from clipper.jobs import Job, JobStatus, StageContext
-from clipper.pipeline import boundaries, common, jumpcuts, quality, reframe, transcribe
+from clipper.pipeline import boundaries, common, jumpcuts, quality, reframe, transcribe, ytdlp
 from clipper.pipeline.common import Deadline
 from clipper.pipeline.fetch_audio import fetch_audio
 from clipper.pipeline.fetch_clips import fetch_clips
-from clipper.pipeline.ytdlp import RunResult, YtDlp
+from clipper.pipeline.ytdlp import RunResult, YtDlp, YtDlpError
 from clipper.urls import SourceRef, canonical_url
 from test_render import EDL_DATA
 from test_render import FakeRunner as RenderRunner
@@ -58,8 +59,8 @@ def assert_id_is_never_an_option(argvs: Sequence[Sequence[str]], ref: SourceRef)
                 continue
             if arg == url:
                 assert "--" in argv[:i], argv  # option parsing ended before the URL
-            else:
-                assert f"youtube_{ref.item_id}" in arg, (arg, argv)
+            else:  # only as the media dir name, never as a file named by the id inside it
+                assert ref.item_id not in arg.replace(f"youtube_{ref.item_id}", ""), (arg, argv)
 
 
 def job(ref: SourceRef, status: JobStatus) -> Job:
@@ -75,14 +76,16 @@ def job(ref: SourceRef, status: JobStatus) -> Job:
 
 
 class Recorder:
-    """yt-dlp, ffmpeg and ffprobe stand-ins that produce what the stages expect."""
+    """yt-dlp, ffmpeg and ffprobe stand-ins that produce what the stages expect. Calls are
+    recorded with `%(id)s` expanded, as yt-dlp would name the file, so the sweep sees an
+    id output template."""
 
     def __init__(self, ref: SourceRef) -> None:
         self.ref = ref
         self.calls: list[list[str]] = []
 
     def __call__(self, args: Sequence[str], timeout_s: float, **_: Any) -> RunResult:
-        argv = list(args)
+        argv = [arg.replace("%(id)s", self.ref.item_id) for arg in args]
         self.calls.append(argv)
         if "yt_dlp" in argv:
             if "--dump-single-json" in argv:
@@ -267,7 +270,7 @@ def test_quality_join_check_audio_and_asr_child(
     heard = quality._hear(video, None, asr, Deadline())
 
     assert heard == [("hi", 1.0, 1.5)]
-    assert [c[0] for c in rec.calls] == ["ffmpeg", rec.calls[1][0]]  # extract, then ASR
+    assert len(rec.calls) == 2 and rec.calls[0][0] == "ffmpeg"  # extract, then ASR
     assert "clipper.pipeline.local_asr" in rec.calls[1]
     assert_id_is_never_an_option(rec.calls, ref)
 
@@ -359,28 +362,58 @@ def test_review_source_link_is_the_canonical_url(ref: SourceRef) -> None:
 SRC = Path(__file__).resolve().parents[1] / "src" / "clipper"
 ITEM_ID_ALLOWLIST: dict[str, int] = {}
 """`relative path -> number of item_id uses` reviewed as safe (logging, SQL,
-canonical_url). Empty: the pipeline and the renderer only use `ref.key` and
+canonical_url). Empty: the pipeline, the renderer and export only use `ref.key` and
 `canonical_url(ref)`."""
 
 
-def test_pipeline_and_render_never_touch_item_id() -> None:
-    """A new `.item_id` in an argv/path-building module must go through review (CLP-84)."""
-    import ast
+def item_id_uses(source: str) -> int:
+    """The number of places in `source` that may put a bare video id into an argv or path."""
+    return sum(
+        (isinstance(n, ast.Attribute) and n.attr == "item_id")
+        or (isinstance(n, ast.Name) and n.id == "item_id")
+        or (isinstance(n, ast.keyword) and n.arg == "item_id")
+        or (isinstance(n, ast.MatchClass) and "item_id" in n.kwd_attrs)
+        or (
+            isinstance(n, ast.Constant)
+            and isinstance(n.value, str)
+            and (n.value == "item_id" or "%(id" in n.value)
+        )
+        for n in ast.walk(ast.parse(source))
+    )
 
-    files = [*sorted((SRC / "pipeline").rglob("*.py")), SRC / "render.py"]
+
+def test_argv_building_modules_never_touch_item_id() -> None:
+    """A new `.item_id` in an argv/path-building module must go through review (CLP-84).
+
+    Also flagged (CLP-86): the string `"item_id"` (getattr, vars()), a `case
+    SourceRef(item_id=...)` pattern, and any string containing a yt-dlp `%(id` template,
+    docstrings included. Still not seen: the id taken back out of the key
+    (`ref.key.split("_", 1)[1]`, `removeprefix("youtube_")`), yt-dlp's info JSON
+    (`info["id"]`), other templates that hold the id (`%(display_id)s`), and the id passed
+    on under another name. The argv sweep above covers what reaches a runner at test time.
+    """
+    files = [*sorted((SRC / "pipeline").rglob("*.py")), SRC / "render.py", SRC / "export.py"]
     uses: dict[str, int] = {}
     for path in files:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        count = sum(
-            (isinstance(n, ast.Attribute) and n.attr == "item_id")
-            or (isinstance(n, ast.Name) and n.id == "item_id")
-            or (isinstance(n, ast.keyword) and n.arg == "item_id")
-            for n in ast.walk(tree)
-        )
-        if count:
+        if count := item_id_uses(path.read_text(encoding="utf-8")):
             uses[str(path.relative_to(SRC))] = count
     assert len(files) > 10
     assert uses == ITEM_ID_ALLOWLIST
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "ref.item_id",
+        'getattr(ref, "item_id")',
+        'vars(ref)["item_id"]',
+        "match ref:\n    case SourceRef(item_id=x):\n        pass",
+        'extra = ["-o", "%(id)s.%(ext)s"]',
+        'out = f"{out_dir}/%(id)s.%(ext)s"',
+    ],
+)
+def test_the_guard_catches_planted_id_use(source: str) -> None:
+    assert item_id_uses(source) > 0
 
 
 @pytest.mark.parametrize(
@@ -390,6 +423,7 @@ def test_pipeline_and_render_never_touch_item_id() -> None:
         ["ffmpeg", "-i", "x", "{id}"],
         ["yt-dlp", "{url}"],  # URL without "--" before it
         ["node", "cli.js", "--props=/tmp/{id}/props.json"],  # id outside the media dir
+        ["ffmpeg", "-i", "/m/youtube_{id}/{id}.mp4"],  # a file named by the bare id
     ],
 )
 def test_the_check_catches_unsafe_argv(argv: list[str]) -> None:
@@ -397,3 +431,21 @@ def test_the_check_catches_unsafe_argv(argv: list[str]) -> None:
     unsafe = [a.format(id=ref.item_id, url=canonical_url(ref)) for a in argv]
     with pytest.raises(AssertionError):
         assert_id_is_never_an_option([unsafe], ref)
+
+
+def _id_template(out_dir: Path, stem: str) -> str:
+    return str(out_dir.resolve() / "%(id)s") + ".%(ext)s"
+
+
+def test_the_sweep_catches_an_id_output_template(
+    ref: SourceRef, media: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A planted yt-dlp `-o ".../%(id)s.%(ext)s"` reaches the recorded argv as the id."""
+    monkeypatch.setattr(ytdlp, "_template", _id_template)
+    rec = Recorder(ref)
+
+    with pytest.raises(YtDlpError):  # the file is named by the id, not by the stem
+        YtDlp(runner=rec).download_audio(canonical_url(ref), media, "source")
+
+    with pytest.raises(AssertionError):
+        assert_id_is_never_an_option(rec.calls, ref)

@@ -18,6 +18,7 @@ cp .env.example .env              # fill in keys as features need them
 uv run clipper check-config       # validate config/creators.yaml
 uv run clipper migrate            # create data/state.db
 uv run pytest                     # tests
+uv run playwright install chromium && uv run pytest tests/e2e -m e2e   # review app in a browser
 docker compose build              # image with ffmpeg + yt-dlp + Deno
 ```
 

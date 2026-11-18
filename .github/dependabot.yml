@@ -32,6 +32,10 @@ updates:
       # move LTS lines deliberately in their own PR.
       - dependency-name: node
         update-types: ["version-update:semver-major"]
+      # The image's Python must match requires-python in pyproject.toml (3.12 only); a
+      # 3.15 image failed the smoke test (#83). Move Python lines in their own PR.
+      - dependency-name: python
+        versions: [">=3.13"]
 
   - package-ecosystem: uv
     directory: /

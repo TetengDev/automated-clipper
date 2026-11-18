@@ -10,7 +10,7 @@ inputs:
     description: Space-separated package names.
     required: true
   save:
-    description: Save the cache on an exact-key miss. Pass true only on dev pushes.
+    description: Save the cache on an exact-key miss. Pass true only on runs whose ref is dev (pushes, the nightly schedule, a dispatch from dev).
     default: "false"
 
 runs:

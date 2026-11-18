@@ -69,11 +69,12 @@ jobs:
       - name: Configure apt retries and timeouts
         run: printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\n' | sudo tee /etc/apt/apt.conf.d/99-retries
 
+      # The package files come from the cache the test job saves on dev (CLP-140, CLP-141).
       - name: Install ffmpeg
         timeout-minutes: 10
-        run: |
-          apt_install() { sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg; }
-          apt_install || apt_install
+        uses: ./.github/actions/apt-install
+        with:
+          packages: ffmpeg
 
       - name: Install dependencies
         run: uv sync --locked

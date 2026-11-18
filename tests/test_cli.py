@@ -21,6 +21,7 @@ COMMANDS = [
     "migrate",
     "check-config",
     "bench-transcribe",
+    "doctor",
 ]
 
 
@@ -352,3 +353,38 @@ def test_bench_transcribe_zero_duration_and_model_errors(
     assert failed.exit_code == 1
     assert "bench-transcribe:" in failed.output and "cannot load the model" in failed.output
     assert "Traceback" not in failed.output
+
+
+@pytest.mark.parametrize(
+    ("statuses", "code", "tail"),
+    [
+        (("ok", "warn"), 0, "doctor: 1 ok, 1 warnings, 0 failed"),
+        (("ok", "fail"), 1, "doctor: 1 ok, 0 warnings, 1 failed"),
+    ],
+)
+def test_doctor_prints_checks_and_exits_on_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    statuses: tuple[str, str],
+    code: int,
+    tail: str,
+) -> None:
+    from clipper import doctor
+
+    fake = [doctor.Check("ffmpeg", statuses[0], "8.1.2 /x"), doctor.Check("node", statuses[1], "y")]
+    monkeypatch.setattr(doctor, "run_checks", lambda: fake)
+    missing = tmp_path / "missing"  # no config file, no database needed
+
+    result = runner.invoke(
+        app, ["--config", str(missing / "c.yaml"), "--db", str(missing / "s.db"), "doctor"]
+    )
+
+    assert result.exit_code == code
+    lines = result.output.splitlines()
+    assert lines == [doctor.format_check(c) for c in fake] + [tail]
+    assert not missing.exists()
+
+
+def test_tracebacks_never_show_local_variables() -> None:
+    """Old typer defaulted to printing locals (doctor's `env`, secrets) in tracebacks."""
+    assert app.pretty_exceptions_show_locals is False

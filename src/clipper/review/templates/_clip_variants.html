@@ -1,5 +1,15 @@
 {# Per-platform title, caption and hashtags (CLP-96), editable until the clip is reviewed. #}
 {% set names = {"tiktok": "TikTok", "instagram": "Instagram", "youtube": "YouTube", "facebook": "Facebook"} %}
+{#- A title or caption field with its counter. `maxlength` counts UTF-16 units, so it is
+    set only where the platform does too (TikTok); elsewhere the counter (review.js) shows the
+    count and the server's check decides (CLP-117). -#}
+{% macro text_field(platform, field, label, value, limit, limits, adjusted) %}
+  {%- set id = platform ~ "-" ~ field %}
+  {%- set described = ([platform ~ "-adjusted"] if adjusted else []) + [id ~ "-count"] %}
+  {%- set attrs %} id="{{ id }}" name="{{ platform }}_{{ field }}"{% if field == "caption" %} rows="4"{% endif %}{% if not limits.counts_code_points %} maxlength="{{ limit }}"{% endif %} data-limit="{{ limit }}" data-count="{{ "code-points" if limits.counts_code_points else "utf16" }}" data-unit="{{ limits.unit }}" data-label="{{ label }}" data-counter="{{ id }}-count" aria-describedby="{{ described | join(" ") }}"{% endset %}
+  {%- if field == "caption" %}<textarea{{ attrs }}>{{ value }}</textarea>{% else %}<input{{ attrs }} value="{{ value }}">{% endif %}
+  <p id="{{ id }}-count" class="char-count">{{ "{:,}".format(limits.length(value)) }} of {{ "{:,}".format(limit) }} {{ limits.unit }}</p>
+{% endmacro %}
 <section class="variants" id="clip-variants" aria-labelledby="variants-heading">
   <h2 id="variants-heading">Per-platform text</h2>
   {% if can_review %}
@@ -15,11 +25,15 @@
     <details class="variant" id="variant-{{ platform }}" open>
       <summary>{{ names.get(platform, platform) }} · {{ variant.title or "Untitled" }}</summary>
       {% if variant_warnings[platform] %}<p class="error variant-warning">Check before approving, links or mentions: {{ variant_warnings[platform] | join(", ") }}</p>{% endif %}
+      {% set adjusted = v.adjusted.get(platform) %}
+      {# Stored text a stricter rule no longer accepts was changed on load (CLP-118). #}
+      {% if adjusted %}<p id="{{ platform }}-adjusted" class="variant-notice">Adjusted on load: {{ adjusted | join("; ") }}.</p>{% endif %}
       {% if can_review %}
+      {% set caption_label = "Description" if platform == "youtube" else "Caption" %}
       <label for="{{ platform }}-title">Title</label>
-      <input id="{{ platform }}-title" name="{{ platform }}_title" maxlength="{{ limits.title_max }}" value="{{ variant.title }}">
-      <label for="{{ platform }}-caption">{{ "Description" if platform == "youtube" else "Caption" }}</label>
-      <textarea id="{{ platform }}-caption" name="{{ platform }}_caption" rows="4" maxlength="{{ caption_room(platform, variant.hashtags) }}">{{ variant.caption }}</textarea>
+      {{ text_field(platform, "title", names.get(platform, platform) ~ " title", variant.title, limits.title_max, limits, adjusted) }}
+      <label for="{{ platform }}-caption">{{ caption_label }}</label>
+      {{ text_field(platform, "caption", names.get(platform, platform) ~ " " ~ caption_label | lower, variant.caption, caption_room(platform, variant.hashtags), limits, adjusted) }}
       {% else %}
       <p class="caption">{{ variant.caption }}</p>
       {% endif %}
@@ -27,6 +41,8 @@
     </details>
     {% endfor %}
   {% if can_review %}
+    {# Speaks only when a field enters its last 10%, passes the limit or drops back (review.js). #}
+    <p id="variant-count-status" class="visually-hidden" aria-live="polite"></p>
     <button type="submit" id="save-variants-btn">Save platform text</button>
   </form>
   {% endif %}

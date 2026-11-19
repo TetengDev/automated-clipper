@@ -266,9 +266,11 @@ def _video_id(body: Any) -> str:
     return video_id
 
 
-def _error(response: httpx.Response, what: str) -> YouTubeError:
-    """A YouTubeError from an API error response: status, reasons and Google's message
-    (which never echoes credentials)."""
+def google_error(response: httpx.Response) -> tuple[list[str], str]:
+    """The reasons and Google's message (which never echoes credentials) from a Google API
+    error body: `error.errors[].reason`, then `error.details[].reason` (where Google puts
+    `ACCESS_TOKEN_SCOPE_INSUFFICIENT` and `API_KEY_INVALID`), or the OAuth token endpoint's
+    `error` string. Shared by the publisher and the insights clients (CLP-154)."""
     reasons: list[str] = []
     message = ""
     try:
@@ -278,11 +280,18 @@ def _error(response: httpx.Response, what: str) -> YouTubeError:
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict):
         message = str(error.get("message") or "")
-        for item in error.get("errors") or ():
-            if isinstance(item, dict) and isinstance(item.get("reason"), str):
-                reasons.append(item["reason"])
+        for group in ("errors", "details"):
+            for item in error.get(group) or ():
+                if isinstance(item, dict) and isinstance(item.get("reason"), str):
+                    reasons.append(item["reason"])
     elif isinstance(error, str):  # the OAuth token endpoint
         reasons.append(error)
+    return reasons, message
+
+
+def _error(response: httpx.Response, what: str) -> YouTubeError:
+    """A YouTubeError from an API error response: status, reasons and Google's message."""
+    reasons, message = google_error(response)
     label = ",".join(reasons) or "-"
     detail = f": {message[:300]}" if message else ""
     return YouTubeError(

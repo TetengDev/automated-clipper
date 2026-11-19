@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% macro n(value) %}{% if value is none %}—{% else %}{{ "{:,}".format(value) }}{% endif %}{% endmacro %}
+{% block title %}Insights · {{ account.id }} · Clipper review{% endblock %}
+{% block content %}
+<h1>Insights: {{ account.id }}</h1>
+<p class="muted">Every Short on the channel is listed, pipeline posts and hand uploads (a
+Short is a video of 3 minutes or less). Public numbers come from the YouTube Data API: hourly
+for 48 hours after a Short goes public, then daily. Tag a hand upload with
+<code>clipper insights tag &lt;video_id&gt; key=value</code>. Analytics numbers arrive 1 to 3
+days late, and each one says the day it covers. YouTube Studio's Earn tab is the source of
+truth for eligibility.</p>
+
+{% if state and state.state == states.NEEDS_REAUTH %}
+<p class="sensitive-note" id="reauth">Analytics needs re-authorisation: the account's refresh
+token lacks the <code>yt-analytics.readonly</code> scope, or Google refused it (revoked or
+invalid). Until it is re-authorised and <code>{{ token_var }}</code> is replaced
+(docs/DEPLOYMENT.md, Channel insights), these show no data: {{ analytics_only | join(", ") }}.</p>
+{% elif state and state.state == states.NO_TOKEN %}
+<p class="sensitive-note" id="no-token">Analytics is off:
+{% if state.detail %}{{ state.detail }}{% else %}<code>{{ token_var }}</code> is not set{% endif %}.
+Until then (docs/DEPLOYMENT.md, Channel insights), these show no data:
+{{ analytics_only | join(", ") }}.</p>
+{% elif state and state.state != states.OK %}
+<p class="sensitive-note" id="analytics-off">Analytics is off ({{ state.state }}):
+{{ state.detail or "see the monitor log" }}. Public numbers only.</p>
+{% endif %}
+
+<h2>Monetisation tracker</h2>
+{% for tier in tiers %}
+<section class="card tier">
+  <h3>{{ tier.tier.name }} <span class="muted count">{{ tier.outlook }}</span></h3>
+  <ul class="goals">
+    {% for g in tier.goals %}
+    <li>
+      {% if g.value is none %}
+      <span>{{ g.goal.label }}: no data yet</span>
+      {% else %}
+      <label>{{ g.goal.label }}: {{ n(g.value) }} of {{ n(g.goal.target) }}
+        <progress max="100" value="{{ g.percent }}">{{ g.percent }}%</progress>
+      </label>
+      <span class="muted">{{ g.outlook }}{% if g.as_of %} · as of {{ g.as_of.isoformat() }}{% endif %}</span>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endfor %}
+<p class="muted">The views figure is an estimate: the larger of the latest lifetime views of
+the public Shorts of the last 90 days and the latest Analytics Shorts views (exact, but 1
+to 3 days late, so it misses the newest Shorts). Both are lower bounds; "as of" is the day
+the figure covers.</p>
+
+<h2>Last 28 days</h2>
+{% if trend %}
+<div class="table-scroll">
+<table class="insights" id="trend">
+  <thead><tr><th>Day</th><th>Subscribers</th><th>Total views</th><th>Shorts views, 90 days</th></tr></thead>
+  <tbody>
+  {% for d in trend %}
+    <tr>
+      <td>{{ d.day.isoformat() }}</td>
+      <td>{{ n(d.subscribers) }}</td>
+      <td>{{ n(d.total_views) }}</td>
+      <td>{{ n(d.shorts_views_90d) }}{% if d.shorts_views_source %} <span class="muted">({{ d.shorts_views_source }})</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">No channel numbers yet.</p>
+{% endif %}
+
+<h2>Shorts of the last {{ table_days }} days</h2>
+{% if rows %}
+<div class="table-scroll">
+<table class="insights" id="shorts">
+  <thead><tr>
+    <th>Short</th><th>From</th><th>Public since</th><th>Views</th><th>vs median</th><th>Engaged views</th>
+    <th>Avg % viewed</th><th>Subs gained</th><th>Shares</th><th>Traffic</th><th>Comments</th>
+    <th>Analytics through</th>
+  </tr></thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td><a href="https://www.youtube.com/shorts/{{ row.video_id | urlencode }}" rel="noopener noreferrer" target="_blank">{{ row.title }}</a></td>
+      <td>{{ row.origin }}</td>
+      <td>{{ row.published.strftime("%Y-%m-%d %H:%M") }} UTC</td>
+      <td>{{ n(row.views) }}</td>
+      <td>{% if row.ratio is none %}—{% else %}{{ "%.1f" | format(row.ratio) }}x{% endif %}</td>
+      <td>{{ n(row.engaged_views) }}</td>
+      <td>{% if row.avg_view_pct is none %}—{% else %}{{ "%.0f" | format(row.avg_view_pct) }}%{% endif %}</td>
+      <td>{{ n(row.subs_gained) }}</td>
+      <td>{{ n(row.shares) }}</td>
+      <td>{% for source, pct in row.traffic_mix %}{{ source }} {{ pct }}%{% if not loop.last %}, {% endif %}{% else %}—{% endfor %}</td>
+      <td>{% if row.comments_enabled is none %}—{% elif row.comments_enabled %}on{% else %}<strong class="error">off</strong>{% endif %}</td>
+      <td>{{ row.through_date.isoformat() if row.through_date else "—" }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">No Shorts with numbers yet.</p>
+{% endif %}
+
+<h2>By tag</h2>
+<p class="muted">Only Shorts public for {{ settled_days }} days or more are grouped, and each
+ratio is against the median of those Shorts, so a tag's ratio can differ from the table's
+ratios while newer Shorts are listed above.</p>
+{% if breakdown %}
+<div class="table-scroll">
+<table class="insights" id="tags">
+  <thead><tr><th>Tag</th><th>Value</th><th>Shorts</th><th>Median vs channel</th></tr></thead>
+  <tbody>
+  {% for key, groups in breakdown %}
+    {% for g in groups %}
+    <tr>
+      <td>{% if loop.first %}{{ key }}{% endif %}</td>
+      <td>{{ g.value }}</td>
+      <td>{{ g.shorts }}</td>
+      <td>{% if g.median_ratio is none %}—{% else %}{{ "%.1f" | format(g.median_ratio) }}x{% endif %}</td>
+    </tr>
+    {% endfor %}
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">No tagged Shorts yet.</p>
+{% endif %}
+{% endblock %}

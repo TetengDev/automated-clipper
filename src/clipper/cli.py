@@ -9,6 +9,7 @@ import re
 import signal
 import sqlite3
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, NoReturn
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from clipper.accounts import Account, AccountsConfig
     from clipper.campaigns import PostingConfig
     from clipper.commentary.daily import DailyTarget
+    from clipper.insights.collect import InsightsAccount, InsightsCollector
     from clipper.notify import Notify
     from clipper.posting.models import Publisher
     from clipper.resolve import Resolved
@@ -59,6 +61,11 @@ app = typer.Typer(
 )
 app.add_typer(posts_app, name="posts")
 app.add_typer(campaigns_app, name="campaigns")
+insights_app = typer.Typer(
+    help="Channel insights (CLP-154): collect now, print the weekly summary, tag a Short.",
+    no_args_is_help=True,
+)
+app.add_typer(insights_app, name="insights")
 
 
 @dataclass(frozen=True)
@@ -273,6 +280,74 @@ def _commentary_targets(config_path: Path, cfg: AppConfig) -> list[DailyTarget]:
     return daily_targets(load_commentary(commentary_path(config_path), accounts), accounts)
 
 
+def _after_cycle(*hooks: Callable[[], object] | None) -> Callable[[], None]:
+    """One monitor hook that runs the given hooks in order (the janitor, then insights).
+    A hook that raises is logged (redacted) and the next one still runs, so neither can
+    stop the monitor."""
+    from clipper.redact import redact
+
+    live = [hook for hook in hooks if hook is not None]
+
+    def run() -> None:
+        for hook in live:
+            try:
+                hook()
+            except Exception as exc:
+                logger.error(
+                    "run-monitor: an after-cycle hook failed: %s",
+                    redact(f"{type(exc).__name__}: {exc}"),
+                )
+
+    return run
+
+
+def _insights_accounts(config_path: Path, cfg: AppConfig) -> list[InsightsAccount]:
+    """The enabled YouTube commentary accounts of accounts.yaml (CLP-154). Raises
+    ConfigError for an invalid file."""
+    from clipper.accounts import accounts_path, load_accounts
+    from clipper.insights.collect import insights_accounts
+
+    return insights_accounts(load_accounts(accounts_path(config_path), cfg).accounts)
+
+
+def _insights(
+    config_path: Path,
+    cfg: AppConfig,
+    conn: sqlite3.Connection,
+    http: httpx.Client,
+    secrets: Secrets,
+    notify: Notify | None,
+) -> InsightsCollector | None:
+    """The insights collector for the enabled YouTube commentary accounts (CLP-154); None
+    without any. Raises ConfigError for an invalid accounts.yaml. Logs only the names of
+    missing settings, never values."""
+    from clipper.insights.analytics import YouTubeAnalytics
+    from clipper.insights.collect import InsightsCollector
+    from clipper.insights.public import PublicYouTube
+    from clipper.posting.youtube import OAuthClient
+
+    accounts = _insights_accounts(config_path, cfg)
+    if not accounts:
+        return None
+    key = secrets.youtube_api_key  # the monitor's key (owner ruling 2): one key, one quota
+    public = None
+    if key is not None and key.get_secret_value().strip():
+        public = PublicYouTube(http, SecretStr(key.get_secret_value().strip()))
+    else:
+        logger.warning(
+            "insights: YOUTUBE_API_KEY is not set; public numbers and hand uploads are off"
+        )
+    client_id = secrets.youtube_oauth_client_id
+    analytics = YouTubeAnalytics(
+        http,
+        OAuthClient(
+            client_id=client_id.get_secret_value() if client_id else "",
+            client_secret=secrets.youtube_oauth_client_secret,
+        ),
+    )
+    return InsightsCollector(conn, accounts, public, analytics, notify=notify)
+
+
 @app.command("run-monitor")
 def run_monitor(
     ctx: typer.Context,
@@ -295,7 +370,8 @@ def run_monitor(
     each commentary channel (commentary.yaml) once its run_at has passed. Between polls, the
     janitor applies the retention and disk budget settings to the media dir at most once an
     hour (the disk budget also counts the models dir, CLIPPER_MODELS_DIR, which it only
-    reads).
+    reads). Then, at most once an hour, the insights job stores the commentary channels'
+    numbers and sends the weekly summaries (CLP-154).
 
     SIGTERM/SIGINT finish the current creator's poll, then exit."""
     from clipper.janitor import Janitor
@@ -323,7 +399,7 @@ def run_monitor(
     stop_event = threading.Event()
     try:
         with _http_client() as http:
-            monitor_alert = _alert_webhook(http, secrets)
+            monitor_alert, pings = _monitor_webhooks(http, secrets)
             _preflight("run-monitor", monitor_alert)
             try:
                 source = _youtube_source(secrets, http, stop_event)
@@ -332,13 +408,20 @@ def run_monitor(
             janitor = Janitor(
                 conn, cfg, media_dir, monitor_alert or log_notify, models_dir=models_dir()
             )
+            try:
+                insights = _insights(
+                    app_ctx.config_path, cfg, conn, http, secrets, pings or log_notify
+                )
+            except ConfigError as exc:
+                logger.error("insights are off: %s", exc)
+                insights = None
             monitor = YouTubeMonitor(
                 conn,
                 cfg,
                 source,
                 first_run_mode=first_run,
                 stop=stop_event,
-                janitor=janitor.tick,
+                janitor=_after_cycle(janitor.tick, insights.tick if insights else None),
                 commentary=targets,
             )
             if once:
@@ -361,6 +444,119 @@ def run_monitor(
                     signal.signal(sig, handler)
     finally:
         conn.close()
+
+
+def _insights_setup(ctx: typer.Context) -> tuple[AppContext, AppConfig, Secrets]:
+    app_ctx = _app(ctx)
+    try:
+        cfg = load_config(app_ctx.config_path)
+        secrets = Secrets()
+    except ConfigError as exc:
+        _fail(str(exc))
+    except ValidationError as exc:
+        _fail(f"insights: {exc}")
+    _setup_logging()
+    return app_ctx, cfg, secrets
+
+
+@insights_app.command("collect")
+def insights_collect(ctx: typer.Context) -> None:
+    """Collect channel insights once, now: every Short on each commentary channel, public
+    numbers with YOUTUBE_API_KEY, Analytics with each account's refresh token. run-monitor
+    does this hourly by itself. Sends no weekly summary."""
+    app_ctx, cfg, secrets = _insights_setup(ctx)
+    conn = _open_db(app_ctx.db_path)
+    try:
+        with _http_client() as http:
+            try:
+                collector = _insights(app_ctx.config_path, cfg, conn, http, secrets, None)
+            except ConfigError as exc:
+                _fail(str(exc))
+            if collector is None:
+                typer.echo("no enabled YouTube commentary accounts")
+                return
+            result = collector.run()
+    finally:
+        conn.close()
+    typer.echo(
+        f"insights: {result.channel_rows} channel row(s), {result.post_rows} video row(s),"
+        f" {len(result.errors)} error(s)"
+    )
+    for error in result.errors:
+        typer.echo(f"{error['account']}: {error.get('step', '-')}: {error['error']}", err=True)
+    if result.errors:
+        raise typer.Exit(code=1)
+
+
+@insights_app.command("weekly")
+def insights_weekly(ctx: typer.Context) -> None:
+    """Print each channel's weekly summary from stored numbers, without sending it."""
+    from clipper.insights.weekly import build_summary
+    from clipper.jobs.models import utcnow
+
+    app_ctx = _app(ctx)
+    try:
+        cfg = load_config(app_ctx.config_path)
+        accounts = _insights_accounts(app_ctx.config_path, cfg)
+    except ConfigError as exc:
+        _fail(str(exc))
+    if not accounts:
+        typer.echo("no enabled YouTube commentary accounts")
+        return
+    conn = _open_db(app_ctx.db_path)
+    try:
+        now = utcnow()
+        for account in accounts:
+            typer.echo(build_summary(conn, account, now))
+            typer.echo("")
+    finally:
+        conn.close()
+
+
+@insights_app.command("tag")
+def insights_tag(
+    ctx: typer.Context,
+    video_id: Annotated[str, typer.Argument(help="The YouTube video id, e.g. 2BpbZneO_To.")],
+    pairs: Annotated[
+        list[str] | None,
+        typer.Argument(help="key=value tags; keys not given stay as they are, or 'unknown'."),
+    ] = None,
+) -> None:
+    """Tag a Short by video id, e.g. a hand upload: `clipper insights tag 2BpbZneO_To
+    hook_type=question topic="gta vi"`. Keys: hook_type, structure, palette, length_bucket,
+    clip_share, streamers, topic, publish_hour."""
+    from clipper.accounts import accounts_path, load_accounts
+    from clipper.insights import repo as insights_repo
+    from clipper.insights.tags import TAG_KEYS, owner_tags, parse_pairs
+
+    app_ctx = _app(ctx)
+    if not pairs:
+        _fail(f"give at least one key=value; keys: {', '.join(TAG_KEYS)}")
+    try:
+        supplied = parse_pairs(pairs)
+    except ValueError as exc:
+        _fail(str(exc))
+    conn = _open_db(app_ctx.db_path)
+    try:
+        video = insights_repo.get_video(conn, video_id)
+        timezone = "UTC"
+        if video is not None:
+            try:
+                cfg = load_config(app_ctx.config_path)
+                accounts = load_accounts(accounts_path(app_ctx.config_path), cfg).accounts
+            except ConfigError:
+                accounts = []
+            timezone = next((a.timezone for a in accounts if a.id == video.account_id), timezone)
+        try:
+            tags = owner_tags(conn, video_id, supplied, timezone)
+        except ValueError as exc:
+            _fail(str(exc))
+    finally:
+        conn.close()
+    if video is None:
+        typer.echo(f"{video_id} is not known to the insights job yet; tags are kept for it")
+    for key in TAG_KEYS:
+        typer.echo(f"{key}={tags.get(key, 'unknown')}")
 
 
 def _open_db(db_path: Path) -> sqlite3.Connection:
@@ -409,13 +605,20 @@ def _webhook(
         return None
 
 
-def _alert_webhook(http: httpx.Client, secrets: Secrets) -> Notify | None:
-    """The monitor's alerts: the worker's alert webhook (DISCORD_ALERTS_WEBHOOK_URL, else
-    DISCORD_WEBHOOK_URL), else None. A malformed URL never stops detection."""
+def _monitor_webhooks(http: httpx.Client, secrets: Secrets) -> tuple[Notify | None, Notify | None]:
+    """The monitor's (alerts, pings) webhooks, each URL parsed once. Alerts: the worker's
+    alert webhook (DISCORD_ALERTS_WEBHOOK_URL, else DISCORD_WEBHOOK_URL), else None. Pings
+    (the weekly insights summary, CLP-154): DISCORD_WEBHOOK_URL, else None. A malformed URL
+    is logged once, by name, and never stops detection."""
     name = "DISCORD_ALERTS_WEBHOOK_URL"
     alerts = _webhook(http, secrets.discord_alerts_webhook_url, name, strict=False)
-    pings = secrets.discord_webhook_url
-    return alerts or _webhook(http, pings, "DISCORD_WEBHOOK_URL", strict=False)
+    pings = _webhook(http, secrets.discord_webhook_url, "DISCORD_WEBHOOK_URL", strict=False)
+    return alerts or pings, pings
+
+
+def _alert_webhook(http: httpx.Client, secrets: Secrets) -> Notify | None:
+    """The monitor's alert webhook (see `_monitor_webhooks`)."""
+    return _monitor_webhooks(http, secrets)[0]
 
 
 def _preflight(service: str, alert: Notify | None) -> None:

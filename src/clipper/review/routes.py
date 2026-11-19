@@ -33,6 +33,7 @@ from clipper.clips import (
 from clipper.config import always_sensitive
 from clipper.db import connect
 from clipper.export import export_clip, sweep_staging
+from clipper.insights.tags import tag_post
 from clipper.metadata import (
     PLATFORM_LIMITS,
     PLATFORMS,
@@ -42,7 +43,7 @@ from clipper.metadata import (
     links_or_mentions,
 )
 from clipper.posting import repo as post_repo
-from clipper.posting.models import PostStatus
+from clipper.posting.models import Post, PostStatus
 from clipper.posting.scheduler import schedule_for_clip
 from clipper.review.app import flash, get_db, render, require_user
 
@@ -377,6 +378,7 @@ def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.Clip
         logger.exception("scheduling posts for clip %d failed", clip.id)
         flash(request, f"Clip {clip.id}: scheduling posts failed; see the server log.")
         return
+    _tag_posts(request, conn, created)
     held = [p for p in created if p.status == PostStatus.HELD]
     scheduled = len(created) - len(held)
     earlier = [
@@ -400,6 +402,21 @@ def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.Clip
             f"Clip {clip.id}: {len(held)} post(s) held by the pre-flight"
             f" ({', '.join(p.account_id for p in held)}); see Scheduled for the reasons.",
         )
+
+
+def _tag_posts(request: Request, conn: sqlite3.Connection, posts: list[Post]) -> None:
+    """Format tags for the insights page (CLP-154), YouTube posts only, stored by post id
+    until the post has a video id. A failure is logged and never fails the approval; the
+    insights job fills in tags a post is missing."""
+    accounts = request.app.state.accounts
+    for post in posts:
+        if post.platform != "youtube":
+            continue  # insights cover YouTube channels only
+        try:
+            zone = next((a.timezone for a in accounts if a.id == post.account_id), "UTC")
+            tag_post(conn, post, zone)
+        except Exception:  # insights never block an approval
+            logger.exception("tagging post %d failed", post.id)
 
 
 def export_in_background(state: State, clip_id: int) -> None:

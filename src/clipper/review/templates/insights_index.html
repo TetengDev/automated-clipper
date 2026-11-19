@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Insights · Clipper review{% endblock %}
+{% block content %}
+<h1>Insights</h1>
+{% if channels %}
+<ul id="channels">
+  {% for account in channels %}
+  <li><a href="/insights/{{ account.id }}">{{ account.id }}</a></li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">No YouTube commentary channels in accounts.yaml.</p>
+{% endif %}
+{% endblock %}

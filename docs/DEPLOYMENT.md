@@ -28,7 +28,7 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 
 `/srv/clipper/.env` exists only on the server and is never committed. It holds:
 
-- `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`
+- `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`. The insights job uses the same key for public channel and Short numbers (see [Channel insights](#channel-insights)).
 - `CLAUDE_CODE_OAUTH_TOKEN`, with `selector: claude_cli` (see [Highlight selection](#highlight-selection))
 - `ANTHROPIC_API_KEY`, only with `selector: api`; `PEXELS_API_KEY`, `PIXABAY_API_KEY`
 - `GROQ_API_KEY`, only with `transcriber: groq` (transcription runs locally by default; see [Local transcription](#local-transcription))
@@ -425,7 +425,8 @@ How it posts:
 
 1. **Google Cloud project.** At <https://console.cloud.google.com>, create a project (for
    example `clipper-publisher`). Under *APIs & Services → Library*, enable **YouTube Data
-   API v3**.
+   API v3** and the **YouTube Analytics API**. The insights job (CLP-154) reads each
+   channel's analytics through the second one.
 2. **OAuth consent screen** (*Google Auth Platform → Branding / Audience / Data access*):
    - User type **External**. Enter the app name, the support email, the developer contact
      email, the home page and the **privacy policy URL**. You need both pages later for
@@ -436,6 +437,9 @@ How it posts:
      account, including private videos and playlists. It is the narrowest scope that lets
      the worker list its own uploads, and without it a timed-out upload could be posted
      twice.
+   - Also add `https://www.googleapis.com/auth/yt-analytics.readonly`. The insights job
+     uses it to read the channel's own analytics: views, engaged views, retention, traffic
+     sources and subscribers gained per Short. It is read-only and gives no upload rights.
    - Under *Audience*, click **Publish app** to move it from *Testing* to **In
      production**. A *Testing* app's refresh tokens expire after 7 days, and the accounts
      would then pause every week. A production app that is not yet verified still works
@@ -455,7 +459,7 @@ How it posts:
       **Use your own OAuth credentials** and paste the client id and secret. Tokens minted
       with your own client do not expire the way the Playground's default client's do.
    2. Under *Input your own scopes*, enter
-      `https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly`
+      `https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly`
       and click **Authorize APIs**.
    3. Sign in with the Google account that owns the channel. If it manages several
       channels (brand accounts), pick the channel of this `accounts.yaml` entry.
@@ -478,11 +482,19 @@ How it posts:
 
    An access token is not needed: the worker mints its own. A changed OAuth client id or
    secret also needs a worker restart.
+
+   **Accounts authorised before CLP-154** have a refresh token without
+   `yt-analytics.readonly`. Uploads keep working, but the insights page shows public
+   numbers only and says the account needs re-authorisation. Repeat this step with all
+   three scopes, replace `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>` in `.env`, and restart the
+   worker and the monitor (`docker compose up -d worker monitor`). The new token keeps
+   uploads working.
 5. **Verification, in parallel.** In *Google Auth Platform → Verification centre*,
    submit the app for verification of the sensitive scopes above. You need the home page
    and privacy policy on a domain you verified in Search Console, a written reason for
    each scope ("uploads the channel owner's approved clips; reads the channel's recent
-   uploads to avoid duplicates"), and an unlisted YouTube demo video. The video shows the
+   uploads to avoid duplicates; reads the channel's own analytics for the owner's
+   insights page"), and an unlisted YouTube demo video. The video shows the
    consent screen with the app name and the scopes, then an upload as it appears on the
    channel. Until verification is done, the owner's own channels work as described in
    step 2, but no more than 100 users can authorise the app.
@@ -499,6 +511,80 @@ token and the client secret are local variables inside httpx.
 
 To revoke access, remove the app at <https://myaccount.google.com/permissions> for that
 Google account. Its account then pauses on the next post, with an alert.
+
+## Channel insights
+
+The monitor stores each YouTube commentary channel's numbers and the numbers of every
+Short on it, pipeline posts and hand uploads alike (`src/clipper/insights/`,
+[CLP-154](https://linear.app/tengdev/issue/CLP-154)). A Short is a video of 180 seconds or
+less; longer videos count as public uploads only. The review
+app shows them at `/insights/<account_id>`, and a summary goes to `DISCORD_WEBHOOK_URL`
+(else the monitor log): the first one on the first run after deploy, then on the first
+run after Monday 09:00 in the account's timezone, once a week. It lists the top 3 and bottom 3 Shorts of the last 28 days, what to do more or less of
+by tag, and the tracker. Insights never block rendering, approval or posting: a failed
+collect run is logged and recorded in the `runs` table (component `insights`), a failed
+weekly summary send is only logged, and the next hourly run tries again.
+
+What it collects, per enabled `content: commentary` YouTube account:
+
+- **Public numbers** (YouTube Data API v3 with the monitor's `YOUTUBE_API_KEY`):
+  subscribers, total views, every upload of the last 90 days from the channel's uploads
+  playlist with its title, publish time and duration; per public Short, views, likes,
+  comments and whether comments are on. Every hour for the first 48 hours after a Short
+  goes public, then once a day. About 5 to 15 quota units an hour per channel, from the
+  same 10,000 a day the monitor uses.
+- **Analytics** (YouTube Analytics API v2 with the account's refresh token): once a UTC
+  day while it works; when it is off (needs re-authorisation, no token, or an error) it is
+  tried again every hour. It stores the channel's daily Shorts views (filter
+  `creatorContentType==shorts`) and, per Short, views, engaged views, average view
+  duration and percentage, subscribers gained and lost, likes, comments, shares, traffic
+  sources and the retention curve. Analytics data arrives 1 to 3 days late, and each
+  figure shows the day it covers.
+- Format tags on every Short (hook type, structure, palette, length, clip share,
+  streamers, topic, publish hour). Pipeline Shorts are tagged when approved. Hand uploads
+  get length and publish hour from YouTube and `unknown` for the rest; set those with
+  `docker compose run --rm monitor insights tag <video_id> hook_type=question topic="gta vi"`.
+  Keys not given stay as they are (`unknown` at first).
+
+The tracker shows tier 1 (500 subscribers, 3 public uploads and 3M public Shorts views in
+90 days) and tier 2 (1,000 subscribers and 10M public Shorts views in 90 days), with the
+days left at the last 7 days' pace. The views figure is an estimate: the larger of the
+latest public figure (the lifetime views of the public Shorts of the last 90 days) and the
+latest Analytics Shorts views (exact, but 1 to 3 days late, so it misses the newest
+Shorts). Both are lower bounds. The tracker shows the day the figure covers ("as of"), the
+trend table labels each day's figure `public` or `analytics`, and the pace runs between
+the days the figures cover. YouTube Studio's Earn tab is the source of truth.
+
+Setup (the owner, once):
+
+1. In the Google Cloud project of [YouTube publishing](#youtube-publishing), enable the
+   **YouTube Analytics API** and add the scope `yt-analytics.readonly` (steps 1 and 2
+   there).
+2. Make sure `YOUTUBE_API_KEY` is set in `/srv/clipper/.env` (the monitor's Data API
+   key; see Secrets). No other key is needed.
+3. Re-authorise each commentary account with the three scopes (step 4 there) and replace
+   its `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>`.
+4. Restart the monitor and the worker: `docker compose up -d monitor worker`.
+5. Check it: `docker compose run --rm monitor insights collect` stores one run now and
+   prints the rows it stored; `... insights weekly` prints the weekly summary without
+   sending it. The new token is tried on the first monitor run an hour after the last
+   Analytics check, or by `insights collect` once that hour has passed; the Analytics
+   notice on `/insights/<account_id>` goes away once it works.
+
+When something is missing, the job says so by name and keeps going:
+
+- No `YOUTUBE_API_KEY`: the monitor logs it by name once at start; no public numbers, and
+  hand uploads are not found (pipeline posts still get Analytics).
+- A refresh token without `yt-analytics.readonly`, or one Google refuses (revoked or
+  invalid): the page and the weekly summary say "needs re-authorisation" and name the
+  `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>` to replace; public numbers are still stored. Do
+  step 3; the new token is tried on the next hourly run (or by `insights collect` about
+  an hour after the last check).
+- No refresh token or no OAuth client: the page and the weekly summary say Analytics is
+  off and name the variable to set.
+
+Hand-uploaded Shorts appear from the first run. Pipeline commentary Shorts join them once
+they are posted to their account ([CLP-149](https://linear.app/tengdev/issue/CLP-149)).
 
 ## Meta publishing (Facebook Page Reels, Instagram Reels)
 

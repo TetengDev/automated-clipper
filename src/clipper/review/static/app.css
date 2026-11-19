@@ -155,3 +155,12 @@ button.danger { background: var(--error); }
 .post-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: flex-end; margin-top: 0.5rem; }
 .inline-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: flex-end; }
 .post-status-post_failed { color: var(--error); border-color: var(--error); }
+/* Insights (CLP-154): tracker bars, trend, Shorts and tag tables. */
+.table-scroll { overflow-x: auto; }
+table.insights { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+table.insights th, table.insights td { text-align: left; padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.goals { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.75rem; }
+.goals label { display: flex; flex-direction: column; gap: 0.25rem; }
+.goals progress { width: 100%; height: 0.75rem; }
+.tier { margin-bottom: 1rem; padding: 0.75rem 1rem; }
+.tier h3 { margin: 0 0 0.5rem; font-size: 1rem; }

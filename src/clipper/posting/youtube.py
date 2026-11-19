@@ -61,9 +61,11 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105 - an endpoint, n
 UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
 API_URL = "https://www.googleapis.com/youtube/v3"
 _UPLOAD_HOST = "www.googleapis.com"
+ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"
 SCOPES = (
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.readonly",  # lookup: list the channel's uploads
+    ANALYTICS_SCOPE,  # channel insights (CLP-154); the publisher itself does not use it
 )
 
 CATEGORY_ENTERTAINMENT = "24"
@@ -106,7 +108,7 @@ logger = logging.getLogger(__name__)
 RefreshTokenSource = Callable[[str], SecretStr | None]
 
 
-def _account_refresh_token(account_id: str) -> SecretStr | None:
+def account_refresh_token(account_id: str) -> SecretStr | None:
     return account_tokens(account_id).refresh_token
 
 
@@ -264,9 +266,11 @@ def _video_id(body: Any) -> str:
     return video_id
 
 
-def _error(response: httpx.Response, what: str) -> YouTubeError:
-    """A YouTubeError from an API error response: status, reasons and Google's message
-    (which never echoes credentials)."""
+def google_error(response: httpx.Response) -> tuple[list[str], str]:
+    """The reasons and Google's message (which never echoes credentials) from a Google API
+    error body: `error.errors[].reason`, then `error.details[].reason` (where Google puts
+    `ACCESS_TOKEN_SCOPE_INSUFFICIENT` and `API_KEY_INVALID`), or the OAuth token endpoint's
+    `error` string. Shared by the publisher and the insights clients (CLP-154)."""
     reasons: list[str] = []
     message = ""
     try:
@@ -276,11 +280,18 @@ def _error(response: httpx.Response, what: str) -> YouTubeError:
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict):
         message = str(error.get("message") or "")
-        for item in error.get("errors") or ():
-            if isinstance(item, dict) and isinstance(item.get("reason"), str):
-                reasons.append(item["reason"])
+        for group in ("errors", "details"):
+            for item in error.get(group) or ():
+                if isinstance(item, dict) and isinstance(item.get("reason"), str):
+                    reasons.append(item["reason"])
     elif isinstance(error, str):  # the OAuth token endpoint
         reasons.append(error)
+    return reasons, message
+
+
+def _error(response: httpx.Response, what: str) -> YouTubeError:
+    """A YouTubeError from an API error response: status, reasons and Google's message."""
+    reasons, message = google_error(response)
     label = ",".join(reasons) or "-"
     detail = f": {message[:300]}" if message else ""
     return YouTubeError(
@@ -339,7 +350,7 @@ class YouTubePublisher:
         *,
         account_ids: Sequence[str],
         client: OAuthClient,
-        refresh_token: RefreshTokenSource = _account_refresh_token,
+        refresh_token: RefreshTokenSource = account_refresh_token,
         http: httpx.Client | None = None,
         clock: Clock = utcnow,
         sleep: Callable[[float], None] = time.sleep,
@@ -517,29 +528,14 @@ class YouTubePublisher:
             and now < cached.expires
         ):
             return cached.value.get_secret_value()
-        response = self.http.post(TOKEN_URL, data=_grant(self.client.client_id, secret, refresh))
-        if response.status_code in (400, 401):
-            error = _error(response, "token refresh")
-            rejected = sorted(error.reasons & REJECTED_GRANT_ERRORS)
-            if rejected:
-                why = f"Google rejected its OAuth credentials ({rejected[0]})"
-                raise self._pause(account_id, fingerprint, why)
-            raise error
-        if response.status_code != 200:
-            raise _error(response, "token refresh")
         try:
-            body = response.json()
-            value = body["access_token"]
-            lifetime = int(body.get("expires_in", 3600))
-        except (ValueError, KeyError, TypeError, OverflowError):
-            raise YouTubeError("YouTube token refresh returned an unexpected body") from None
-        if not isinstance(value, str) or not value:
-            raise YouTubeError("YouTube token refresh returned no access token")
-        low, high = TOKEN_LIFETIME_BOUNDS
-        lifetime = min(max(lifetime, low), high)
-        expires = now + timedelta(seconds=lifetime) - TOKEN_EXPIRY_MARGIN
-        self._tokens[account_id] = _AccessToken(fingerprint, SecretStr(value), expires)
-        return value
+            grant = mint_access_token(self.http, self.client.client_id, secret, refresh)
+        except GrantRejected as exc:
+            why = f"Google rejected its OAuth credentials ({exc.reason})"
+            raise self._pause(account_id, fingerprint, why) from None
+        expires = now + timedelta(seconds=grant.lifetime_s) - TOKEN_EXPIRY_MARGIN
+        self._tokens[account_id] = _AccessToken(fingerprint, grant.value, expires)
+        return grant.value.get_secret_value()
 
     def _authorized(self, account_id: str, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """A request with the account's bearer token; on a 401, one retry with a fresh
@@ -707,6 +703,52 @@ def _grant(client_id: str, secret: SecretStr, refresh: SecretStr) -> dict[str, s
         "client_id": client_id,
         "client_secret": secret.get_secret_value(),
     }
+
+
+class GrantRejected(YouTubeError):
+    """Google refused the refresh token or the OAuth client (`invalid_grant`,
+    `invalid_client`, `unauthorized_client`). New credentials are needed."""
+
+    def __init__(self, reason: str, *, status: int) -> None:
+        super().__init__(
+            f"Google rejected the OAuth credentials ({reason})", status=status, reasons=(reason,)
+        )
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class TokenGrant:
+    """A fresh access token and its lifetime in seconds, clamped to TOKEN_LIFETIME_BOUNDS."""
+
+    value: SecretStr
+    lifetime_s: int
+
+
+def mint_access_token(
+    http: httpx.Client, client_id: str, client_secret: SecretStr, refresh: SecretStr
+) -> TokenGrant:
+    """Trade a refresh token for an access token at Google's token endpoint. Used by the
+    publisher and by the insights job (CLP-154). Raises GrantRejected when Google refuses
+    the credentials and YouTubeError for any other failure; neither carries a token."""
+    response = http.post(TOKEN_URL, data=_grant(client_id, client_secret, refresh))
+    if response.status_code in (400, 401):
+        error = _error(response, "token refresh")
+        rejected = sorted(error.reasons & REJECTED_GRANT_ERRORS)
+        if rejected:
+            raise GrantRejected(rejected[0], status=response.status_code)
+        raise error
+    if response.status_code != 200:
+        raise _error(response, "token refresh")
+    try:
+        body = response.json()
+        value = body["access_token"]
+        lifetime = int(body.get("expires_in", 3600))
+    except (ValueError, KeyError, TypeError, OverflowError):
+        raise YouTubeError("YouTube token refresh returned an unexpected body") from None
+    if not isinstance(value, str) or not value:
+        raise YouTubeError("YouTube token refresh returned no access token")
+    low, high = TOKEN_LIFETIME_BOUNDS
+    return TokenGrant(SecretStr(value), min(max(lifetime, low), high))
 
 
 def _video_body(response: httpx.Response) -> dict[str, Any]:

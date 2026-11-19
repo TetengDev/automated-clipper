@@ -85,6 +85,12 @@ def older_channel_rows(conn) -> None:
     channel(conn, TODAY - timedelta(days=2), ANALYTICS, shorts_views_90d=900)
 
 
+def stopped_feed_rows(conn) -> None:
+    """The last Analytics row is older than the 28 days the trend shows."""
+    channel(conn, TODAY - timedelta(days=30), ANALYTICS, shorts_views_90d=900)
+    channel(conn, TODAY, shorts_views_90d=100)
+
+
 @pytest.mark.parametrize(
     ("rows", "expected"),
     [(live_rows, (483, PUBLIC)), (older_channel_rows, (900, ANALYTICS))],
@@ -101,7 +107,7 @@ def test_shorts_views_are_the_larger_of_public_and_the_latest_analytics(
     assert (views.source, views.as_of) == (expected[1], TODAY)
 
 
-@pytest.mark.parametrize("rows", [live_rows, older_channel_rows])
+@pytest.mark.parametrize("rows", [live_rows, older_channel_rows, stopped_feed_rows])
 def test_trend_shows_the_same_shorts_views_and_source_as_the_tracker(conn, rows) -> None:
     rows(conn)
 

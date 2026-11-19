@@ -169,12 +169,19 @@ def _shorts_views(
     return found
 
 
+def _history_since(today: date) -> date:
+    """The first day the tracker reads: the trend's days plus the pace window before them.
+    The trend reads Analytics from the same day, so a carried Analytics figure is the same
+    in both."""
+    return today - timedelta(days=TREND_DAYS + PACE_DAYS)
+
+
 def _series(
     conn: sqlite3.Connection, account_id: str, key: str, today: date
 ) -> list[tuple[date, int, str | None]]:
     """The goal's (day, value, Shorts views source) in day order; the source is None for
     the other goals."""
-    since = today - timedelta(days=TREND_DAYS + PACE_DAYS)
+    since = _history_since(today)
     public = repo.channel_history(conn, account_id, repo.PUBLIC, since)
     if key == "shorts_views_90d":
         analytics = repo.channel_history(conn, account_id, repo.ANALYTICS, since)
@@ -219,11 +226,13 @@ def trend(
 ) -> list[TrendDay]:
     since = today - timedelta(days=days - 1)
     public_rows = repo.channel_history(conn, account_id, repo.PUBLIC, since)
-    analytics_rows = repo.channel_history(conn, account_id, repo.ANALYTICS, since)
+    analytics_rows = repo.channel_history(
+        conn, account_id, repo.ANALYTICS, min(since, _history_since(today))
+    )
     public = {r.day: r for r in public_rows}
     views = _shorts_views(public_rows, analytics_rows)
     found: list[TrendDay] = []
-    for day in sorted(set(public) | {r.day for r in analytics_rows}):
+    for day in sorted(set(public) | {r.day for r in analytics_rows if r.day >= since}):
         p = public.get(day)
         value, source = views.get(day, (None, None))
         found.append(

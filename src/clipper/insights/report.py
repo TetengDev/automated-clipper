@@ -5,12 +5,14 @@ median, and the per-tag breakdown. Read-only queries over the 0012 tables.
 Tracker. Tier 1 (fan funding): 500 subscribers, 3 public uploads in the last 90 days and
 3,000,000 public Shorts views in the last 90 days. Tier 2 (ad revenue): 1,000 subscribers
 and 10,000,000 public Shorts views in the last 90 days. The views figure is an estimate:
-on each day, the larger of the public figure (lifetime views of the public Shorts of the
-last 90 days) and the latest Analytics `views` with `creatorContentType==shorts` covering
-that day or before. Both are lower bounds: Analytics is exact but 1 to 3 days late, so it
-misses the newest Shorts. YouTube Studio's Earn tab is the source of truth. Days to go
-divide the gap by the pace of the last 7 days: (latest value - value at least 7 days
-earlier) / days between them. Without 7 days of data, or with no progress, there is no estimate.
+on each day, the larger of the latest public figure (lifetime views of the public Shorts
+of the last 90 days) and the latest Analytics `views` with `creatorContentType==shorts`,
+each from that day or before (a tie goes to Analytics). Both are lower bounds: Analytics
+is exact but 1 to 3 days late, so it misses the newest Shorts. The figure is as of the day
+its row covers. YouTube Studio's Earn tab is the source of truth. Days to go divide the
+gap by the pace of the last 7 days: (latest value - the value covering a day at least 7
+days earlier) / days between the days they cover. Without 7 days of data, or with no
+progress, there is no estimate.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
+from typing import NamedTuple
 
 from clipper.insights import repo
 from clipper.insights.tags import TAG_KEYS, UNKNOWN
@@ -85,6 +88,7 @@ class GoalProgress:
     goal: Goal
     value: int | None
     as_of: date | None
+    """The day the value covers (an Analytics figure covers a day 1 to 3 days back)."""
     pace: float | None
     """Per day over the last 7 days; None without 7 days of data."""
     source: str | None = None
@@ -149,45 +153,55 @@ class TierProgress:
         return f"about {self.days_to_go} days at the last 7 days' pace"
 
 
+class _Point(NamedTuple):
+    """A goal's value on a series day."""
+
+    value: int
+    source: str | None
+    """`public` or `analytics` for Shorts views; None for the other goals."""
+    covers: date
+    """The day of the row the value comes from."""
+
+
 def _shorts_views(
     public: Sequence[repo.ChannelMetrics], analytics: Sequence[repo.ChannelMetrics]
-) -> dict[date, tuple[int, str]]:
-    """Shorts views and their source on each day of `public` and `analytics` (rows in day
-    order): the larger of the public figure on that day and the latest Analytics figure
-    on or before it (a tie goes to Analytics). Days without either figure are left out."""
-    on_day = {r.day: r.shorts_views_90d for r in public if r.shorts_views_90d is not None}
-    latest = {r.day: r.shorts_views_90d for r in analytics if r.shorts_views_90d is not None}
-    found: dict[date, tuple[int, str]] = {}
-    carried: int | None = None
-    for day in sorted(set(on_day) | set(latest)):
-        carried = latest.get(day, carried)
-        p = on_day.get(day)
-        if carried is not None and (p is None or carried >= p):
-            found[day] = (carried, repo.ANALYTICS)
-        elif p is not None:
-            found[day] = (p, repo.PUBLIC)
+) -> dict[date, _Point]:
+    """Shorts views on each day of `public` and `analytics`: the larger of the latest public
+    and the latest Analytics figure on or before that day (a tie goes to Analytics), with
+    the source and the day of the winning row. Days without either figure are left out."""
+    on_public = {r.day: r.shorts_views_90d for r in public if r.shorts_views_90d is not None}
+    on_analytics = {r.day: r.shorts_views_90d for r in analytics if r.shorts_views_90d is not None}
+    found: dict[date, _Point] = {}
+    last_public: tuple[date, int] | None = None
+    last_analytics: tuple[date, int] | None = None
+    for day in sorted(set(on_public) | set(on_analytics)):
+        if day in on_public:
+            last_public = (day, on_public[day])
+        if day in on_analytics:
+            last_analytics = (day, on_analytics[day])
+        if last_analytics is not None and (
+            last_public is None or last_analytics[1] >= last_public[1]
+        ):
+            found[day] = _Point(last_analytics[1], repo.ANALYTICS, last_analytics[0])
+        elif last_public is not None:
+            found[day] = _Point(last_public[1], repo.PUBLIC, last_public[0])
     return found
 
 
 def _history_since(today: date) -> date:
     """The first day the tracker reads: the trend's days plus the pace window before them.
-    The trend reads Analytics from the same day, so a carried Analytics figure is the same
-    in both."""
+    The trend reads from the same day, so a carried figure is the same in both."""
     return today - timedelta(days=TREND_DAYS + PACE_DAYS)
 
 
-def _series(
-    conn: sqlite3.Connection, account_id: str, key: str, today: date
-) -> list[tuple[date, int, str | None]]:
-    """The goal's (day, value, Shorts views source) in day order; the source is None for
-    the other goals."""
+def _series(conn: sqlite3.Connection, account_id: str, key: str, today: date) -> list[_Point]:
+    """The goal's points in day order."""
     since = _history_since(today)
     public = repo.channel_history(conn, account_id, repo.PUBLIC, since)
     if key == "shorts_views_90d":
         analytics = repo.channel_history(conn, account_id, repo.ANALYTICS, since)
-        views = _shorts_views(public, analytics)
-        return [(day, value, source) for day, (value, source) in sorted(views.items())]
-    return [(r.day, value, None) for r in public if (value := getattr(r, key)) is not None]
+        return [point for _, point in sorted(_shorts_views(public, analytics).items())]
+    return [_Point(value, None, r.day) for r in public if (value := getattr(r, key)) is not None]
 
 
 def goal_progress(
@@ -196,13 +210,13 @@ def goal_progress(
     series = _series(conn, account_id, goal.key, today)
     if not series:
         return GoalProgress(goal, None, None, None)
-    day, value, source = series[-1]
-    earlier = [(d, v) for d, v, _ in series if d <= day - timedelta(days=PACE_DAYS)]
+    last = series[-1]
+    earlier = [p for p in series if p.covers <= last.covers - timedelta(days=PACE_DAYS)]
     pace = None
     if earlier:
-        past_day, past_value = earlier[-1]
-        pace = (value - past_value) / (day - past_day).days
-    return GoalProgress(goal, value, day, pace, source)
+        past = earlier[-1]
+        pace = (last.value - past.value) / (last.covers - past.covers).days
+    return GoalProgress(goal, last.value, last.covers, pace, last.source)
 
 
 def tracker(conn: sqlite3.Connection, account_id: str, today: date) -> list[TierProgress]:
@@ -225,18 +239,23 @@ def trend(
     conn: sqlite3.Connection, account_id: str, today: date, days: int = TREND_DAYS
 ) -> list[TrendDay]:
     since = today - timedelta(days=days - 1)
-    public_rows = repo.channel_history(conn, account_id, repo.PUBLIC, since)
-    analytics_rows = repo.channel_history(
-        conn, account_id, repo.ANALYTICS, min(since, _history_since(today))
-    )
+    history = min(since, _history_since(today))
+    public_rows = repo.channel_history(conn, account_id, repo.PUBLIC, history)
+    analytics_rows = repo.channel_history(conn, account_id, repo.ANALYTICS, history)
     public = {r.day: r for r in public_rows}
     views = _shorts_views(public_rows, analytics_rows)
     found: list[TrendDay] = []
-    for day in sorted(set(public) | {r.day for r in analytics_rows if r.day >= since}):
+    for day in sorted(d for d in set(public) | {r.day for r in analytics_rows} if d >= since):
         p = public.get(day)
-        value, source = views.get(day, (None, None))
+        point = views.get(day)
         found.append(
-            TrendDay(day, p.subscribers if p else None, p.total_views if p else None, value, source)
+            TrendDay(
+                day,
+                p.subscribers if p else None,
+                p.total_views if p else None,
+                point.value if point else None,
+                point.source if point else None,
+            )
         )
     return found
 

@@ -548,11 +548,12 @@ What it collects, per enabled `content: commentary` YouTube account:
 
 The tracker shows tier 1 (500 subscribers, 3 public uploads and 3M public Shorts views in
 90 days) and tier 2 (1,000 subscribers and 10M public Shorts views in 90 days), with the
-days left at the last 7 days' pace. The views figure is an estimate: on each day, the
-larger of the public figure (the lifetime views of the public Shorts of the last 90 days)
-and the latest Analytics Shorts views (exact, but 1 to 3 days late, so it misses the
-newest Shorts). Both are lower bounds; the trend table labels each day's figure `public`
-or `analytics`. YouTube Studio's Earn tab is the source of truth.
+days left at the last 7 days' pace. The views figure is an estimate: the larger of the
+latest public figure (the lifetime views of the public Shorts of the last 90 days) and the
+latest Analytics Shorts views (exact, but 1 to 3 days late, so it misses the newest
+Shorts). Both are lower bounds. The tracker shows the day the figure covers ("as of"), the
+trend table labels each day's figure `public` or `analytics`, and the pace runs between
+the days the figures cover. YouTube Studio's Earn tab is the source of truth.
 
 Setup (the owner, once):
 

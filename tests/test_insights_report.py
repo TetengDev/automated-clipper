@@ -68,7 +68,7 @@ def test_shorts_views_come_from_analytics_when_there_are_any(conn) -> None:
 
     views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
 
-    assert (views.value, views.as_of, views.days_to_go) == (1_240_000, TODAY, 88)
+    assert (views.value, views.as_of, views.days_to_go) == (1_240_000, date(2027, 1, 13), 88)
     assert views.source == ANALYTICS
 
 
@@ -91,30 +91,67 @@ def stopped_feed_rows(conn) -> None:
     channel(conn, TODAY, shorts_views_90d=100)
 
 
+def stopped_public_rows(conn) -> None:
+    """The public feed stopped (no API key) after the Shorts went public; Analytics, which
+    covers a later day but predates the Shorts' views, says 0."""
+    channel(conn, TODAY - timedelta(days=5), shorts_views_90d=483)
+    channel(conn, TODAY - timedelta(days=2), ANALYTICS, shorts_views_90d=0)
+
+
 @pytest.mark.parametrize(
     ("rows", "expected"),
-    [(live_rows, (483, PUBLIC)), (older_channel_rows, (900, ANALYTICS))],
+    [
+        (live_rows, (483, PUBLIC, TODAY)),
+        (older_channel_rows, (900, ANALYTICS, TODAY - timedelta(days=2))),
+        (stopped_public_rows, (483, PUBLIC, TODAY - timedelta(days=5))),
+    ],
 )
-def test_shorts_views_are_the_larger_of_public_and_the_latest_analytics(
-    conn, rows, expected: tuple[int, str]
+def test_shorts_views_are_the_larger_of_the_latest_public_and_analytics(
+    conn, rows, expected: tuple[int, str, date]
 ) -> None:
-    """Both are lower bounds: Analytics is exact but lags, so it misses new uploads."""
+    """Both are lower bounds: Analytics is exact but lags, so it misses new uploads. The
+    figure is as of the day its winning row covers."""
     rows(conn)
 
     views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
 
     assert views.value == expected[0]
-    assert (views.source, views.as_of) == (expected[1], TODAY)
+    assert (views.source, views.as_of) == expected[1:]
 
 
-@pytest.mark.parametrize("rows", [live_rows, older_channel_rows, stopped_feed_rows])
+def test_shorts_views_pace_runs_between_the_days_the_figures_cover(conn) -> None:
+    """Daily public and Analytics feeds, Analytics 3 days late and larger: the pace is the
+    Analytics growth per day it covers, not per calendar day of the public rows."""
+    for back in range(15):
+        channel(conn, TODAY - timedelta(days=back), shorts_views_90d=100)
+    for back in range(3, 18):
+        channel(
+            conn,
+            TODAY - timedelta(days=back),
+            ANALYTICS,
+            shorts_views_90d=1_000_000 - 10_000 * back,
+        )
+
+    views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
+
+    assert views.pace == pytest.approx(10_000)
+    assert views.days_to_go == 203
+    assert (views.value, views.as_of, views.source) == (
+        970_000,
+        TODAY - timedelta(days=3),
+        ANALYTICS,
+    )
+
+
+@pytest.mark.parametrize(
+    "rows", [live_rows, older_channel_rows, stopped_feed_rows, stopped_public_rows]
+)
 def test_trend_shows_the_same_shorts_views_and_source_as_the_tracker(conn, rows) -> None:
     rows(conn)
 
     views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
     last = report.trend(conn, ACCOUNT, TODAY)[-1]
 
-    assert last.day == TODAY
     assert (last.shorts_views_90d, last.shorts_views_source) == (views.value, views.source)
 
 
@@ -127,7 +164,11 @@ def test_a_stopped_analytics_feed_still_counts_while_it_is_larger(conn) -> None:
 
     views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
 
-    assert (views.value, views.as_of, views.source) == (1_240_000, TODAY, ANALYTICS)
+    assert (views.value, views.as_of, views.source) == (
+        1_240_000,
+        TODAY - timedelta(days=4),
+        ANALYTICS,
+    )
 
 
 def test_analytics_days_before_any_public_row_keep_the_analytics_value(conn) -> None:

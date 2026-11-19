@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from clipper.insights import repo
-from clipper.insights.repo import PUBLIC, ChannelMetrics
+from clipper.insights.repo import ANALYTICS, PUBLIC, ChannelMetrics
 from insights_support import ACCOUNT, HAND_UPLOADS, T0, short, upload
 from posting_support import FakeAccount
 from review_support import Env, login, make_env
@@ -105,6 +105,23 @@ def test_the_page_shows_the_tracker_trend_shorts_and_tags(client: TestClient, en
     assert 'href="https://www.youtube.com/shorts/2BpbZneO_To"' in html
     assert 'id="tags"' in html and "question" in html and "hook_type" in html
     assert 'id="reauth"' not in html and 'id="no-token"' not in html
+
+
+def test_an_analytics_views_figure_is_as_of_the_day_it_covers(client: TestClient, env: Env) -> None:
+    seed(env)
+    repo.upsert_channel_metrics(
+        env.conn,
+        ChannelMetrics(ACCOUNT, TODAY - timedelta(days=2), ANALYTICS, shorts_views_90d=1_240_000),
+        T0,
+    )
+
+    html = client.get(f"/insights/{ACCOUNT}").text
+
+    views = html.split("Public Shorts views, last 90 days (estimate): ", 1)[1].split("</li>")[0]
+    assert views.startswith("1,240,000 of 3,000,000")
+    assert "as of 2027-01-13" in views
+    subs = html.split("Subscribers: ", 1)[1].split("</li>")[0]
+    assert "as of 2027-01-15" in subs
 
 
 def test_every_short_links_to_youtube_by_video_id(client: TestClient, env: Env) -> None:

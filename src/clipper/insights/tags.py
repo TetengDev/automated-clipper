@@ -9,7 +9,7 @@ Eight keys, each always present (`unknown` when nothing says):
 - clip_share: the share of the runtime that is streamer clips, in 10-point buckets, from
   the story's excerpts. A creator's clip is all clip (90-100%).
 - streamers: the Twitch logins of the story's excerpts, comma-separated. A creator's clip
-  names the creator.
+  names the creator (lower case, as the owner's tags are).
 - publish_hour: the hour, in the account's timezone, at which the post goes public
   (`scheduled_at`, which the YouTube publisher sends as `publishAt`).
 
@@ -66,14 +66,10 @@ def publish_hour(when: datetime, timezone: str) -> str:
     return f"{when.astimezone(ZoneInfo(timezone)).hour:02d}"
 
 
-def _clean(value: str, *, lower: bool = False) -> str:
-    text = strip_control(value)[:MAX_VALUE].strip()
-    return (text.lower() if lower else text) or UNKNOWN
-
-
 def clean_value(value: str) -> str:
-    """A tag value as stored: no control characters, at most 80 characters, lower case."""
-    return _clean(value, lower=True)
+    """A tag value as stored: no control characters, at most 80 characters, lower case.
+    Derived and owner-set values both go through it, so one creator has one spelling."""
+    return strip_control(value)[:MAX_VALUE].strip().lower() or UNKNOWN
 
 
 def derive_tags(conn: sqlite3.Connection, post: Post, timezone: str) -> dict[str, str]:
@@ -90,7 +86,7 @@ def derive_tags(conn: sqlite3.Connection, post: Post, timezone: str) -> dict[str
     duration = row["duration_s"] or (row["end_s"] - row["start_s"])
     tags["length_bucket"] = length_bucket(duration)
     if row["platform"] != COMMENTARY:  # a creator's clip
-        tags["streamers"] = _clean(row["creator"])
+        tags["streamers"] = clean_value(row["creator"])
         tags["clip_share"] = share_bucket(1.0)
         return tags
     story = conn.execute(
@@ -117,14 +113,14 @@ def derive_tags(conn: sqlite3.Connection, post: Post, timezone: str) -> dict[str
             f" WHERE twitch_clip_id IN ({marks})",
             ids,
         )
-        logins = sorted({_clean(r[0]) for r in rows if r[0]})
+        logins = sorted({clean_value(r[0]) for r in rows if r[0]})
         if logins:
             tags["streamers"] = ",".join(logins)[:MAX_VALUE]
     fmt = repo.loads_json(story["format"], dict) or {}
     for key in FORMAT_KEYS:
         value = fmt.get(key)
         if isinstance(value, str):
-            tags[key] = _clean(value, lower=True)
+            tags[key] = clean_value(value)
     return tags
 
 

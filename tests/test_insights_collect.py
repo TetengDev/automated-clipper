@@ -538,3 +538,16 @@ def test_a_revoked_token_on_a_video_report_flags_reauth(conn, clock) -> None:
     assert report.errors == []
     state = repo.analytics_state(conn, ACCOUNT)
     assert state is not None and state.state is repo.AnalyticsState.NEEDS_REAUTH
+
+
+def test_a_hand_upload_tagged_by_the_owner_first_still_gets_data_api_defaults(conn, clock) -> None:
+    vid = HAND_UPLOADS[0]
+    owner_tags(conn, vid, {"hook_type": "reaction"})  # before any run saw the video
+    public = FakePublic()
+    public.add(vid, 100, T0 - timedelta(days=1), duration=58.0)
+
+    collector(conn, clock, public).run()
+
+    tags = repo.tags_for_videos(conn, [vid])[vid]
+    assert tags["hook_type"] == "reaction"
+    assert tags["length_bucket"] == "40-60s" and tags["publish_hour"] != "unknown"

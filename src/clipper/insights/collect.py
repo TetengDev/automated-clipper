@@ -52,7 +52,7 @@ from clipper.insights.analytics import (
     VideoTotals,
 )
 from clipper.insights.public import ChannelStats, InsightsError, Upload, VideoStats
-from clipper.insights.tags import TAG_KEYS, ensure_video_tags, tag_post
+from clipper.insights.tags import ensure_video_tags, needs_defaults, tag_post
 from clipper.jobs.models import Clock, to_iso, utcnow
 from clipper.posting import repo as posting_repo
 from clipper.posting.models import Post
@@ -260,7 +260,7 @@ class InsightsCollector:
         shorts = repo.channel_videos(self.conn, account.id, until=now, shorts_only=True)
         tagged = repo.tags_for_videos(self.conn, [v.video_id for v in shorts])
         for video in shorts:
-            if set(tagged.get(video.video_id, {})) >= set(TAG_KEYS):
+            if not needs_defaults(tagged.get(video.video_id, {})):
                 continue
             with self._contained(report, account, "tags", video.video_id):
                 ensure_video_tags(self.conn, video, account.timezone)
@@ -310,17 +310,18 @@ class InsightsCollector:
         )
         report.channel_rows += 1
         for video in shorts:
-            last = repo.last_capture(self.conn, video.video_id, repo.PUBLIC)
-            if not public_due(video.published_at, last, now):
-                continue
             with self._contained(report, account, "public", video.video_id):
-                self._public_video(account, video, stats[video.video_id], now)
-                report.post_rows += 1
+                if self._public_video(account, video, stats[video.video_id], now):
+                    report.post_rows += 1
 
     def _public_video(
         self, account: InsightsAccount, video: repo.Video, found: VideoStats, now: datetime
-    ) -> None:
+    ) -> bool:
+        """Store the Short's public numbers when a capture is due; True when stored."""
         assert self.public is not None
+        last = repo.last_capture(self.conn, video.video_id, repo.PUBLIC)
+        if not public_due(video.published_at, last, now):
+            return False
         enabled = self.public.comments_enabled(video.video_id)
         if enabled is False:
             logger.warning("insights %s: comments are off on %s", account.id, video.video_id)
@@ -336,6 +337,7 @@ class InsightsCollector:
             ),
             now,
         )
+        return True
 
     def _analytics(self, account: InsightsAccount, now: datetime, report: CollectReport) -> None:
         assert self.analytics is not None

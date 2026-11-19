@@ -41,6 +41,8 @@ TAG_KEYS = (
     "publish_hour",
 )
 FORMAT_KEYS = ("hook_type", "structure", "palette", "topic")
+DATA_KEYS = ("length_bucket", "publish_hour")
+"""The keys `video_defaults` derives from the Data API."""
 UNKNOWN = repo.UNKNOWN
 MAX_VALUE = 80
 _LENGTHS = ((20.0, "<20s"), (40.0, "20-40s"), (60.0, "40-60s"), (90.0, "60-90s"))
@@ -137,8 +139,16 @@ def video_defaults(video: repo.Video, timezone: str) -> dict[str, str]:
     return tags
 
 
+def needs_defaults(tags: Mapping[str, str]) -> bool:
+    """Whether `ensure_video_tags` would change a video with these tags: a key is missing,
+    or a key the Data API can tell (length, publish hour) is still `unknown`."""
+    missing = set(TAG_KEYS) - set(tags)
+    return bool(missing) or any(tags[key] == UNKNOWN for key in DATA_KEYS)
+
+
 def ensure_video_tags(conn: sqlite3.Connection, video: repo.Video, timezone: str) -> None:
-    """Give a video every key it lacks (a hand upload's defaults); never changes a value."""
+    """Give a video its defaults (a hand upload's) where a key is missing or `unknown`;
+    never changes a real value, so the owner's tags stay."""
     repo.set_tags(conn, video_defaults(video, timezone), video_id=video.video_id, replace=False)
 
 

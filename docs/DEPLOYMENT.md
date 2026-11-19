@@ -519,8 +519,8 @@ Short on it, pipeline posts and hand uploads alike (`src/clipper/insights/`,
 [CLP-154](https://linear.app/tengdev/issue/CLP-154)). A Short is a video of 180 seconds or
 less; longer videos count as public uploads only. The review
 app shows them at `/insights/<account_id>`, and a summary goes to `DISCORD_WEBHOOK_URL`
-(else the monitor log) once a week, on the first run after Monday 09:00 in the account's
-timezone: the top 3 and bottom 3 Shorts of the last 28 days, what to do more or less of
+(else the monitor log): the first one on the first run after deploy, then on the first
+run after Monday 09:00 in the account's timezone, once a week. It lists the top 3 and bottom 3 Shorts of the last 28 days, what to do more or less of
 by tag, and the tracker. Insights never block rendering, approval or posting: a failure
 is logged and recorded in the `runs` table (component `insights`), and the next hourly
 run tries again.

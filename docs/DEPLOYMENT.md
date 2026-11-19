@@ -425,7 +425,8 @@ How it posts:
 
 1. **Google Cloud project.** At <https://console.cloud.google.com>, create a project (for
    example `clipper-publisher`). Under *APIs & Services → Library*, enable **YouTube Data
-   API v3**.
+   API v3** and the **YouTube Analytics API**. The insights job (CLP-154) reads each
+   channel's analytics through the second one.
 2. **OAuth consent screen** (*Google Auth Platform → Branding / Audience / Data access*):
    - User type **External**. Enter the app name, the support email, the developer contact
      email, the home page and the **privacy policy URL**. You need both pages later for
@@ -436,6 +437,9 @@ How it posts:
      account, including private videos and playlists. It is the narrowest scope that lets
      the worker list its own uploads, and without it a timed-out upload could be posted
      twice.
+   - Also add `https://www.googleapis.com/auth/yt-analytics.readonly`. The insights job
+     uses it to read the channel's own analytics: views, engaged views, retention, traffic
+     sources and subscribers gained per Short. It is read-only and gives no upload rights.
    - Under *Audience*, click **Publish app** to move it from *Testing* to **In
      production**. A *Testing* app's refresh tokens expire after 7 days, and the accounts
      would then pause every week. A production app that is not yet verified still works
@@ -455,7 +459,7 @@ How it posts:
       **Use your own OAuth credentials** and paste the client id and secret. Tokens minted
       with your own client do not expire the way the Playground's default client's do.
    2. Under *Input your own scopes*, enter
-      `https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly`
+      `https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly`
       and click **Authorize APIs**.
    3. Sign in with the Google account that owns the channel. If it manages several
       channels (brand accounts), pick the channel of this `accounts.yaml` entry.
@@ -478,11 +482,19 @@ How it posts:
 
    An access token is not needed: the worker mints its own. A changed OAuth client id or
    secret also needs a worker restart.
+
+   **Accounts authorised before CLP-154** have a refresh token without
+   `yt-analytics.readonly`. Uploads keep working, but the insights page shows public
+   numbers only and says the account needs re-authorisation. Repeat this step with all
+   three scopes, replace `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>` in `.env`, and restart the
+   worker and the monitor (`docker compose up -d worker monitor`). The new token keeps
+   uploads working.
 5. **Verification, in parallel.** In *Google Auth Platform → Verification centre*,
    submit the app for verification of the sensitive scopes above. You need the home page
    and privacy policy on a domain you verified in Search Console, a written reason for
    each scope ("uploads the channel owner's approved clips; reads the channel's recent
-   uploads to avoid duplicates"), and an unlisted YouTube demo video. The video shows the
+   uploads to avoid duplicates; reads the channel's own analytics for the owner's
+   insights page"), and an unlisted YouTube demo video. The video shows the
    consent screen with the app name and the scopes, then an upload as it appears on the
    channel. Until verification is done, the owner's own channels work as described in
    step 2, but no more than 100 users can authorise the app.

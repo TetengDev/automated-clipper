@@ -228,7 +228,10 @@ def test_a_failing_hook_is_logged_and_the_next_one_still_runs(
 
 
 def test_run_monitor_calls_the_insights_tick_after_each_cycle(
-    tmp_path: Path, args: list[str], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    args: list[str],
+    requests: list[httpx.Request],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (tmp_path / "accounts.yaml").write_text(ACCOUNTS_YAML)
     monkeypatch.setenv("CLIPPER_MEDIA_DIR", str(tmp_path / "media"))
@@ -251,11 +254,16 @@ def test_run_monitor_calls_the_insights_tick_after_each_cycle(
 
     assert result.exit_code == 0, result.output
     assert ticks == ["insights"]
+    assert requests == []  # the MockTransport client; nothing reached it
 
 
 @pytest.mark.parametrize("webhook", [True, False])
 def test_run_monitor_sends_the_weekly_summary_to_the_ping_webhook_built_once(
-    tmp_path: Path, args: list[str], monkeypatch: pytest.MonkeyPatch, webhook: bool
+    tmp_path: Path,
+    args: list[str],
+    requests: list[httpx.Request],
+    monkeypatch: pytest.MonkeyPatch,
+    webhook: bool,
 ) -> None:
     (tmp_path / "accounts.yaml").write_text(ACCOUNTS_YAML)
     monkeypatch.setenv("CLIPPER_MEDIA_DIR", str(tmp_path / "media"))
@@ -289,3 +297,4 @@ def test_run_monitor_sends_the_weekly_summary_to_the_ping_webhook_built_once(
         assert len(built) == 1 and collector.notify is built[0]  # type: ignore[attr-defined]
     else:
         assert built == [] and collector.notify is notify.log_notify  # type: ignore[attr-defined]
+    assert requests == []  # the MockTransport client; nothing reached it

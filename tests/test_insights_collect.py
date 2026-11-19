@@ -551,3 +551,22 @@ def test_a_hand_upload_tagged_by_the_owner_first_still_gets_data_api_defaults(co
     tags = repo.tags_for_videos(conn, [vid])[vid]
     assert tags["hook_type"] == "reaction"
     assert tags["length_bucket"] == "40-60s" and tags["publish_hour"] != "unknown"
+
+
+def test_a_failing_capture_lookup_stops_only_that_video(conn, clock, monkeypatch) -> None:
+    public = FakePublic()
+    for hand in HAND_UPLOADS:
+        public.add(hand, 100, T0 - timedelta(days=1))
+    real = repo.last_capture
+
+    def last_capture(c: sqlite3.Connection, video_id: str, source: str) -> datetime | None:
+        if video_id == HAND_UPLOADS[2]:
+            raise sqlite3.OperationalError("database is locked")
+        return real(c, video_id, source)
+
+    monkeypatch.setattr(repo, "last_capture", last_capture)
+
+    report = collector(conn, clock, public).run()
+
+    assert [public_rows(conn, hand) for hand in HAND_UPLOADS[:2]] == [1, 1]
+    assert [(e["step"], e["video"]) for e in report.errors] == [("public", HAND_UPLOADS[2])]

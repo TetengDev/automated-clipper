@@ -203,6 +203,78 @@ def test_video_tags_replace_or_only_fill_in(conn: sqlite3.Connection) -> None:
         repo.set_tags(conn, {"topic": "x"})
 
 
+def _tag_rows(conn: sqlite3.Connection) -> list[tuple[str | None, int | None, str, str]]:
+    return [
+        tuple(r)
+        for r in conn.execute("SELECT video_id, post_id, key, value FROM post_tags ORDER BY id")
+    ]
+
+
+def test_linking_merges_an_approval_tag_with_a_default_video_tag(
+    conn: sqlite3.Connection,
+) -> None:
+    post = short(conn)
+    vid = post.external_id or ""
+    repo.set_tags(conn, {"hook_type": "question"}, post_id=post.id)
+    repo.set_tags(conn, {"hook_type": "unknown"}, video_id=vid, replace=False)
+
+    repo.link_post_tags(conn, post.id, vid)
+
+    assert repo.tags_for_videos(conn, [vid]) == {vid: {"hook_type": "question"}}
+    assert repo.tags_for_post(conn, post.id) == {"hook_type": "question"}
+    assert _tag_rows(conn) == [(vid, post.id, "hook_type", "question")]
+
+
+def test_linking_keeps_the_owners_video_tag_over_the_approval_tag(
+    conn: sqlite3.Connection,
+) -> None:
+    post = short(conn)
+    vid = post.external_id or ""
+    repo.set_tags(conn, {"hook_type": "reaction"}, video_id=vid)
+    repo.set_tags(conn, {"hook_type": "question"}, post_id=post.id)
+
+    repo.link_post_tags(conn, post.id, vid)
+
+    assert repo.tags_for_videos(conn, [vid]) == {vid: {"hook_type": "reaction"}}
+    assert repo.tags_for_post(conn, post.id) == {"hook_type": "reaction"}
+    assert _tag_rows(conn) == [(vid, post.id, "hook_type", "reaction")]
+
+
+def test_tags_with_both_ids_replace_both_rows_with_one(conn: sqlite3.Connection) -> None:
+    post = short(conn)
+    vid = post.external_id or ""
+    repo.set_tags(conn, {"hook_type": "question"}, post_id=post.id)
+    repo.set_tags(conn, {"hook_type": "unknown"}, video_id=vid, replace=False)
+
+    repo.set_tags(conn, {"hook_type": "reaction"}, video_id=vid, post_id=post.id)
+
+    assert repo.tags_for_videos(conn, [vid]) == {vid: {"hook_type": "reaction"}}
+    assert repo.tags_for_post(conn, post.id) == {"hook_type": "reaction"}
+    assert _tag_rows(conn) == [(vid, post.id, "hook_type", "reaction")]
+
+
+def test_tags_with_both_ids_fill_in_keeps_the_real_value(conn: sqlite3.Connection) -> None:
+    post = short(conn)
+    vid = post.external_id or ""
+    repo.set_tags(conn, {"hook_type": "question"}, post_id=post.id)
+    repo.set_tags(conn, {"hook_type": "unknown"}, video_id=vid, replace=False)
+
+    repo.set_tags(conn, {"hook_type": "unknown"}, video_id=vid, post_id=post.id, replace=False)
+
+    assert _tag_rows(conn) == [(vid, post.id, "hook_type", "question")]
+
+
+def test_registering_without_a_post_keeps_the_link(conn: sqlite3.Connection) -> None:
+    post = short(conn)
+    vid = post.external_id or ""
+    repo.register_post_video(conn, repo.Video(vid, ACCOUNT, T0, "Title", 42.5, post.id), T0)
+
+    repo.register_post_video(conn, repo.Video(vid, ACCOUNT, T0), T0)
+
+    video = repo.get_video(conn, vid)
+    assert video is not None and video.post_id == post.id
+
+
 def test_analytics_state_is_one_row_per_account(conn: sqlite3.Connection) -> None:
     repo.set_analytics_state(conn, ACCOUNT, repo.AnalyticsState.NEEDS_REAUTH, "re-authorise", T0)
     repo.set_analytics_state(conn, ACCOUNT, repo.AnalyticsState.OK, None, T0 + timedelta(days=1))

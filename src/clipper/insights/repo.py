@@ -30,6 +30,8 @@ VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 SHORT_MAX_S = 180.0
 """A video of this many seconds or fewer is a Short (YouTube's limit since 2024-10)."""
 SHORTS_URL = "https://www.youtube.com/shorts/"
+UNKNOWN = "unknown"
+"""The value of a format tag nobody has set yet."""
 
 
 def is_short(duration_s: float | None) -> bool | None:
@@ -187,7 +189,7 @@ def register_post_video(conn: sqlite3.Connection, video: Video, now: datetime) -
             "INSERT INTO channel_videos (video_id, account_id, post_id, title, published_at,"
             " duration_s, first_seen_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (video_id) DO UPDATE SET"
-            " post_id = excluded.post_id,"
+            " post_id = COALESCE(excluded.post_id, post_id),"
             " title = COALESCE(title, excluded.title),"
             " duration_s = COALESCE(duration_s, excluded.duration_s),"
             " updated_at = excluded.updated_at",
@@ -364,38 +366,78 @@ def set_tags(
     post_id: int | None = None,
     replace: bool = True,
 ) -> None:
-    """Store format tags of a video, of a post, or of both. A key already present keeps
-    its value unless `replace`; either way the row gains the id it was missing."""
+    """Store format tags of a video, of a post, or of both. With `replace` the value
+    passed wins; without it a key already present keeps its value. Either way the key ends
+    as one row carrying every id given: a video row and a post row for the same key are
+    merged (see `link_post_tags` for which existing value survives)."""
     if video_id is None and post_id is None:
         raise ValueError("tags need a video id or a post id")
     with transaction(conn):
         for key, value in sorted(tags.items()):
-            found = conn.execute(
-                "SELECT id FROM post_tags WHERE key = ?"
-                " AND ((? IS NOT NULL AND video_id = ?) OR (? IS NOT NULL AND post_id = ?))"
-                " ORDER BY id LIMIT 1",
-                (key, video_id, video_id, post_id, post_id),
-            ).fetchone()
-            if found is None:
-                conn.execute(
-                    "INSERT INTO post_tags (video_id, post_id, key, value) VALUES (?, ?, ?, ?)",
-                    (video_id, post_id, key, value),
-                )
-                continue
-            conn.execute(
-                "UPDATE OR IGNORE post_tags SET value = CASE WHEN ? THEN ? ELSE value END,"
-                " video_id = COALESCE(video_id, ?), post_id = COALESCE(post_id, ?) WHERE id = ?",
-                (int(replace), value, video_id, post_id, found["id"]),
-            )
+            _write_tag(conn, key, video_id, post_id, value if replace else None, value)
 
 
 def link_post_tags(conn: sqlite3.Connection, post_id: int, video_id: str) -> None:
-    """Give a post's tags its video id, once the post is uploaded."""
+    """Give a post's tags its video id, once the post is uploaded. Where the video already
+    has a tag for the same key, the two rows become one carrying both ids: a real value
+    beats `UNKNOWN`, and between two real values the video's wins (the owner tags by
+    video id)."""
     with transaction(conn):
-        conn.execute(
-            "UPDATE OR IGNORE post_tags SET video_id = ? WHERE post_id = ? AND video_id IS NULL",
-            (video_id, post_id),
-        )
+        keys = [
+            r["key"]
+            for r in conn.execute(
+                "SELECT key FROM post_tags WHERE post_id = ? AND video_id IS NULL", (post_id,)
+            ).fetchall()
+        ]
+        for key in keys:
+            _write_tag(conn, key, video_id, post_id, None, None)
+
+
+def _merged(video_value: str | None, post_value: str | None) -> str | None:
+    """The surviving value when a video row and a post row of one key merge."""
+    if video_value is None or video_value == UNKNOWN:
+        return post_value or video_value
+    return video_value
+
+
+def _write_tag(
+    conn: sqlite3.Connection,
+    key: str,
+    video_id: str | None,
+    post_id: int | None,
+    value: str | None,
+    default: str | None,
+) -> None:
+    """Make `key` one row carrying the given ids. Its value is `value` when given, else the
+    merged existing value, else `default` (a new row). Runs inside the caller's transaction:
+    the duplicate row is deleted before the kept row takes its id."""
+    rows = conn.execute(
+        "SELECT id, video_id, post_id, value FROM post_tags"
+        " WHERE key = ? AND (video_id = ? OR post_id = ?) ORDER BY id",
+        (key, video_id, post_id),
+    ).fetchall()
+    if not rows:
+        if default is not None:
+            conn.execute(
+                "INSERT INTO post_tags (video_id, post_id, key, value) VALUES (?, ?, ?, ?)",
+                (video_id, post_id, key, default),
+            )
+        return
+    by_video = next((r["value"] for r in rows if video_id and r["video_id"] == video_id), None)
+    by_post = next((r["value"] for r in rows if post_id and r["post_id"] == post_id), None)
+    keep, *duplicates = rows
+    for row in duplicates:
+        conn.execute("DELETE FROM post_tags WHERE id = ?", (row["id"],))
+    conn.execute(
+        "UPDATE post_tags SET value = ?, video_id = COALESCE(?, video_id),"
+        " post_id = COALESCE(?, post_id) WHERE id = ?",
+        (
+            value if value is not None else _merged(by_video, by_post),
+            video_id,
+            post_id,
+            keep["id"],
+        ),
+    )
 
 
 def tags_for_videos(

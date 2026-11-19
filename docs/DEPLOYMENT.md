@@ -28,7 +28,7 @@ The services share a SQLite database (WAL mode) and a media volume. All of them 
 
 `/srv/clipper/.env` exists only on the server and is never committed. It holds:
 
-- `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`
+- `YOUTUBE_API_KEY`, `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`. The insights job uses the same key for public channel and Short numbers (see [Channel insights](#channel-insights)).
 - `CLAUDE_CODE_OAUTH_TOKEN`, with `selector: claude_cli` (see [Highlight selection](#highlight-selection))
 - `ANTHROPIC_API_KEY`, only with `selector: api`; `PEXELS_API_KEY`, `PIXABAY_API_KEY`
 - `GROQ_API_KEY`, only with `transcriber: groq` (transcription runs locally by default; see [Local transcription](#local-transcription))
@@ -511,6 +511,71 @@ token and the client secret are local variables inside httpx.
 
 To revoke access, remove the app at <https://myaccount.google.com/permissions> for that
 Google account. Its account then pauses on the next post, with an alert.
+
+## Channel insights
+
+The monitor stores each YouTube commentary channel's numbers and the numbers of every
+Short on it, pipeline posts and hand uploads alike (`src/clipper/insights/`,
+[CLP-154](https://linear.app/tengdev/issue/CLP-154)). A Short is a video of 180 seconds or
+less; longer videos count as public uploads only. The review
+app shows them at `/insights/<account_id>`, and a summary goes to `DISCORD_WEBHOOK_URL`
+(else the monitor log) once a week, on the first run after Monday 09:00 in the account's
+timezone: the top 3 and bottom 3 Shorts of the last 28 days, what to do more or less of
+by tag, and the tracker. Insights never block rendering, approval or posting: a failure
+is logged and recorded in the `runs` table (component `insights`), and the next hourly
+run tries again.
+
+What it collects, per enabled `content: commentary` YouTube account:
+
+- **Public numbers** (YouTube Data API v3 with the monitor's `YOUTUBE_API_KEY`):
+  subscribers, total views, every upload of the last 90 days from the channel's uploads
+  playlist with its title, publish time and duration; per public Short, views, likes,
+  comments and whether comments are on. Every hour for the first 48 hours after a Short
+  goes public, then once a day. About 5 to 15 quota units an hour per channel, from the
+  same 10,000 a day the monitor uses.
+- **Analytics** (YouTube Analytics API v2 with the account's refresh token): once a day,
+  the channel's daily Shorts views (filter `creatorContentType==shorts`) and, per Short,
+  views, engaged views, average view duration and percentage, subscribers gained and
+  lost, likes, comments, shares, traffic sources and the retention curve. Analytics data
+  arrives 1 to 3 days late, and each figure shows the day it covers.
+- Format tags on every Short (hook type, structure, palette, length, clip share,
+  streamers, topic, publish hour). Pipeline Shorts are tagged when approved. Hand uploads
+  get length and publish hour from YouTube and `unknown` for the rest; set those with
+  `docker compose run --rm monitor insights tag <video_id> hook_type=question topic="gta vi"`.
+  Keys not given stay as they are (`unknown` at first).
+
+The tracker shows tier 1 (500 subscribers, 3 public uploads and 3M public Shorts views in
+90 days) and tier 2 (1,000 subscribers and 10M public Shorts views in 90 days), with the
+days left at the last 7 days' pace. The views figure is an estimate. YouTube Studio's
+Earn tab is the source of truth.
+
+Setup (the owner, once):
+
+1. In the Google Cloud project of [YouTube publishing](#youtube-publishing), enable the
+   **YouTube Analytics API** and add the scope `yt-analytics.readonly` (steps 1 and 2
+   there).
+2. Make sure `YOUTUBE_API_KEY` is set in `/srv/clipper/.env` (the monitor's Data API
+   key; see Secrets). No other key is needed.
+3. Re-authorise each commentary account with the three scopes (step 4 there) and replace
+   its `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>`.
+4. Restart the monitor and the worker: `docker compose up -d monitor worker`.
+5. Check it: `docker compose run --rm monitor insights collect` stores one run now and
+   prints the rows it stored; `... insights weekly` prints the weekly summary without
+   sending it.
+
+When something is missing, the job says so by name and keeps going:
+
+- No `YOUTUBE_API_KEY`: the monitor logs it by name once at start; no public numbers, and
+  hand uploads are not found (pipeline posts still get Analytics).
+- A refresh token without `yt-analytics.readonly`, or one Google refuses (revoked or
+  invalid): the page and the weekly summary say "needs re-authorisation" and name the
+  `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>` to replace; public numbers are still stored. Do
+  step 3.
+- No refresh token or no OAuth client: the page and the weekly summary say Analytics is
+  off and name the variable to set.
+
+Hand-uploaded Shorts appear from the first run. Pipeline commentary Shorts join them once
+they are posted to their account ([CLP-149](https://linear.app/tengdev/issue/CLP-149)).
 
 ## Meta publishing (Facebook Page Reels, Instagram Reels)
 

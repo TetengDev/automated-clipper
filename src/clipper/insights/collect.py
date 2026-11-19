@@ -4,7 +4,8 @@ every Short on it, pipeline posts and hand uploads alike, keyed by YouTube video
 run-monitor calls `tick()` after every poll cycle; a run happens at most once an hour, and
 `tick` never raises, so insights can never stop detection, rendering, approval or
 posting. Each run writes one `runs` row (component `insights`) with the rows stored, the
-Data API units spent and the errors (redacted).
+Data API units spent and the errors (redacted). After each run, `tick` sends any weekly
+summary that is due (`clipper.insights.weekly`) through `notify`.
 
 Per enabled YouTube commentary account:
 - Pipeline posts: each posted YouTube post is registered in `channel_videos` with its
@@ -54,6 +55,7 @@ from clipper.insights.analytics import (
 from clipper.insights.public import ChannelStats, InsightsError, Upload, VideoStats
 from clipper.insights.tags import ensure_video_tags, needs_defaults, tag_post
 from clipper.jobs.models import Clock, to_iso, utcnow
+from clipper.notify import Notify
 from clipper.posting import repo as posting_repo
 from clipper.posting.models import Post
 from clipper.redact import redact
@@ -159,20 +161,36 @@ class InsightsCollector:
     """None without YOUTUBE_API_KEY: no public numbers, and only pipeline posts and
     videos seen on earlier runs are known."""
     analytics: AnalyticsSource | None
+    notify: Notify | None = None
+    """Where the weekly summary goes (`weekly.send_weekly`); None sends none."""
     clock: Clock = utcnow
     last_run: datetime | None = None
 
     def tick(self) -> CollectReport | None:
-        """The monitor's hook: run when an hour has passed since the last run. Never raises."""
+        """The monitor's hook: run when an hour has passed since the last run, then send
+        any weekly summary that is due. Never raises."""
         now = self.clock()
         if self.last_run is not None and now - self.last_run < INTERVAL:
             return None
         self.last_run = now
         try:
-            return self.run()
+            result: CollectReport | None = self.run()
         except Exception as exc:
             logger.error("insights run failed: %s", _error_text(exc))
-            return None
+            result = None
+        self._weekly()
+        return result
+
+    def _weekly(self) -> None:
+        if self.notify is None:
+            return
+        from clipper.insights.weekly import send_weekly  # weekly imports this module
+
+        for account in self.accounts:
+            try:
+                send_weekly(self.conn, account, self.clock(), self.notify)
+            except Exception as exc:
+                logger.error("insights %s: weekly summary failed: %s", account.id, _error_text(exc))
 
     def run(self) -> CollectReport:
         now = self.clock()

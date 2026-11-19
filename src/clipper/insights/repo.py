@@ -132,7 +132,9 @@ def _source(source: str) -> str:
     return source
 
 
-def _json(raw: str | None, kind: type) -> Any:
+def loads_json(raw: str | None, kind: type) -> Any:
+    """A stored JSON column as `kind` (dict, list, ...); None when empty, invalid or of
+    another type."""
     if not raw:
         return None
     try:
@@ -274,8 +276,8 @@ def add_video_metrics(
 
 
 def _snapshot(row: sqlite3.Row) -> Snapshot:
-    traffic = _json(row["traffic"], dict)
-    retention = _json(row["retention"], list)
+    traffic = loads_json(row["traffic"], dict)
+    retention = loads_json(row["retention"], list)
     metrics = PostMetrics(
         **{name: row[name] for name in _SCALARS},
         comments_enabled=None if row["comments_enabled"] is None else bool(row["comments_enabled"]),

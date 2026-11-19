@@ -22,10 +22,12 @@ Per enabled YouTube commentary account:
 - Tags: every known Short lacking a key gets the default (length and publish hour from
   the Data API, `unknown` for the rest).
 - Analytics (the account's refresh token, scope yt-analytics.readonly): once per UTC day
-  (an error is retried after an hour). The channel's daily Shorts views give an
-  `analytics` channel row dated the last day they cover, with the 90-day sum. Each known
-  Short of the last 90 days gets an `analytics` row with its totals and, for Shorts of
-  the last 28 days, its traffic sources and retention curve. A token without the scope,
+  when the last check was ok; any other state (an error, needs_reauth, no_token) is
+  retried after an hour, so a replaced token is checked on the next hourly run. The
+  channel's daily Shorts views give an `analytics` channel row dated the last day they
+  cover, with the 90-day sum. Each known Short of the last 90 days gets an `analytics`
+  row with its totals and, for Shorts of the last 28 days, its traffic sources and
+  retention curve. A token without the scope,
   or one Google refuses (revoked or invalid), sets the account's state to needs_reauth;
   the public numbers are stored all the same.
 """
@@ -126,7 +128,7 @@ def public_due(went_public: datetime, last: datetime | None, now: datetime) -> b
 def analytics_due(state: repo.StateRow | None, now: datetime) -> bool:
     if state is None:
         return True
-    if state.state is repo.AnalyticsState.ERROR:
+    if state.state is not repo.AnalyticsState.OK:
         return now - state.checked_at >= INTERVAL - SLACK
     return state.checked_at.date() < now.date()
 

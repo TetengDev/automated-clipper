@@ -22,7 +22,12 @@ from clipper.insights.analytics import (
     ShortsDay,
     VideoTotals,
 )
-from clipper.insights.collect import InsightsAccount, InsightsCollector, insights_accounts
+from clipper.insights.collect import (
+    InsightsAccount,
+    InsightsCollector,
+    analytics_due,
+    insights_accounts,
+)
 from clipper.insights.public import ChannelStats, InsightsError, Upload, VideoStats
 from clipper.insights.tags import TAG_KEYS, owner_tags
 from insights_support import ACCOUNT, CHANNEL, HAND_UPLOADS, T0, TIMEZONE, open_db, short, upload
@@ -313,6 +318,45 @@ def test_analytics_once_a_utc_day_and_an_error_is_retried_after_an_hour(conn, cl
     clock.now += timedelta(minutes=30)
     c.run()
     assert len(analytics.accounts) == 4
+
+
+@pytest.mark.parametrize(
+    "state", [repo.AnalyticsState.NEEDS_REAUTH, repo.AnalyticsState.NO_TOKEN], ids=str
+)
+def test_analytics_off_is_retried_after_an_hour_the_same_utc_day(
+    conn, state: repo.AnalyticsState
+) -> None:
+    repo.set_analytics_state(conn, ACCOUNT, state, "replace the token", T0)
+    checked = repo.analytics_state(conn, ACCOUNT)
+
+    assert not analytics_due(checked, T0 + timedelta(minutes=30))
+    assert analytics_due(checked, T0 + timedelta(hours=1))  # 13:00 UTC, the same day
+
+
+def test_ok_analytics_wait_for_the_next_utc_day(conn) -> None:
+    repo.set_analytics_state(conn, ACCOUNT, repo.AnalyticsState.OK, None, T0)
+    checked = repo.analytics_state(conn, ACCOUNT)
+
+    assert not analytics_due(checked, T0 + timedelta(hours=11, minutes=59))
+    assert analytics_due(checked, T0 + timedelta(hours=12))  # 00:00 UTC, the next day
+
+
+def test_a_replaced_token_is_checked_on_the_next_hourly_tick(conn, clock) -> None:
+    missing = ScopeMissing(
+        "the token lacks the scope", status=403, reasons=["insufficientPermissions"]
+    )
+    reports = FakeReports(error=missing)
+    c = collector(conn, clock, None, FakeAnalytics(reports))
+
+    assert c.tick() is not None
+    state = repo.analytics_state(conn, ACCOUNT)
+    assert state is not None and state.state is repo.AnalyticsState.NEEDS_REAUTH
+
+    reports.error = None  # re-authorised: the new token has the scope
+    clock.now += timedelta(hours=1)
+    assert c.tick() is not None
+    state = repo.analytics_state(conn, ACCOUNT)
+    assert state is not None and state.state is repo.AnalyticsState.OK
 
 
 def test_one_failing_account_does_not_stop_the_others_and_errors_are_redacted(

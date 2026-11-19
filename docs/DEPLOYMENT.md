@@ -533,11 +533,13 @@ What it collects, per enabled `content: commentary` YouTube account:
   comments and whether comments are on. Every hour for the first 48 hours after a Short
   goes public, then once a day. About 5 to 15 quota units an hour per channel, from the
   same 10,000 a day the monitor uses.
-- **Analytics** (YouTube Analytics API v2 with the account's refresh token): once a day,
-  the channel's daily Shorts views (filter `creatorContentType==shorts`) and, per Short,
-  views, engaged views, average view duration and percentage, subscribers gained and
-  lost, likes, comments, shares, traffic sources and the retention curve. Analytics data
-  arrives 1 to 3 days late, and each figure shows the day it covers.
+- **Analytics** (YouTube Analytics API v2 with the account's refresh token): once a UTC
+  day while it works; when it is off (needs re-authorisation, no token, or an error) it is
+  tried again every hour. It stores the channel's daily Shorts views (filter
+  `creatorContentType==shorts`) and, per Short, views, engaged views, average view
+  duration and percentage, subscribers gained and lost, likes, comments, shares, traffic
+  sources and the retention curve. Analytics data arrives 1 to 3 days late, and each
+  figure shows the day it covers.
 - Format tags on every Short (hook type, structure, palette, length, clip share,
   streamers, topic, publish hour). Pipeline Shorts are tagged when approved. Hand uploads
   get length and publish hour from YouTube and `unknown` for the rest; set those with
@@ -561,7 +563,9 @@ Setup (the owner, once):
 4. Restart the monitor and the worker: `docker compose up -d monitor worker`.
 5. Check it: `docker compose run --rm monitor insights collect` stores one run now and
    prints the rows it stored; `... insights weekly` prints the weekly summary without
-   sending it.
+   sending it. The new token is tried on the first monitor run an hour after the last
+   Analytics check, or by `insights collect` once that hour has passed; the Analytics
+   notice on `/insights/<account_id>` goes away once it works.
 
 When something is missing, the job says so by name and keeps going:
 
@@ -570,7 +574,8 @@ When something is missing, the job says so by name and keeps going:
 - A refresh token without `yt-analytics.readonly`, or one Google refuses (revoked or
   invalid): the page and the weekly summary say "needs re-authorisation" and name the
   `CLIPPER_REFRESH_TOKEN_<ACCOUNT_ID>` to replace; public numbers are still stored. Do
-  step 3.
+  step 3; the new token is tried on the next hourly run (or by `insights collect` about
+  an hour after the last check).
 - No refresh token or no OAuth client: the page and the weekly summary say Analytics is
   off and name the variable to set.
 

@@ -166,13 +166,30 @@ def test_the_page_says_which_metrics_need_reauthorisation(client: TestClient, en
 
 
 def test_the_page_says_when_no_refresh_token_is_set(client: TestClient, env: Env) -> None:
-    repo.set_analytics_state(env.conn, ACCOUNT, repo.AnalyticsState.NO_TOKEN, "not set", T0)
+    detail = "no refresh token (set CLIPPER_REFRESH_TOKEN_RANDOM_GAMING_YT)"
+    repo.set_analytics_state(env.conn, ACCOUNT, repo.AnalyticsState.NO_TOKEN, detail, T0)
 
     html = client.get(f"/insights/{ACCOUNT}").text
 
     assert 'id="no-token"' in html and 'id="reauth"' not in html
     assert "CLIPPER_REFRESH_TOKEN_RANDOM_GAMING_YT" in html
     assert "engaged views" in html and "retention" in html
+
+
+def test_the_no_token_notice_names_the_missing_oauth_client_variable(
+    client: TestClient, env: Env
+) -> None:
+    detail = (
+        "the OAuth client is not configured (set YOUTUBE_OAUTH_CLIENT_ID and"
+        " YOUTUBE_OAUTH_CLIENT_SECRET)"
+    )
+    repo.set_analytics_state(env.conn, ACCOUNT, repo.AnalyticsState.NO_TOKEN, detail, T0)
+
+    html = client.get(f"/insights/{ACCOUNT}").text
+
+    notice = html.split('id="no-token"', 1)[1].split("</p>", 1)[0]
+    assert "YOUTUBE_OAUTH_CLIENT_ID" in notice and "YOUTUBE_OAUTH_CLIENT_SECRET" in notice
+    assert "CLIPPER_REFRESH_TOKEN_RANDOM_GAMING_YT" not in notice  # it may well be set
 
 
 def test_an_empty_channel_renders(client: TestClient) -> None:

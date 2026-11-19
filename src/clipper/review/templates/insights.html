@@ -16,8 +16,9 @@ token lacks the <code>yt-analytics.readonly</code> scope, or Google refused it (
 invalid). Until it is re-authorised and <code>{{ token_var }}</code> is replaced
 (docs/DEPLOYMENT.md, Channel insights), these show no data: {{ analytics_only | join(", ") }}.</p>
 {% elif state and state.state == states.NO_TOKEN %}
-<p class="sensitive-note" id="no-token">Analytics is off: <code>{{ token_var }}</code> is not
-set. Until it is (docs/DEPLOYMENT.md, Channel insights), these show no data:
+<p class="sensitive-note" id="no-token">Analytics is off:
+{% if state.detail %}{{ state.detail }}{% else %}<code>{{ token_var }}</code> is not set{% endif %}.
+Until then (docs/DEPLOYMENT.md, Channel insights), these show no data:
 {{ analytics_only | join(", ") }}.</p>
 {% elif state and state.state != states.OK %}
 <p class="sensitive-note" id="analytics-off">Analytics is off ({{ state.state }}):

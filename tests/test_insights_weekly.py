@@ -13,7 +13,7 @@ import pytest
 
 from clipper.insights import repo
 from clipper.insights.collect import InsightsAccount, InsightsCollector
-from clipper.insights.repo import PUBLIC, ChannelMetrics
+from clipper.insights.repo import ANALYTICS, PUBLIC, ChannelMetrics
 from clipper.insights.report import FINDINGS_MIN_AGE_DAYS
 from clipper.insights.weekly import build_summary, send_weekly, summary_due, week_start
 from clipper.notify import NotifyError
@@ -81,6 +81,26 @@ def test_the_summary_names_top_bottom_tags_and_tracker(conn: sqlite3.Connection)
     assert "needs re-authorisation" in text and TOKEN_VAR in text
     assert f"Details: /insights/{ACCOUNT}" in text
     assert len(text) <= 2000
+
+
+def test_the_tracker_line_counts_shorts_published_after_the_latest_analytics_day(
+    conn: sqlite3.Connection,
+) -> None:
+    """The live run of 2026-11-19: Analytics covered a day before the three Shorts went
+    public and said 0; the public figure counts them."""
+    today = date(2027, 1, 15)  # T0 in New York
+    for row in (
+        ChannelMetrics(
+            ACCOUNT, today, PUBLIC, subscribers=2, shorts_views_90d=483, public_uploads_90d=3
+        ),
+        ChannelMetrics(ACCOUNT, today - timedelta(days=3), ANALYTICS, shorts_views_90d=0),
+    ):
+        repo.upsert_channel_metrics(conn, row, T0)
+
+    text = build_summary(conn, ACC, T0)
+
+    assert "Public Shorts views, last 90 days (estimate) 483/3,000,000" in text
+    assert "(estimate) 0/" not in text
 
 
 def test_fresh_shorts_are_listed_but_make_no_findings(conn: sqlite3.Connection) -> None:

@@ -68,24 +68,72 @@ def test_shorts_views_come_from_analytics_when_there_are_any(conn) -> None:
 
     views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
 
-    assert (views.value, views.as_of, views.days_to_go) == (1_240_000, date(2027, 1, 13), 88)
+    assert (views.value, views.as_of, views.days_to_go) == (1_240_000, TODAY, 88)
+    assert views.source == ANALYTICS
+
+
+def live_rows(conn) -> None:
+    """The live run of 2026-11-19, moved to TODAY: three Shorts went public today, and
+    the latest Analytics row covers a day 3 days before, before any of them."""
+    channel(conn, TODAY, subscribers=2, shorts_views_90d=483, public_uploads_90d=3)
+    channel(conn, TODAY - timedelta(days=3), ANALYTICS, shorts_views_90d=0)
+
+
+def older_channel_rows(conn) -> None:
+    """Analytics counts more than the public lower bound (older Shorts, deleted ones)."""
+    channel(conn, TODAY, shorts_views_90d=100)
+    channel(conn, TODAY - timedelta(days=2), ANALYTICS, shorts_views_90d=900)
 
 
 @pytest.mark.parametrize(
-    ("lag", "expected"),
-    [(3, (1_240_000, TODAY - timedelta(days=3))), (4, (1_000_000, TODAY))],
+    ("rows", "expected"),
+    [(live_rows, (483, PUBLIC)), (older_channel_rows, (900, ANALYTICS))],
 )
-def test_analytics_views_more_than_3_days_behind_public_give_way_to_public(
-    conn, lag: int, expected: tuple[int, date]
+def test_shorts_views_are_the_larger_of_public_and_the_latest_analytics(
+    conn, rows, expected: tuple[int, str]
 ) -> None:
-    """A revoked token stops Analytics; the tracker must not freeze on its last rows."""
-    seed_week(conn)
-    channel(conn, TODAY - timedelta(days=lag + 7), ANALYTICS, shorts_views_90d=1_100_000)
-    channel(conn, TODAY - timedelta(days=lag), ANALYTICS, shorts_views_90d=1_240_000)
+    """Both are lower bounds: Analytics is exact but lags, so it misses new uploads."""
+    rows(conn)
 
     views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
 
-    assert (views.value, views.as_of) == expected
+    assert views.value == expected[0]
+    assert (views.source, views.as_of) == (expected[1], TODAY)
+
+
+@pytest.mark.parametrize("rows", [live_rows, older_channel_rows])
+def test_trend_shows_the_same_shorts_views_and_source_as_the_tracker(conn, rows) -> None:
+    rows(conn)
+
+    views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
+    last = report.trend(conn, ACCOUNT, TODAY)[-1]
+
+    assert last.day == TODAY
+    assert (last.shorts_views_90d, last.shorts_views_source) == (views.value, views.source)
+
+
+def test_a_stopped_analytics_feed_still_counts_while_it_is_larger(conn) -> None:
+    """Analytics rows 4 days behind the public rows are no longer dropped (the old rule):
+    the latest one is carried forward and the larger figure wins on each day."""
+    seed_week(conn)
+    channel(conn, TODAY - timedelta(days=11), ANALYTICS, shorts_views_90d=1_100_000)
+    channel(conn, TODAY - timedelta(days=4), ANALYTICS, shorts_views_90d=1_240_000)
+
+    views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
+
+    assert (views.value, views.as_of, views.source) == (1_240_000, TODAY, ANALYTICS)
+
+
+def test_analytics_days_before_any_public_row_keep_the_analytics_value(conn) -> None:
+    channel(conn, TODAY - timedelta(days=3), ANALYTICS, shorts_views_90d=50)
+    channel(conn, TODAY, shorts_views_90d=20)
+
+    days = report.trend(conn, ACCOUNT, TODAY)
+
+    assert [(d.day, d.shorts_views_90d, d.shorts_views_source) for d in days] == [
+        (TODAY - timedelta(days=3), 50, ANALYTICS),
+        (TODAY, 50, ANALYTICS),
+    ]
 
 
 def test_falling_subscribers_have_no_days_to_go(conn) -> None:

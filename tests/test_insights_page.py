@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -46,7 +47,9 @@ def client(env: Env) -> TestClient:
     return c
 
 
-def seed(env: Env) -> None:
+def seed(env: Env) -> str:
+    """Two weeks of channel numbers and three settled Shorts; returns the pipeline
+    Short's video id."""
     for day, subs, views in ((TODAY - timedelta(days=7), 300, 860_000), (TODAY, 370, 1_000_000)):
         repo.upsert_channel_metrics(
             env.conn,
@@ -71,10 +74,18 @@ def seed(env: Env) -> None:
         video = upload(env.conn, vid, title=title, published_at=SETTLED, post_id=post_id)
         repo.add_video_metrics(env.conn, video, PUBLIC, repo.PostMetrics(views=n), T0)
         repo.set_tags(env.conn, {"hook_type": hook}, video_id=vid)
+    return post.external_id or ""
 
 
 def tags_section(html: str) -> str:
     return html.split("<h2>By tag</h2>", 1)[1]
+
+
+def shorts_cells(html: str, title: str) -> list[str]:
+    """The cell texts of the Shorts table row whose link text is `title`."""
+    table = html.split('id="shorts"', 1)[1].split("</table>", 1)[0]
+    row = next(r for r in table.split("<tr>") if f">{title}</a>" in r)
+    return [re.sub(r"<[^>]+>", "", cell).strip() for cell in re.findall(r"<td>(.*?)</td>", row)]
 
 
 def test_the_page_shows_the_tracker_trend_shorts_and_tags(client: TestClient, env: Env) -> None:
@@ -97,12 +108,35 @@ def test_the_page_shows_the_tracker_trend_shorts_and_tags(client: TestClient, en
 
 
 def test_every_short_links_to_youtube_by_video_id(client: TestClient, env: Env) -> None:
+    pipeline_vid = seed(env)
+
+    html = client.get(f"/insights/{ACCOUNT}").text
+
+    for vid in (*HAND_UPLOADS[:2], pipeline_vid):
+        assert f'href="https://www.youtube.com/shorts/{vid}"' in html
+
+
+def test_a_short_with_public_numbers_only_shows_no_analytics(client: TestClient, env: Env) -> None:
     seed(env)
 
     html = client.get(f"/insights/{ACCOUNT}").text
 
-    for vid in (*HAND_UPLOADS[:2], "vid"):
-        assert f'href="https://www.youtube.com/shorts/{vid}' in html
+    cells = shorts_cells(html, "Mid")
+    assert cells[3] == "200"  # views
+    # engaged views, avg % viewed, subs gained, shares, traffic, comments, analytics through
+    assert cells[5:] == ["—"] * 7
+
+
+def test_youtube_titles_are_escaped(client: TestClient, env: Env) -> None:
+    video = upload(
+        env.conn, HAND_UPLOADS[0], title="<script>alert(1)</script> & co", published_at=SETTLED
+    )
+    repo.add_video_metrics(env.conn, video, PUBLIC, repo.PostMetrics(views=10), T0)
+
+    html = client.get(f"/insights/{ACCOUNT}").text
+
+    assert "&lt;script&gt;alert(1)&lt;/script&gt; &amp; co" in html
+    assert "<script>alert(1)" not in html
 
 
 def test_fresh_shorts_are_in_the_table_but_not_the_tags(client: TestClient, env: Env) -> None:

@@ -405,11 +405,13 @@ def _schedule_posts(request: Request, conn: sqlite3.Connection, clip: clips.Clip
 
 
 def _tag_posts(request: Request, conn: sqlite3.Connection, posts: list[Post]) -> None:
-    """Format tags for the insights page (CLP-154), stored by post id until the post has a
-    video id. A failure is logged and never fails the approval; the insights job fills in
-    tags a post is missing."""
+    """Format tags for the insights page (CLP-154), YouTube posts only, stored by post id
+    until the post has a video id. A failure is logged and never fails the approval; the
+    insights job fills in tags a post is missing."""
     accounts = request.app.state.accounts
     for post in posts:
+        if post.platform != "youtube":
+            continue  # insights cover YouTube channels only
         try:
             zone = next((a.timezone for a in accounts if a.id == post.account_id), "UTC")
             tag_post(conn, post, zone)

@@ -219,27 +219,29 @@ def video_clip(env: Env) -> int:
     return env.clip(job, video_path=rel)  # 125-155 s: 30 s
 
 
-def test_approval_writes_format_tags_for_each_new_post(env: Env) -> None:
+def test_approval_writes_format_tags_for_the_youtube_post_only(env: Env) -> None:
     client = logged_in(env)
     clip_id = video_clip(env)
 
     assert approve(client, clip_id).status_code == 200
 
-    posts = posting_repo.list_posts(env.conn, clip_id=clip_id)
-    assert len(posts) == 2
-    for post in posts:
-        found = repo.tags_for_post(env.conn, post.id)
-        assert set(found) == set(TAG_KEYS)
-        assert found["length_bucket"] == "20-40s"
-        assert found["streamers"] == "mrbeast"  # one spelling per creator
-        assert found["clip_share"] == "90-100%"
+    posts = {p.platform: p for p in posting_repo.list_posts(env.conn, clip_id=clip_id)}
+    assert set(posts) == {"tiktok", "youtube"}
+    found = repo.tags_for_post(env.conn, posts["youtube"].id)
+    assert set(found) == set(TAG_KEYS)
+    assert found["length_bucket"] == "20-40s"
+    assert found["streamers"] == "mrbeast"  # one spelling per creator
+    assert found["clip_share"] == "90-100%"
+    assert repo.tags_for_post(env.conn, posts["tiktok"].id) == {}  # insights are YouTube only
 
 
 def test_a_derived_streamer_and_an_owner_set_streamer_are_one_spelling(env: Env) -> None:
     client = logged_in(env)
     clip_id = video_clip(env)
     assert approve(client, clip_id).status_code == 200
-    post = posting_repo.list_posts(env.conn, clip_id=clip_id)[0]
+    (post,) = [
+        p for p in posting_repo.list_posts(env.conn, clip_id=clip_id) if p.platform == "youtube"
+    ]
 
     derived = repo.tags_for_post(env.conn, post.id)["streamers"]
     owned = owner_tags(env.conn, HAND_UPLOADS[0], parse_pairs(["streamers=MrBeast"]))

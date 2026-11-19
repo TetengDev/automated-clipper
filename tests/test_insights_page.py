@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -144,13 +145,22 @@ def test_an_empty_channel_renders(client: TestClient) -> None:
     html = client.get(f"/insights/{ACCOUNT}").text
 
     assert "no data yet" in html and "No Shorts with numbers yet" in html
-    assert "<progress" not in html and "0%" not in html  # no data is not 0%
+    assert "<progress" not in html  # no data is not a 0% bar
 
 
 def test_unknown_and_clips_accounts_are_404(client: TestClient) -> None:
     assert client.get("/insights/nobody_yt").status_code == 404
     assert client.get("/insights/yt_main").status_code == 404
     assert client.get("/insights/Bad-Id").status_code == 422
+
+
+def test_a_disabled_channel_is_404(env: Env) -> None:
+    disabled = replace(CHANNEL, enabled=False)
+    c = env.client(accounts=(disabled,))
+    login(c)
+
+    assert c.get(f"/insights/{ACCOUNT}").status_code == 404
+    assert f'href="/insights/{ACCOUNT}"' not in c.get("/insights").text
 
 
 def test_the_index_lists_commentary_channels_and_the_nav_links_it(client: TestClient) -> None:

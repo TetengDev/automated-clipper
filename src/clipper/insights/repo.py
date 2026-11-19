@@ -62,7 +62,8 @@ class Video:
 class AnalyticsState(StrEnum):
     OK = "ok"
     NEEDS_REAUTH = "needs_reauth"
-    """The refresh token lacks yt-analytics.readonly: re-authorise the account."""
+    """The refresh token lacks yt-analytics.readonly or Google refuses it (revoked or
+    invalid): re-authorise the account."""
     NO_TOKEN = "no_token"  # noqa: S105 - a state label, not a secret
     ERROR = "error"
 

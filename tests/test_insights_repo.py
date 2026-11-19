@@ -203,6 +203,15 @@ def test_video_tags_replace_or_only_fill_in(conn: sqlite3.Connection) -> None:
         repo.set_tags(conn, {"topic": "x"})
 
 
+def test_a_fill_in_replaces_unknown_but_never_a_real_value(conn: sqlite3.Connection) -> None:
+    vid = HAND_UPLOADS[1]
+    repo.set_tags(conn, {"hook_type": "unknown", "palette": "neon"}, video_id=vid)
+
+    repo.set_tags(conn, {"hook_type": "question", "palette": "pastel"}, video_id=vid, replace=False)
+
+    assert repo.tags_for_videos(conn, [vid]) == {vid: {"hook_type": "question", "palette": "neon"}}
+
+
 def _tag_rows(conn: sqlite3.Connection) -> list[tuple[str | None, int | None, str, str]]:
     return [
         tuple(r)

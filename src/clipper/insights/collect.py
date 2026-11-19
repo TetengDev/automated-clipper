@@ -24,8 +24,9 @@ Per enabled YouTube commentary account:
   (an error is retried after an hour). The channel's daily Shorts views give an
   `analytics` channel row dated the last day they cover, with the 90-day sum. Each known
   Short of the last 90 days gets an `analytics` row with its totals and, for Shorts of
-  the last 28 days, its traffic sources and retention curve. A token without the scope
-  sets the account's state to needs_reauth; the public numbers are stored all the same.
+  the last 28 days, its traffic sources and retention curve. A token without the scope,
+  or one Google refuses (revoked or invalid), sets the account's state to needs_reauth;
+  the public numbers are stored all the same.
 """
 
 from __future__ import annotations
@@ -43,7 +44,13 @@ from zoneinfo import ZoneInfo
 from clipper.accounts import Account, token_env_name
 from clipper.db import transaction
 from clipper.insights import repo
-from clipper.insights.analytics import NoCredentials, ScopeMissing, ShortsDay, VideoTotals
+from clipper.insights.analytics import (
+    CredentialsRejected,
+    NoCredentials,
+    ScopeMissing,
+    ShortsDay,
+    VideoTotals,
+)
 from clipper.insights.public import ChannelStats, InsightsError, Upload, VideoStats
 from clipper.insights.tags import TAG_KEYS, ensure_video_tags, tag_post
 from clipper.jobs.models import Clock, to_iso, utcnow
@@ -356,6 +363,14 @@ class InsightsCollector:
                 self.conn, account.id, repo.AnalyticsState.NEEDS_REAUTH, detail, now
             )
             return
+        except CredentialsRejected as exc:
+            name = token_env_name(account.id, "refresh_token")
+            detail = f"{redact(str(exc))}; replace {name}"
+            logger.warning("insights %s: analytics off until re-authorised: %s", account.id, detail)
+            repo.set_analytics_state(
+                self.conn, account.id, repo.AnalyticsState.NEEDS_REAUTH, detail, now
+            )
+            return
         except NoCredentials as exc:
             detail = redact(str(exc))
             logger.warning("insights %s: analytics off: %s", account.id, detail)
@@ -405,13 +420,14 @@ class InsightsCollector:
             found = totals.get(video.video_id)
             if found is None:
                 continue  # no Analytics rows yet
-            # A token without the scope stops the account's Analytics, not just this video.
+            # A token refused or without the scope stops the account's Analytics, not just
+            # this video.
             with self._contained(
                 report,
                 account,
                 "analytics",
                 video.video_id,
-                passthrough=(ScopeMissing, NoCredentials),
+                passthrough=(ScopeMissing, CredentialsRejected, NoCredentials),
             ):
                 self._video_report(video, found, reports, now, through)
                 report.post_rows += 1

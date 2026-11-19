@@ -15,7 +15,13 @@ import pytest
 
 from clipper.accounts import Account
 from clipper.insights import repo
-from clipper.insights.analytics import NoCredentials, ScopeMissing, ShortsDay, VideoTotals
+from clipper.insights.analytics import (
+    CredentialsRejected,
+    NoCredentials,
+    ScopeMissing,
+    ShortsDay,
+    VideoTotals,
+)
 from clipper.insights.collect import InsightsAccount, InsightsCollector, insights_accounts
 from clipper.insights.public import ChannelStats, InsightsError, Upload, VideoStats
 from clipper.insights.tags import TAG_KEYS, owner_tags
@@ -503,3 +509,32 @@ def test_without_credentials_analytics_are_off_and_public_numbers_stay(conn, clo
     state = repo.analytics_state(conn, ACCOUNT)
     assert state is not None and state.state is repo.AnalyticsState.NO_TOKEN
     assert state.detail == "CLIPPER_REFRESH_TOKEN_RANDOM_GAMING_YT is not set"
+
+
+def test_a_revoked_token_flags_reauth_and_public_numbers_stay(conn, clock) -> None:
+    public = FakePublic()
+    public.add(HAND_UPLOADS[0], 500, T0 - timedelta(days=3))
+    revoked = CredentialsRejected(
+        "Google rejected the OAuth credentials (invalid_grant); re-authorise the account"
+    )
+
+    report = collector(conn, clock, public, FakeAnalytics(error=revoked)).run()
+
+    assert report.errors == [] and public_rows(conn, HAND_UPLOADS[0]) == 1
+    state = repo.analytics_state(conn, ACCOUNT)
+    assert state is not None and state.state is repo.AnalyticsState.NEEDS_REAUTH
+    assert "CLIPPER_REFRESH_TOKEN_RANDOM_GAMING_YT" in (state.detail or "")
+    assert "invalid_grant" in (state.detail or "")
+
+
+def test_a_revoked_token_on_a_video_report_flags_reauth(conn, clock) -> None:
+    upload(conn, HAND_UPLOADS[0], published_at=T0 - timedelta(days=2))
+    totals = {HAND_UPLOADS[0]: VideoTotals(900, 700, 30.0, 70.0, 3, 0, 50, 4, 2)}
+    revoked = CredentialsRejected("Google rejected the OAuth credentials (invalid_grant)")
+    reports = FlakyReports(HAND_UPLOADS[0], revoked, totals=totals)
+
+    report = collector(conn, clock, None, FakeAnalytics(reports)).run()
+
+    assert report.errors == []
+    state = repo.analytics_state(conn, ACCOUNT)
+    assert state is not None and state.state is repo.AnalyticsState.NEEDS_REAUTH

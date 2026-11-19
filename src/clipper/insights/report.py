@@ -6,7 +6,9 @@ Tracker. Tier 1 (fan funding): 500 subscribers, 3 public uploads in the last 90 
 3,000,000 public Shorts views in the last 90 days. Tier 2 (ad revenue): 1,000 subscribers
 and 10,000,000 public Shorts views in the last 90 days. The views figure is an estimate:
 Analytics `views` with `creatorContentType==shorts` when there are any, else the public
-lower bound. YouTube Studio's Earn tab is the source of truth. Days to go divide the gap
+lower bound. Analytics rows count only while they are at most 3 days behind the public
+rows: a revoked token stops them, and the tracker then follows the public numbers.
+YouTube Studio's Earn tab is the source of truth. Days to go divide the gap
 by the pace of the last 7 days: (latest value - value at least 7 days earlier) / days
 between them. Without 7 days of data, or with no progress, there is no estimate.
 """
@@ -29,6 +31,10 @@ PACE_DAYS = 7
 TREND_DAYS = 28
 TABLE_DAYS = 28
 MIN_TAG_SHORTS = 2
+ANALYTICS_MAX_LAG_DAYS = 3
+"""Analytics Shorts views older than this behind the latest public row are stale."""
+FINDINGS_MIN_AGE_DAYS = 3
+"""Shorts younger than this are still gaining views: left out of the tag breakdown."""
 VIEWS_LABEL = "Public Shorts views, last 90 days (estimate)"
 ANALYTICS_ONLY = (
     "engaged views",
@@ -147,19 +153,25 @@ def _series(
     conn: sqlite3.Connection, account_id: str, key: str, today: date
 ) -> list[tuple[date, int]]:
     since = today - timedelta(days=TREND_DAYS + PACE_DAYS)
-    if key == "shorts_views_90d":
-        analytics = [
+    analytics = (
+        [
             (r.day, r.shorts_views_90d)
             for r in repo.channel_history(conn, account_id, repo.ANALYTICS, since)
             if r.shorts_views_90d is not None
         ]
-        if analytics:
-            return analytics
-    return [
+        if key == "shorts_views_90d"
+        else []
+    )
+    public = [
         (r.day, value)
         for r in repo.channel_history(conn, account_id, repo.PUBLIC, since)
         if (value := getattr(r, key)) is not None
     ]
+    if key == "shorts_views_90d" and analytics:
+        lag = (public[-1][0] - analytics[-1][0]).days if public else 0
+        if lag <= ANALYTICS_MAX_LAG_DAYS:
+            return analytics
+    return public
 
 
 def goal_progress(
@@ -287,9 +299,14 @@ def shorts_table(
                 tags=tags.get(video.video_id, {}),
             )
         )
+    return sorted(_with_ratios(rows), key=lambda r: (r.published, r.video_id), reverse=True)
+
+
+def _with_ratios(rows: Sequence[ShortRow]) -> list[ShortRow]:
+    """The rows with each one's views over the median views of `rows`; None without
+    views or when the median is 0 or unknown."""
     mid = median(r.views for r in rows if r.views is not None)
-    rows = [replace(r, ratio=r.views / mid if mid and r.views is not None else None) for r in rows]
-    return sorted(rows, key=lambda r: (r.published, r.video_id), reverse=True)
+    return [replace(r, ratio=r.views / mid if mid and r.views is not None else None) for r in rows]
 
 
 @dataclass(frozen=True)
@@ -300,9 +317,13 @@ class TagGroup:
     median_ratio: float | None
 
 
-def tag_breakdown(rows: Sequence[ShortRow]) -> dict[str, list[TagGroup]]:
+def tag_breakdown(rows: Sequence[ShortRow], today: date) -> dict[str, list[TagGroup]]:
     """Per tag key, each value's Short count and median ratio to the channel median, best
-    first."""
+    first. Only settled Shorts count: those published FINDINGS_MIN_AGE_DAYS or more days
+    before `today`. Their ratios are taken against the median of the settled Shorts, so
+    fresh Shorts with few views yet neither join a group nor pull the median down."""
+    cutoff = today - timedelta(days=FINDINGS_MIN_AGE_DAYS)
+    rows = _with_ratios([r for r in rows if r.published.date() <= cutoff])
     found: dict[str, list[TagGroup]] = {}
     for key in TAG_KEYS:
         counts: Counter[str] = Counter()

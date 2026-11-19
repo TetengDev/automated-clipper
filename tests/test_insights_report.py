@@ -71,6 +71,32 @@ def test_shorts_views_come_from_analytics_when_there_are_any(conn) -> None:
     assert (views.value, views.as_of, views.days_to_go) == (1_240_000, date(2027, 1, 13), 88)
 
 
+@pytest.mark.parametrize(
+    ("lag", "expected"),
+    [(3, (1_240_000, TODAY - timedelta(days=3))), (4, (1_000_000, TODAY))],
+)
+def test_analytics_views_more_than_3_days_behind_public_give_way_to_public(
+    conn, lag: int, expected: tuple[int, date]
+) -> None:
+    """A revoked token stops Analytics; the tracker must not freeze on its last rows."""
+    seed_week(conn)
+    channel(conn, TODAY - timedelta(days=lag + 7), ANALYTICS, shorts_views_90d=1_100_000)
+    channel(conn, TODAY - timedelta(days=lag), ANALYTICS, shorts_views_90d=1_240_000)
+
+    views = report.tracker(conn, ACCOUNT, TODAY)[0].goals[2]
+
+    assert (views.value, views.as_of) == expected
+
+
+def test_falling_subscribers_have_no_days_to_go(conn) -> None:
+    channel(conn, TODAY - timedelta(days=7), subscribers=300)
+    channel(conn, TODAY, subscribers=290)
+
+    subs = report.tracker(conn, ACCOUNT, TODAY)[0].goals[0]
+
+    assert subs.days_to_go is None and subs.outlook == "no progress in the last 7 days"
+
+
 def test_flat_or_short_history_has_no_days_to_go(conn) -> None:
     channel(conn, TODAY - timedelta(days=7), subscribers=300)
     channel(conn, TODAY, subscribers=300)
@@ -161,15 +187,48 @@ def test_a_short_without_public_numbers_shows_its_analytics_views(conn) -> None:
     assert row.views == 77 and row.ratio == 1.0 and row.title == "Hand upload"
 
 
-def test_tag_breakdown_and_findings(conn) -> None:
-    hooks = {"A": ("question", 400), "B": ("question", 200), "C": ("list", 100), "D": ("list", 100)}
-    for i, (title, (hook, n)) in enumerate(hooks.items()):
-        video = upload(conn, f"video{i:06d}", title=title, published_at=T0 - timedelta(days=1))
-        views(conn, video, n)
-        repo.set_tags(conn, {"hook_type": hook, "palette": "unknown"}, video_id=video.video_id)
+def test_a_channel_median_of_zero_gives_no_ratios(conn) -> None:
+    for i in range(2):
+        views(conn, upload(conn, HAND_UPLOADS[i], published_at=T0 - timedelta(days=i + 1)), 0)
 
     rows = report.shorts_table(conn, ACCOUNT, T0)
-    breakdown = report.tag_breakdown(rows)
+
+    assert [(r.views, r.ratio) for r in rows] == [(0, None), (0, None)]
+
+
+def test_a_short_without_metrics_has_no_views_and_no_ratio(conn) -> None:
+    upload(conn, HAND_UPLOADS[0], title="New", published_at=T0 - timedelta(hours=1))
+    views(
+        conn, upload(conn, HAND_UPLOADS[1], title="Old", published_at=T0 - timedelta(days=2)), 100
+    )
+
+    new, old = report.shorts_table(conn, ACCOUNT, T0)
+
+    assert (new.views, new.ratio, new.engaged_views, new.traffic_mix) == (None, None, None, [])
+    assert new.through_date is None and old.ratio == 1.0
+
+
+def tag_shorts(conn, shorts: dict[str, tuple[str, str, int, int]]) -> None:
+    """Title -> (hook_type, palette, views, days since published)."""
+    for i, (title, (hook, palette, n, age)) in enumerate(shorts.items()):
+        video = upload(conn, f"video{i:06d}", title=title, published_at=T0 - timedelta(days=age))
+        views(conn, video, n)
+        repo.set_tags(conn, {"hook_type": hook, "palette": palette}, video_id=video.video_id)
+
+
+def test_tag_breakdown_and_findings(conn) -> None:
+    tag_shorts(
+        conn,
+        {
+            "A": ("question", "unknown", 400, 5),
+            "B": ("question", "unknown", 200, 5),
+            "C": ("list", "neon", 100, 5),
+            "D": ("list", "neon", 100, 3),
+        },
+    )
+
+    rows = report.shorts_table(conn, ACCOUNT, T0)
+    breakdown = report.tag_breakdown(rows, TODAY)
     more, less = report.findings(breakdown)
 
     question, listing = breakdown["hook_type"]
@@ -178,4 +237,32 @@ def test_tag_breakdown_and_findings(conn) -> None:
     assert listing.median_ratio == pytest.approx(100 / 150)
     assert [(g.key, g.value) for g in more] == [("hook_type", "question")]
     assert [(g.key, g.value) for g in less] == [("hook_type", "list")]
-    assert "palette" in breakdown  # shown on the page, but 'unknown' never becomes a finding
+    # palette has two values of 2 Shorts each: 'unknown' high, 'neon' low. Shown on the
+    # page, but 'unknown' never becomes a finding, so palette has no finding at all.
+    assert [g.value for g in breakdown["palette"]] == ["unknown", "neon"]
+    assert all(g.value != "unknown" for g in more + less)
+
+
+def test_findings_leave_out_shorts_younger_than_3_days(conn) -> None:
+    tag_shorts(
+        conn,
+        {
+            "A": ("question", "neon", 400, 5),
+            "B": ("question", "neon", 200, 5),
+            "C": ("list", "neon", 100, 5),
+            "D": ("list", "neon", 100, 5),
+            "Fresh 1": ("list", "neon", 10_000, 2),
+            "Fresh 2": ("list", "neon", 10_000, 0),
+        },
+    )
+
+    rows = report.shorts_table(conn, ACCOUNT, T0)
+    breakdown = report.tag_breakdown(rows, TODAY)
+    more, less = report.findings(breakdown)
+
+    assert {"Fresh 1", "Fresh 2"} <= {r.title for r in rows}  # still in the Shorts table
+    question, listing = breakdown["hook_type"]
+    assert (listing.value, listing.shorts) == ("list", 2)
+    assert listing.median_ratio == pytest.approx(100 / 150)  # ratio to the settled median
+    assert [(g.key, g.value) for g in more] == [("hook_type", "question")]
+    assert [(g.key, g.value) for g in less] == [("hook_type", "list")]

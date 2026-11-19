@@ -108,7 +108,7 @@ logger = logging.getLogger(__name__)
 RefreshTokenSource = Callable[[str], SecretStr | None]
 
 
-def _account_refresh_token(account_id: str) -> SecretStr | None:
+def account_refresh_token(account_id: str) -> SecretStr | None:
     return account_tokens(account_id).refresh_token
 
 
@@ -350,7 +350,7 @@ class YouTubePublisher:
         *,
         account_ids: Sequence[str],
         client: OAuthClient,
-        refresh_token: RefreshTokenSource = _account_refresh_token,
+        refresh_token: RefreshTokenSource = account_refresh_token,
         http: httpx.Client | None = None,
         clock: Clock = utcnow,
         sleep: Callable[[float], None] = time.sleep,

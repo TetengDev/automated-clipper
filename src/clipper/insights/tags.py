@@ -75,18 +75,13 @@ def clean_value(value: str) -> str:
 def derive_tags(conn: sqlite3.Connection, post: Post, timezone: str) -> dict[str, str]:
     tags = dict.fromkeys(TAG_KEYS, UNKNOWN)
     tags["publish_hour"] = publish_hour(post.scheduled_at, timezone)
-    row = conn.execute(
-        "SELECT v.start_s, v.end_s, v.duration_s, j.platform, j.creator FROM clip_versions v"
-        " JOIN clips c ON c.id = v.clip_id JOIN jobs j ON j.id = c.job_id"
-        " WHERE v.clip_id = ? AND v.version = ?",
-        (post.clip_id, post.clip_version),
-    ).fetchone()
-    if row is None:
+    clip = repo.post_clip(conn, post)
+    if clip is None:
         return tags
-    duration = row["duration_s"] or (row["end_s"] - row["start_s"])
+    duration = clip.duration_s
     tags["length_bucket"] = length_bucket(duration)
-    if row["platform"] != COMMENTARY:  # a creator's clip
-        tags["streamers"] = clean_value(row["creator"])
+    if clip.platform != COMMENTARY:  # a creator's clip
+        tags["streamers"] = clean_value(clip.creator)
         tags["clip_share"] = share_bucket(1.0)
         return tags
     story = conn.execute(
@@ -125,11 +120,12 @@ def derive_tags(conn: sqlite3.Connection, post: Post, timezone: str) -> dict[str
 
 
 def tag_post(conn: sqlite3.Connection, post: Post, timezone: str) -> dict[str, str]:
-    """Derive the post's tags and store them by post id, and by video id once the post is
-    uploaded (replacing earlier values)."""
+    """Derive the post's tags and store them by post id, replacing earlier values. Once
+    the post is uploaded they are stored by video id too and only fill keys without a
+    real value, so the owner's tags (set by video id) always win."""
     tags = derive_tags(conn, post, timezone)
     vid = post.external_id if repo.VIDEO_ID.fullmatch(post.external_id or "") else None
-    repo.set_tags(conn, tags, post_id=post.id, video_id=vid)
+    repo.set_tags(conn, tags, post_id=post.id, video_id=vid, replace=vid is None)
     return tags
 
 

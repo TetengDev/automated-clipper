@@ -129,6 +129,20 @@ def test_the_owner_can_tag_a_video_the_job_has_not_seen_yet(conn: sqlite3.Connec
     assert {tags[k] for k in TAG_KEYS if k != "palette"} == {"unknown"}
 
 
+def test_tagging_an_uploaded_post_keeps_the_owners_video_tags(conn: sqlite3.Connection) -> None:
+    vid = HAND_UPLOADS[0]
+    owner_tags(conn, vid, {"hook_type": "reaction"})  # before the job knew the post
+    post = short(conn, duration_s=42.5, video_id=vid)
+    story(conn, post, excerpts=[("ClipA", "kaicenat", 1.0, 6.0)], fmt={"hook_type": "question"})
+
+    tag_post(conn, post, "UTC")
+
+    tags = repo.tags_for_videos(conn, [vid])[vid]
+    assert tags["hook_type"] == "reaction"  # the owner's value wins
+    assert tags["length_bucket"] == "40-60s" and tags["streamers"] == "kaicenat"  # filled in
+    assert repo.tags_for_post(conn, post.id) == tags
+
+
 @pytest.mark.parametrize(
     ("args", "error"),
     [

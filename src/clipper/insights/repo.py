@@ -369,9 +369,10 @@ def set_tags(
     replace: bool = True,
 ) -> None:
     """Store format tags of a video, of a post, or of both. With `replace` the value
-    passed wins; without it a key already present keeps its value. Either way the key ends
-    as one row carrying every id given: a video row and a post row for the same key are
-    merged (see `link_post_tags` for which existing value survives)."""
+    passed wins; without it a key already present keeps its real value, and only a key
+    missing or `UNKNOWN` takes the value passed. Either way the key ends as one row
+    carrying every id given: a video row and a post row for the same key are merged (see
+    `link_post_tags` for which existing value survives)."""
     if video_id is None and post_id is None:
         raise ValueError("tags need a video id or a post id")
     with transaction(conn):
@@ -411,8 +412,9 @@ def _write_tag(
     default: str | None,
 ) -> None:
     """Make `key` one row carrying the given ids. Its value is `value` when given, else the
-    merged existing value, else `default` (a new row). Runs inside the caller's transaction:
-    the duplicate row is deleted before the kept row takes its id."""
+    merged existing value unless that is `UNKNOWN` and `default` is real, else `default`.
+    Runs inside the caller's transaction: the duplicate row is deleted before the kept row
+    takes its id."""
     rows = conn.execute(
         "SELECT id, video_id, post_id, value FROM post_tags"
         " WHERE key = ? AND (video_id = ? OR post_id = ?) ORDER BY id",
@@ -434,7 +436,7 @@ def _write_tag(
         "UPDATE post_tags SET value = ?, video_id = COALESCE(?, video_id),"
         " post_id = COALESCE(?, post_id) WHERE id = ?",
         (
-            value if value is not None else _merged(by_video, by_post),
+            value if value is not None else _merged(_merged(by_video, by_post), default),
             video_id,
             post_id,
             keep["id"],
@@ -501,6 +503,29 @@ def youtube_posts(conn: sqlite3.Connection, account_id: str) -> list[Post]:
         (account_id, str(PostStatus.POSTED)),
     )
     return [p for p in map(Post.from_row, rows) if VIDEO_ID.fullmatch(p.external_id or "")]
+
+
+@dataclass(frozen=True)
+class PostClip:
+    """The rendered clip a post publishes, and the job it came from."""
+
+    duration_s: float
+    """The rendered length: `duration_s`, else end_s - start_s."""
+    platform: str
+    creator: str
+
+
+def post_clip(conn: sqlite3.Connection, post: Post) -> PostClip | None:
+    row = conn.execute(
+        "SELECT v.start_s, v.end_s, v.duration_s, j.platform, j.creator FROM clip_versions v"
+        " JOIN clips c ON c.id = v.clip_id JOIN jobs j ON j.id = c.job_id"
+        " WHERE v.clip_id = ? AND v.version = ?",
+        (post.clip_id, post.clip_version),
+    ).fetchone()
+    if row is None:
+        return None
+    duration = row["duration_s"] or (row["end_s"] - row["start_s"])
+    return PostClip(duration, row["platform"], row["creator"])
 
 
 def went_public(post: Post) -> datetime:

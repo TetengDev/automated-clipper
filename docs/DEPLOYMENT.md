@@ -521,9 +521,9 @@ less; longer videos count as public uploads only. The review
 app shows them at `/insights/<account_id>`, and a summary goes to `DISCORD_WEBHOOK_URL`
 (else the monitor log): the first one on the first run after deploy, then on the first
 run after Monday 09:00 in the account's timezone, once a week. It lists the top 3 and bottom 3 Shorts of the last 28 days, what to do more or less of
-by tag, and the tracker. Insights never block rendering, approval or posting: a failure
-is logged and recorded in the `runs` table (component `insights`), and the next hourly
-run tries again.
+by tag, and the tracker. Insights never block rendering, approval or posting: a failed
+collect run is logged and recorded in the `runs` table (component `insights`), a failed
+weekly summary send is only logged, and the next hourly run tries again.
 
 What it collects, per enabled `content: commentary` YouTube account:
 

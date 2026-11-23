@@ -34,7 +34,7 @@ from clipper.posting.models import (
     StoredRef,
 )
 from clipper.posting.stage import STALE_UPLOAD, PostingStage, StoredRefs, allow_all
-from clipper.publish.facebook import FacebookPublisher
+from clipper.publish.facebook import SCHEDULE_MIN_AHEAD, UPLOAD_MARGIN, FacebookPublisher
 from clipper.publish.instagram import InstagramPublisher
 from clipper.publish.meta import GraphClient, MetaError
 from meta_support import (
@@ -53,6 +53,7 @@ from meta_support import (
     video,
 )
 from meta_support import make_post as meta_post
+from posting_support import write_rendered
 from review_support import Env, make_env
 
 CONTAINER = recorded("ig_container")["id"]
@@ -158,9 +159,7 @@ def stage(
 def add_post(env: Env, platform: str, account: str, at: datetime = T0) -> Post:
     job = env.job()
     rel = f"youtube_{job}/clip_1_v1.mp4"
-    target = env.media_root / rel
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"\x00" * 2048)
+    write_rendered(env.media_root / rel, content=b"\x00" * 2048)
     clip_id = env.clip(job, status="approved", video_path=rel)
     return repo.insert_post(
         env.conn,
@@ -1055,3 +1054,46 @@ def test_a_token_error_while_confirming_the_media_id_pauses_the_account(
     with pytest.raises(PublishDeferred):
         publisher.lookup("idem-0001")
     assert routes["status"].call_count == 0 and routes["recent"].call_count == 0
+
+
+def test_a_finish_time_deferral_is_not_sent_and_the_retry_uploads_fresh(
+    env: Env, mock: respx.MockRouter, http: httpx.Client, clock: Clock
+) -> None:
+    """Integration CLP-115/120 + CLP-122: the upload took so long that the slot came too
+    close to schedule natively. The deferral fires before the finish call and before the
+    ref is marked sent, so the post is deferred (no attempt, no human) and the next
+    attempt, by a new worker, uploads a new Reel instead of looking the old one up."""
+    routes = fb_routes(mock)
+    routes["reels"].side_effect = [
+        reply("fb_reels_start"),
+        reply("fb_reels_start"),
+        reply("fb_reels_finish"),
+    ]
+    slot = T0 + SCHEDULE_MIN_AHEAD + UPLOAD_MARGIN + timedelta(minutes=1)
+
+    def slow(_: httpx.Request) -> httpx.Response:
+        clock.now = slot - timedelta(minutes=5)  # the slot is now too close
+        return reply("fb_upload_ok")
+
+    routes["upload"].side_effect = [slow, reply("fb_upload_ok")]
+    post = add_post(env, "facebook", "fb_main", at=slot)
+
+    stage(env, clock, "facebook", facebook(http, clock), "w1").run_once()
+
+    deferred = current(env, post)
+    assert deferred.status == PostStatus.SCHEDULED and deferred.attempts == 0
+    assert deferred.scheduled_at == slot and deferred.slot == slot
+    assert finish_calls(routes["reels"]) == 0
+    assert stored(env, post) == {"video_id": VIDEO_ID, "finish_sent": False}
+    fresh = facebook(http, clock)
+    fresh.use_platform_refs(StoredRefs(env.conn, "w1"))
+    assert fresh.lookup(post.idempotency_key) is None  # unfinished: not sent
+
+    clock.now = slot
+    restarted(env, clock, "facebook", facebook(http, clock))
+
+    done = current(env, post)
+    assert done.status == PostStatus.POSTED
+    assert start_calls(routes["reels"]) == 2
+    assert finish_calls(routes["reels"]) == 1
+    assert routes["video"].call_count == 0

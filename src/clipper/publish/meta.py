@@ -467,30 +467,17 @@ class MetaPublisher:
         *,
         credentials: Credentials = load_credentials,
         clock: Clock = utcnow,
-        campaigns: Mapping[str, str] | None = None,
     ) -> None:
         self.client = client
         self.guard = guard
         self._credentials = credentials
         self.clock = clock
-        self.campaigns = dict(campaigns or {})
-        """Account id -> campaign. Their posts are refused (fail closed): the campaign's
-        tags and paid-partnership flag now reach the stored post metadata (CLP-97), and
-        publishing campaign posts on Meta is CLP-121."""
         self._refs: PlatformRefs | None = None
         """Where each upload's platform id is kept too (CLP-122); set by the stage."""
 
     def close(self) -> None:
         """Called by the worker on exit (CLP-93's registry contract)."""
         self.client.close()
-
-    def _refuse_campaign(self, account_id: str) -> None:
-        campaign = self.campaigns.get(account_id)
-        if campaign is not None:
-            raise PublishRejected(
-                f"{self.platform}: account {account_id} posts for campaign {campaign};"
-                " campaign posts are published by hand until CLP-121"
-            )
 
     def _deadline(self) -> datetime:
         return self.clock() + PUBLISH_DEADLINE
@@ -585,18 +572,15 @@ def meta_publishers(
     platforms = {a.platform for a in enabled} & {"facebook", "instagram"}
     if not platforms:
         return {}
-    campaigns = {a.id: a.campaign for a in enabled if a.campaign}
     owned = http is None
     client = GraphClient(httpx.Client(follow_redirects=False) if http is None else http)
     client.owned = owned
     guard = TokenGuard(client, clock=clock, alert=alert)
     publishers: dict[str, Publisher] = {}
     if "facebook" in platforms:
-        publishers["facebook"] = FacebookPublisher(client, guard, clock=clock, campaigns=campaigns)
+        publishers["facebook"] = FacebookPublisher(client, guard, clock=clock)
     if "instagram" in platforms:
-        publishers["instagram"] = InstagramPublisher(
-            client, guard, clock=clock, campaigns=campaigns
-        )
+        publishers["instagram"] = InstagramPublisher(client, guard, clock=clock)
     return publishers
 
 

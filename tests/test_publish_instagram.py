@@ -15,13 +15,14 @@ import respx
 
 from clipper.posting.models import PublishDeferred, PublishRejected, PublishResult
 from clipper.publish.instagram import InstagramPublisher
-from clipper.publish.meta import GraphClient, MetaError
+from clipper.publish.meta import GraphClient, MetaError, meta_publishers
 from meta_support import (
     IG_ID,
     IG_TOKEN,
     T0,
     Alerts,
     Clock,
+    campaign_account,
     credentials,
     graph,
     guard,
@@ -30,6 +31,7 @@ from meta_support import (
     recorded,
     reply,
     stored_metadata,
+    use_fake_credentials,
     video,
 )
 
@@ -381,22 +383,30 @@ def test_polling_stops_at_the_deadline(
     assert routes["publish"].call_count == 0
 
 
-def test_campaign_account_is_refused_until_disclosure_is_wired(
-    mock: respx.MockRouter, clock: Clock, alerts: Alerts, tmp_path: Path
+def test_campaign_account_post_is_published_with_both_flags(
+    mock: respx.MockRouter,
+    clock: Clock,
+    alerts: Alerts,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    """CLP-121: the worker's Instagram publisher (`meta_publishers`) no longer refuses a
+    campaign account; the AI and paid-partnership flags stored at scheduling are sent."""
+    use_fake_credentials(monkeypatch, tmp_path)
     routes = container_flow(mock, "finished")
     with httpx.Client() as http:
-        publisher = InstagramPublisher(
-            GraphClient(http),
-            guard(http, clock, alerts),
-            credentials=credentials(),
-            clock=clock,
-            campaigns={"ig_main": "vyro_mrbeast"},
+        publishers = meta_publishers(
+            [campaign_account("ig_main", "instagram")], http, clock=clock, alert=alerts
         )
-        with pytest.raises(PublishRejected, match="by hand until CLP-121"):
-            publisher.publish(ig_post(), video(tmp_path), metadata())
+        result = publishers["instagram"].publish(
+            ig_post(), video(tmp_path), stored_metadata("instagram", ai=True, paid=True)
+        )
 
-    assert routes["media"].call_count == 0
+    assert result == PublishResult(external_id=MEDIA, url=PERMALINK)
+    sent = form(routes["media"].calls.last.request)
+    assert sent["is_ai_generated"] == "true"
+    assert sent["is_paid_partnership"] == "true"
+    assert routes["publish"].call_count == 1
 
 
 def test_lookup_of_a_published_container_without_a_match_raises(

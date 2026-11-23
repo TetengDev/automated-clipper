@@ -18,6 +18,7 @@ from clipper.campaigns import (
     campaign_preflight,
     campaigns_path,
     load_campaigns,
+    read_render_sidecar,
     render_edl,
     unconfigured_campaigns,
 )
@@ -72,6 +73,7 @@ campaigns:
     rate_per_1k: 1.25
     per_clip_cap: 500
     budget: 10000
+    paid_partnership: false
     ends_at: 2027-03-01T00:00:00Z
 """
 
@@ -187,6 +189,38 @@ def test_shipped_campaigns_are_unverified_placeholders() -> None:
     assert reach is not None
     assert "ai_content" in reach.forbidden
     assert reach.submit_within_minutes == 30
+
+
+@pytest.mark.parametrize(
+    "terms", [{"rate_per_1k": 1}, {"budget": 500}, {"rate_per_1k": 0}, {"per_clip_cap": 50}]
+)
+def test_paid_terms_need_an_explicit_paid_partnership(terms: dict[str, object]) -> None:
+    """CLP-121: a campaign that pays for views must say whether the brief requires the
+    paid-partnership label; the False default must never stand in for that decision."""
+    with pytest.raises(ValidationError, match="paid_partnership"):
+        _campaign(**terms)
+
+
+@pytest.mark.parametrize("paid", [True, False])
+def test_paid_terms_with_an_explicit_paid_partnership_load(paid: bool) -> None:
+    campaign = _campaign(rate_per_1k=1, budget=500, paid_partnership=paid)
+
+    assert campaign.paid_partnership is paid
+
+
+def test_unset_or_null_paid_terms_need_no_paid_partnership() -> None:
+    assert _campaign().paid_partnership is False
+    assert _campaign(rate_per_1k=None, budget=None).paid_partnership is False
+
+
+def test_a_campaigns_file_with_paid_terms_but_no_paid_partnership_is_refused(
+    tmp_path: Path, creators: AppConfig
+) -> None:
+    text = CAMPAIGNS_YAML.replace("    paid_partnership: false\n", "")
+    path = _write(tmp_path, "campaigns.yaml", text)
+
+    with pytest.raises(ConfigError, match="paid_partnership"):
+        load_campaigns(path, creators, _accounts(tmp_path, creators))
 
 
 @pytest.mark.parametrize(
@@ -443,6 +477,69 @@ def test_render_edl_never_reads_outside_the_media_root(tmp_path: Path) -> None:
 def test_render_edl_survives_a_path_without_a_name(tmp_path: Path) -> None:
     assert render_edl(tmp_path, ".") is None
     assert render_edl(tmp_path, "dir/") is None
+
+
+_EDL = {"source": {"path": "a.mp4", "in_s": 0, "out_s": 5}}
+_DEEP = "[" * 200_000 + "]" * 200_000
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,  # missing
+        " " * 1_000_001 + "{}",  # oversize
+        "{not json",
+        b"\xff\xfe{}",  # not UTF-8
+        "[]",  # not an object
+        json.dumps({"sidecar_version": 1}),  # no edl key
+        json.dumps({"edl": {**_EDL, "hook": {"text": "x", "ai_generated": "true"}}}),
+        json.dumps({"edl": {**_EDL, "surprise": 1}}),  # schema drift
+        json.dumps({"edl": "x"})[:-1] + _DEEP + "}",  # nesting past the recursion limit
+    ],
+    ids=[
+        "missing",
+        "oversize",
+        "bad-json",
+        "not-utf8",
+        "not-object",
+        "no-edl",
+        "string-flag",
+        "unknown-key",
+        "deep-nesting",
+    ],
+)
+def test_a_rendered_video_gives_an_edl_or_a_problem_never_neither(
+    tmp_path: Path, content: str | bytes | None
+) -> None:
+    """CLP-121: next to a video that exists, a sidecar that cannot be read is a problem
+    (the post is held), never "no AI elements"."""
+    stored = _sidecar(tmp_path, None)
+    sidecar = tmp_path / "job" / "clip_v1.json"
+    if isinstance(content, bytes):
+        sidecar.write_bytes(content)
+    elif content is not None:
+        sidecar.write_text(content)
+
+    found = read_render_sidecar(tmp_path, stored)
+
+    assert found.edl is None
+    assert found.problem is not None and "render sidecar" in found.problem
+
+
+def test_a_valid_sidecar_gives_its_edl_and_no_problem(tmp_path: Path) -> None:
+    found = read_render_sidecar(tmp_path, _sidecar(tmp_path, _EDL))
+
+    assert found.problem is None
+    assert found.edl == parse_edl(_EDL)
+
+
+@pytest.mark.parametrize("video_path", [None, "", "job/never_rendered.mp4", "../job/x.mp4"])
+def test_without_a_video_no_sidecar_is_expected(tmp_path: Path, video_path: str | None) -> None:
+    """No rendered video under the media root: nothing to check (the posting stage fails
+    the attempt on the missing file itself)."""
+    found = read_render_sidecar(tmp_path, video_path)
+
+    assert (found.edl, found.problem) == (None, None)
 
 
 def test_oversized_sidecar_is_not_parsed(tmp_path: Path) -> None:

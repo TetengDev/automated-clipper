@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from clipper.posting import repo
 from clipper.posting.models import Post, PostStatus
 from clipper.review import routes
-from posting_support import FakeAccount
+from posting_support import FakeAccount, write_rendered
 from review_support import Env, login, make_env
 
 NOW = datetime(2027, 1, 15, 8, 0, tzinfo=UTC)  # review_support.WALL_START
@@ -53,9 +53,7 @@ def post(client: TestClient, url: str, htmx: bool = True, **data: object):
 def video_clip(env: Env, **kwargs: object) -> int:
     job = env.job()
     rel = f"youtube_{job}/clip_1_v1.mp4"
-    target = env.media_root / rel
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"fake mp4")
+    write_rendered(env.media_root / rel)
     return env.clip(job, video_path=rel, **kwargs)  # type: ignore[arg-type]
 
 

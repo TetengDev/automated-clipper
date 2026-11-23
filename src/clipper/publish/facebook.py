@@ -28,7 +28,6 @@ so a post with `paid_partnership` set is refused rather than published undisclos
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -94,9 +93,8 @@ class FacebookPublisher(MetaPublisher):
         *,
         credentials: Credentials = load_credentials,
         clock: Clock = utcnow,
-        campaigns: Mapping[str, str] | None = None,
     ) -> None:
-        super().__init__(client, guard, credentials=credentials, clock=clock, campaigns=campaigns)
+        super().__init__(client, guard, credentials=credentials, clock=clock)
         self._progress: dict[str, _Progress] = {}
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult:
@@ -105,7 +103,6 @@ class FacebookPublisher(MetaPublisher):
                 "facebook: the paid partnership label cannot be set through the Reels API;"
                 " post this campaign clip by hand"
             )
-        self._refuse_campaign(post.account_id)
         deadline = self._deadline()
         creds = self._creds(post.account_id)
         try:

@@ -633,13 +633,26 @@ cost.
   paid-partnership flag goes to `is_paid_partnership` on Instagram. The Facebook Reels
   API has no plain paid-partnership toggle, so a Facebook post that needs one is refused
   (`post_failed`, with an alert) and must be posted by hand.
-  - **Campaign accounts fail closed.** Every post on an account with `campaign:` set is
-    refused, and must be posted by hand. The campaign's tags and paid-partnership flag
-    are stored with the post at scheduling
-    ([CLP-97](https://linear.app/tengdev/issue/CLP-97)); publishing campaign posts on
-    Meta is [CLP-121](https://linear.app/tengdev/issue/CLP-121).
+  - **Campaign accounts** are published like any other account
+    ([CLP-121](https://linear.app/tengdev/issue/CLP-121)). The campaign's tags and
+    paid-partnership flag are stored with the post at scheduling
+    ([CLP-97](https://linear.app/tengdev/issue/CLP-97)). The publish-time pre-flight
+    holds a post when the brief is paid and the stored flag is off. A stored flag that is
+    on goes out as is, even if the brief has since dropped the paid partnership. A paid
+    campaign post to Facebook is still refused (above). A campaign applies only to its
+    own creator's clips: a clip of another creator on a campaign account is published as
+    a plain post, with no campaign tags and the paid-partnership flag off.
+  - **End date.** The pre-flight checks the campaign's `ends_at` against the time the
+    post goes live: its slot, for a Facebook post claimed early.
   - **AI flag.** It is set at scheduling from the clip's render sidecar (the EDL's AI
-    elements) and stored with the post. Posts scheduled before CLP-97 carry no AI flag.
+    elements) and stored with the post. At publish the worker reads the sidecar again: an
+    AI element sets the flag even when it was stored off, and the flag turned on is
+    written to the post (audited as `post_ai_flag_set`). A stored flag is never cleared, also
+    not when a held post is released for the same file; a held post released with a
+    re-edited, re-rendered clip takes the new file's flag. A rendered clip whose sidecar
+    is missing, unreadable or not a valid EDL is **held**, at scheduling and at publish,
+    on every platform and for plain posts too: nothing shows whether it has AI elements.
+    Restore or re-render the sidecar and run `clipper posts recheck`.
 - **Rate limits**: before each Instagram publish the worker reads
   `content_publishing_limit`. Within 2 posts of the 24-hour limit (50), the post is
   deferred by an hour. A Graph rate-limit error (codes 4, 9, 17, 32, 613, 80001, 80002)
@@ -761,30 +774,36 @@ Paid clipping campaigns live in `config/campaigns.yaml` (or the file named by
 3. Run `clipper check-config`. It prints one line per campaign. It fails when an account
    cannot be assigned to its campaign: the platform is not one the campaign takes, the
    account does not post the campaign's creator, or the account's `market` is not one of
-   the audience rule's markets (a PH account cannot deliver a US audience).
+   the audience rule's markets (a PH account cannot deliver a US audience). It also fails
+   when a campaign sets `rate_per_1k`, `per_clip_cap` or `budget` but not
+   `paid_partnership`: a paid campaign must say whether the brief requires the
+   paid-partnership label (`true` or `false`), so the default never decides it.
 
 When a clip is approved, each campaign account's post goes through a pre-flight: the
 platform limits, the brief's length range, its required hashtags (added to the post
 automatically), its forbidden keywords, the paid-partnership toggle, the end date, and
 AI content when the brief forbids it. AI content is read from the render sidecar; a clip
-without one is held under an AI ban, because nothing shows it is free of AI. A post that
+without a readable one is held, under an AI ban or not, because nothing shows whether it
+has AI elements (CLP-121). A post that
 fails is `held` with the reason on the review app's Scheduled page and in
 `clipper posts list`, and it is never published. Logos, negative framing and reposts
 cannot be seen by the pipeline: the clip page lists them for each campaign an enabled
 account posts the creator for (a disabled campaign included), and the reviewer must tick
 "I checked these in the video" before approving. The approval's history row records them.
 
-A post for an account outside any campaign goes through the platform part of the same
-check, at scheduling and again just before it is published: the platform's length, title,
-caption and hashtag limits, generic hashtags, disclosure-like, malformed or mixed-script
-tags on its hashtag list, and generic, disclosure-like (`#ad`, `#sponsored`) or
-mixed-script tags written into the title or caption. A post that fails is held the same
-way. Links, mentions and too few hashtags hold only campaign posts. Such inline tags are
-also stripped from the model's titles and captions, from the per-platform text and from
-the export package, so in practice the check catches only text stored before that cleaning
-existed. A `#` inside a URL (`https://site.com/page#fyp`) is not stripped: the URL is left
-whole and judged by the link rules, which hold campaign posts only, but a disclosure-like
-one (`https://site.com/page#ad`) still holds a plain post for a person to look at. After a
+A post for an account outside any campaign (or for a clip of another creator than the
+account's campaign's) goes through the platform part of the same check and the render
+sidecar check, at scheduling and again just before it is published: the platform's
+length, title, caption and hashtag limits, generic hashtags, disclosure-like, malformed
+or mixed-script tags on its hashtag list, and generic, disclosure-like (`#ad`,
+`#sponsored`) or mixed-script tags written into the title or caption. A post that fails
+is held the same way. Links, mentions and too few hashtags hold only campaign posts.
+Such inline tags are also stripped from the model's titles and captions, from the
+per-platform text and from the export package, so in practice the check catches only
+text stored before that cleaning existed. A `#` inside a URL
+(`https://site.com/page#fyp`) is not stripped: the URL is left whole and judged by the
+link rules, which hold campaign posts only, but a disclosure-like one
+(`https://site.com/page#ad`) still holds a plain post for a person to look at. After a
 mention or a bare domain (`@bob/#ad`, `site.com/#ad`) a `#` starts a tag as usual.
 
 A bare domain counts as a link only when it ends in a real top-level domain from the IANA

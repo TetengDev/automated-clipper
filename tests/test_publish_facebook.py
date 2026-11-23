@@ -14,7 +14,13 @@ import pytest
 import respx
 
 from clipper.posting import repo
-from clipper.posting.models import PostStatus, PublishDeferred, PublishRejected, PublishResult
+from clipper.posting.models import (
+    PostStatus,
+    PublishDeferred,
+    Publisher,
+    PublishRejected,
+    PublishResult,
+)
 from clipper.posting.stage import STALE_UPLOAD, PostingStage, allow_all
 from clipper.publish.facebook import (
     LEAD_TIME,
@@ -22,7 +28,7 @@ from clipper.publish.facebook import (
     UPLOAD_MARGIN,
     FacebookPublisher,
 )
-from clipper.publish.meta import GraphClient, MetaError
+from clipper.publish.meta import GraphClient, MetaError, meta_publishers
 from meta_support import (
     ENV,
     FB_TOKEN,
@@ -30,6 +36,7 @@ from meta_support import (
     T0,
     Alerts,
     Clock,
+    campaign_account,
     credentials,
     graph,
     guard,
@@ -38,6 +45,7 @@ from meta_support import (
     recorded,
     reply,
     stored_metadata,
+    use_fake_credentials,
     video,
 )
 from review_support import make_env
@@ -429,22 +437,48 @@ def test_lookup_of_a_failed_reel_is_not_found(
     assert publisher.lookup(post.idempotency_key) is None
 
 
-def test_campaign_account_is_refused_until_disclosure_is_wired(
-    mock: respx.MockRouter, clock: Clock, alerts: Alerts, tmp_path: Path
-) -> None:
-    reels, _ = happy(mock)
+@pytest.fixture
+def campaign_publisher(
+    clock: Clock, alerts: Alerts, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[Publisher]:
+    """The worker's Facebook publisher (`meta_publishers`) for a campaign account. Its
+    credentials come from the process env (the fake tokens), never a real `.env`."""
+    use_fake_credentials(monkeypatch, tmp_path)
     with httpx.Client() as http:
-        publisher = FacebookPublisher(
-            GraphClient(http),
-            guard(http, clock, alerts),
-            credentials=credentials(),
-            clock=clock,
-            campaigns={"fb_main": "vyro_mrbeast"},
+        publishers = meta_publishers(
+            [campaign_account("fb_main", "facebook")], http, clock=clock, alert=alerts
         )
-        with pytest.raises(PublishRejected, match="vyro_mrbeast"):
-            publisher.publish(make_post(), video(tmp_path), metadata())
+        yield publishers["facebook"]
 
-    assert reels.call_count == 0
+
+def test_campaign_account_post_is_published_with_its_ai_flag(
+    mock: respx.MockRouter, campaign_publisher: Publisher, tmp_path: Path
+) -> None:
+    """CLP-121: a campaign account is no longer refused; its stored flags are sent."""
+    reels, upload = happy(mock)
+
+    result = campaign_publisher.publish(
+        make_post(), video(tmp_path), stored_metadata("facebook", ai=True)
+    )
+
+    assert result.external_id == VIDEO_ID
+    assert reels.call_count == 2 and upload.call_count == 1
+    assert form(reels.calls[1].request)["is_ai_generated"] == "true"
+
+
+def test_paid_campaign_post_is_still_refused_before_any_call(
+    mock: respx.MockRouter, campaign_publisher: Publisher, tmp_path: Path
+) -> None:
+    """CLP-121 keeps one refusal: the Reels API cannot set the paid partnership label."""
+    reels, upload = happy(mock)
+
+    with pytest.raises(PublishRejected, match="paid partnership"):
+        campaign_publisher.publish(
+            make_post(), video(tmp_path), stored_metadata("facebook", paid=True)
+        )
+
+    assert reels.call_count == 0 and upload.call_count == 0
+    assert mock.calls.call_count == 0  # not even the token check
 
 
 def test_permission_error_pauses_the_account(

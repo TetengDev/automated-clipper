@@ -28,7 +28,7 @@ import hashlib
 import logging
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -136,9 +136,8 @@ class InstagramPublisher(MetaPublisher):
         sleep: Callable[[float], None] = time.sleep,
         poll_every: float = POLL_EVERY,
         max_polls: int = MAX_POLLS,
-        campaigns: Mapping[str, str] | None = None,
     ) -> None:
-        super().__init__(client, guard, credentials=credentials, clock=clock, campaigns=campaigns)
+        super().__init__(client, guard, credentials=credentials, clock=clock)
         self.sleep = sleep
         self.poll_every = poll_every
         self.max_polls = max(1, max_polls)
@@ -146,7 +145,6 @@ class InstagramPublisher(MetaPublisher):
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult:
         check_caption(metadata)
-        self._refuse_campaign(post.account_id)
         deadline = self._deadline()
         creds = self._creds(post.account_id)
         try:

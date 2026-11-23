@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
+from clipper.accounts import Account, Platform
 from clipper.edl import parse_edl
 from clipper.metadata import Variant, build_post_metadata
 from clipper.posting.models import Post, PostMetadata, PostStatus
@@ -58,6 +60,27 @@ class Alerts:
 
     def __call__(self, message: str) -> None:
         self.messages.append(message)
+
+
+def campaign_account(account_id: str, platform: Platform) -> Account:
+    """An enabled Meta account that posts for a campaign (CLP-97 `campaign:`)."""
+    return Account(
+        id=account_id,
+        platform=platform,
+        handle="@mrbeast.clips.daily",
+        market="US",
+        timezone="America/New_York",
+        creators=["MrBeast"],
+        campaign="vyro_mrbeast",
+    )
+
+
+def use_fake_credentials(monkeypatch: pytest.MonkeyPatch, cwd: Path) -> None:
+    """For publishers built by `meta_publishers`, which read the process env and `.env`:
+    the fake tokens in the env, and a working directory without a `.env`."""
+    monkeypatch.chdir(cwd)  # no stray .env
+    for name, value in ENV.items():
+        monkeypatch.setenv(name, value)
 
 
 def credentials(env: dict[str, str] | None = None):  # noqa: ANN201 - a partial

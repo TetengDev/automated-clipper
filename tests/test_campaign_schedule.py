@@ -6,18 +6,22 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from clipper.campaigns import Campaign, PostingConfig
+from clipper import clips
+from clipper.campaigns import Campaign, PostingConfig, render_edl
 from clipper.cli import app
-from clipper.edl import parse_edl
+from clipper.edl import EDL, parse_edl
 from clipper.posting import repo
-from clipper.posting.models import OPEN_STATUSES, InvalidPostTransition, PostStatus
+from clipper.posting.models import OPEN_STATUSES, InvalidPostTransition, Post, PostStatus
 from clipper.posting.scheduler import (
     publish_guard,
     publish_problem,
@@ -25,6 +29,12 @@ from clipper.posting.scheduler import (
     schedule_for_clip,
 )
 from clipper.posting.stage import PostingStage, allow_all
+from clipper.publish.facebook import LEAD_TIME, FacebookPublisher
+from clipper.publish.meta import GraphClient
+from meta_support import Alerts as MetaAlerts
+from meta_support import Clock as MetaClock
+from meta_support import credentials as meta_credentials
+from meta_support import guard as meta_guard
 from posting_support import FakeAccount, FakePublisher
 from review_support import Env, login, make_env
 
@@ -735,3 +745,479 @@ def test_posting_config_error_holds_rather_than_publishing(env: Env, tmp_path: P
     reason = guard(post)
 
     assert reason is not None and "config" in reason
+
+
+# --- CLP-121: the disclosure flags the post is published with --------------------------------
+
+
+def write_sidecar(env: Env, video_path: str, *, ai: bool) -> None:
+    """(Re)write the render sidecar next to the video, e.g. one that appeared after the
+    post was scheduled."""
+    hook = {"text": "Wait for it", "ai_generated": ai}
+    edl = parse_edl({"source": {"path": "s.mp4", "in_s": 0, "out_s": 30}, "hook": hook})
+    video = env.media_root / video_path
+    video.with_suffix(".json").write_text(json.dumps({"edl": edl.to_props()}))
+
+
+def edl_of(env: Env, post: Post) -> EDL | None:
+    return render_edl(env.media_root, post.video_path)
+
+
+@pytest.mark.parametrize("ai", [True, False])
+def test_metadata_for_sets_the_ai_flag_from_the_edl(env: Env, ai: bool) -> None:
+    [post] = schedule(env, rendered_clip(env, ai=ai), vyro_mrbeast=campaign(forbidden=[]))
+
+    metadata = repo.metadata_for(env.conn, post, edl=edl_of(env, post))
+
+    assert metadata.flags["is_aigc"] is ai
+
+
+def break_sidecar(env: Env, video_path: str, how: str) -> None:
+    sidecar = (env.media_root / video_path).with_suffix(".json")
+    if how == "missing":
+        sidecar.unlink(missing_ok=True)
+    else:
+        sidecar.write_text(json.dumps({"edl": {"source": "drifted"}}))
+
+
+@pytest.mark.parametrize("how", ["missing", "invalid"])
+@pytest.mark.parametrize("platform", ["tiktok", "instagram", "youtube", "facebook"])
+def test_a_plain_post_whose_sidecar_is_missing_or_invalid_is_held_at_scheduling(
+    env: Env, platform: str, how: str
+) -> None:
+    """CLP-121: without a readable sidecar nobody can tell whether the clip has AI
+    elements, so it is held rather than posted with the AI flag off."""
+    clip_id = rendered_clip(env)
+    version = clips.get_version(env.conn, clip_id, 1)
+    assert version is not None and version.video_path is not None
+    break_sidecar(env, version.video_path, how)
+
+    [post] = schedule(
+        env, clip_id, account(id=f"{platform}_main", platform=platform, campaign=None)
+    )
+
+    assert post.status == PostStatus.HELD
+    assert post.error is not None and "render sidecar" in post.error
+
+
+def test_a_campaign_post_without_a_sidecar_is_held_even_without_an_ai_ban(env: Env) -> None:
+    [post] = schedule(env, rendered_clip(env, sidecar=False), vyro_mrbeast=campaign(forbidden=[]))
+
+    assert post.status == PostStatus.HELD
+    assert post.error is not None and "render sidecar" in post.error
+
+
+@pytest.mark.parametrize(
+    ("platform", "flag"),
+    [
+        ("tiktok", "is_aigc"),
+        ("instagram", "is_ai_generated"),
+        ("facebook", "is_ai_generated"),
+        ("youtube", "contains_synthetic_media"),  # sent as containsSyntheticMedia
+    ],
+)
+def test_metadata_for_sets_each_platforms_ai_flag_from_the_edl(
+    env: Env, platform: str, flag: str
+) -> None:
+    """Stored off at scheduling, on once the EDL read at publish has an AI element."""
+    plain = account(id=f"{platform}_main", platform=platform, campaign=None)
+    [post] = schedule(env, rendered_clip(env, ai=False), plain)
+    assert post.status == PostStatus.SCHEDULED, post.error
+    write_sidecar(env, post.video_path, ai=True)
+
+    metadata = repo.metadata_for(env.conn, post, edl=edl_of(env, post))
+
+    assert metadata.flags[flag] is True
+
+
+def test_an_ai_flag_turned_on_at_publish_is_stored_on_the_post(env: Env) -> None:
+    """The post's row records what was sent: the upgraded flag is written back."""
+    [post] = schedule(env, rendered_clip(env, ai=False), account(campaign=None))
+    write_sidecar(env, post.video_path, ai=True)
+
+    repo.metadata_for(env.conn, post, edl=edl_of(env, post))
+
+    assert stored_metadata(env, post.id)["flags"] == {
+        "is_aigc": True,
+        "brand_content_toggle": False,
+    }
+    assert repo.metadata_for(env.conn, post).flags["is_aigc"] is True
+
+
+def test_an_ai_flag_turned_on_for_a_post_without_stored_metadata_is_stored(env: Env) -> None:
+    clip_id = rendered_clip(env)
+    version = clips.get_version(env.conn, clip_id, 1)
+    assert version is not None and version.video_path is not None
+    post = repo.insert_post(
+        env.conn,
+        clip_id=clip_id,
+        clip_version=1,
+        account_id="tt_main",
+        platform="tiktok",
+        scheduled_at=NOW,
+        video_path=version.video_path,
+        now=NOW,
+    )
+    write_sidecar(env, post.video_path, ai=True)
+
+    sent = repo.metadata_for(env.conn, post, edl=edl_of(env, post))
+
+    stored = stored_metadata(env, post.id)
+    assert stored["flags"] == {"is_aigc": True, "brand_content_toggle": False}
+    assert stored["caption"] == sent.caption
+
+
+def test_metadata_for_writes_nothing_when_the_flag_does_not_change(env: Env) -> None:
+    [post] = schedule(env, rendered_clip(env, ai=False), account(campaign=None))
+    before = stored_metadata(env, post.id)
+
+    repo.metadata_for(env.conn, post, edl=edl_of(env, post))
+
+    assert stored_metadata(env, post.id) == before
+
+
+def test_metadata_for_sets_the_ai_flag_when_the_sidecar_gains_an_ai_element(env: Env) -> None:
+    """The stored flag is off (no AI element at scheduling); the EDL read now turns it on."""
+    [post] = schedule(env, rendered_clip(env, ai=False), account(campaign=None))
+    write_sidecar(env, post.video_path, ai=True)
+
+    metadata = repo.metadata_for(env.conn, post, edl=edl_of(env, post))
+
+    assert metadata.flags["is_aigc"] is True
+
+
+def test_metadata_for_never_clears_a_stored_ai_flag(env: Env) -> None:
+    [post] = schedule(env, rendered_clip(env, ai=True), vyro_mrbeast=campaign(forbidden=[]))
+    write_sidecar(env, post.video_path, ai=False)
+
+    assert repo.metadata_for(env.conn, post, edl=edl_of(env, post)).flags["is_aigc"] is True
+    assert repo.metadata_for(env.conn, post).flags["is_aigc"] is True
+
+
+@pytest.mark.parametrize("ai", [True, False])
+def test_a_post_without_stored_metadata_gets_the_ai_flag_from_the_edl(env: Env, ai: bool) -> None:
+    """Posts scheduled before CLP-97 stored no metadata: the flags are built at publish."""
+    clip_id = rendered_clip(env)
+    version = clips.get_version(env.conn, clip_id, 1)
+    assert version is not None and version.video_path is not None
+    post = repo.insert_post(
+        env.conn,
+        clip_id=clip_id,
+        clip_version=1,
+        account_id="ig_main",
+        platform="instagram",
+        scheduled_at=NOW,
+        video_path=version.video_path,
+        now=NOW,
+    )
+    write_sidecar(env, post.video_path, ai=ai)
+
+    metadata = repo.metadata_for(env.conn, post, edl=edl_of(env, post))
+
+    assert metadata.flags == {"is_ai_generated": ai, "paid_partnership": False}
+
+
+@pytest.mark.parametrize(
+    ("platform", "flag"),
+    [
+        ("tiktok", "brand_content_toggle"),
+        ("instagram", "paid_partnership"),
+        ("facebook", "paid_partnership"),
+    ],
+)
+@pytest.mark.parametrize("paid", [True, False])
+def test_metadata_for_sets_the_paid_flag_from_the_campaign_brief(
+    env: Env, platform: str, flag: str, paid: bool
+) -> None:
+    brief = campaign(
+        platforms=["tiktok", "instagram", "facebook"], paid_partnership=paid, forbidden=[]
+    )
+    [post] = schedule(
+        env,
+        rendered_clip(env),
+        account(id=f"{platform}_main", platform=platform),
+        vyro_mrbeast=brief,
+    )
+    assert post.status == PostStatus.SCHEDULED, post.error
+
+    metadata = repo.metadata_for(env.conn, post, edl=edl_of(env, post))
+
+    assert metadata.flags[flag] is paid
+
+
+def plain_stage(env: Env, publisher: FakePublisher, at: datetime) -> PostingStage:
+    return PostingStage(
+        env.conn,
+        {"tiktok": publisher},
+        "w1",
+        media_root=env.media_root,
+        clock=lambda: at + timedelta(minutes=1),
+        guard=allow_all,
+    )
+
+
+def test_posting_stage_sends_the_ai_flag_from_the_render_sidecar(env: Env) -> None:
+    [post] = schedule(env, rendered_clip(env, ai=False), account(campaign=None))
+    write_sidecar(env, post.video_path, ai=True)
+    publisher = FakePublisher()
+
+    plain_stage(env, publisher, post.scheduled_at).run_once()
+
+    [(_, _, metadata)] = publisher.calls
+    assert metadata.flags["is_aigc"] is True
+
+
+@pytest.mark.parametrize("how", ["missing", "invalid"])
+def test_posting_stage_holds_a_post_whose_sidecar_is_missing_or_invalid(env: Env, how: str) -> None:
+    """Even with a guard that lets everything through, the stage never sends a post whose
+    AI flag it cannot confirm."""
+    [post] = schedule(env, rendered_clip(env), account(campaign=None))
+    break_sidecar(env, post.video_path, how)
+    publisher = FakePublisher()
+
+    plain_stage(env, publisher, post.scheduled_at).run_once()
+
+    assert publisher.calls == []
+    found = repo.get_post(env.conn, post.id)
+    assert found is not None and found.status == PostStatus.HELD
+    assert found.error is not None and "render sidecar" in found.error
+
+
+def test_a_post_held_for_its_sidecar_is_released_once_it_is_fixed(env: Env) -> None:
+    plain = account(campaign=None)
+    [post] = schedule(env, rendered_clip(env), plain)
+    break_sidecar(env, post.video_path, "missing")
+    plain_stage(env, FakePublisher(), post.scheduled_at).run_once()
+    write_sidecar(env, post.video_path, ai=True)
+
+    result = recheck_held(
+        env.conn, [plain], {}, NOW, media_root=env.media_root, is_sensitive=NOT_SENSITIVE
+    )
+
+    [released] = result.released
+    assert released.id == post.id
+    assert repo.metadata_for(env.conn, released).flags["is_aigc"] is True
+
+
+def test_releasing_a_held_post_never_clears_its_stored_ai_flag(env: Env) -> None:
+    """The recheck re-plans from the sidecar as it is now; a stored AI flag stays on."""
+    plain = account(campaign=None)
+    [post] = schedule(env, rendered_clip(env, ai=True), plain)
+    break_sidecar(env, post.video_path, "missing")
+    plain_stage(env, FakePublisher(), post.scheduled_at).run_once()
+    write_sidecar(env, post.video_path, ai=False)
+
+    [released] = recheck_held(
+        env.conn, [plain], {}, NOW, media_root=env.media_root, is_sensitive=NOT_SENSITIVE
+    ).released
+
+    assert repo.metadata_for(env.conn, released).flags["is_aigc"] is True
+
+
+def test_publish_holds_a_facebook_post_whose_campaign_ends_before_its_slot(env: Env) -> None:
+    """Facebook posts are claimed LEAD_TIME early and go live at the slot: a campaign that
+    ends inside that window must hold the post, though it has not ended at claim time."""
+    fb = account(id="fb_main", platform="facebook")
+    brief = campaign(platforms=["facebook"], forbidden=[])
+    [post] = schedule(env, rendered_clip(env), fb, vyro_mrbeast=brief)
+    assert post.status == PostStatus.SCHEDULED, post.error
+    claimed_at = post.scheduled_at - LEAD_TIME
+    ended = campaign(
+        platforms=["facebook"], forbidden=[], ends_at=claimed_at + timedelta(minutes=10)
+    )
+
+    reason = publish_problem(
+        env.conn,
+        post,
+        {"fb_main": fb},
+        {"vyro_mrbeast": ended},
+        claimed_at,
+        media_root=env.media_root,
+    )
+
+    assert reason is not None and "ended" in reason
+
+
+# --- CLP-121: the publish guard in front of the publishers -----------------------------------
+
+
+def guarded_stage(
+    env: Env,
+    publishers: dict[str, object],
+    accounts: list[FakeAccount],
+    briefs: dict[str, Campaign],
+    at: datetime,
+    alerts: list[str] | None = None,
+) -> PostingStage:
+    """A stage with the real publish-time pre-flight (`publish_problem`), run at `at`."""
+    found = {a.id: a for a in accounts}
+
+    def guard(post: Post) -> str | None:
+        return publish_problem(env.conn, post, found, briefs, at, media_root=env.media_root)
+
+    return PostingStage(
+        env.conn,
+        publishers,  # type: ignore[arg-type]
+        "w1",
+        media_root=env.media_root,
+        clock=lambda: at,
+        guard=guard,
+        alert=(alerts.append if alerts is not None else lambda _message: None),
+    )
+
+
+def test_publish_holds_a_post_whose_brief_became_paid_after_scheduling(env: Env) -> None:
+    [post] = schedule(env, rendered_clip(env), vyro_mrbeast=campaign(forbidden=[]))
+    publisher = FakePublisher()
+    paid = {"vyro_mrbeast": campaign(forbidden=[], paid_partnership=True)}
+    at = post.scheduled_at + timedelta(minutes=1)
+
+    guarded_stage(env, {"tiktok": publisher}, [account()], paid, at).run_once()
+
+    assert publisher.calls == []
+    found = repo.get_post(env.conn, post.id)
+    assert found is not None and found.status == PostStatus.HELD
+    assert found.error is not None and "paid partnership toggle is off" in found.error
+
+
+@pytest.mark.parametrize("platform", ["instagram", "facebook"])
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [({"enabled": False}, "disabled"), ({"brief_verified": False}, "placeholder")],
+)
+def test_publish_holds_a_meta_campaign_post_whose_campaign_is_off(
+    env: Env, platform: str, change: dict[str, object], reason: str
+) -> None:
+    meta = account(id=f"{platform}_main", platform=platform)
+    brief = {"platforms": [platform], "forbidden": []}
+    [post] = schedule(env, rendered_clip(env), meta, vyro_mrbeast=campaign(**brief))
+    assert post.status == PostStatus.SCHEDULED, post.error
+    publisher = FakePublisher()
+    off = {"vyro_mrbeast": campaign(**brief, **change)}
+
+    guarded_stage(env, {platform: publisher}, [meta], off, post.scheduled_at).run_once()
+
+    assert publisher.calls == []
+    found = repo.get_post(env.conn, post.id)
+    assert found is not None and found.status == PostStatus.HELD
+    assert found.error is not None and reason in found.error
+
+
+def test_a_paid_facebook_campaign_post_fails_with_an_alert_and_no_call(env: Env) -> None:
+    """The guard lets it through (holding it at scheduling is CLP-138); the real Facebook
+    publisher refuses it before any Graph call, and the stage alerts."""
+    fb = account(id="fb_main", platform="facebook")
+    paid = {"vyro_mrbeast": campaign(platforms=["facebook"], forbidden=[], paid_partnership=True)}
+    [post] = schedule(env, rendered_clip(env), fb, **paid)
+    assert post.status == PostStatus.SCHEDULED, post.error
+    alerts: list[str] = []
+    meta_clock, meta_alerts = MetaClock(post.scheduled_at), MetaAlerts()
+
+    with respx.mock(assert_all_mocked=True) as graph_api, httpx.Client() as http:
+        publisher = FacebookPublisher(
+            GraphClient(http),
+            meta_guard(http, meta_clock, meta_alerts),
+            credentials=meta_credentials(),
+            clock=meta_clock,
+        )
+        guarded_stage(
+            env, {"facebook": publisher}, [fb], paid, post.scheduled_at, alerts
+        ).run_once()
+
+    assert graph_api.calls.call_count == 0
+    found = repo.get_post(env.conn, post.id)
+    assert found is not None and found.status == PostStatus.POST_FAILED
+    assert found.error is not None and "paid partnership" in found.error
+    assert len(alerts) == 1 and "paid partnership" in alerts[0]
+
+
+@dataclass
+class EarlyPublisher(FakePublisher):
+    """A publisher whose posts are claimed `lead_time` before the slot, like Facebook's."""
+
+    lead_time: timedelta = LEAD_TIME
+
+
+def test_an_early_claimed_post_is_held_when_the_campaign_ends_before_its_slot(env: Env) -> None:
+    fb = account(id="fb_main", platform="facebook")
+    brief = {"platforms": ["facebook"], "forbidden": []}
+    [post] = schedule(env, rendered_clip(env), fb, vyro_mrbeast=campaign(**brief))
+    claimed_at = post.scheduled_at - LEAD_TIME + timedelta(minutes=1)
+    ends = {"vyro_mrbeast": campaign(**brief, ends_at=claimed_at + timedelta(minutes=10))}
+    publisher = EarlyPublisher()
+
+    guarded_stage(env, {"facebook": publisher}, [fb], ends, claimed_at).run_once()
+
+    assert publisher.calls == []
+    found = repo.get_post(env.conn, post.id)
+    assert found is not None and found.status == PostStatus.HELD
+    assert found.error is not None and "ended" in found.error
+
+
+# --- CLP-121 review round 2 -------------------------------------------------------------------
+
+
+def test_a_re_rendered_clip_without_ai_is_released_with_the_ai_flag_off(env: Env) -> None:
+    """Held under an AI ban, re-edited without the AI hook and re-rendered to a new file:
+    the stored flag belonged to the old file, so the release takes the new plan's flag."""
+    clip_id = rendered_clip(env, ai=True)
+    [held] = schedule(env, clip_id)  # campaign() bans AI content
+    assert held.status == PostStatus.HELD
+    assert stored_metadata(env, held.id)["flags"]["is_aigc"] is True
+    new_path = held.video_path.replace("_v1.mp4", "_v2.mp4")
+    (env.media_root / new_path).write_bytes(b"fake mp4")
+    write_sidecar(env, new_path, ai=False)
+    env.conn.execute(
+        "INSERT INTO clip_versions (clip_id, version, start_s, end_s, title, caption, hashtags,"
+        " video_path, sensitive, created_at)"
+        " SELECT clip_id, 2, start_s, end_s, title, caption, hashtags, ?, sensitive, created_at"
+        " FROM clip_versions WHERE clip_id = ? AND version = 1",
+        (new_path, clip_id),
+    )
+    env.conn.execute("UPDATE clips SET current_version = 2 WHERE id = ?", (clip_id,))
+
+    [released] = recheck_held(
+        env.conn,
+        [account()],
+        {"vyro_mrbeast": campaign()},
+        NOW,
+        media_root=env.media_root,
+        is_sensitive=NOT_SENSITIVE,
+    ).released
+
+    assert released.video_path == new_path
+    assert repo.metadata_for(env.conn, released).flags["is_aigc"] is False
+
+
+def test_an_ai_flag_turned_on_at_publish_is_audited(env: Env) -> None:
+    [post] = schedule(env, rendered_clip(env, ai=False), account(campaign=None))
+    write_sidecar(env, post.video_path, ai=True)
+
+    repo.metadata_for(env.conn, post, edl=edl_of(env, post), now=NOW)
+
+    [row] = [r for r in env.reviews(post.clip_id) if r["action"] == "post_ai_flag_set"]
+    assert json.loads(row["payload"])["flag"] == "is_aigc"
+
+
+def test_the_ai_flag_is_not_written_to_a_post_that_changed_meanwhile(env: Env) -> None:
+    """The write is guarded by the status and worker read with the post: a stale post (here
+    cancelled since) is left as it is, though the metadata returned still has the flag."""
+    [post] = schedule(env, rendered_clip(env, ai=False), account(campaign=None))
+    write_sidecar(env, post.video_path, ai=True)
+    repo.cancel(env.conn, post.id, NOW)
+
+    sent = repo.metadata_for(env.conn, post, edl=edl_of(env, post), now=NOW)
+
+    assert sent.flags["is_aigc"] is True
+    assert stored_metadata(env, post.id)["flags"]["is_aigc"] is False
+    assert not [r for r in env.reviews(post.clip_id) if r["action"] == "post_ai_flag_set"]
+
+
+def test_a_sidecar_hold_is_logged_as_such(env: Env, caplog: pytest.LogCaptureFixture) -> None:
+    [post] = schedule(env, rendered_clip(env), account(campaign=None))
+    break_sidecar(env, post.video_path, "missing")
+
+    plain_stage(env, FakePublisher(), post.scheduled_at).run_once()
+
+    assert "held: render sidecar" in caplog.text
+    assert "held by pre-flight" not in caplog.text

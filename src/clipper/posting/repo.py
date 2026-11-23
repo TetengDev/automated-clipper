@@ -21,15 +21,17 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
 
 from clipper.clips import get_version
 from clipper.db import transaction
-from clipper.jobs.models import from_iso, to_iso
+from clipper.edl import EDL, has_ai_elements
+from clipper.jobs.models import from_iso, to_iso, utcnow
 from clipper.metadata import (
     PLATFORM_LIMITS,
+    ai_flag,
     build_post_metadata,
     clean_caption,
     clean_hashtags,
@@ -339,7 +341,15 @@ def release_held(
 ) -> Post:
     """A held post passed the pre-flight again: schedule it at `at` with what was checked
     (the clip's current version and file, the campaign that now applies). The caller
-    holds the transaction, so the slot it picked cannot be taken meanwhile."""
+    holds the transaction, so the slot it picked cannot be taken meanwhile. For the same
+    file, an AI flag stored on the post stays on, whatever the new metadata says; a new
+    file (a re-edited, re-rendered clip) takes the new metadata's flag (CLP-121)."""
+    if video_path == post.video_path:
+        row = conn.execute("SELECT metadata FROM posts WHERE id = ?", (post.id,)).fetchone()
+        stored = _stored_metadata(row["metadata"] if row else None)
+        flag = ai_flag(post.platform)
+        if stored is not None and stored.flags.get(flag):
+            metadata = replace(metadata, flags={**metadata.flags, flag: True})
     _update(
         conn,
         post,
@@ -1029,11 +1039,46 @@ def mark_failed(
     return failed
 
 
-def metadata_for(conn: sqlite3.Connection, post: Post) -> PostMetadata:
+def metadata_for(
+    conn: sqlite3.Connection,
+    post: Post,
+    *,
+    edl: EDL | None = None,
+    now: datetime | None = None,
+) -> PostMetadata:
     """What the post is published with: the metadata stored at scheduling (the clip's
-    platform variant, campaign tags and flags, as the pre-flight checked them). Posts
-    scheduled before CLP-97 fall back to the clip version's platform variant (CLP-96,
-    without campaign tags or the AI flag), else its single title and caption."""
+    platform variant, campaign tags and flags, as the pre-flight checked them: the AI flag
+    from the render sidecar's EDL, the paid-partnership flag from the campaign brief).
+    Posts scheduled before CLP-97 fall back to the clip version's platform variant (CLP-96,
+    without campaign tags or the paid flag), else its single title and caption.
+
+    `edl` is the clip's EDL read now (the render sidecar, None when unknown). When it has
+    an AI element the AI flag is set, whatever was stored (CLP-121): a clip whose sidecar
+    gained an AI element after scheduling, or a post from before CLP-97, still goes out
+    disclosed. A stored flag is never cleared. A flag turned on here is written to the
+    post's stored metadata (for a post from before CLP-97, the metadata built here), so
+    the row records what was sent, and audited as `post_ai_flag_set` at `now`. The write is
+    guarded by the status and worker read with `post`: a post that changed meanwhile is
+    left as it is (the metadata returned still has the flag). The write opens its own
+    transaction, so call this with `edl` outside any transaction."""
+    metadata = _metadata_for(conn, post)
+    if edl is None or not has_ai_elements(edl):
+        return metadata
+    flag = ai_flag(post.platform)
+    if metadata.flags.get(flag):
+        return metadata
+    upgraded = replace(metadata, flags={**metadata.flags, flag: True})
+    with transaction(conn):
+        cur = conn.execute(
+            "UPDATE posts SET metadata = ? WHERE id = ? AND status = ? AND worker_id IS ?",
+            (_metadata_json(upgraded), post.id, str(post.status), post.worker_id),
+        )
+        if cur.rowcount == 1:
+            _audit(conn, post, "post_ai_flag_set", now or utcnow(), flag=flag)
+    return upgraded
+
+
+def _metadata_for(conn: sqlite3.Connection, post: Post) -> PostMetadata:
     row = conn.execute("SELECT metadata FROM posts WHERE id = ?", (post.id,)).fetchone()
     stored = _stored_metadata(row["metadata"] if row else None)
     if stored is not None:

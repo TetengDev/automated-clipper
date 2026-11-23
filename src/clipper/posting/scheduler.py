@@ -37,8 +37,10 @@ from clipper import clips
 from clipper.campaigns import (
     Campaign,
     PostingConfig,
+    RenderSidecar,
     campaign_for,
     campaign_preflight,
+    read_render_sidecar,
     render_edl,
 )
 from clipper.clips import ClipDetail, ClipStatus
@@ -268,7 +270,12 @@ def _plan(
     when: datetime,
 ) -> _Plan:
     campaign_id, campaign = campaign_for(account, clip.creator, campaigns)
-    edl = render_edl(media_root, clip.current.video_path) if media_root else None
+    # Without a media root (tests, tools) the sidecar is not checked; production passes it.
+    sidecar = (
+        read_render_sidecar(media_root, clip.current.video_path) if media_root else RenderSidecar()
+    )
+    edl = sidecar.edl
+    unread = [f"clip {clip.id}: {sidecar.problem}; re-render it"] if sidecar.problem else []
     built = build_post_metadata(
         clip.current.variants,
         account.platform,
@@ -279,14 +286,14 @@ def _plan(
     metadata = PostMetadata(**asdict(built))
     if campaign_id is None:
         problems = preflight(built, account.platform, clip.current.duration_s, plain=True)
-        return _Plan(None, metadata, problems)
+        return _Plan(None, metadata, [*unread, *problems])
     if campaign is None:
         problem = f"account {account.id}: unknown campaign {campaign_id!r}; fix accounts.yaml"
-        return _Plan(campaign_id, metadata, [problem])
+        return _Plan(campaign_id, metadata, [*unread, problem])
     problems = campaign_preflight(
         campaign, built, account.platform, clip.current.duration_s, edl, when
     )
-    return _Plan(campaign_id, metadata, problems)
+    return _Plan(campaign_id, metadata, [*unread, *problems])
 
 
 def _log_text(text: str | None) -> str:
@@ -522,7 +529,8 @@ def publish_problem(
     """The publish-time pre-flight (CLP-97): why a claimed post must not go out now, or
     None. The config may have changed since scheduling (campaign disabled or ended, brief
     tightened, the account moved to another campaign) and a reschedule may have moved the
-    post past the campaign's end, so the brief is checked again with the stored metadata.
+    post past the campaign's end, so the brief is checked again with the stored metadata,
+    at the time the post goes live (its slot, when it is claimed early).
     Fails closed: an account no longer configured, or a post whose campaign differs from
     the one its account has now (including one scheduled before CLP-97), is held."""
     account = accounts.get(post.account_id)
@@ -547,7 +555,9 @@ def publish_problem(
     if campaign is None:
         return f"account {account.id}: unknown campaign {campaign_id!r}"
     edl = render_edl(media_root, post.video_path) if media_root else None
-    problems = campaign_preflight(campaign, metadata, post.platform, version.duration_s, edl, now)
+    # A post claimed early (Facebook's lead time) goes live at its slot, not now.
+    when = max(now, post.scheduled_at)
+    problems = campaign_preflight(campaign, metadata, post.platform, version.duration_s, edl, when)
     return "; ".join(problems) if problems else None
 
 

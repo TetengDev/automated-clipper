@@ -25,7 +25,7 @@ from clipper.posting.scheduler import (
 )
 from clipper.posting.stage import BACKOFF_BASE, PostingStage, allow_all
 from config_support import VALID_YAML
-from posting_support import FakeAccount, FakePublisher
+from posting_support import FakeAccount, FakePublisher, write_rendered
 from review_support import Env, login, make_env
 
 MANILA = ZoneInfo("Asia/Manila")  # UTC+8, no DST
@@ -68,9 +68,7 @@ def make_post(
 ) -> Post:
     job = env.job()
     rel = f"youtube_{job}/clip_1_v1.mp4"
-    target = env.media_root / rel
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"fake mp4")
+    write_rendered(env.media_root / rel)
     clip_id = env.clip(job, status="approved", video_path=rel, title="t", caption="c")
     post = repo.insert_post(
         env.conn,

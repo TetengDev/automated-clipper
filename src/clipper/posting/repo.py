@@ -43,6 +43,7 @@ from clipper.posting.models import (
     PostMetadata,
     PostStatus,
     PublishResult,
+    StoredRef,
     can_transition,
 )
 
@@ -660,6 +661,33 @@ def touch_claim(conn: sqlite3.Connection, post_id: int, worker_id: str, now: dat
         (to_iso(now), to_iso(now), post_id, str(PostStatus.UPLOADING), worker_id),
     )
     return cur.rowcount == 1
+
+
+def save_platform_ref(
+    conn: sqlite3.Connection, idempotency_key: str, worker_id: str, ref: str
+) -> bool:
+    """Store the platform's id for the upload in progress (CLP-122) on the post with this
+    key. Only while it is this worker's upload, like `touch_claim`: False when it is not
+    (finished, or taken over), and nothing is written. No audit row; `updated_at` is
+    left alone, since the claim-time caps count recent uploads by it."""
+    cur = conn.execute(
+        "UPDATE posts SET platform_ref = ?"
+        " WHERE idempotency_key = ? AND status = ? AND worker_id = ?",
+        (ref, idempotency_key, str(PostStatus.UPLOADING), worker_id),
+    )
+    return cur.rowcount == 1
+
+
+def platform_ref(conn: sqlite3.Connection, idempotency_key: str) -> StoredRef | None:
+    """The stored platform id of the post with this key (`save_platform_ref`) with the
+    post's own account, or None when there is no such post or nothing is stored."""
+    row = conn.execute(
+        "SELECT account_id, platform_ref FROM posts WHERE idempotency_key = ?",
+        (idempotency_key,),
+    ).fetchone()
+    if row is None or row["platform_ref"] is None:
+        return None
+    return StoredRef(row["account_id"], row["platform_ref"])
 
 
 def release_uploads(

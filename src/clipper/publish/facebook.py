@@ -77,6 +77,11 @@ class _Progress:
     video_id: str
     finish_sent: bool = False
 
+    def ref(self, *, finish_sent: bool) -> dict[str, object]:
+        """What is kept on the post (`posts.platform_ref`, CLP-122). Not the account:
+        the post's own account is the only one whose token checks the Reel."""
+        return {"video_id": self.video_id, "finish_sent": finish_sent}
+
 
 class FacebookPublisher(MetaPublisher):
     platform = "facebook"
@@ -126,6 +131,7 @@ class FacebookPublisher(MetaPublisher):
             upload_url = f"https://{UPLOAD_HOST}/video-upload/{GRAPH_VERSION}/{video_id}"
         progress = _Progress(post.account_id, video_id)
         self._remember(post.idempotency_key, progress)
+        self._save_ref(post.idempotency_key, progress.ref(finish_sent=False))
         self._in_time(deadline, "the upload")
         uploaded = self.client.upload(upload_url, creds.token, video_path)
         if uploaded.get("success") is not True:
@@ -150,6 +156,7 @@ class FacebookPublisher(MetaPublisher):
             **({"title": metadata.title} if metadata.title else {}),
             "is_ai_generated": form_bool(bool(metadata.flags.get(AI_FLAG))),
         }
+        self._save_ref(post.idempotency_key, progress.ref(finish_sent=True))
         progress.finish_sent = True
         done = self.client.post(reels, creds.token, data=finish)
         if done.get("success") is not True:
@@ -188,6 +195,18 @@ class FacebookPublisher(MetaPublisher):
             "scheduled_publish_time": str(int(post.scheduled_at.timestamp())),
         }
 
+    def _stored(self, key: str) -> _Progress | None:
+        """The progress kept on the post by an earlier worker (CLP-122), or None."""
+        loaded = self._load_ref(key)
+        if loaded is None:
+            return None
+        account_id, ref = loaded
+        sent = ref.get("finish_sent")
+        if not isinstance(sent, bool):
+            raise MetaError("facebook: the stored upload reference is unreadable")
+        video_id = graph_id(ref.get("video_id"), "stored video id")
+        return _Progress(account_id, video_id, finish_sent=sent)
+
     def _remember(self, key: str, progress: _Progress) -> None:
         self._progress.pop(key, None)
         self._progress[key] = progress
@@ -195,32 +214,50 @@ class FacebookPublisher(MetaPublisher):
             self._progress.pop(next(iter(self._progress)))
 
     def lookup(self, idempotency_key: str) -> PublishResult | None:
-        """Whether an earlier attempt of this worker got the Reel accepted after all (its
-        finish reply was lost). Only attempts made by this process are known; after a
-        restart this says not found and the stage handles the post as usual.
+        """Whether an earlier attempt got the Reel accepted after all (its finish reply
+        was lost, or the worker died). The Reel is checked by its `video_id`: the one
+        stored on the post (`use_platform_refs`, CLP-122), else this process's memory, so
+        a restart does not lose it. With neither, this says not found and the stage handles
+        the post as usual. A video whose `from` names another Page raises (a reply without
+        `from` is logged and checked as usual).
 
         Once the finish call was sent, only a Reel Facebook reports as failed (`status`
         `error`) is "not found". One that is neither scheduled nor published yet may still
-        be processing, so this raises and the stage hands the post to a human rather
-        than uploading it a second time."""
-        progress = self._progress.get(idempotency_key)
+        be processing, or the finish call may never have reached Meta, so this raises and
+        the stage hands the post to a human rather than uploading it a second time."""
+        # The post's stored Reel wins: another worker may have started a newer upload.
+        progress = self._stored(idempotency_key) or self._progress.get(idempotency_key)
         if progress is None or not progress.finish_sent:
             return None
         creds = self._creds(progress.account_id)
-        fields = "id,published,scheduled_publish_time,permalink_url,status"
+        fields = "id,from,published,scheduled_publish_time,permalink_url,status"
         try:
             info = self.client.get(progress.video_id, creds.token, params={"fields": fields})
         except MetaError as exc:
             self._raise(creds, exc)
             raise  # unreachable
+        # Not confirmed that Graph returns `from` for an unpublished or scheduled Reel:
+        # only a different Page raises; a missing one is logged and the lookup goes on.
+        owner = info.get("from")
+        owner_id = owner.get("id") if isinstance(owner, dict) else None
+        if owner_id is None:
+            logger.info(
+                "video %s: no `from` in the reply; its Page is not checked", progress.video_id
+            )
+        elif str(owner_id) != creds.object_id:
+            raise MetaError(
+                f"facebook: video {progress.video_id} is not a video of this Page;"
+                " check the Page before requeueing"
+            )
         if not (info.get("published") is True or info.get("scheduled_publish_time")):
             status = info.get("status") if isinstance(info.get("status"), dict) else {}
             if status.get("video_status") == "error":
                 self._progress.pop(idempotency_key, None)
                 return None
             raise MetaError(
-                f"facebook: Reel {progress.video_id} was finished but is neither scheduled"
-                " nor published yet; check the Page before requeueing"
+                f"facebook: Reel {progress.video_id} is neither scheduled nor published yet;"
+                " it may still be processing, or the finish call may not have reached Meta;"
+                " check the Page before requeueing"
             )
         self._progress.pop(idempotency_key, None)
         return PublishResult(

@@ -75,6 +75,16 @@ CLP-106 (with the accounts config, `accounts`):
   deferral is never earlier than the slot nor sooner than `MIN_DEFER` from now.
   One pass handles each post at most once, so it never defers the same post twice.
 * Posts of an account missing from the config keep the plain backoff.
+
+CLP-122: a publisher with `use_platform_refs` (Facebook, Instagram) gets a store on
+`posts.platform_ref` (`StoredRefs`, this stage's connection and worker id). It keeps the
+platform's id for the upload there before each step that can be interrupted, so the
+`lookup` of a later worker (the stale pass, or a retry after a restart) checks the upload
+by id instead of finding nothing. The save is fail-closed: if it cannot be written (the
+post was taken over, or the database stays locked past its busy timeout), the publisher
+raises before the next platform call: the upload is aborted (fail-closed), never sent on
+without its id on record. The attempt then fails as usual, or, if even that cannot be
+recorded, the post stays `uploading` for the stale pass.
 """
 
 from __future__ import annotations
@@ -103,6 +113,7 @@ from clipper.posting.models import (
     Publisher,
     PublishRejected,
     PublishResult,
+    StoredRef,
 )
 from clipper.posting.scheduler import (
     HISTORY,
@@ -207,6 +218,13 @@ class PostingStage:
                 "PostingStage with publishers needs a guard (scheduler.publish_guard, or"
                 " allow_all to publish without the campaign pre-flight)"
             )
+        # CLP-122: publishers that track an upload by the platform's id keep it on the
+        # post, through this stage's connection (publish and lookup run on its thread).
+        refs = StoredRefs(self.conn, self.worker_id)
+        for publisher in self.publishers.values():
+            use = getattr(publisher, "use_platform_refs", None)
+            if callable(use):
+                use(refs)
 
     def run_once(self) -> int:
         """One posting pass; returns how many posts it acted on."""
@@ -707,6 +725,23 @@ class PostingStage:
             self.alert(message)
         except Exception:
             logger.exception("%s: alert failed", _label(post))
+
+
+@dataclass(frozen=True)
+class StoredRefs:
+    """`PlatformRefs` on `posts.platform_ref` (CLP-122). A save is refused (`PostConflict`)
+    once the post is no longer this worker's upload, so a worker that lost its claim never
+    overwrites the new owner's id nor carries on uploading."""
+
+    conn: sqlite3.Connection
+    worker_id: str
+
+    def save(self, idempotency_key: str, ref: str) -> None:
+        if not repo.save_platform_ref(self.conn, idempotency_key, self.worker_id, ref):
+            raise PostConflict("the post is no longer this worker's upload")
+
+    def load(self, idempotency_key: str) -> StoredRef | None:
+        return repo.platform_ref(self.conn, idempotency_key)
 
 
 def _lead_time(publisher: Publisher) -> timedelta | None:

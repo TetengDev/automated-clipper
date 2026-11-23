@@ -71,6 +71,24 @@ def test_list_shows_open_posts(env: Env) -> None:
     assert "yt_main" not in result.output  # cancelled is hidden by default
 
 
+def test_list_shows_the_slot_and_a_different_next_try(env: Env) -> None:
+    # CLP-115: a deferred post keeps its slot; the time it is tried next is shown apart.
+    deferred = make_post(env)
+    on_time = make_post(env, account="yt_main", platform="youtube")
+    retry = AT + timedelta(hours=3)
+    env.conn.execute(
+        "UPDATE posts SET scheduled_at = ?, error = 'quota' WHERE id = ?",
+        (retry.strftime("%Y-%m-%dT%H:%M:%SZ"), deferred.id),
+    )
+
+    lines = {line.split()[0]: line for line in run(env, "list").output.splitlines() if line}
+
+    slot = AT.strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert slot in lines[str(deferred.id)]
+    assert f"next try {retry.strftime('%Y-%m-%dT%H:%M:%SZ')}" in lines[str(deferred.id)]
+    assert slot in lines[str(on_time.id)] and "next try" not in lines[str(on_time.id)]
+
+
 def test_list_all_and_status_filter(env: Env) -> None:
     first = make_post(env)
     second = make_post(env, account="yt_main", platform="youtube")

@@ -1,10 +1,13 @@
 """YouTube Shorts publisher (CLP-93), on the YouTube Data API v3 over plain httpx.
 
-* `publish` uploads with the resumable protocol (`videos.insert`, `uploadType=resumable`)
-  as `private` with `status.publishAt` = the post's `scheduled_at`, so YouTube itself
-  makes it public at that time. A `publishAt` in the past publishes right away (videos
-  resource, `status.publishAt`), so a late retry still goes out. Vertical videos up to
-  3 minutes are classified as Shorts by YouTube; no flag is needed.
+* `publish` uploads with the resumable protocol (`videos.insert`, `uploadType=resumable`).
+  While the post's slot (`Post.slot`, the stored `publish_at`) is still ahead, the video
+  goes up `private` with `status.publishAt` = the slot, so YouTube itself makes it public
+  then; the posting stage claims a first attempt `LEAD_TIME` (30 minutes) before the slot
+  so that it can (CLP-115). A slot that has come (a late worker, a retry, a slot kept or
+  found after a deferral) is uploaded `public`, without `publishAt`; one at most
+  `SCHEDULE_MIN_AHEAD` ahead is deferred to the slot, so nothing goes live early.
+  Vertical videos up to 3 minutes are classified as Shorts by YouTube; no flag is needed.
 * Quota: one `videos.insert` costs 1 unit of the separate "Video Uploads" bucket
   (100 calls a day). `quotaExceeded` and `uploadLimitExceeded` raise `PublishDeferred`
   to just after the next quota reset (midnight Pacific time), so they never count as an
@@ -89,6 +92,14 @@ TOKEN_LIFETIME_BOUNDS = (300, 86400)
 PAUSE_RECHECK = timedelta(hours=1)
 """How far a paused account's posts are pushed each time they come due."""
 REJECTED_GRANT_ERRORS = frozenset({"invalid_grant", "invalid_client", "unauthorized_client"})
+LEAD_TIME = timedelta(minutes=30)
+"""How long before its slot a post's first attempt is uploaded (CLP-115), so YouTube's own
+scheduler publishes it at `publishAt`. Kept short on purpose: once a video is uploaded
+with a `publishAt`, a later pause, a disabled account or a lapsed campaign no longer stops
+it going live (there is no unschedule path yet), so that window is at most this long."""
+SCHEDULE_MIN_AHEAD = timedelta(seconds=60)
+"""A slot no further ahead than this is too close to schedule: the post waits for it
+(`PublishDeferred`) and then goes up public, never early."""
 
 QUOTA_TIMEZONE = ZoneInfo("America/Los_Angeles")
 QUOTA_RESET_SLACK = timedelta(minutes=5)
@@ -227,11 +238,21 @@ def _rfc3339(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def video_resource(post: Post, metadata: PostMetadata) -> dict[str, Any]:
-    """The `videos.insert` body: private, published by YouTube at `post.scheduled_at`.
-    A post that needs the paid-partnership disclosure is refused: it is not set here."""
+def video_resource(post: Post, metadata: PostMetadata, *, now: datetime) -> dict[str, Any]:
+    """The `videos.insert` body: private and published by YouTube at the post's slot while
+    that is more than `SCHEDULE_MIN_AHEAD` after `now`; public at once when the slot has
+    come. A slot ahead by no more than that raises `PublishDeferred` until the slot, so
+    nothing goes live early (`publish` builds this before any API call). A post that
+    needs the paid-partnership disclosure is refused: it is not set here."""
     if metadata.flags.get("paid_partnership", False):
         raise PublishRejected("the YouTube publisher cannot set the paid partnership disclosure")
+    slot = post.slot
+    if slot <= now:
+        timing = {"privacyStatus": "public"}
+    elif slot <= now + SCHEDULE_MIN_AHEAD:
+        raise PublishDeferred("youtube: the slot is too close to schedule; waiting for it", slot)
+    else:
+        timing = {"privacyStatus": "private", "publishAt": _rfc3339(slot)}
     return {
         "snippet": {
             "title": _title(metadata),
@@ -240,8 +261,7 @@ def video_resource(post: Post, metadata: PostMetadata) -> dict[str, Any]:
             "categoryId": CATEGORY_ENTERTAINMENT,
         },
         "status": {
-            "privacyStatus": "private",
-            "publishAt": _rfc3339(post.scheduled_at),
+            **timing,
             "selfDeclaredMadeForKids": False,
             "containsSyntheticMedia": bool(metadata.flags.get("contains_synthetic_media", False)),
         },
@@ -343,7 +363,9 @@ def _quota_deferral(exc: YouTubeError, now: datetime) -> PublishDeferred | None:
 
 
 class YouTubePublisher:
-    """`Publisher` for the `youtube` platform, covering every configured YouTube account."""
+    """`Publisher` for the `youtube` platform, covering every configured YouTube account.
+    `lead_time` (default `LEAD_TIME`) is how early the posting stage uploads a post's
+    first attempt before its slot."""
 
     def __init__(
         self,
@@ -355,10 +377,12 @@ class YouTubePublisher:
         clock: Clock = utcnow,
         sleep: Callable[[float], None] = time.sleep,
         chunk_size: int = CHUNK_SIZE,
+        lead_time: timedelta = LEAD_TIME,
     ) -> None:
         if chunk_size <= 0 or chunk_size % UPLOAD_UNIT:
             raise ValueError("chunk_size must be a positive multiple of 256 KiB")
         self.account_ids = tuple(account_ids)
+        self.lead_time = lead_time
         self.client = client
         self.refresh_token = refresh_token
         self.http = http or httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=False)
@@ -383,7 +407,7 @@ class YouTubePublisher:
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult:
         if post.account_id not in self.account_ids:
             raise self._unknown_account(post.account_id)
-        resource = video_resource(post, metadata)
+        resource = video_resource(post, metadata, now=self.clock())
         size = video_path.stat().st_size
         if size == 0:
             raise ValueError("the rendered video is empty")
@@ -403,7 +427,7 @@ class YouTubePublisher:
             self._call_tokens = None
         video_id = _video_id(video)
         logger.info(
-            "youtube %s: uploaded %s for %s", post.account_id, video_id, _rfc3339(post.scheduled_at)
+            "youtube %s: uploaded %s for %s", post.account_id, video_id, _rfc3339(post.slot)
         )
         return PublishResult(external_id=video_id, url=shorts_url(video_id))
 

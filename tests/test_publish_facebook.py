@@ -3,6 +3,7 @@ SCHEDULED + scheduled_publish_time, so Facebook publishes at the slot. Recorded 
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
@@ -12,9 +13,15 @@ import httpx
 import pytest
 import respx
 
-from clipper.posting.models import PublishDeferred, PublishRejected, PublishResult
-from clipper.posting.stage import STALE_UPLOAD
-from clipper.publish.facebook import LEAD_TIME, SCHEDULE_MIN_AHEAD, FacebookPublisher
+from clipper.posting import repo
+from clipper.posting.models import PostStatus, PublishDeferred, PublishRejected, PublishResult
+from clipper.posting.stage import STALE_UPLOAD, PostingStage, allow_all
+from clipper.publish.facebook import (
+    LEAD_TIME,
+    SCHEDULE_MIN_AHEAD,
+    UPLOAD_MARGIN,
+    FacebookPublisher,
+)
 from clipper.publish.meta import GraphClient, MetaError
 from meta_support import (
     ENV,
@@ -33,6 +40,7 @@ from meta_support import (
     stored_metadata,
     video,
 )
+from review_support import make_env
 
 REELS = graph(f"{PAGE_ID}/video_reels")
 UPLOAD = recorded("fb_reels_start")["upload_url"]
@@ -113,13 +121,118 @@ def test_late_post_is_published_now(
     mock: respx.MockRouter, publisher: FacebookPublisher, tmp_path: Path
 ) -> None:
     reels, _ = happy(mock)
-    post = make_post(at=T0 + SCHEDULE_MIN_AHEAD - timedelta(seconds=1))
+    post = make_post(at=T0)
 
     publisher.publish(post, video(tmp_path), metadata())
 
     finish = form(reels.calls[1].request)
     assert finish["video_state"] == "PUBLISHED"
     assert "scheduled_publish_time" not in finish
+
+
+@pytest.mark.parametrize(
+    "ahead", [timedelta(seconds=1), timedelta(minutes=5), SCHEDULE_MIN_AHEAD - timedelta(seconds=1)]
+)
+def test_a_slot_too_close_to_schedule_waits_for_it_before_any_upload(
+    mock: respx.MockRouter, publisher: FacebookPublisher, tmp_path: Path, ahead: timedelta
+) -> None:
+    # Review round 1: publishing at once would go live up to 11 minutes before the slot.
+    reels, upload = happy(mock)
+    post = make_post(at=T0 + ahead)
+
+    with pytest.raises(PublishDeferred) as deferred:
+        publisher.publish(post, video(tmp_path), metadata())
+
+    assert deferred.value.until == post.scheduled_at
+    assert reels.calls == [] and upload.calls == []
+
+
+def test_a_first_attempt_claimed_a_lead_time_ahead_is_scheduled_natively(
+    mock: respx.MockRouter, publisher: FacebookPublisher, tmp_path: Path
+) -> None:
+    reels, _ = happy(mock)
+    post = make_post(at=T0 + LEAD_TIME)
+
+    publisher.publish(post, video(tmp_path), metadata())
+
+    finish = form(reels.calls[1].request)
+    assert finish["video_state"] == "SCHEDULED"
+    assert finish["scheduled_publish_time"] == str(int(post.scheduled_at.timestamp()))
+
+
+def test_a_slot_that_comes_too_close_during_the_upload_waits_for_it(
+    mock: respx.MockRouter, publisher: FacebookPublisher, clock: Clock, tmp_path: Path
+) -> None:
+    # The backstop: an upload slower than `UPLOAD_MARGIN` defers at the finish call. It
+    # leaves an unfinished draft on the Page, but nothing goes live early.
+    reels = mock.post(REELS)
+    reels.side_effect = [reply("fb_reels_start"), reply("fb_reels_finish")]
+    slot = T0 + SCHEDULE_MIN_AHEAD + UPLOAD_MARGIN + timedelta(minutes=1)
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        clock.now = slot - timedelta(minutes=5)  # the upload took 12 minutes
+        return reply("fb_upload_ok")
+
+    mock.post(UPLOAD).mock(side_effect=slow)
+
+    with pytest.raises(PublishDeferred) as deferred:
+        publisher.publish(make_post(at=slot), video(tmp_path), metadata())
+
+    assert deferred.value.until == slot
+    assert len(reels.calls) == 1  # started, never finished: nothing goes live early
+
+
+def test_a_draft_left_by_the_finish_time_backstop_is_named_for_the_operator(
+    mock: respx.MockRouter,
+    publisher: FacebookPublisher,
+    clock: Clock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Security review round 3: the operator must be able to find (and delete) the draft.
+    reels = mock.post(REELS)
+    reels.side_effect = [reply("fb_reels_start"), reply("fb_reels_finish")]
+    slot = T0 + SCHEDULE_MIN_AHEAD + UPLOAD_MARGIN + timedelta(minutes=1)
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        clock.now = slot - timedelta(minutes=5)
+        return reply("fb_upload_ok")
+
+    mock.post(UPLOAD).mock(side_effect=slow)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="clipper.publish.facebook"),
+        pytest.raises(PublishDeferred) as deferred,
+    ):
+        publisher.publish(make_post(at=slot), video(tmp_path), metadata())
+
+    assert VIDEO_ID in deferred.value.reason and "draft" in deferred.value.reason
+    [record] = [r for r in caplog.records if VIDEO_ID in r.getMessage()]
+    assert record.levelno == logging.WARNING and "draft" in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    "ahead",
+    [SCHEDULE_MIN_AHEAD, SCHEDULE_MIN_AHEAD + UPLOAD_MARGIN - timedelta(seconds=1)],
+    ids=["at-the-minimum", "inside-the-upload-margin"],
+)
+def test_a_slot_the_upload_might_not_make_in_time_waits_before_uploading(
+    mock: respx.MockRouter, publisher: FacebookPublisher, tmp_path: Path, ahead: timedelta
+) -> None:
+    # Review round 2: deferring before the upload leaves no unfinished Reel draft.
+    reels, upload = happy(mock)
+    post = make_post(at=T0 + ahead)
+
+    with pytest.raises(PublishDeferred) as deferred:
+        publisher.publish(post, video(tmp_path), metadata())
+
+    assert deferred.value.until == post.scheduled_at
+    assert reels.calls == [] and upload.calls == []
+
+
+def test_the_upload_margin_still_leaves_the_lead_time_to_schedule() -> None:
+    assert timedelta(minutes=5) == UPLOAD_MARGIN
+    assert LEAD_TIME > SCHEDULE_MIN_AHEAD + UPLOAD_MARGIN
 
 
 def test_ai_disclosure_maps_to_is_ai_generated(
@@ -413,3 +526,57 @@ def test_lookup_without_a_finish_call_is_not_found(
 
     assert publisher.lookup(post.idempotency_key) is None
     assert publisher.lookup("never-seen") is None
+
+
+def test_a_deferral_ending_just_before_the_slot_publishes_no_reel_before_it(
+    mock: respx.MockRouter, publisher: FacebookPublisher, clock: Clock, tmp_path: Path
+) -> None:
+    # Review round 1 (CLP-115): a deferral that ends 5 minutes before the slot is too
+    # late to schedule natively; the Reel must not go live early, but at the slot.
+    env = make_env(tmp_path)
+    try:
+        job = env.job()
+        rel = f"youtube_{job}/clip_1_v1.mp4"
+        (env.media_root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (env.media_root / rel).write_bytes(b"fake mp4")
+        clip_id = env.clip(job, status="approved", video_path=rel, title="Chair falls", caption="c")
+        slot = T0 + timedelta(minutes=30)
+        post = repo.insert_post(
+            env.conn,
+            clip_id=clip_id,
+            clip_version=1,
+            account_id="fb_main",
+            platform="facebook",
+            scheduled_at=slot,
+            video_path=rel,
+            now=T0,
+        )
+        early = {"facebook": LEAD_TIME}
+        [claimed] = repo.claim_due(
+            env.conn, slot - LEAD_TIME, "w0", platforms={"facebook"}, early=early
+        )
+        repo.defer(env.conn, claimed, "w0", "rate limit", slot - timedelta(minutes=5), T0)
+        reels, _ = happy(mock)
+        posting = PostingStage(
+            conn=env.conn,
+            publishers={"facebook": publisher},
+            worker_id="w1",
+            media_root=env.media_root,
+            clock=clock,
+            guard=allow_all,
+        )
+
+        clock.now = slot - timedelta(minutes=5)
+        posting.run_once()
+        assert reels.calls == []
+        waiting = repo.get_post(env.conn, post.id)
+        assert waiting is not None and waiting.status == PostStatus.SCHEDULED
+        assert waiting.scheduled_at == slot
+
+        clock.now = slot
+        posting.run_once()
+        assert form(reels.calls[1].request)["video_state"] == "PUBLISHED"
+        done = repo.get_post(env.conn, post.id)
+        assert done is not None and done.status == PostStatus.POSTED
+    finally:
+        env.conn.close()

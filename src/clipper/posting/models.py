@@ -140,6 +140,21 @@ class Post:
     claimed_at: datetime | None = None
     created_at: str = ""
     campaign_id: str | None = None
+    publish_at: datetime | None = None
+    """The slot the post goes live at (CLP-115); `scheduled_at` is when it is next tried,
+    which a deferral moves and this does not. None for a held post."""
+
+    @property
+    def slot(self) -> datetime:
+        """When the post is meant to go live: `publish_at`, else `scheduled_at`."""
+        return self.publish_at or self.scheduled_at
+
+    @property
+    def next_try(self) -> datetime | None:
+        """When a scheduled post is next tried, if not at its slot (a deferral); else None."""
+        if self.status == PostStatus.SCHEDULED and self.scheduled_at != self.slot:
+            return self.scheduled_at
+        return None
 
     @property
     def safe_url(self) -> str | None:
@@ -170,6 +185,7 @@ class Post:
             claimed_at=from_iso(row["claimed_at"]),
             created_at=row["created_at"],
             campaign_id=row["campaign_id"],
+            publish_at=from_iso(row["publish_at"]),
         )
 
 
@@ -232,9 +248,9 @@ class Publisher(Protocol):
 
     * `publish` may raise `PublishRejected`: the post is `post_failed` at once (no retry).
     * `lead_time: timedelta`: a post's first attempt is claimed this long before its
-      `scheduled_at`, for a platform that publishes natively at a given time (Facebook's
-      `scheduled_publish_time`). Retries still wait for their backoff, and never come
-      before the slot.
+      slot, for a platform that publishes natively at a given time (Facebook's
+      `scheduled_publish_time`, YouTube's `publishAt`; CLP-115). Retries and deferrals
+      still wait for their own time, and never come before the slot.
     """
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult: ...

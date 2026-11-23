@@ -206,6 +206,26 @@ def test_scheduled_page_shows_an_empty_state(client: TestClient) -> None:
     assert "No upcoming posts" in client.get("/scheduled").text
 
 
+def test_scheduled_page_shows_the_slot_and_a_different_next_try(
+    client: TestClient, env: Env
+) -> None:
+    # CLP-115: a deferred post keeps its slot; the time it is tried next is shown apart.
+    slot = NOW + timedelta(hours=2)
+    deferred = scheduled_post(env, at=slot)
+    env.conn.execute(
+        "UPDATE posts SET scheduled_at = ?, error = 'quota' WHERE id = ?",
+        ("2027-01-15T13:30:00Z", deferred.id),
+    )
+
+    html = client.get("/scheduled").text
+
+    row = html[html.index(f'id="post-{deferred.id}"') :]
+    row = row[: row.index("</li>")]
+    assert "2027-01-15 10:00 UTC" in row
+    assert "next try" in row and "2027-01-15 13:30 UTC" in row
+    assert 'value="2027-01-15T10:00"' in row  # a reschedule starts from the slot
+
+
 def test_scheduled_page_needs_a_login(env: Env) -> None:
     response = env.client().get("/scheduled")
 

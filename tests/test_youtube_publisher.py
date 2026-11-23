@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,7 @@ from clipper.posting.publishers import build_publishers
 from clipper.posting.youtube import (
     API_URL,
     CATEGORY_ENTERTAINMENT,
+    LEAD_TIME,
     TOKEN_URL,
     UPLOAD_URL,
     OAuthClient,
@@ -209,11 +210,11 @@ def test_approved_clip_is_uploaded_private_with_publish_at(
     assert sent.headers["Authorization"] == f"Bearer {ACCESS}"
 
 
-def test_publish_at_in_the_past_is_still_sent_private(
+def test_a_slot_in_the_past_is_uploaded_public_without_publish_at(
     clock: Clock, video: Path, google: respx.MockRouter
 ) -> None:
-    """A retry or a deferred post is uploaded after its slot. YouTube publishes a private
-    video whose publishAt is in the past right away (videos resource, status.publishAt)."""
+    """A retry or a post with no future slot is uploaded after its slot: it is published
+    at once, with no `publishAt` (CLP-115)."""
     ok_token(google)
     session = ok_session(google)
     ok_upload(google)
@@ -221,14 +222,73 @@ def test_publish_at_in_the_past_is_still_sent_private(
     publisher(clock).publish(make_post(at=T0 - timedelta(minutes=10)), video, META)
 
     body = json.loads(session.calls.last.request.content)
-    assert body["status"]["privacyStatus"] == "private"
-    assert body["status"]["publishAt"] == "2027-01-15T00:50:00Z"
+    assert body["status"]["privacyStatus"] == "public"
+    assert "publishAt" not in body["status"]
+
+
+def test_publish_at_is_the_stored_slot_not_the_retry_time() -> None:
+    """A post deferred to before its slot keeps the slot (CLP-115): `publishAt` is the
+    stored `publish_at`, whatever `scheduled_at` says."""
+    post = replace(make_post(at=T0 + timedelta(minutes=5)), publish_at=T0 + timedelta(hours=3))
+
+    status = video_resource(post, META, now=T0)["status"]
+
+    assert status["privacyStatus"] == "private"
+    assert status["publishAt"] == "2027-01-15T04:00:00Z"
+
+
+def test_a_slot_more_than_a_minute_ahead_is_scheduled() -> None:
+    status = video_resource(make_post(at=T0 + timedelta(seconds=61)), META, now=T0)["status"]
+
+    assert status["privacyStatus"] == "private"
+    assert status["publishAt"] == "2027-01-15T01:01:01Z"
+
+
+@pytest.mark.parametrize(
+    "ahead", [timedelta(seconds=1), timedelta(seconds=60)], ids=["1s-defers", "60s-defers"]
+)
+def test_a_slot_less_than_a_minute_ahead_waits_for_the_slot(ahead: timedelta) -> None:
+    # Review round 2: uploading public now would go live up to a minute early.
+    post = make_post(at=T0 + ahead)
+
+    with pytest.raises(PublishDeferred) as deferred:
+        video_resource(post, META, now=T0)
+
+    assert deferred.value.until == post.scheduled_at
+
+
+def test_no_upload_happens_before_a_slot_too_close_to_schedule(
+    clock: Clock, video: Path, google: respx.MockRouter
+) -> None:
+    token = ok_token(google)
+    session = ok_session(google)
+    upload = ok_upload(google)
+    post = make_post(at=T0 + timedelta(seconds=30))
+
+    with pytest.raises(PublishDeferred) as deferred:
+        publisher(clock).publish(post, video, META)
+
+    assert deferred.value.until == post.scheduled_at
+    assert not token.called and not session.called and not upload.called
+
+
+def test_a_slot_that_is_now_is_published_at_once() -> None:
+    status = video_resource(make_post(at=T0), META, now=T0)["status"]
+
+    assert status["privacyStatus"] == "public" and "publishAt" not in status
+
+
+def test_the_publisher_uploads_thirty_minutes_ahead_of_the_slot(clock: Clock) -> None:
+    """CLP-115: the posting stage claims a first attempt `lead_time` before its slot, so
+    the upload is done in time for YouTube's own scheduler."""
+    assert publisher(clock).lead_time == LEAD_TIME == timedelta(minutes=30)
+    assert isinstance(publisher(clock), Publisher)
 
 
 def test_ai_elements_set_contains_synthetic_media(clock: Clock) -> None:
     # The flag name `build_post_metadata` stores for YouTube posts (CLP-96/97).
     meta = PostMetadata(title="t", caption="c", flags={"contains_synthetic_media": True})
-    assert video_resource(make_post(), meta)["status"]["containsSyntheticMedia"] is True
+    assert video_resource(make_post(), meta, now=T0)["status"]["containsSyntheticMedia"] is True
 
 
 def test_flags_stored_at_scheduling_reach_the_upload() -> None:
@@ -242,11 +302,13 @@ def test_flags_stored_at_scheduling_reach_the_upload() -> None:
         built = build_post_metadata(variants, "youtube", edl=edl, paid_partnership=paid)
         return PostMetadata(**asdict(built))
 
-    status = video_resource(make_post(), stored(edl=ai_edl))["status"]
+    status = video_resource(make_post(), stored(edl=ai_edl), now=T0)["status"]
     assert status["containsSyntheticMedia"] is True
-    assert video_resource(make_post(), stored())["status"]["containsSyntheticMedia"] is False
+    assert (
+        video_resource(make_post(), stored(), now=T0)["status"]["containsSyntheticMedia"] is False
+    )
     with pytest.raises(PublishRejected, match="paid partnership"):
-        video_resource(make_post(), stored(paid=True))
+        video_resource(make_post(), stored(paid=True), now=T0)
 
 
 def test_a_paid_partnership_post_is_refused_before_any_upload(
@@ -262,7 +324,7 @@ def test_a_paid_partnership_post_is_refused_before_any_upload(
 
 def test_title_is_capped_at_100_characters_without_angle_brackets() -> None:
     meta = PostMetadata(title="<b>Wow</b> " + "x" * 200, caption="")
-    title = video_resource(make_post(), meta)["snippet"]["title"]
+    title = video_resource(make_post(), meta, now=T0)["snippet"]["title"]
     assert len(title) <= 100
     assert "<" not in title and ">" not in title
     assert title.startswith("bWow/b x")
@@ -271,18 +333,18 @@ def test_title_is_capped_at_100_characters_without_angle_brackets() -> None:
 
 def test_blank_title_falls_back_to_the_caption() -> None:
     meta = PostMetadata(title="  ", caption="First line of caption\nsecond line")
-    assert video_resource(make_post(), meta)["snippet"]["title"] == "First line of caption"
+    assert video_resource(make_post(), meta, now=T0)["snippet"]["title"] == "First line of caption"
 
 
 def test_no_title_and_no_caption_is_refused() -> None:
     with pytest.raises(ValueError, match="title"):
-        video_resource(make_post(), PostMetadata(title="", caption=""))
+        video_resource(make_post(), PostMetadata(title="", caption=""), now=T0)
 
 
 def test_description_keeps_at_most_five_hashtags_and_fits_5000_bytes() -> None:
     tags = ["funny", "#fail", "#a", "#b", "#c", "#d", "#bad tag!"]
     meta = PostMetadata(title="t", caption="é" * 4000 + " <script>", hashtags=tags)
-    description = video_resource(make_post(), meta)["snippet"]["description"]
+    description = video_resource(make_post(), meta, now=T0)["snippet"]["description"]
     assert len(description.encode("utf-8")) <= 5000
     assert description.endswith("\n\n#funny #fail #a #b #c")
     assert "<" not in description and ">" not in description
@@ -291,7 +353,7 @@ def test_description_keeps_at_most_five_hashtags_and_fits_5000_bytes() -> None:
 def test_description_does_not_repeat_hashtags_already_in_the_caption() -> None:
     # Metadata stored at scheduling (CLP-97) already ends the caption with its hashtags.
     meta = PostMetadata(title="t", caption="Wow\n\n#funny #Fail", hashtags=["#funny", "#fail"])
-    description = video_resource(make_post(), meta)["snippet"]["description"]
+    description = video_resource(make_post(), meta, now=T0)["snippet"]["description"]
     assert description == "Wow\n\n#funny #Fail"
 
 

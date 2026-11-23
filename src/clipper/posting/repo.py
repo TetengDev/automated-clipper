@@ -3,9 +3,16 @@
 Every status change runs inside BEGIN IMMEDIATE, is conditional on the current status
 (and, for a worker's own claim, on its worker id), and writes an audit row to
 `clip_reviews` (action `post_scheduled`, `post_uploading`, `post_posted`, `post_failed`,
-`post_cancelled`, `post_rescheduled`, `post_held` or `post_released`), next to the clip's review
-history. Functions that change state open their own transaction, except `insert_post`,
-which callers wrap (see `scheduler.schedule_for_clip`).
+`post_cancelled`, `post_rescheduled`, `post_held`, `post_released`, `post_deferred`,
+`post_slot_kept` or `post_repicked`), next to the clip's review history. Functions that
+change state open their own transaction, except `insert_post`, which callers wrap (see
+`scheduler.schedule_for_clip`).
+
+CLP-115/CLP-120: `publish_at` is the post's slot, when it goes live; `scheduled_at` is
+when it is next tried. Scheduling, a reschedule, a release, a retry and a claim-time cap
+deferral (whose time the caps picked) set both; a publisher's deferral moves only
+`scheduled_at`, so the slot survives a quota day or a paused account.
+`settle_slot` decides, once a deferral is over, whether the slot still stands.
 """
 
 from __future__ import annotations
@@ -46,6 +53,15 @@ _COUNTED = "status != 'cancelled'"
 """Posts that hold their file on the platform (`posts_one_file_per_platform`)."""
 _TAKES_SLOT = "status NOT IN ('cancelled', 'held')"
 """Posts that use one of the account's slots: a held post has none until it is released."""
+_GO_LIVE = (
+    "CASE WHEN status = 'posted' THEN MAX(posted_at, COALESCE(publish_at, posted_at))"
+    " ELSE MAX(claimed_at, COALESCE(publish_at, claimed_at)) END"
+)
+"""When a posted or uploading post goes (or went) live: its upload, or its slot when the
+platform scheduled it for later (YouTube `publishAt`, Facebook; CLP-115 review)."""
+_UPLOAD_LEAD_MAX = timedelta(days=1)
+"""Uploads never start this long before they go live (lead times are minutes), so the
+go-live counts only look at posts changed since a day before the window."""
 _REVIEWER_EDITABLE = frozenset({PostStatus.SCHEDULED, PostStatus.POST_FAILED})
 _CANCELLABLE = _REVIEWER_EDITABLE | {PostStatus.HELD}
 
@@ -99,16 +115,17 @@ def account_post_times(
     exclude_post_id: int | None = None,
     since: datetime | None = None,
 ) -> list[datetime]:
-    """When the account's posts are (or were) scheduled; cancelled and held posts take no
-    slot. `exclude_post_id` leaves out the post being moved and `since` skips older
-    history, which the slot picker never looks at (CLP-106; the `(account_id,
-    scheduled_at)` index keeps it cheap)."""
+    """The slots of the account's posts (`Post.slot`: when each goes, or went, live, not
+    when a deferred one is next tried; CLP-120); cancelled and held posts take no slot.
+    `exclude_post_id` leaves out the post being moved and `since` skips older history,
+    which the slot picker never looks at (CLP-106). Every post that takes a slot has a
+    `publish_at` (only held posts have none), so the range uses `posts_account_publish`."""
     rows = conn.execute(
         f"SELECT * FROM posts WHERE account_id = ? AND {_TAKES_SLOT} AND id IS NOT ?"  # noqa: S608 - constant
-        " AND scheduled_at >= ?",
+        " AND publish_at >= ?",
         (account_id, exclude_post_id, to_iso(since) if since is not None else ""),
     )
-    return [Post.from_row(r).scheduled_at for r in rows]
+    return [Post.from_row(r).slot for r in rows]
 
 
 def uploads_between(
@@ -120,22 +137,30 @@ def uploads_between(
     exclude_post_id: int | None = None,
     per_attempt: bool = False,
 ) -> int:
-    """Uploads the account made or started in [start, end), for the claim-time caps
-    (CLP-106): posts posted then (`posted_at`), posts claimed for upload then
-    (`claimed_at`), and failed attempts (or unresolved uploads) recorded then, from their
-    audit rows: a failed attempt may have reached the platform, used quota or even gone
-    live. Audit rows keep their time, so a later deferral, reschedule or retry neither
-    moves an attempt into another window nor erases it.
+    """Uploads of the account in [start, end), for the claim-time caps (CLP-106): posts
+    posted or being uploaded, and failed attempts (or unresolved uploads) recorded then,
+    from their audit rows: a failed attempt may have reached the platform, used quota or
+    even gone live. Audit rows keep their time, so a later deferral, reschedule or retry
+    neither moves an attempt into another window nor erases it.
 
-    By default each other post counts once. `per_attempt` counts API attempts instead (for
-    the platform's API cap), including the excluded post's own failed attempts."""
+    By default each other post counts once, by when it goes live (`_GO_LIVE`: an upload
+    scheduled natively for its slot counts on the slot's day; CLP-115 review), for the
+    daily limit. `per_attempt` counts API attempts instead, by when they were made (for the
+    platform's API cap), including the excluded post's own failed attempts."""
     window = (to_iso(start), to_iso(end))
-    live = conn.execute(
-        "SELECT id FROM posts WHERE account_id = ? AND id IS NOT ? AND updated_at >= ? AND ("
-        " (status = 'posted' AND posted_at >= ? AND posted_at < ?)"
-        " OR (status = 'uploading' AND claimed_at >= ? AND claimed_at < ?))",
-        (account_id, exclude_post_id, window[0], *window, *window),
-    ).fetchall()
+    if per_attempt:
+        live = conn.execute(
+            "SELECT id FROM posts WHERE account_id = ? AND id IS NOT ? AND updated_at >= ? AND ("
+            " (status = 'posted' AND posted_at >= ? AND posted_at < ?)"
+            " OR (status = 'uploading' AND claimed_at >= ? AND claimed_at < ?))",
+            (account_id, exclude_post_id, window[0], *window, *window),
+        ).fetchall()
+    else:
+        live = conn.execute(
+            "SELECT id FROM posts WHERE account_id = ? AND id IS NOT ? AND updated_at >= ?"  # noqa: S608 - constant
+            f" AND status IN ('posted', 'uploading') AND {_GO_LIVE} >= ? AND {_GO_LIVE} < ?",
+            (account_id, exclude_post_id, to_iso(start - _UPLOAD_LEAD_MAX), *window),
+        ).fetchall()
     failed = [
         row[0]
         for row in conn.execute(
@@ -177,21 +202,30 @@ def had_failed_attempt(conn: sqlite3.Connection, post: Post) -> bool:
     return row is not None
 
 
-def last_upload(
+def go_lives_near(
     conn: sqlite3.Connection,
     account_id: str,
-    since: datetime,
+    at: datetime,
+    gap: timedelta,
     *,
     exclude_post_id: int | None = None,
-) -> datetime | None:
-    """When the account's latest upload since `since` started (posted or in flight)."""
-    row = conn.execute(
-        "SELECT MAX(CASE WHEN status = 'posted' THEN posted_at ELSE claimed_at END)"
-        " FROM posts WHERE account_id = ? AND id IS NOT ? AND ("
-        " (status = 'posted' AND posted_at >= ?) OR (status = 'uploading' AND claimed_at >= ?))",
-        (account_id, exclude_post_id, to_iso(since), to_iso(since)),
-    ).fetchone()
-    return from_iso(row[0]) if row and row[0] else None
+) -> list[datetime]:
+    """When the account's posted or in-flight posts go (or went) live within `gap` of
+    `at`, on either side, latest first: an upload scheduled natively for later is seen at
+    its slot, not at its upload (CLP-115 review)."""
+    rows = conn.execute(
+        f"SELECT {_GO_LIVE} AS live FROM posts WHERE account_id = ? AND id IS NOT ?"  # noqa: S608 - constant
+        " AND status IN ('posted', 'uploading') AND updated_at >= ?"
+        " AND live > ? AND live < ? ORDER BY live DESC",
+        (
+            account_id,
+            exclude_post_id,
+            to_iso(at - gap - _UPLOAD_LEAD_MAX),
+            to_iso(at - gap),
+            to_iso(at + gap),
+        ),
+    ).fetchall()
+    return [moment for row in rows if (moment := from_iso(row["live"])) is not None]
 
 
 def has_post(conn: sqlite3.Connection, clip_id: int, account_id: str) -> bool:
@@ -246,13 +280,13 @@ def insert_post(
 ) -> Post:
     """Create a `scheduled` post (and its audit row) with a fresh idempotency key; or a
     `held` one when `held` gives the reason (CLP-97). `metadata` is what it is published
-    with."""
+    with. `scheduled_at` is the post's slot (`publish_at`); a held post has none."""
     stamp = to_iso(now)
     status = PostStatus.HELD if held else PostStatus.SCHEDULED
     cur = conn.execute(
         "INSERT INTO posts (clip_id, clip_version, account_id, platform, status, scheduled_at,"
-        " idempotency_key, video_path, created_at, updated_at, campaign_id, metadata, error)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " publish_at, idempotency_key, video_path, created_at, updated_at, campaign_id,"
+        " metadata, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             clip_id,
             clip_version,
@@ -260,6 +294,7 @@ def insert_post(
             platform,
             str(status),
             to_iso(scheduled_at),
+            None if held else to_iso(scheduled_at),
             uuid.uuid4().hex,
             video_path,
             stamp,
@@ -310,6 +345,7 @@ def release_held(
         PostStatus.SCHEDULED,
         now,
         scheduled_at=at,
+        publish_at=at,
         error=None,
         attempts=0,
         metadata=_metadata_json(metadata),
@@ -354,6 +390,7 @@ def hold_claimed(
             now,
             owner=worker_id,
             error=reason,
+            publish_at=None,  # a held post has no slot
             worker_id=None,
             claimed_at=None,
         )
@@ -441,6 +478,7 @@ def reschedule(
         action="post_rescheduled",
         by=by,
         scheduled_at=at,
+        publish_at=at,
         attempts=0,
         error=None,
     )
@@ -460,11 +498,11 @@ def retry(
 
     def slot(c: sqlite3.Connection, post: Post) -> dict[str, Any]:
         if at is not None or pick is None:
-            return {"scheduled_at": at or now}
+            return {"scheduled_at": at or now, "publish_at": at or now}
         chosen = pick(c, post)
         if chosen is None:
             raise NoFreeSlot(post.account_id)
-        return {"scheduled_at": chosen}
+        return {"scheduled_at": chosen, "publish_at": chosen}
 
     return _change(
         conn,
@@ -517,9 +555,13 @@ def claim_due(
     """Atomically move due `scheduled` posts on `platforms` to `uploading` for this worker.
     Posts in `exclude` (already handled in this pass) are skipped.
 
-    `early` maps a platform to a lead time: its posts that were never attempted are due
-    that long before `scheduled_at` (CLP-94: Facebook schedules natively). Retries are
-    due at their backoff time as on every other platform.
+    `early` maps a platform to a lead time (CLP-94, CLP-115: Facebook and YouTube publish
+    natively at the slot). A post is due once its `scheduled_at` has come and its slot is
+    no further ahead than the lead time (none: the slot has come too), so a platform
+    without a lead time never publishes before the slot. A first attempt at its slot (no
+    attempt, no deferral: `error` is unset, since every deferral records its reason) is
+    due the lead time before it. A retry or a deferral is never claimed before its own
+    time, whatever the lead time.
 
     BEGIN IMMEDIATE holds the write lock from the read to the update, so two workers can
     never claim the same post.
@@ -528,12 +570,22 @@ def claim_due(
     if not wanted:
         return []
     marks = ", ".join("?" for _ in wanted)
-    due = ["scheduled_at <= ?"]
-    params: list[Any] = [to_iso(now)]
-    for platform, lead in sorted((early or {}).items()):
-        if platform in wanted and lead > timedelta(0):
-            due.append("(platform = ? AND attempts = 0 AND scheduled_at <= ?)")
-            params += [platform, to_iso(now + lead)]
+    due: list[str] = []
+    params: list[Any] = []
+    for platform in wanted:
+        lead = max((early or {}).get(platform, timedelta(0)), timedelta(0))
+        ahead = to_iso(now + lead)
+        if lead:
+            due.append(
+                "(platform = ? AND COALESCE(publish_at, scheduled_at) <= ? AND (scheduled_at <= ?"
+                " OR (attempts = 0 AND error IS NULL AND scheduled_at <= ?)))"
+            )
+            params += [platform, ahead, to_iso(now), ahead]
+        else:
+            due.append(
+                "(platform = ? AND scheduled_at <= ? AND COALESCE(publish_at, scheduled_at) <= ?)"
+            )
+            params += [platform, ahead, ahead]
     skipped = sorted(exclude)
     skip = f" AND id NOT IN ({', '.join('?' for _ in skipped)})" if skipped else ""
     with transaction(conn):
@@ -670,8 +722,17 @@ def release_uploads(
 
 
 def mark_posted(
-    conn: sqlite3.Connection, post: Post, worker_id: str, result: PublishResult, now: datetime
+    conn: sqlite3.Connection,
+    post: Post,
+    worker_id: str,
+    result: PublishResult,
+    now: datetime,
+    *,
+    live_at: datetime | None = None,
 ) -> Post:
+    """Record the upload. `live_at`, when known, is when it goes (or went) live and becomes
+    `publish_at`: the slot for a natively scheduled upload, else the upload itself."""
+    fields = {} if live_at is None else {"publish_at": live_at}
     with transaction(conn):
         _update(
             conn,
@@ -683,6 +744,7 @@ def mark_posted(
             external_id=result.external_id,
             url=result.url,
             error=None,
+            **fields,
         )
         done = _require(conn, post.id)
         _audit(conn, done, _action(PostStatus.POSTED), now, external_id=result.external_id)
@@ -712,13 +774,14 @@ def record_failure(
         if attempts < max_attempts:
             # Never before the slot: a first attempt claimed early (a publisher lead time)
             # must not be retried, and so published, ahead of the time it was given.
-            when: datetime | None = max(now + backoff * 2**attempts, current.scheduled_at)
+            when: datetime | None = max(now + backoff * 2**attempts, current.slot)
             if retry_at is not None:
                 when = retry_at(conn, when)
             if when is None:
                 error = f"{error}; {no_slot_note}" if no_slot_note else error
             else:
-                target, fields = PostStatus.SCHEDULED, {"scheduled_at": when}
+                # The retry goes live when it is uploaded: that is its slot now (CLP-115).
+                target, fields = PostStatus.SCHEDULED, {"scheduled_at": when, "publish_at": when}
         _update(
             conn,
             current,
@@ -753,7 +816,8 @@ def defer(
     now: datetime,
 ) -> Post:
     """Put a claimed post back to `scheduled` at `until` without counting an attempt
-    (CLP-93: quota, upload limit or a paused account). Audited as `post_deferred`."""
+    (CLP-93: quota, upload limit or a paused account). Audited as `post_deferred`. The
+    slot is kept (CLP-115): `settle_slot` checks it once the deferral is over."""
     with transaction(conn):
         _update(
             conn,
@@ -762,6 +826,7 @@ def defer(
             now,
             owner=worker_id,
             scheduled_at=until,
+            publish_at=post.slot,
             error=reason,
             worker_id=None,
             claimed_at=None,
@@ -790,7 +855,9 @@ def defer_claimed(
     """Claim-time caps (CLP-106): run `decide` and act on it in one write transaction, so
     the count and the slot it picks are not stale. A deferral puts the claimed post back
     to `scheduled` at `until` without counting an attempt (audit `post_deferred`, as for
-    CLP-93's `PublishDeferred`); with no `until` it is `post_failed`. None: go ahead."""
+    CLP-93's `PublishDeferred`); with no `until` it is `post_failed`. None: go ahead.
+    `until` is a time the caps picked for the post to go live, so it becomes the post's
+    slot and is reserved for the slot picker (CLP-115 review)."""
     with transaction(conn):
         decision = decide(conn)
         if decision is None:
@@ -816,6 +883,7 @@ def defer_claimed(
             now,
             owner=worker_id,
             scheduled_at=decision.until,
+            publish_at=decision.until,
             error=decision.reason,
             worker_id=None,
             claimed_at=None,
@@ -830,6 +898,87 @@ def defer_claimed(
             scheduled_at=to_iso(decision.until),
         )
     return decision
+
+
+def settle_slot(
+    conn: sqlite3.Connection,
+    post: Post,
+    worker_id: str,
+    now: datetime,
+    *,
+    pick: Callable[[sqlite3.Connection], datetime | None] | None,
+    go_by: datetime,
+    grace: timedelta = timedelta(0),
+    no_slot: str = "no free slot",
+) -> Post:
+    """A claimed post whose deferral is over (CLP-115, CLP-120): put `scheduled_at` back
+    on the slot it goes live at, in one write transaction. Returns the post as it is now:
+    `uploading` to upload it, `scheduled` for a later slot, or `post_failed`.
+
+    * Not deferred (`scheduled_at` is the slot) or no slot: unchanged.
+    * The slot is still ahead, or passed by at most `grace` (measured at the later of the
+      deferral's end and now, so a worker back from an outage does not count as on
+      time): the slot is kept (audit `post_slot_kept`); one that passed goes out at once.
+    * Otherwise the slot is re-picked (audit `post_repicked`): `pick` chooses the
+      account's next free slot inside this transaction. Without `pick` (no account rules)
+      the post goes out now; when `pick` finds none it is `post_failed` with `no_slot`.
+      A slot no later than `go_by` is uploaded at once (one already behind now records
+      now, when it really goes live); a later one goes back to `scheduled` at that slot
+      with its error cleared, so a lead-time platform claims it early, as a first attempt."""
+    slot = post.publish_at
+    if slot is None or slot == post.scheduled_at:
+        return post
+    with transaction(conn):
+        if max(post.scheduled_at, now) - slot <= grace:
+            _update(conn, post, PostStatus.UPLOADING, now, owner=worker_id, scheduled_at=slot)
+            kept = _require(conn, post.id)
+            previous = to_iso(post.scheduled_at)
+            _audit(conn, kept, "post_slot_kept", now, previous=previous, scheduled_at=to_iso(slot))
+            return kept
+        chosen = now if pick is None else pick(conn)
+        if chosen is None:
+            _update(
+                conn,
+                post,
+                PostStatus.POST_FAILED,
+                now,
+                owner=worker_id,
+                error=no_slot,
+                worker_id=None,
+                claimed_at=None,
+            )
+            failed = _require(conn, post.id)
+            _audit(conn, failed, _action(PostStatus.POST_FAILED), now, error=no_slot)
+            return failed
+        if chosen <= go_by:
+            at = max(chosen, now)
+            _update(
+                conn,
+                post,
+                PostStatus.UPLOADING,
+                now,
+                owner=worker_id,
+                scheduled_at=at,
+                publish_at=at,
+                error=None,
+            )
+        else:
+            at = chosen
+            _update(
+                conn,
+                post,
+                PostStatus.SCHEDULED,
+                now,
+                owner=worker_id,
+                scheduled_at=at,
+                publish_at=at,
+                error=None,
+                worker_id=None,
+                claimed_at=None,
+            )
+        settled = _require(conn, post.id)
+        _audit(conn, settled, "post_repicked", now, previous=to_iso(slot), scheduled_at=to_iso(at))
+    return settled
 
 
 def mark_failed(

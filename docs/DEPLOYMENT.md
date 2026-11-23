@@ -392,10 +392,28 @@ scheduled.
 
 How it posts:
 
-- Each due post is uploaded as `private` with `status.publishAt` set to the post's
-  scheduled time, so YouTube makes it public. A late retry has a `publishAt` in the past,
-  and YouTube publishes such a video right away. Vertical videos up to 3 minutes become
-  Shorts automatically.
+- A post is uploaded up to 30 minutes before its slot as `private`, with
+  `status.publishAt` set to the slot, so YouTube makes it public at that time. A post
+  whose slot has come (a late worker, a retry, a slot kept or found after a deferral) is
+  uploaded `public` without `publishAt`, and goes live at once. One whose slot is less
+  than a minute away waits for the slot, so it never goes live early. Vertical videos up to 3 minutes become Shorts automatically.
+- Once a video is uploaded with a `publishAt`, nothing stops it going live: pausing or
+  disabling the account, cancelling the post or a campaign ending in those last 30
+  minutes does not reach YouTube (there is no unschedule step yet). Keep that window in
+  mind when you pause an account or end a campaign; remove the video in YouTube Studio
+  if it must not go out.
+- A post keeps its slot when a publisher defers it (quota day, paused account). A
+  deferral that ends at most 30 minutes after the slot (`REPICK_GRACE`, e.g. Instagram's
+  5-minute recheck) keeps the slot, and the post goes out at once. If the deferral ends
+  later than that, or the worker only gets to the post more than 30 minutes after the
+  slot, the post gets the account's next free slot, so a backlog after a pause follows
+  the account's windows, gap and posts per day instead of going out at once. If the
+  account has no free slot in the next 7 days, the post fails with an alert. Retries
+  keep their backoff times.
+- The daily limit and the minimum gap are checked when the post is uploaded, using
+  when each post goes live: an upload scheduled for later counts at its slot, on the
+  slot's day, and the gap is kept on both sides. A post the daily limit or the gap holds
+  back moves to the account's next free slot, which becomes its new slot.
 - The title is capped at 100 characters. The description is the caption plus up to 5
   hashtags, within 5000 bytes. The category is 24 (Entertainment), the video is declared
   not made for kids, and `containsSyntheticMedia` is set when the clip has an AI element.
@@ -594,7 +612,13 @@ cost.
 
 - **Facebook**: the Reel is uploaded about 25 minutes before its slot and scheduled with
   `scheduled_publish_time`, so Facebook publishes it on time. A slot less than 11
-  minutes away (a late worker, a retry) is published at once. The post is marked
+  minutes ahead (too close for Facebook to schedule), or less than 16 minutes ahead before
+  the upload starts (room for the upload), waits for the slot and is published then,
+  never early; a slot that has passed (a late worker, a retry) is published at once. An
+  upload slower than 5 minutes that misses the 11-minute minimum also waits; it leaves an
+  unfinished draft on the Page, which is never published. The worker logs a WARNING
+  with the draft's video id and puts the id in the post's error; delete that draft in
+  Meta Business Suite. The post is marked
   `posted` when Facebook accepts the Reel, before it goes live. A Facebook post of a clip
   outside 3–90 s is held with the reason, and is never uploaded.
 - **Instagram**: Instagram has no API scheduling, so the worker publishes at the slot. It

@@ -7,7 +7,8 @@
     <a href="/clip/{{ post.clip_id }}">clip {{ post.clip_id }}</a> v{{ post.clip_version }} ·
     {% if post.posted_at %}posted {{ post.posted_at.strftime("%Y-%m-%d %H:%M") }} UTC
     {% elif post.status == "held" %}not scheduled
-    {% else %}<time datetime="{{ post.scheduled_at.isoformat() }}">{{ post.scheduled_at.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% endif %}
+    {% else %}<time datetime="{{ post.slot.isoformat() }}">{{ post.slot.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% endif %}
+    {% if post.next_try %} · next try <time datetime="{{ post.next_try.isoformat() }}">{{ post.next_try.strftime("%Y-%m-%d %H:%M") }} UTC</time>{% endif %}
     {% if post.attempts %} · {{ post.attempts }} attempt(s){% endif %}
     {% if post.safe_url %} · <a href="{{ post.safe_url }}" target="_blank" rel="noopener noreferrer">view post</a>{% endif %}
   </div>
@@ -23,7 +24,7 @@
       <input type="hidden" name="next" value="{{ next }}">
       <label>New time (UTC)
         <input type="datetime-local" name="scheduled_at" required
-               value="{{ post.scheduled_at.strftime('%Y-%m-%dT%H:%M') }}"></label>
+               value="{{ post.slot.strftime('%Y-%m-%dT%H:%M') }}"></label>
       <button type="submit">{{ "Retry at" if post.status == "post_failed" else "Reschedule" }}</button>
     </form>
     <form method="post" action="/posts/{{ post.id }}/cancel" hx-post="/posts/{{ post.id }}/cancel"

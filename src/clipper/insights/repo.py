@@ -530,6 +530,8 @@ def post_clip(conn: sqlite3.Connection, post: Post) -> PostClip | None:
 
 
 def went_public(post: Post) -> datetime:
-    """When the Short became public: the YouTube publisher uploads it private with
-    `publishAt` = `scheduled_at`, so it is public from the later of that and the upload."""
+    """When the Short became public. The post's `publish_at` records its real go-live
+    time (CLP-115): the slot, sent as `publishAt` when the upload was scheduled, or the
+    upload itself when it went up public. At upload `scheduled_at` is that slot, so the
+    later of it and the upload is when the Short went public."""
     return max(post.scheduled_at, post.posted_at or post.scheduled_at)

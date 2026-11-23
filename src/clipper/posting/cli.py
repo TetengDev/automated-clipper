@@ -123,7 +123,10 @@ def _warn_unknown(accounts: dict[str, AccountLike], post: Post) -> None:
 
 
 def _line(post: Post) -> str:
+    """One post: its slot (when it goes live, CLP-115) and, for a deferred or retried post
+    tried at another time, that time too."""
     detail = post.url or post.error or ""
+    next_try = [f"next try {to_iso(post.next_try)}"] if post.next_try else []
     return "  ".join(
         [
             f"{post.id:>5}",
@@ -131,7 +134,8 @@ def _line(post: Post) -> str:
             f"{post.platform:<9}",
             f"{strip_control(post.account_id):<20}",
             f"clip {post.clip_id} v{post.clip_version}",
-            to_iso(post.scheduled_at),
+            to_iso(post.slot),
+            *next_try,
             f"attempts {post.attempts}",
             strip_control(detail),
         ]

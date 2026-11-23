@@ -10,10 +10,14 @@ The Reels Publishing API, three calls with the Page access token:
    `is_ai_generated`. Facebook itself publishes at the slot.
 
 Facebook accepts a scheduled time 10 minutes to 29 days ahead, so the posting stage
-claims a Facebook post's first attempt `LEAD_TIME` before its slot. When the slot is less
-than `SCHEDULE_MIN_AHEAD` away at the finish call (a late worker, a retry), the Reel is
-published at once instead. The post is recorded `posted` when Facebook accepts the Reel,
-which for a scheduled Reel is up to `LEAD_TIME` before it goes live.
+claims a Facebook post's first attempt `LEAD_TIME` before its slot. A slot that has come
+(a late worker, a retry) is published at once. A slot still ahead but less than
+`SCHEDULE_MIN_AHEAD` plus `UPLOAD_MARGIN` away is waited for before uploading
+(`PublishDeferred` until the slot), so a Reel never goes live before its slot (CLP-115).
+The finish call checks `SCHEDULE_MIN_AHEAD` again as a backstop for a slow upload; that
+deferral leaves an unfinished draft on the Page.
+The post is recorded `posted` when Facebook accepts the Reel, which for a scheduled Reel
+is up to `LEAD_TIME` before it goes live.
 
 Clips longer than 90 s never get here: the pre-flight holds them for Facebook at
 scheduling and the publish-time guard checks again (CLP-94, CLP-111).
@@ -30,7 +34,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from clipper.jobs.models import Clock, utcnow
-from clipper.posting.models import Post, PostMetadata, PublishRejected, PublishResult
+from clipper.posting.models import (
+    Post,
+    PostMetadata,
+    PublishDeferred,
+    PublishRejected,
+    PublishResult,
+)
 from clipper.publish.meta import (
     GRAPH_VERSION,
     UPLOAD_HOST,
@@ -50,6 +60,9 @@ LEAD_TIME = timedelta(minutes=25)
 """How early the stage claims a first attempt, so the Reel can be scheduled natively."""
 SCHEDULE_MIN_AHEAD = timedelta(minutes=11)
 """Facebook's minimum is 10 minutes; one more for clock skew."""
+UPLOAD_MARGIN = timedelta(minutes=5)
+"""Room for the upload itself: a slot closer than `SCHEDULE_MIN_AHEAD` plus this is waited
+for before uploading, so the finish-time check (which leaves a draft) rarely fires."""
 SCHEDULE_MAX_AHEAD = timedelta(days=29)
 AI_FLAG = "is_ai_generated"
 PAID_FLAG = "paid_partnership"
@@ -105,6 +118,7 @@ class FacebookPublisher(MetaPublisher):
         deadline: datetime,
     ) -> PublishResult:
         reels = f"{creds.object_id}/video_reels"
+        self._ready(post)
         start = self.client.post(reels, creds.token, data={"upload_phase": "start"})
         video_id = graph_id(start.get("video_id"), "video id")
         upload_url = start.get("upload_url")
@@ -117,10 +131,21 @@ class FacebookPublisher(MetaPublisher):
         if uploaded.get("success") is not True:
             raise MetaError("facebook: the video upload was not accepted")
         self._in_time(deadline, "the finish call")
+        try:
+            timing = self._timing(post)
+        except PublishDeferred as exc:
+            # No delete call here: that would be a new Graph write path. The operator
+            # finds the draft by its id and deletes it in Meta Business Suite.
+            reason = (
+                f"{exc.reason}; unfinished Reel draft {video_id} left on the Page"
+                " (delete it in Meta Business Suite)"
+            )
+            logger.warning("post %d: %s", post.id, reason)
+            raise PublishDeferred(reason, until=exc.until, alert=exc.alert) from None
         finish = {
             "upload_phase": "finish",
             "video_id": video_id,
-            **self._timing(post),
+            **timing,
             "description": metadata.caption,
             **({"title": metadata.title} if metadata.title else {}),
             "is_ai_generated": form_bool(bool(metadata.flags.get(AI_FLAG))),
@@ -133,10 +158,29 @@ class FacebookPublisher(MetaPublisher):
         logger.info("post %d: Reel %s accepted (%s)", post.id, video_id, finish["video_state"])
         return PublishResult(external_id=video_id, url=f"https://www.facebook.com/reel/{video_id}")
 
-    def _timing(self, post: Post) -> dict[str, str]:
+    def _ready(self, post: Post) -> None:
+        """Before uploading: a slot ahead by less than `SCHEDULE_MIN_AHEAD` plus the
+        `UPLOAD_MARGIN` the upload may take is waited for, so no draft is left behind."""
         ahead = post.scheduled_at - self.clock()
-        if ahead < SCHEDULE_MIN_AHEAD:
+        if timedelta(0) < ahead < SCHEDULE_MIN_AHEAD + UPLOAD_MARGIN:
+            raise PublishDeferred(
+                "facebook: the slot is too close to upload and schedule; waiting for it",
+                until=post.scheduled_at,
+            )
+
+    def _timing(self, post: Post) -> dict[str, str]:
+        """At the finish call. The backstop when the upload took longer than
+        `UPLOAD_MARGIN`: deferring here leaves the uploaded, unfinished Reel as a draft on
+        the Page (it is never published; a later attempt uploads again). `_upload` logs
+        the draft's video id at WARNING and names it in the deferral reason."""
+        ahead = post.scheduled_at - self.clock()
+        if ahead <= timedelta(0):
             return {"video_state": "PUBLISHED"}
+        if ahead < SCHEDULE_MIN_AHEAD:
+            raise PublishDeferred(
+                "facebook: the slot is too close to schedule natively; waiting for it",
+                until=post.scheduled_at,
+            )
         if ahead > SCHEDULE_MAX_AHEAD:
             raise PublishRejected("facebook: a Reel can be scheduled at most 29 days ahead")
         return {

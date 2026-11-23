@@ -24,7 +24,22 @@ Each pass (the worker runs one per poll, see `clipper.jobs.worker.Worker.posting
 
 A publisher that raises `PublishRejected` (CLP-94) gets the post `post_failed` at once,
 with an alert. A publisher with a `lead_time` gets its posts' first attempts that long
-before `scheduled_at` (Facebook schedules natively).
+before their slot (Facebook and YouTube schedule natively; CLP-115).
+
+CLP-115/CLP-120: a post keeps its slot (`publish_at`) apart from its next attempt
+(`scheduled_at`). Retries and deferrals are claimed at their own time, never earlier for
+a lead time. Once a deferral is over (`repo.settle_slot`, before the claim-time caps), a
+slot still ahead is kept, and so is one passed by at most `REPICK_GRACE` at the later of
+the deferral's end and now (the post goes out at once). A slot passed by more is replaced
+by the account's next free slot (`pick_slot`, with the other posts' slots, searched from
+the deferral's end but never earlier than `REPICK_SLACK` before now), so a backlog
+released by a paused account is spread over its windows, gap and posts per day instead
+of going out at once. A fresh slot within the lead time (plus `REPICK_SLACK`, on a
+platform with a lead time only) is uploaded at once; a later one waits for it, claimed
+like a first attempt. With no account rules (or broken ones) the post goes now; an
+account whose rules leave no free slot within `MAX_DAYS_AHEAD` days gets the post
+`post_failed` with an alert. `publish_at` ends as the real go-live time: the slot when
+the platform scheduled the upload natively, else the upload.
 
 If recording a successful upload fails (DB error), the post stays `uploading` and step 1
 resolves it later through `lookup`; it is never re-published blindly.
@@ -49,12 +64,15 @@ CLP-106 (with the accounts config, `accounts`):
 * At claim time (after the lookup of an earlier attempt), in one write transaction:
   a post that would take its account over the `daily_limit` of the local day it publishes
   on (the platform cap on the UTC day for an account not in the config), over the
-  platform cap in a rolling 24 hours, or inside the minimum gap after its last upload, is
-  deferred to the account's next free slot (audit `post_deferred`, no attempt counted),
-  or, with no free slot, is `post_failed` and alerts. Posts posted, in flight, or with
-  failed attempts in the window count (`repo.uploads_between`). A post claimed before its
-  slot publishes at its slot, so the day and the gap are those of `max(now, scheduled_at)`,
-  and a deferral is never earlier than the slot nor sooner than `MIN_DEFER` from now.
+  platform cap in a rolling 24 hours, or within the minimum gap of another post's go-live
+  time on either side, is deferred to the account's next free slot (audit
+  `post_deferred`, no attempt counted; that time becomes its slot), or, with no free slot,
+  is `post_failed` and alerts. Posts posted, in flight, or with failed attempts in the
+  window count (`repo.uploads_between`). The daily limit and the gap use when posts go
+  live (an upload scheduled natively counts at its slot; CLP-115 review); the rolling
+  API cap counts attempts when they were made. A post claimed before its slot publishes
+  at its slot, so the day and the gap are those of `max(now, scheduled_at)`, and a
+  deferral is never earlier than the slot nor sooner than `MIN_DEFER` from now.
   One pass handles each post at most once, so it never defers the same post twice.
 * Posts of an account missing from the config keep the plain backoff.
 """
@@ -118,6 +136,13 @@ MAX_STALE_PER_PASS = DEFAULT_BATCH
 ROLLING_DAY = timedelta(hours=24)
 ROLLING_RETRY = timedelta(hours=1)
 """A post held by the rolling 24-hour platform cap is tried again this much later."""
+REPICK_SLACK = timedelta(minutes=1)
+"""`pick_slot` rounds up to the minute: a re-picked slot this close is uploaded at once."""
+REPICK_GRACE = timedelta(minutes=30)
+"""A deferral that ends at most this long after the post's slot keeps the slot: the post
+goes out at once (the claim-time caps still apply), so a short deferral (Instagram's
+5-minute lookup recheck, `MIN_DEFER`) never moves a post by hours. Only a longer one, a
+real pause, re-picks the slot (CLP-115/CLP-120)."""
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +253,10 @@ class PostingStage:
             post, publisher, strict=not requeued
         ):
             return
+        settled = self._settle_slot(post, publisher)
+        if settled is None:
+            return
+        post = settled
         if self._held_by_caps(post):
             return
         if self._held(post):
@@ -250,7 +279,7 @@ class PostingStage:
             return
         # Outside the try: if this write fails the post stays `uploading` and the stale
         # pass resolves it through `lookup` instead of uploading it again.
-        self._posted(post, result)
+        self._posted(post, result, uploaded=True)
 
     @contextmanager
     def _heartbeat(self, post: Post) -> Iterator[None]:
@@ -394,9 +423,14 @@ class PostingStage:
 
     # --- outcomes ----------------------------------------------------------------------
 
-    def _posted(self, post: Post, result: PublishResult) -> None:
+    def _posted(self, post: Post, result: PublishResult, *, uploaded: bool = False) -> None:
+        """Record a live post. `uploaded`: this worker just uploaded it, so it goes live at
+        its slot when the platform scheduled it, else now (`publish_at`, CLP-115 review);
+        an upload found by `lookup` keeps its slot, its go-live time being unknown."""
+        now = self.clock()
+        live_at = max(post.slot, now) if uploaded else None
         try:
-            repo.mark_posted(self.conn, post, self.worker_id, result, self.clock())
+            repo.mark_posted(self.conn, post, self.worker_id, result, now, live_at=live_at)
         except PostConflict as exc:
             # The video is live but the row changed under us: a possible duplicate.
             message = (
@@ -408,6 +442,67 @@ class PostingStage:
             self._send(message, post)
             return
         logger.info("%s: posted (%s)", _label(post), result.external_id)
+
+    def _settle_slot(self, post: Post, publisher: Publisher) -> Post | None:
+        """After a deferral: keep the slot, or re-pick one that passed (CLP-115, CLP-120).
+        The post to upload, or None when it went back to `scheduled`, was given up (with
+        an alert) or changed meanwhile."""
+        now = self.clock()
+        account = self.accounts.get(post.account_id)
+
+        def pick(conn: sqlite3.Connection) -> datetime | None:
+            assert account is not None
+            try:
+                taken = repo.account_post_times(
+                    conn, account.id, exclude_post_id=post.id, since=now - HISTORY
+                )
+                # From the deferral's end, so a claim a little late keeps the slot a cap
+                # deferral chose (pick_slot rounds up to the minute), but never from hours
+                # ago after a worker outage.
+                return pick_slot(account, taken, max(post.scheduled_at, now - REPICK_SLACK))
+            except (ValueError, ZoneInfoNotFoundError) as exc:
+                logger.error("account %s: invalid schedule config: %s", account.id, exc)
+                return now  # no usable rules: as for an account not in the config
+
+        lead = _lead_time(publisher)
+        # A slot a minute away is near enough for a platform that schedules natively; one
+        # without a lead time never posts before its slot.
+        go_by = now + lead + REPICK_SLACK if lead else now
+        no_slot = f"slot passed while deferred; no free slot in the next {MAX_DAYS_AHEAD} days"
+        try:
+            settled = repo.settle_slot(
+                self.conn,
+                post,
+                self.worker_id,
+                now,
+                pick=None if account is None else pick,
+                go_by=go_by,
+                grace=REPICK_GRACE,
+                no_slot=no_slot,
+            )
+        except PostConflict as exc:
+            logger.warning("%s: slot not settled: %s", _label(post), exc)
+            return None
+        except Exception as exc:
+            # Never leave the post claimed: the stale pass would take it for a crashed upload.
+            reason = f"slot check failed: {_describe(exc)}"
+            logger.error("%s: %s; retrying later", _label(post), reason)
+            try:
+                repo.defer(self.conn, post, self.worker_id, reason, now + BACKOFF_BASE, now)
+            except Exception:
+                logger.exception("%s: could not release the claim", _label(post))
+            return None
+        if settled.status == PostStatus.POST_FAILED:
+            self._alert(settled, no_slot)
+            return None
+        if settled.status != PostStatus.UPLOADING:
+            logger.info(
+                "%s: slot passed while deferred; re-picked %s",
+                _label(post),
+                settled.slot.isoformat(),
+            )
+            return None
+        return settled
 
     def _held_by_caps(self, post: Post) -> bool:
         """Claim-time caps (CLP-106). True when the claimed post must not upload now: it
@@ -425,9 +520,10 @@ class PostingStage:
             # would hand it to a human as an unresolved upload).
             logger.error("%s: cap check failed: %s; retrying later", _label(post), _describe(exc))
             until = max(now + BACKOFF_BASE, post.scheduled_at)
-            hold = repo.Deferral(f"cap check failed: {_describe(exc)}", until)
+            reason = f"cap check failed: {_describe(exc)}"
             try:
-                repo.defer_claimed(self.conn, post, self.worker_id, now, lambda _: hold)
+                # A plain deferral: the slot is kept, this time was not picked as a slot.
+                repo.defer(self.conn, post, self.worker_id, reason, until, now)
             except Exception:
                 logger.exception("%s: could not release the claim", _label(post))
             return True
@@ -509,11 +605,12 @@ class PostingStage:
                 )
         if account is not None and account.min_gap_minutes > 0:
             gap = timedelta(minutes=account.min_gap_minutes)
-            last = repo.last_upload(conn, account.id, at - gap, exclude_post_id=others)
-            if last is not None and at - last < gap:
+            near = repo.go_lives_near(conn, account.id, at, gap, exclude_post_id=others)
+            if near:
                 return held(
-                    f"within the {account.min_gap_minutes}-minute gap of the last upload",
-                    after(last + gap, last),
+                    f"within the {account.min_gap_minutes}-minute gap of another post"
+                    f" going live at {near[0].isoformat()}",
+                    after(near[0] + gap, *near),
                 )
         return None
 
@@ -569,9 +666,8 @@ class PostingStage:
         """Reschedule without counting an attempt (CLP-93). Never earlier than
         `MIN_DEFER` from now, so a bad `until` cannot make a pass spin on one post."""
         now = self.clock()
-        # Past the publisher's lead time too, or a first attempt is due again at once.
-        lead = _lead_time(self.publishers[post.platform]) or timedelta(0)
-        until = max(deferral.until, now + MIN_DEFER + lead)
+        # A deferred post is claimed at `until` (CLP-115): the lead time never shortens it.
+        until = max(deferral.until, now + MIN_DEFER)
         reason = redact(deferral.reason)
         try:
             repo.defer(self.conn, post, self.worker_id, reason, until, now)

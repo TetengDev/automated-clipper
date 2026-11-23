@@ -862,14 +862,19 @@ def test_a_failed_early_attempt_is_not_retried_before_its_slot(env: Env, clock: 
     assert len(publisher.calls) == 2
 
 
-def test_a_deferral_clears_the_lead_time(env: Env, clock: Clock) -> None:
-    post = make_post(env, platform="facebook", account="fb_main", at=T0 + timedelta(minutes=20))
+def test_a_deferral_is_not_shortened_by_the_lead_time(env: Env, clock: Clock) -> None:
+    # CLP-115: a deferral keeps its own time (no longer padded by the lead time) and the
+    # post keeps its slot, which the publisher gets back once the deferral ends.
+    slot = T0 + timedelta(minutes=20)
+    post = make_post(env, platform="facebook", account="fb_main", at=slot)
 
     @dataclass
     class EarlyDeferring(EarlyPublisher):
         def publish(self, sent: Post, *_: object) -> PublishResult:
             self.calls.append((sent, Path(), None))  # type: ignore[arg-type]
-            raise PublishDeferred("rate limit", until=T0)
+            if len(self.calls) == 1:
+                raise PublishDeferred("rate limit", until=T0)
+            return PublishResult(external_id="reel-1")
 
     publisher = EarlyDeferring()
     stage(env, clock, {"facebook": publisher}).run_once()
@@ -877,4 +882,12 @@ def test_a_deferral_clears_the_lead_time(env: Env, clock: Clock) -> None:
     assert len(publisher.calls) == 1
     deferred = repo.get_post(env.conn, post.id)
     assert deferred is not None
-    assert deferred.scheduled_at == T0 + MIN_DEFER + publisher.lead_time
+    assert deferred.scheduled_at == T0 + MIN_DEFER
+    assert deferred.publish_at == slot
+    clock.now = T0 + MIN_DEFER - timedelta(seconds=1)
+    stage(env, clock, {"facebook": publisher}).run_once()
+    assert len(publisher.calls) == 1
+    clock.now = T0 + MIN_DEFER
+    stage(env, clock, {"facebook": publisher}).run_once()
+    [_, (sent, _, _)] = publisher.calls
+    assert sent.scheduled_at == slot  # Facebook schedules the Reel at the kept slot

@@ -48,6 +48,7 @@ from meta_support import (
     use_fake_credentials,
     video,
 )
+from posting_support import write_rendered
 from review_support import make_env
 
 REELS = graph(f"{PAGE_ID}/video_reels")
@@ -571,8 +572,7 @@ def test_a_deferral_ending_just_before_the_slot_publishes_no_reel_before_it(
     try:
         job = env.job()
         rel = f"youtube_{job}/clip_1_v1.mp4"
-        (env.media_root / rel).parent.mkdir(parents=True, exist_ok=True)
-        (env.media_root / rel).write_bytes(b"fake mp4")
+        write_rendered(env.media_root / rel)
         clip_id = env.clip(job, status="approved", video_path=rel, title="Chair falls", caption="c")
         slot = T0 + timedelta(minutes=30)
         post = repo.insert_post(

@@ -530,7 +530,7 @@ def publish_problem(
     None. The config may have changed since scheduling (campaign disabled or ended, brief
     tightened, the account moved to another campaign) and a reschedule may have moved the
     post past the campaign's end, so the brief is checked again with the stored metadata,
-    at the time the post goes live (its slot, when it is claimed early).
+    at the time the post goes live (its slot, when it is claimed or retried early).
     Fails closed: an account no longer configured, or a post whose campaign differs from
     the one its account has now (including one scheduled before CLP-97), is held."""
     account = accounts.get(post.account_id)
@@ -555,8 +555,9 @@ def publish_problem(
     if campaign is None:
         return f"account {account.id}: unknown campaign {campaign_id!r}"
     edl = render_edl(media_root, post.video_path) if media_root else None
-    # A post claimed early (Facebook's lead time) goes live at its slot, not now.
-    when = max(now, post.scheduled_at)
+    # A post goes live at its slot (`publish_at`, CLP-115), not now: it may be claimed
+    # early for a lead time, or retried before its slot after a deferral.
+    when = max(now, post.slot)
     problems = campaign_preflight(campaign, metadata, post.platform, version.duration_s, edl, when)
     return "; ".join(problems) if problems else None
 

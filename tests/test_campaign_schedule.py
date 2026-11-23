@@ -20,6 +20,7 @@ from clipper import clips
 from clipper.campaigns import Campaign, PostingConfig, render_edl
 from clipper.cli import app
 from clipper.edl import EDL, parse_edl
+from clipper.jobs.models import to_iso
 from clipper.posting import repo
 from clipper.posting.models import OPEN_STATUSES, InvalidPostTransition, Post, PostStatus
 from clipper.posting.scheduler import (
@@ -1221,3 +1222,24 @@ def test_a_sidecar_hold_is_logged_as_such(env: Env, caplog: pytest.LogCaptureFix
 
     assert "held: render sidecar" in caplog.text
     assert "held by pre-flight" not in caplog.text
+
+
+def test_publish_checks_the_campaign_end_at_the_slot_not_the_next_try(env: Env) -> None:
+    """CLP-115/120 keep the slot (`publish_at`) apart from the next try (`scheduled_at`):
+    a deferred post retried before its slot still goes live at the slot, so a campaign
+    ending in between holds it."""
+    fb = account(id="fb_main", platform="facebook")
+    brief = {"platforms": ["facebook"], "forbidden": []}
+    [post] = schedule(env, rendered_clip(env), fb, vyro_mrbeast=campaign(**brief))
+    slot = post.slot
+    next_try = slot - timedelta(hours=2)
+    env.conn.execute("UPDATE posts SET scheduled_at = ? WHERE id = ?", (to_iso(next_try), post.id))
+    deferred = repo.get_post(env.conn, post.id)
+    assert deferred is not None and deferred.scheduled_at == next_try and deferred.slot == slot
+    ends = {"vyro_mrbeast": campaign(**brief, ends_at=slot - timedelta(hours=1))}
+
+    reason = publish_problem(
+        env.conn, deferred, {"fb_main": fb}, ends, next_try, media_root=env.media_root
+    )
+
+    assert reason is not None and "ended" in reason

@@ -15,11 +15,11 @@ from clipper.edl import parse_edl
 from clipper.posting.models import Post, PostMetadata, PublishResult
 
 
-def write_rendered(video: Path, *, ai: bool = False) -> None:
-    """A rendered clip as `clipper.render` leaves it: the video and its sidecar with the
-    EDL (an AI hook when `ai`). Without the sidecar the post is held (CLP-121)."""
+def write_rendered(video: Path, *, ai: bool = False, content: bytes = b"fake mp4") -> None:
+    """A rendered clip as `clipper.render` leaves it: the video (`content`) and its sidecar
+    with the EDL (an AI hook when `ai`). Without the sidecar the post is held (CLP-121)."""
     video.parent.mkdir(parents=True, exist_ok=True)
-    video.write_bytes(b"fake mp4")
+    video.write_bytes(content)
     hook = {"text": "Wait for it", "ai_generated": ai}
     edl = parse_edl({"source": {"path": "s.mp4", "in_s": 0, "out_s": 30}, "hook": hook})
     video.with_suffix(".json").write_text(json.dumps({"sidecar_version": 1, "edl": edl.to_props()}))

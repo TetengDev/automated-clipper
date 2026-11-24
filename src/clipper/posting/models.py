@@ -251,6 +251,31 @@ class Publisher(Protocol):
       slot, for a platform that publishes natively at a given time (Facebook's
       `scheduled_publish_time`, YouTube's `publishAt`; CLP-115). Retries and deferrals
       still wait for their own time, and never come before the slot.
+    * `use_platform_refs(refs: PlatformRefs)` (CLP-122): the stage hands the publisher a
+      store for the platform's id of an upload in progress, kept on the post, so `lookup`
+      still finds the upload after a worker restart.
     """
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult: ...
+
+
+@dataclass(frozen=True)
+class StoredRef:
+    """A post's stored upload reference (CLP-122) with the post's own account: the
+    account, never one named in the reference, decides whose token checks it."""
+
+    account_id: str
+    ref: str
+
+
+class PlatformRefs(Protocol):
+    """Where a publisher keeps the platform's id for an upload in progress (CLP-122), by
+    the post's idempotency key; the posting stage backs it with `posts.platform_ref`.
+
+    `save` raises when the post is no longer this worker's upload (or the write fails):
+    the publisher then stops before the next platform call. `load` returns the last
+    saved value with the post's account, or None."""
+
+    def save(self, idempotency_key: str, ref: str) -> None: ...
+
+    def load(self, idempotency_key: str) -> StoredRef | None: ...

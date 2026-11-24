@@ -28,7 +28,7 @@ from clipper.posting.stage import (
     allow_all,
 )
 from clipper.urls import SourceRef
-from posting_support import LookupPublisher
+from posting_support import LookupPublisher, write_rendered
 from review_support import Env, make_env
 
 T0 = datetime(2027, 1, 15, 1, 0, tzinfo=UTC)
@@ -58,9 +58,7 @@ def clock() -> Clock:
 def make_post(env: Env, *, account: str = "tt_main", at: datetime = T0) -> Post:
     job = env.job()
     rel = f"youtube_{job}/clip_1_v1.mp4"
-    target = env.media_root / rel
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"fake mp4")
+    write_rendered(env.media_root / rel)
     clip_id = env.clip(job, status="approved", video_path=rel, title="t", caption="c")
     return repo.insert_post(
         env.conn,

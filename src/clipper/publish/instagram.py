@@ -24,15 +24,16 @@ within both, so this only guards against a bad edit.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from clipper.jobs.models import Clock, utcnow
+from clipper.jobs.models import Clock, from_iso, to_iso, utcnow
 from clipper.posting.models import (
     Post,
     PostMetadata,
@@ -84,10 +85,31 @@ _HOSTS = frozenset({"www.instagram.com", "instagram.com"})
 class _Progress:
     account_id: str
     container_id: str
-    caption: str
+    caption_sha256: str
+    """The caption's digest: a published container is matched to a recent media by it."""
     started_at: datetime
     publish_sent: bool = False
     rechecked: bool = False
+    media_id: str | None = None
+    """What media_publish answered, once it did: the post is live."""
+
+    def ref(self, **changes: object) -> dict[str, object]:
+        """What is kept on the post (`posts.platform_ref`, CLP-122), with `changes`
+        applied. Not the account: the post's own account is the only one whose token
+        checks the container."""
+        state = replace(self, **changes)  # type: ignore[arg-type]
+        return {
+            "container_id": state.container_id,
+            "caption_sha256": state.caption_sha256,
+            "started_at": to_iso(state.started_at),
+            "publish_sent": state.publish_sent,
+            "rechecked": state.rechecked,
+            "media_id": state.media_id,
+        }
+
+
+def _digest(caption: str) -> str:
+    return hashlib.sha256(caption.encode("utf-8")).hexdigest()
 
 
 def check_caption(metadata: PostMetadata) -> None:
@@ -114,9 +136,8 @@ class InstagramPublisher(MetaPublisher):
         sleep: Callable[[float], None] = time.sleep,
         poll_every: float = POLL_EVERY,
         max_polls: int = MAX_POLLS,
-        campaigns: Mapping[str, str] | None = None,
     ) -> None:
-        super().__init__(client, guard, credentials=credentials, clock=clock, campaigns=campaigns)
+        super().__init__(client, guard, credentials=credentials, clock=clock)
         self.sleep = sleep
         self.poll_every = poll_every
         self.max_polls = max(1, max_polls)
@@ -124,7 +145,6 @@ class InstagramPublisher(MetaPublisher):
 
     def publish(self, post: Post, video_path: Path, metadata: PostMetadata) -> PublishResult:
         check_caption(metadata)
-        self._refuse_campaign(post.account_id)
         deadline = self._deadline()
         creds = self._creds(post.account_id)
         try:
@@ -160,19 +180,25 @@ class InstagramPublisher(MetaPublisher):
         uri = container.get("uri")
         if not isinstance(uri, str) or not uri:
             uri = f"https://{UPLOAD_HOST}/ig-api-upload/{GRAPH_VERSION}/{container_id}"
-        progress = _Progress(post.account_id, container_id, metadata.caption, started)
+        progress = _Progress(post.account_id, container_id, _digest(metadata.caption), started)
         self._remember(post.idempotency_key, progress)
+        self._save_ref(post.idempotency_key, progress.ref())
         self._in_time(deadline, "the upload")
         uploaded = self.client.upload(uri, creds.token, video_path)
         if uploaded.get("success") is not True:
             raise MetaError("instagram: the video upload was not accepted")
         self._wait(creds, container_id, deadline)
         self._in_time(deadline, "media_publish")
+        self._save_ref(post.idempotency_key, progress.ref(publish_sent=True))
         progress.publish_sent = True
         published = self.client.post(
             f"{ig}/media_publish", creds.token, data={"creation_id": container_id}
         )
         media_id = graph_id(published.get("id"), "media id")
+        # Live now: the id only spares a later lookup the caption match, so a failed
+        # write is logged, never raised.
+        progress.media_id = media_id
+        self._note_ref(post.idempotency_key, progress.ref())
         self._progress.pop(post.idempotency_key, None)
         logger.info("post %d: Reel %s published", post.id, media_id)
         return PublishResult(external_id=media_id, url=self._permalink(creds, media_id))
@@ -244,27 +270,122 @@ class InstagramPublisher(MetaPublisher):
         while len(self._progress) > _PROGRESS_MAX:
             self._progress.pop(next(iter(self._progress)))
 
-    def lookup(self, idempotency_key: str) -> PublishResult | None:
-        """Whether an earlier attempt of this worker published the Reel after all (its
-        media_publish reply was lost). Only attempts made by this process are known.
+    def _current(self, key: str) -> _Progress | None:
+        """The latest attempt's progress. The post's stored one wins (another worker may
+        have started a newer upload since); this process's memory of the same container
+        is kept, with the stored recheck and media id merged in, so a recheck is never
+        repeated and a known media id is used."""
+        stored = self._stored(key)
+        known = self._progress.get(key)
+        if stored is None:
+            return known
+        if known is not None and known.container_id == stored.container_id:
+            known.rechecked = known.rechecked or stored.rechecked
+            known.media_id = known.media_id or stored.media_id
+            return known
+        self._remember(key, stored)
+        return stored
 
-        A container still FINISHED may have a media_publish in flight: the first time,
-        this defers the post by `RECHECK_AFTER`; still FINISHED after that, it was never
+    def _stored(self, key: str) -> _Progress | None:
+        """The progress kept on the post (CLP-122), or None."""
+        loaded = self._load_ref(key)
+        if loaded is None:
+            return None
+        account_id, ref = loaded
+        sent, digest, stamp = (
+            ref.get("publish_sent"),
+            ref.get("caption_sha256"),
+            ref.get("started_at"),
+        )
+        rechecked, media = ref.get("rechecked", False), ref.get("media_id")
+        try:
+            started = from_iso(stamp) if isinstance(stamp, str) else None
+        except ValueError:
+            started = None
+        if not (
+            isinstance(sent, bool)
+            and isinstance(rechecked, bool)
+            and isinstance(digest, str)
+            and started is not None
+        ):
+            raise MetaError("instagram: the stored upload reference is unreadable")
+        return _Progress(
+            account_id,
+            graph_id(ref.get("container_id"), "stored container id"),
+            digest,
+            started,
+            publish_sent=sent,
+            rechecked=rechecked,
+            media_id=None if media is None else graph_id(media, "stored media id"),
+        )
+
+    def _confirmed(self, creds: MetaCredentials, progress: _Progress) -> PublishResult | None:
+        """The stored media id, once a GET shows that media: it has this attempt's caption,
+        its `owner`, when given (Graph leaves it out for media the querying user did not
+        create), is this account, and it was posted since the attempt began. None when it
+        cannot be confirmed (the container and caption match decide then). Token and
+        rate-limit errors raise as usual."""
+        media_id = progress.media_id
+        if media_id is None:
+            return None
+        fields = "id,caption,owner,permalink,timestamp"
+        try:
+            body = self.client.get(media_id, creds.token, params={"fields": fields})
+        except MetaError as exc:
+            if exc.token_problem or exc.account_problem or exc.rate_limited:
+                raise
+            logger.warning("media %s: not confirmed (%s); matching by caption", media_id, exc)
+            return None
+        owner = body.get("owner")
+        owner_id = owner.get("id") if isinstance(owner, dict) else None
+        posted = _timestamp(body.get("timestamp"))
+        caption = body.get("caption")
+        if (
+            str(body.get("id")) != media_id
+            or not isinstance(caption, str)
+            or _digest(caption) != progress.caption_sha256
+            or (owner_id is not None and str(owner_id) != creds.object_id)
+            or posted is None
+            or posted < progress.started_at - MATCH_SLACK
+        ):
+            logger.warning("media %s: not confirmed; matching by caption", media_id)
+            return None
+        return PublishResult(external_id=media_id, url=safe_link(body.get("permalink"), _HOSTS))
+
+    def lookup(self, idempotency_key: str) -> PublishResult | None:
+        """Whether an earlier attempt published the Reel after all (its media_publish
+        reply was lost, or the worker died). The container is checked by its id: the one
+        stored on the post (`use_platform_refs`, CLP-122), else this process's memory, so
+        a restart does not lose it. When media_publish answered before the worker died,
+        its media id is stored too and returned once a GET confirms it. Otherwise, as the
+        Graph API links no container to the media it became, the media id comes from
+        matching the caption and time.
+
+        A container still FINISHED may have a media_publish in flight (or one that never
+        reached Meta): the first time, this defers the post by `RECHECK_AFTER` (the recheck
+        is stored, so a restart does not repeat it); still FINISHED after that, it was never
         published: not found, so the stage publishes again (with a new container). Any
         other state than PUBLISHED is not found. A PUBLISHED container is matched to one
         recent media with the same caption posted since the attempt began; none, or more
         than one, raises: it is live, and the stage hands the post to a human instead of
         posting it twice."""
-        progress = self._progress.get(idempotency_key)
+        progress = self._current(idempotency_key)
         if progress is None or not progress.publish_sent:
             return None
         creds = self._creds(progress.account_id)
         try:
+            if progress.media_id is not None:
+                confirmed = self._confirmed(creds, progress)
+                if confirmed is not None:
+                    self._progress.pop(idempotency_key, None)
+                    return confirmed
             code, _ = self._status(creds, progress.container_id)
             if code == "FINISHED" and not progress.rechecked:
                 progress.rechecked = True
+                self._note_ref(idempotency_key, progress.ref())
                 raise PublishDeferred(
                     f"instagram: container {progress.container_id} not published yet;"
+                    " media_publish may still be in flight or may not have reached Meta;"
                     " checking again before publishing",
                     until=self.clock() + RECHECK_AFTER,
                 )
@@ -285,7 +406,8 @@ class InstagramPublisher(MetaPublisher):
             item
             for item in items
             if isinstance(item, dict)
-            and item.get("caption") == progress.caption
+            and isinstance(caption := item.get("caption"), str)
+            and _digest(caption) == progress.caption_sha256
             and (posted := _timestamp(item.get("timestamp"))) is not None
             and posted >= since
         ]

@@ -15,7 +15,10 @@ Each pass (the worker runs one per poll, see `clipper.jobs.worker.Worker.posting
    and raises an alert. A successful upload whose result cannot be recorded because the
    post changed meanwhile alerts too (a possible duplicate).
    Before publishing, the `guard` (the campaign pre-flight, CLP-97) runs again with the
-   current config: a post it refuses, or a guard that fails, is `held` instead.
+   current config: a post it refuses, or a guard that fails, is `held` instead. So is a
+   post whose render sidecar is missing or invalid (CLP-121): the AI disclosure flag is
+   sent from the sidecar's EDL, and without it nothing shows whether the clip has AI
+   elements.
    A publisher that raises `PublishDeferred` (a quota or upload limit, a paused account;
    CLP-93) puts the post back to `scheduled` at the given time without counting an
    attempt, and its alert, if any, goes to a human.
@@ -75,6 +78,16 @@ CLP-106 (with the accounts config, `accounts`):
   deferral is never earlier than the slot nor sooner than `MIN_DEFER` from now.
   One pass handles each post at most once, so it never defers the same post twice.
 * Posts of an account missing from the config keep the plain backoff.
+
+CLP-122: a publisher with `use_platform_refs` (Facebook, Instagram) gets a store on
+`posts.platform_ref` (`StoredRefs`, this stage's connection and worker id). It keeps the
+platform's id for the upload there before each step that can be interrupted, so the
+`lookup` of a later worker (the stale pass, or a retry after a restart) checks the upload
+by id instead of finding nothing. The save is fail-closed: if it cannot be written (the
+post was taken over, or the database stays locked past its busy timeout), the publisher
+raises before the next platform call: the upload is aborted (fail-closed), never sent on
+without its id on record. The attempt then fails as usual, or, if even that cannot be
+recorded, the post stays `uploading` for the stale pass.
 """
 
 from __future__ import annotations
@@ -89,6 +102,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from clipper.campaigns import read_render_sidecar
 from clipper.clips import resolve_media_path
 from clipper.jobs.models import Clock, utcnow
 from clipper.jobs.worker import DEFAULT_MEDIA_ROOT
@@ -103,6 +117,7 @@ from clipper.posting.models import (
     Publisher,
     PublishRejected,
     PublishResult,
+    StoredRef,
 )
 from clipper.posting.scheduler import (
     HISTORY,
@@ -207,6 +222,13 @@ class PostingStage:
                 "PostingStage with publishers needs a guard (scheduler.publish_guard, or"
                 " allow_all to publish without the campaign pre-flight)"
             )
+        # CLP-122: publishers that track an upload by the platform's id keep it on the
+        # post, through this stage's connection (publish and lookup run on its thread).
+        refs = StoredRefs(self.conn, self.worker_id)
+        for publisher in self.publishers.values():
+            use = getattr(publisher, "use_platform_refs", None)
+            if callable(use):
+                use(refs)
 
     def run_once(self) -> int:
         """One posting pass; returns how many posts it acted on."""
@@ -265,7 +287,14 @@ class PostingStage:
             path = resolve_media_path(self.media_root, post.video_path)
             if path is None:
                 raise FileNotFoundError("rendered video is missing")
-            metadata = repo.metadata_for(self.conn, post)
+            # The guard read the sidecar too (a campaign's AI ban) and it may have changed
+            # since: this read is the one the AI flag is sent from, so it decides (CLP-121).
+            sidecar = read_render_sidecar(self.media_root, post.video_path)
+            if sidecar.problem is not None:
+                reason = f"{sidecar.problem}; cannot confirm the AI disclosure flag"
+                self._hold(post, reason, label="held: render sidecar")
+                return
+            metadata = repo.metadata_for(self.conn, post, edl=sidecar.edl, now=self.clock())
             with self._heartbeat(post):
                 result = publisher.publish(post, path, metadata)
         except PublishDeferred as exc:
@@ -337,13 +366,18 @@ class PostingStage:
             reason = f"publish pre-flight failed: {_describe(exc)}"
         if reason is None:
             return False
+        self._hold(post, reason)
+        return True
+
+    def _hold(self, post: Post, reason: str, *, label: str = "held by pre-flight") -> None:
+        """Hold the claimed post with `reason` instead of publishing it; `label` says why
+        in the log."""
         try:
             repo.hold_claimed(self.conn, post, self.worker_id, reason, self.clock())
         except PostConflict as exc:
             logger.warning("%s: hold not recorded: %s", _label(post), exc)
-            return True
-        logger.warning("%s: held by pre-flight: %s", _label(post), strip_control(reason))
-        return True
+            return
+        logger.warning("%s: %s: %s", _label(post), label, strip_control(reason))
 
     def _already_live(self, post: Post, publisher: Publisher, *, strict: bool = True) -> bool:
         """Before re-publishing after a failed attempt, ask `lookup` (when there is one)
@@ -707,6 +741,23 @@ class PostingStage:
             self.alert(message)
         except Exception:
             logger.exception("%s: alert failed", _label(post))
+
+
+@dataclass(frozen=True)
+class StoredRefs:
+    """`PlatformRefs` on `posts.platform_ref` (CLP-122). A save is refused (`PostConflict`)
+    once the post is no longer this worker's upload, so a worker that lost its claim never
+    overwrites the new owner's id nor carries on uploading."""
+
+    conn: sqlite3.Connection
+    worker_id: str
+
+    def save(self, idempotency_key: str, ref: str) -> None:
+        if not repo.save_platform_ref(self.conn, idempotency_key, self.worker_id, ref):
+            raise PostConflict("the post is no longer this worker's upload")
+
+    def load(self, idempotency_key: str) -> StoredRef | None:
+        return repo.platform_ref(self.conn, idempotency_key)
 
 
 def _lead_time(publisher: Publisher) -> timedelta | None:

@@ -22,6 +22,7 @@ import json
 import os
 import re
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -121,6 +122,8 @@ class Campaign(BaseModel):
     currency: str = Field("USD", pattern=r"^[A-Z]{3}$")
     ends_at: AwareDatetime | None = None
     paid_partnership: bool = False
+    """The brief requires the paid-partnership label. Must be set explicitly when
+    `rate_per_1k`, `per_clip_cap` or `budget` is (`_paid_label_decided`)."""
     enabled: bool = True
 
     @field_validator("platforms", "forbidden")
@@ -146,6 +149,20 @@ class Campaign(BaseModel):
         if any(not k.strip() for k in value):
             raise ValueError("forbidden_keywords must not be empty strings")
         return list(dict.fromkeys(k.strip() for k in value))
+
+    @model_validator(mode="after")
+    def _paid_label_decided(self) -> Campaign:
+        """A campaign that pays for views (CLP-121) must say whether its brief requires the
+        paid-partnership label: the False default would publish it unlabelled."""
+        terms = (self.rate_per_1k, self.per_clip_cap, self.budget)
+        pays = any(term is not None for term in terms)
+        if pays and "paid_partnership" not in self.model_fields_set:
+            raise ValueError(
+                "set paid_partnership (true or false) for a campaign with rate_per_1k,"
+                " per_clip_cap or budget: check whether the brief requires the"
+                " paid-partnership label"
+            )
+        return self
 
     @model_validator(mode="after")
     def _duration_range(self) -> Campaign:
@@ -280,25 +297,46 @@ def _read(path: Path) -> CampaignsConfig:
 # --- pre-flight ---------------------------------------------------------------------------
 
 
-def render_edl(media_root: Path, video_path: str | None) -> EDL | None:
+@dataclass(frozen=True)
+class RenderSidecar:
+    """What the render sidecar next to a clip's video says (CLP-121). Next to a video that
+    exists there is either an `edl` or a `problem`, never neither: a sidecar that is
+    missing or cannot be read is not "no AI elements". Both None means there is no
+    rendered video to check (no path, outside the media root, or not on disk)."""
+
+    edl: EDL | None = None
+    problem: str | None = None
+
+
+def read_render_sidecar(media_root: Path, video_path: str | None) -> RenderSidecar:
     """The EDL a clip was rendered from, read from the render sidecar next to the video
-    (`<basename>.json`, see `clipper.render`). None when the video or sidecar is missing,
-    outside `media_root`, or not a valid EDL: callers treat None as "unknown"."""
-    if not video_path:
-        return None
+    (`<basename>.json`, see `clipper.render`), or why it cannot be. The sidecar decides the
+    AI disclosure flag, so a post whose sidecar is missing or invalid is held."""
+    video = resolve_media_path(media_root, video_path)
+    if video is None or video_path is None:
+        return RenderSidecar()
     try:
         sidecar = resolve_media_path(media_root, str(Path(video_path).with_suffix(".json")))
         if sidecar is None:
-            return None
+            return RenderSidecar(problem="the render sidecar next to the video is missing")
         with sidecar.open("rb") as fh:  # one bounded read: no stat-then-read race
             raw = fh.read(MAX_SIDECAR_BYTES + 1)
         if len(raw) > MAX_SIDECAR_BYTES:
-            return None
+            return RenderSidecar(problem="the render sidecar is too large to be ours")
         data = json.loads(raw.decode("utf-8"))
         edl = data.get("edl") if isinstance(data, dict) else None
-        return parse_edl(edl) if isinstance(edl, dict) else None
-    except (OSError, UnicodeError, ValueError):  # ValidationError is a ValueError
-        return None
+        if not isinstance(edl, dict):
+            return RenderSidecar(problem="the render sidecar has no EDL")
+        return RenderSidecar(edl=parse_edl(edl))
+    # ValidationError is a ValueError; RecursionError: JSON nested past the parser's limit.
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return RenderSidecar(problem="the render sidecar is unreadable or not a valid EDL")
+
+
+def render_edl(media_root: Path, video_path: str | None) -> EDL | None:
+    """The sidecar's EDL, or None when there is none or it cannot be read: callers treat
+    None as "unknown" (see `read_render_sidecar` for why)."""
+    return read_render_sidecar(media_root, video_path).edl
 
 
 def campaign_preflight(

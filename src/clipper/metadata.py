@@ -871,6 +871,11 @@ _PAID_FLAG = {
 }
 
 
+def ai_flag(platform: str) -> str:
+    """The name of `platform`'s AI disclosure flag in `PostMetadata.flags`."""
+    return _DISCLOSURE_FLAG[platform]
+
+
 def build_post_metadata(
     variants: Mapping[str, Variant],
     platform: str,

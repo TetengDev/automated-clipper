@@ -32,7 +32,7 @@ from clipper.posting.stage import (
     PostingStage,
     allow_all,
 )
-from posting_support import FakePublisher, LookupPublisher
+from posting_support import FakePublisher, LookupPublisher, write_rendered
 from review_support import Env, make_env
 
 T0 = datetime(2027, 1, 15, 1, 0, tzinfo=UTC)
@@ -69,9 +69,7 @@ def make_post(
     job = env.job()
     rel = f"youtube_{job}/clip_1_v1.mp4"
     if write_file:
-        target = env.media_root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"fake mp4")
+        write_rendered(env.media_root / rel)
     clip_id = env.clip(
         job,
         status="approved",

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -38,7 +39,7 @@ from clipper.redact import redact
 
 if TYPE_CHECKING:
     from clipper.accounts import Account
-    from clipper.posting.models import Publisher
+    from clipper.posting.models import PlatformRefs, Publisher
 
 GRAPH_VERSION = "v26.0"
 GRAPH_URL = f"https://graph.facebook.com/{GRAPH_VERSION}"
@@ -53,6 +54,8 @@ DEFER_TOKEN = timedelta(hours=1)
 DEFER_RATE = timedelta(hours=1)
 TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=60.0, write=60.0)
 """Per request step (connect, each read or write); `PUBLISH_DEADLINE` bounds a publish."""
+REF_MAX = 4096
+"""Bytes; a stored upload reference (CLP-122) is a small JSON object, never more."""
 PUBLISH_DEADLINE = timedelta(minutes=15)
 """A publish gives up between steps after this, well within the stage's STALE_UPLOAD."""
 MAX_UPLOAD_BYTES = 1024**3
@@ -464,28 +467,17 @@ class MetaPublisher:
         *,
         credentials: Credentials = load_credentials,
         clock: Clock = utcnow,
-        campaigns: Mapping[str, str] | None = None,
     ) -> None:
         self.client = client
         self.guard = guard
         self._credentials = credentials
         self.clock = clock
-        self.campaigns = dict(campaigns or {})
-        """Account id -> campaign. Their posts are refused (fail closed): the campaign's
-        tags and paid-partnership flag now reach the stored post metadata (CLP-97), and
-        publishing campaign posts on Meta is CLP-121."""
+        self._refs: PlatformRefs | None = None
+        """Where each upload's platform id is kept too (CLP-122); set by the stage."""
 
     def close(self) -> None:
         """Called by the worker on exit (CLP-93's registry contract)."""
         self.client.close()
-
-    def _refuse_campaign(self, account_id: str) -> None:
-        campaign = self.campaigns.get(account_id)
-        if campaign is not None:
-            raise PublishRejected(
-                f"{self.platform}: account {account_id} posts for campaign {campaign};"
-                " campaign posts are published by hand until CLP-121"
-            )
 
     def _deadline(self) -> datetime:
         return self.clock() + PUBLISH_DEADLINE
@@ -520,6 +512,49 @@ class MetaPublisher:
             raise exc
         raise translated from exc
 
+    # --- the upload's platform id, kept on the post (CLP-122) ------------------------------
+
+    def use_platform_refs(self, refs: PlatformRefs) -> None:
+        """Called by the posting stage: keep each upload's platform id in `refs` too, so a
+        restarted worker's `lookup` still finds it. Without it, progress is in memory only."""
+        self._refs = refs
+
+    def _save_ref(self, idempotency_key: str, ref: Mapping[str, object]) -> None:
+        """Store the upload's progress before the next platform call. A refused or failed
+        write raises, so that call is never made without its id on record."""
+        if self._refs is not None:
+            self._refs.save(idempotency_key, json.dumps(ref, sort_keys=True))
+
+    def _note_ref(self, idempotency_key: str, ref: Mapping[str, object]) -> None:
+        """Store progress that only saves work later (the post may already be live, or
+        a recheck is being recorded): a failed write is logged, never raised."""
+        try:
+            self._save_ref(idempotency_key, ref)
+        except Exception as exc:
+            logger.warning(
+                "%s: could not store the upload reference (%s)", self.platform, redact(str(exc))
+            )
+
+    def _load_ref(self, idempotency_key: str) -> tuple[str, dict[str, Any]] | None:
+        """The stored progress of an upload with the post's own account, or None. The
+        account is the post's, never one named in the reference: a reference that names
+        another account, is not a JSON object or is over `REF_MAX` bytes raises, and the
+        stage hands the post to a human instead of guessing."""
+        stored = self._refs.load(idempotency_key) if self._refs is not None else None
+        if stored is None:
+            return None
+        ref: object = None
+        if len(stored.ref.encode("utf-8")) <= REF_MAX:
+            try:
+                ref = json.loads(stored.ref)
+            except (ValueError, TypeError, RecursionError):
+                ref = None
+        if not isinstance(ref, dict) or ref.get("account_id", stored.account_id) != (
+            stored.account_id
+        ):
+            raise MetaError(f"{self.platform}: the stored upload reference is unreadable")
+        return stored.account_id, ref
+
 
 def meta_publishers(
     accounts: Iterable[Account],
@@ -537,18 +572,15 @@ def meta_publishers(
     platforms = {a.platform for a in enabled} & {"facebook", "instagram"}
     if not platforms:
         return {}
-    campaigns = {a.id: a.campaign for a in enabled if a.campaign}
     owned = http is None
     client = GraphClient(httpx.Client(follow_redirects=False) if http is None else http)
     client.owned = owned
     guard = TokenGuard(client, clock=clock, alert=alert)
     publishers: dict[str, Publisher] = {}
     if "facebook" in platforms:
-        publishers["facebook"] = FacebookPublisher(client, guard, clock=clock, campaigns=campaigns)
+        publishers["facebook"] = FacebookPublisher(client, guard, clock=clock)
     if "instagram" in platforms:
-        publishers["instagram"] = InstagramPublisher(
-            client, guard, clock=clock, campaigns=campaigns
-        )
+        publishers["instagram"] = InstagramPublisher(client, guard, clock=clock)
     return publishers
 
 

@@ -16,10 +16,9 @@ from collections.abc import Mapping
 from clipper.commentary import discovery
 from clipper.jobs.models import Job, JobStatus
 from clipper.jobs.stages import SkipJob, StageContext, StageDef
-from clipper.pipeline import commentary_sources
+from clipper.pipeline import commentary_script, commentary_sources
 
 NOT_BUILT: Mapping[JobStatus, tuple[str, str]] = {
-    JobStatus.SCRIPTING: ("scripting", "CLP-146"),
     JobStatus.VOICING: ("voicing", "CLP-147"),
     JobStatus.RENDERING: ("rendering", "CLP-148"),
 }
@@ -37,6 +36,7 @@ BUILT: Mapping[JobStatus, StageDef] = {
     JobStatus.DISCOVERING: discovery.STAGE,  # CLP-144
     JobStatus.FETCHING_SOURCES: commentary_sources.FETCH_STAGE,  # CLP-145
     JobStatus.TRANSCRIBING: commentary_sources.TRANSCRIBE_STAGE,  # CLP-145
+    JobStatus.SCRIPTING: commentary_script.STAGE,  # CLP-146
 }
 """Stages whose story has shipped."""
 

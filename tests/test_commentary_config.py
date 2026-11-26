@@ -6,12 +6,15 @@ from datetime import time
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from clipper.accounts import AccountsConfig, load_accounts
 from clipper.cli import app
 from clipper.commentary.config import (
     COMMENTARY_ENV,
+    CommentaryOverrides,
+    CommentarySettings,
     commentary_path,
     load_commentary,
 )
@@ -128,6 +131,7 @@ def test_commentary_yaml_loads(tmp_path: Path, accounts: AccountsConfig) -> None
     assert (settings.candidates_per_day, settings.stories_per_day) == (12, 3)
     assert (settings.trending_boost, settings.pinned_boost) == (0.5, 0.5)
     assert (settings.min_clip_views, settings.max_streamers_scanned) == (1000, 50)
+    assert (settings.min_views_per_hour, settings.min_score) == (400, None)
     assert settings.excluded_game_ids == ()
     assert settings.voice == "am_michael"
     assert settings.music_dir is None
@@ -147,9 +151,11 @@ def test_defaults_apply_when_left_out(tmp_path: Path, accounts: AccountsConfig) 
         settings.candidates_per_day,
         settings.pinned_boost,
         settings.min_clip_views,
+        settings.min_views_per_hour,
+        settings.min_score,
         settings.max_streamers_scanned,
         settings.voice,
-    ) == ("06:00", 12, 0.5, 1000, 50, "am_michael")
+    ) == ("06:00", 12, 0.5, 10000, 400, None, 50, "am_michael")
 
 
 def test_aliases_pins_and_excludes_are_optional(tmp_path: Path, accounts: AccountsConfig) -> None:
@@ -182,6 +188,7 @@ def test_channel_overrides_change_only_what_they_set(
         + '    overrides:\n      run_at: "07:30"\n      voice: af_heart\n'
         + "      excluded_game_ids: [498566]\n      min_clip_views: 5000\n"
         + "      pinned_boost: 1.0\n      max_streamers_scanned: 20\n"
+        + "      min_views_per_hour: 900\n      min_score: 250.5\n"
     )
 
     cfg = load_commentary(_write(tmp_path, text), accounts)
@@ -192,7 +199,26 @@ def test_channel_overrides_change_only_what_they_set(
     assert settings.excluded_game_ids == ("498566",)
     assert (settings.min_clip_views, settings.pinned_boost) == (5000, 1.0)
     assert settings.max_streamers_scanned == 20
+    assert (settings.min_views_per_hour, settings.min_score) == (900, 250.5)
     assert settings.candidates_per_day == 12
+
+
+def test_virality_bar_and_score_floor_defaults() -> None:
+    settings = CommentarySettings()
+
+    assert settings.min_clip_views == 10000
+    assert settings.min_views_per_hour == 400
+    assert settings.min_score is None
+
+
+@pytest.mark.parametrize(
+    "bad", [{"min_views_per_hour": -1}, {"min_score": -0.5}, {"min_clip_views": -1}]
+)
+def test_virality_bar_and_score_floor_reject_negatives(bad: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        CommentarySettings.model_validate(bad)
+    with pytest.raises(ValidationError):
+        CommentaryOverrides.model_validate(bad)
 
 
 SECOND_YOUTUBE_PIN = '      - name: Speed Two\n        youtube:\n          handle: "@speedtwo"\n'
@@ -455,7 +481,8 @@ def test_shipped_commentary_yaml_validates_against_shipped_accounts() -> None:
     assert settings.run_at == "06:00"
     assert (settings.candidates_per_day, settings.stories_per_day) == (12, 3)
     assert (settings.trending_boost, settings.pinned_boost) == (0.5, 0.5)
-    assert (settings.min_clip_views, settings.max_streamers_scanned) == (1000, 50)
+    assert (settings.min_clip_views, settings.max_streamers_scanned) == (10000, 50)
+    assert (settings.min_views_per_hour, settings.min_score) == (400, None)
     assert (settings.voice, settings.music_dir) == ("am_michael", None)
 
 

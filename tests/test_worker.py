@@ -756,9 +756,12 @@ def test_a_worker_without_commentary_stages_never_touches_a_commentary_job(
     assert sum(pipeline.calls.values()) == 0
 
 
-def test_a_commentary_day_is_skipped_at_discovery_until_clp_144(
+def test_a_commentary_day_reaches_the_real_discovery_stage(
     make_worker: MakeWorker, db: Path
 ) -> None:
+    """Discovery is built (CLP-144); with no commentary.yaml there is no channel for the
+    day's account, so the day fails there with an alert. The stage itself is tested in
+    test_commentary_discovery.py."""
     pipeline = StubPipeline()
     worker = make_worker(pipeline)
     worker.commentary_stages = build_commentary_stages()
@@ -767,17 +770,22 @@ def test_a_commentary_day_is_skipped_at_discovery_until_clp_144(
     with closing(connect(db)) as conn:
         job, _ = enqueue(conn, DAY, T0, creator="random_gaming_yt")
 
-    assert _drain(worker) == 2  # detected -> discovering, then the placeholder skips
+    assert _drain(worker) == 2  # detected -> discovering, then discovery fails
 
     row = _row(db, job.id)
-    assert row["status"] == "skipped"
-    assert row["skip_reason"] == "commentary discovery is not built yet (CLP-144)"
+    assert row["status"] == "failed"
+    assert "no commentary channel for account random_gaming_yt" in row["last_error"]
     assert sum(pipeline.calls.values()) == 0  # no clip stage ran
-    assert alerts == []  # a skip is not a failure
+    assert len(alerts) == 1
 
 
 @pytest.mark.parametrize(
-    "status", [s for s in COMMENTARY_PIPELINE if s not in TERMINAL and s is not JobStatus.DETECTED]
+    "status",
+    [
+        s
+        for s in COMMENTARY_PIPELINE
+        if s not in TERMINAL and s not in (JobStatus.DETECTED, JobStatus.DISCOVERING)
+    ],
 )
 def test_every_commentary_status_has_a_placeholder_that_skips(
     make_worker: MakeWorker, db: Path, status: JobStatus

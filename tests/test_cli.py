@@ -582,5 +582,7 @@ def test_run_worker_skips_a_commentary_day_without_a_clip_stage(
     assert "no due jobs" in runs[2].output
     assert calls == []  # never reached fetching_audio's yt-dlp
     with closing(connect(db)) as conn:
-        row = conn.execute("SELECT status, skip_reason FROM jobs").fetchone()
-    assert tuple(row) == ("skipped", "commentary discovery is not built yet (CLP-144)")
+        row = conn.execute("SELECT status, last_error FROM jobs").fetchone()
+    # Discovery (CLP-144) runs; this config has no commentary channel for the day's account.
+    assert row["status"] == "failed"
+    assert "no commentary channel for account random_gaming_yt" in row["last_error"]

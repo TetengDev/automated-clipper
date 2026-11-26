@@ -1,4 +1,6 @@
-"""`clipper resolve` (CLP-22): creator handles -> stable platform IDs in creators.yaml.
+"""`clipper resolve` (CLP-22): creator handles -> stable platform IDs in creators.yaml, and
+(CLP-144) each commentary channel's games -> Twitch game_id and pinned Twitch streamers ->
+user_id in commentary.yaml.
 
 Every handle is looked up on each run, so a handle edited to point at another channel
 gets that channel's ID. The file is rewritten only when an ID actually changes, so a
@@ -14,18 +16,19 @@ import io
 import os
 import stat
 import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
+from clipper.commentary.config import CommentaryConfig
 from clipper.config import ConfigError, Creator, load_config
-from clipper.sources.twitch import TwitchError, app_token, user_ids
+from clipper.sources.twitch import Helix, TwitchError, app_token, user_ids
 from clipper.sources.youtube import HandleNotFound, MetadataProvider, SourceError
 from clipper.urls import Platform
 
@@ -91,6 +94,12 @@ def _yaml() -> YAML:
     yaml.preserve_quotes = True
     yaml.indent(mapping=2, sequence=4, offset=2)
     yaml.width = 4096  # never re-wrap long lines
+    # Write `null` back as `null`: the round trip would otherwise leave the value empty
+    # (commentary.yaml has `min_score: null` and `music_dir: null`).
+    yaml.representer.add_representer(
+        type(None),
+        lambda rep, _: rep.represent_scalar("tag:yaml.org,2002:null", "null"),
+    )
     return yaml
 
 
@@ -137,6 +146,13 @@ def write_ids(path: Path, results: Sequence[Resolved]) -> int:
             _insert_after(node, handle_key, id_key, value)
     out = io.StringIO()
     yaml.dump(doc, out)
+    _replace_validated(path, out.getvalue(), load_config)
+    return len(changes)
+
+
+def _replace_validated(path: Path, text: str, validate: Callable[[Path], object]) -> None:
+    """Atomically replace `path` with `text` once `validate(temp file)` accepts it; a
+    ConfigError from it is a ValueError and leaves `path` untouched."""
     # Same directory (atomic replace). The temp file gets a fresh random name created with
     # O_EXCL and is written and chmod-ed only through that one handle, so a file or symlink
     # planted in the directory is never written through.
@@ -151,14 +167,105 @@ def write_ids(path: Path, results: Sequence[Resolved]) -> int:
             delete=False,
         ) as handle:
             tmp = Path(handle.name)
-            handle.write(out.getvalue())
+            handle.write(text)
             os.fchmod(handle.fileno(), stat.S_IMODE(path.stat().st_mode))
         try:
-            load_config(tmp)
+            validate(tmp)
         except ConfigError as exc:
             raise ValueError(f"not writing {path}: the result would be invalid: {exc}") from None
         os.replace(tmp, path)
     finally:
         if tmp is not None:
             tmp.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class CommentaryResolved:
+    """One commentary.yaml id: a game's Twitch game_id or a pinned streamer's user_id."""
+
+    channel: str
+    """The channel's account id."""
+    kind: Literal["game", "twitch"]
+    key: str
+    """The game name, or the streamer's Twitch login."""
+    old: str | None
+    new: str | None = None
+    error: str | None = None
+
+    @property
+    def changed(self) -> bool:
+        return self.new is not None and self.new != self.old
+
+
+def resolve_commentary(
+    config: CommentaryConfig, http: httpx.Client, client_id: str, client_secret: str
+) -> list[CommentaryResolved]:
+    """Look up every channel's games (Get Games by name) and pinned Twitch logins (Get
+    Users) with one app token. YouTube pins are not on Twitch and are left alone."""
+    games = [(c.account, g.name, g.game_id) for c in config.channels for g in c.games]
+    pins = [
+        (c.account, s.twitch, s.user_id)
+        for c in config.channels
+        for s in c.streamers
+        if s.twitch is not None
+    ]
+    if not games and not pins:
+        return []
+    helix = Helix(http, client_id, client_secret)
+    try:
+        game_ids = helix.game_ids(list(dict.fromkeys(name for _, name, _ in games)))
+        users = helix.user_ids(list(dict.fromkeys(login for _, login, _ in pins)))
+    except TwitchError as exc:
+        return [
+            CommentaryResolved(channel, kind, key, old, error=str(exc))
+            for kind, rows in (("game", games), ("twitch", pins))
+            for channel, key, old in rows
+        ]
+    results = [
+        CommentaryResolved(channel, "game", name, old, game_ids[name])
+        if name in game_ids
+        else CommentaryResolved(channel, "game", name, old, error=f"no Twitch game is named {name}")
+        for channel, name, old in games
+    ]
+    results += [
+        CommentaryResolved(channel, "twitch", login, old, users[login])
+        if login in users
+        else CommentaryResolved(
+            channel, "twitch", login, old, error=f"no Twitch user has the login {login}"
+        )
+        for channel, login, old in pins
+    ]
+    return results
+
+
+def write_commentary_ids(
+    path: Path, results: Sequence[CommentaryResolved], validate: Callable[[Path], object]
+) -> int:
+    """Write changed ids into commentary.yaml (`game_id` after the game's last key,
+    `user_id` after `twitch`); returns how many. Nothing changed: file untouched. Raises
+    ValueError (file untouched) when `validate` rejects the result."""
+    changes = [r for r in results if r.changed]
+    if not changes:
+        return 0
+    yaml = _yaml()
+    doc = yaml.load(path.read_text(encoding="utf-8"))
+    channels = {str(node.get("account")): node for node in doc["channels"]}
+    for result in changes:
+        channel = channels[result.channel]
+        if result.kind == "game":
+            node = next(g for g in channel["games"] if str(g.get("name")) == result.key)
+            id_key = "game_id"
+        else:
+            node = next(s for s in channel["streamers"] if s.get("twitch") == result.key)
+            id_key = "user_id"
+        value = DoubleQuotedScalarString(result.new)
+        if id_key in node:
+            node[id_key] = value
+        else:
+            _insert_after(
+                node, list(node)[-1] if result.kind == "game" else "twitch", id_key, value
+            )
+    out = io.StringIO()
+    yaml.dump(doc, out)
+    _replace_validated(path, out.getvalue(), validate)
     return len(changes)

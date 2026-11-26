@@ -384,7 +384,7 @@ def test_fetching_and_transcribing_are_real_stages_now() -> None:
 
     assert JobStatus.FETCHING_SOURCES not in commentary.NOT_BUILT
     assert JobStatus.TRANSCRIBING not in commentary.NOT_BUILT
-    assert JobStatus.DISCOVERING in commentary.NOT_BUILT  # CLP-144's, untouched
+    assert JobStatus.DISCOVERING not in commentary.NOT_BUILT  # CLP-144 shipped too
     assert stages[JobStatus.FETCHING_SOURCES] is cs.FETCH_STAGE
     assert stages[JobStatus.TRANSCRIBING] is cs.TRANSCRIBE_STAGE
 

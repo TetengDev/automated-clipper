@@ -25,7 +25,9 @@ defaults:
   stories_per_day: 3
   trending_boost: 0.5        # the clip's game is in Twitch's top 20 today
   pinned_boost: 0.5          # the clip's streamer is pinned
-  min_clip_views: 1000       # skip clips with fewer views
+  min_clip_views: 10000      # virality bar: at least this many views ...
+  min_views_per_hour: 400    # ... or at least this many views an hour (10,000 / 24 h, rounded down)
+  min_score: null            # score floor; null = none (default decided from real scores)
   max_streamers_scanned: 50  # trending streamers kept from each day's scan
   excluded_game_ids: []      # added to the gambling categories the code always excludes
   voice: am_michael

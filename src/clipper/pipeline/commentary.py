@@ -13,12 +13,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from clipper.commentary import discovery
 from clipper.jobs.models import Job, JobStatus
 from clipper.jobs.stages import SkipJob, StageContext, StageDef
 from clipper.pipeline import commentary_sources
 
 NOT_BUILT: Mapping[JobStatus, tuple[str, str]] = {
-    JobStatus.DISCOVERING: ("discovery", "CLP-144"),
     JobStatus.SCRIPTING: ("scripting", "CLP-146"),
     JobStatus.VOICING: ("voicing", "CLP-147"),
     JobStatus.RENDERING: ("rendering", "CLP-148"),
@@ -34,6 +34,7 @@ def _not_built(what: str, issue: str) -> StageDef:
 
 
 BUILT: Mapping[JobStatus, StageDef] = {
+    JobStatus.DISCOVERING: discovery.STAGE,  # CLP-144
     JobStatus.FETCHING_SOURCES: commentary_sources.FETCH_STAGE,  # CLP-145
     JobStatus.TRANSCRIBING: commentary_sources.TRANSCRIBE_STAGE,  # CLP-145
 }

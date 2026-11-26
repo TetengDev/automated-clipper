@@ -9,7 +9,7 @@ import re
 import signal
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, NoReturn
@@ -41,11 +41,12 @@ if TYPE_CHECKING:
 
     from clipper.accounts import Account, AccountsConfig
     from clipper.campaigns import PostingConfig
+    from clipper.commentary.config import CommentaryConfig
     from clipper.commentary.daily import DailyTarget
     from clipper.insights.collect import InsightsAccount, InsightsCollector
     from clipper.notify import Notify
     from clipper.posting.models import Publisher
-    from clipper.resolve import Resolved
+    from clipper.resolve import CommentaryResolved, Resolved
     from clipper.sources.youtube import MetadataProvider, YouTubeSource
 
 EXIT_NOT_IMPLEMENTED = 70  # EX_SOFTWARE; distinct from Click's usage-error code 2
@@ -1115,14 +1116,19 @@ def resolve(
         bool, typer.Option("--dry-run", help="Show what would change; write nothing.")
     ] = False,
 ) -> None:
-    """Resolve creator handles to stable channel / user IDs (written into creators.yaml).
+    """Resolve creator handles to stable channel / user IDs (written into creators.yaml),
+    and each commentary channel's games and pinned Twitch streamers to Twitch game and user
+    IDs (written into commentary.yaml, CLP-144).
 
-    Twitch logins are resolved only when TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET are set.
-    Exits non-zero if any handle failed; the others are still written."""
+    Twitch IDs are resolved only when TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET are set.
+    Exits non-zero if any lookup failed; the others are still written."""
+    from clipper.accounts import AccountsConfig, accounts_path, load_accounts
+    from clipper.commentary.config import CommentaryConfig, commentary_path, load_commentary
     from clipper.pipeline.ytdlp import YtDlpError
-    from clipper.resolve import resolve_twitch, resolve_youtube, write_ids
+    from clipper.resolve import resolve_commentary, resolve_twitch, resolve_youtube, write_ids
 
     path = _app(ctx).config_path
+    commentary_file = commentary_path(path)
     try:
         cfg = load_config(path)
         secrets = Secrets()
@@ -1130,6 +1136,15 @@ def resolve(
         _fail(str(exc))
     except ValidationError as exc:
         _fail(f"resolve: {exc}")
+    # A broken accounts.yaml or commentary.yaml skips only the commentary half.
+    commentary_problem: str | None = None
+    try:
+        accounts = load_accounts(accounts_path(path), cfg)
+        commentary = load_commentary(commentary_file, accounts)
+    except ConfigError as exc:
+        accounts, commentary = AccountsConfig(), CommentaryConfig()
+        commentary_problem = str(exc)
+        typer.echo(f"commentary: skipped: {commentary_problem}", err=True)
     twitch_creators = [c for c in cfg.creators if c.twitch is not None]
     twitch_id, twitch_secret = (
         s.get_secret_value() if s else ""
@@ -1143,6 +1158,11 @@ def resolve(
         results = resolve_youtube(cfg.creators, provider)
         if twitch_creators and twitch_id and twitch_secret:
             results += resolve_twitch(twitch_creators, http, twitch_id, twitch_secret)
+        commentary_results = (
+            resolve_commentary(commentary, http, twitch_id, twitch_secret)
+            if twitch_id and twitch_secret
+            else []
+        )
     for result in results:
         typer.echo(_describe(result), err=result.error is not None)
     if twitch_creators and not (twitch_id and twitch_secret):
@@ -1163,8 +1183,54 @@ def resolve(
         typer.echo(f"wrote {written} id(s) to {path}")
     else:
         typer.echo("nothing to write")
-    if any(r.error is not None for r in results):
+    _resolve_commentary_ids(commentary, commentary_file, commentary_results, dry_run, accounts)
+    if commentary_problem or any(r.error is not None for r in [*results, *commentary_results]):
         raise typer.Exit(code=1)
+
+
+def _resolve_commentary_ids(
+    commentary: CommentaryConfig,
+    path: Path,
+    results: Sequence[CommentaryResolved],
+    dry_run: bool,
+    accounts: AccountsConfig,
+) -> None:
+    """The commentary half of `clipper resolve` (CLP-144): report each game and pinned
+    Twitch streamer, then write the changed ids into commentary.yaml."""
+    from clipper.commentary.config import load_commentary
+    from clipper.resolve import write_commentary_ids
+
+    games = sum(len(c.games) for c in commentary.channels)
+    pins = sum(1 for c in commentary.channels for s in c.streamers if s.twitch is not None)
+    if not games and not pins:
+        return
+    if not results:
+        typer.echo(
+            f"commentary: skipped {games} game(s) and {pins} pinned streamer(s)"
+            " (set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET to resolve them)"
+        )
+        return
+    for r in results:
+        head = f"{r.channel}: {r.kind} {r.key}"
+        if r.error is not None:
+            typer.echo(f"{head}: error: {r.error}", err=True)
+        elif not r.changed:
+            typer.echo(f"{head} -> {r.new} (unchanged)")
+        else:
+            typer.echo(f"{head} -> {r.new} ({f'was {r.old}' if r.old else 'new'})")
+    changed = sum(r.changed for r in results)
+    if dry_run:
+        typer.echo(f"dry run: {changed} commentary id(s) would change; nothing written")
+    elif changed:
+        try:
+            written = write_commentary_ids(
+                path, results, lambda tmp: load_commentary(tmp, accounts)
+            )
+        except (ValueError, OSError) as exc:
+            _fail(f"resolve: {exc}")
+        typer.echo(f"wrote {written} id(s) to {path}")
+    else:
+        typer.echo(f"{path}: nothing to write")
 
 
 @app.command("status")

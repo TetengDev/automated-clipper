@@ -106,8 +106,14 @@ class CommentarySettings(BaseModel):
     """Score boost for a clip whose game is in Twitch's top 20 today."""
     pinned_boost: float = Field(0.5, ge=0, le=10)
     """Score boost for a clip from a pinned streamer."""
-    min_clip_views: int = Field(1000, ge=0)
-    """Clips with fewer views are skipped."""
+    min_clip_views: int = Field(10000, ge=0)
+    """Virality bar (CLP-144): a clip qualifies with at least this many views ..."""
+    min_views_per_hour: float = Field(400, ge=0)
+    """... or at least this many views an hour, view_count / max(age_hours, 1). The default
+    is 10,000 views over the 24 h scan window, rounded down."""
+    min_score: float | None = Field(None, ge=0)
+    """Score floor: a clip scoring lower is dropped. None: no floor. The default is decided
+    from the first week's real scores (spec, open question 1)."""
     max_streamers_scanned: int = Field(50, ge=1, le=500)
     """Trending streamers kept from each day's game scan, besides the pinned ones."""
     excluded_game_ids: tuple[str, ...] = ()
@@ -162,6 +168,9 @@ class CommentaryOverrides(BaseModel):
     trending_boost: float | None = Field(None, ge=0, le=10)
     pinned_boost: float | None = Field(None, ge=0, le=10)
     min_clip_views: int | None = Field(None, ge=0)
+    min_views_per_hour: float | None = Field(None, ge=0)
+    min_score: float | None = Field(None, ge=0)
+    """An override can set a floor; with `exclude_none` it cannot clear one back to None."""
     max_streamers_scanned: int | None = Field(None, ge=1, le=500)
     excluded_game_ids: tuple[str, ...] | None = None
     voice: str | None = Field(None, pattern=_VOICE_PATTERN)

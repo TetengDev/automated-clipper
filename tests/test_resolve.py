@@ -10,9 +10,19 @@ import respx
 from typer.testing import CliRunner
 
 from clipper import cli
+from clipper.accounts import load_accounts
 from clipper.cli import app
+from clipper.commentary.config import CommentaryConfig, load_commentary
 from clipper.config import load_config
-from clipper.resolve import Resolved, resolve_twitch, resolve_youtube, write_ids
+from clipper.resolve import (
+    CommentaryResolved,
+    Resolved,
+    resolve_commentary,
+    resolve_twitch,
+    resolve_youtube,
+    write_commentary_ids,
+    write_ids,
+)
 from clipper.sources import twitch
 from clipper.sources.youtube import HandleNotFound, QuotaMeter, SourceError
 
@@ -443,3 +453,368 @@ def test_twitch_ignores_malformed_user_rows(small: Path, helix: respx.MockRouter
         results = resolve_twitch(cfg.creators, http, "cid", "csecret")
 
     assert results[0].error == "no Twitch user has the login kaicenat"
+
+
+# --- Commentary channels: game ids and pinned Twitch user ids (CLP-144) -------------------
+
+COMMENTARY_CREATORS = """\
+creators:
+  - name: MrBeast
+    region: global
+    youtube:
+      handle: "@MrBeast"
+"""
+
+COMMENTARY_ACCOUNTS = """\
+accounts:
+  - id: random_gaming_yt
+    platform: youtube
+    content: commentary
+    channel_id: UCcMYw3Ae2crqXE2yzFBSUig
+    handle: "@RandomGaming-f3w"
+    market: US
+    timezone: America/New_York
+"""
+
+COMMENTARY = """\
+# Header comment.
+defaults:
+  run_at: "06:00"
+channels:
+  - account: random_gaming_yt   # Random Gaming
+    source: twitch_clips
+    prompt: commentary_gaming_v1
+    games:
+      - name: Grand Theft Auto VI
+        aliases: [GTA 6, GTA VI]   # keep me
+      - name: Fortnite
+    # Pinned streamers.
+    streamers:
+      - name: Kai Cenat
+        twitch: kaicenat
+      - name: IShowSpeed
+        youtube:
+          handle: "@IShowSpeed"
+    exclude_streamers: []
+"""
+
+GTA_ID, FORTNITE_ID, KAI_ID = "1867279146", "33214", "641972806"
+COMMENTARY_SECRET = "SENTINEL-commentary-secret"
+
+
+@pytest.fixture
+def commentary_dir(tmp_path: Path) -> Path:
+    """creators.yaml, accounts.yaml and commentary.yaml; returns creators.yaml."""
+    (tmp_path / "accounts.yaml").write_text(COMMENTARY_ACCOUNTS)
+    (tmp_path / "commentary.yaml").write_text(COMMENTARY)
+    creators = tmp_path / "creators.yaml"
+    creators.write_text(COMMENTARY_CREATORS)
+    return creators
+
+
+def _commentary(creators: Path) -> CommentaryConfig:
+    folder = creators.parent
+    accounts = load_accounts(folder / "accounts.yaml", load_config(creators))
+    return load_commentary(folder / "commentary.yaml", accounts)
+
+
+def _validate_commentary(tmp: Path) -> object:
+    creators = tmp.parent / "creators.yaml"
+    accounts = load_accounts(tmp.parent / "accounts.yaml", load_config(creators))
+    return load_commentary(tmp, accounts)
+
+
+@pytest.fixture
+def games_and_users(helix: respx.MockRouter) -> respx.MockRouter:
+    helix.get(twitch.GAMES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": GTA_ID, "name": "Grand Theft Auto VI"},
+                    {"id": FORTNITE_ID, "name": "Fortnite"},
+                ]
+            },
+        )
+    )
+    helix.get(twitch.USERS_URL).mock(
+        return_value=httpx.Response(200, json={"data": [{"id": KAI_ID, "login": "kaicenat"}]})
+    )
+    return helix
+
+
+def test_commentary_games_and_twitch_pins_resolve(
+    commentary_dir: Path, games_and_users: respx.MockRouter
+) -> None:
+    with httpx.Client() as http:
+        results = resolve_commentary(_commentary(commentary_dir), http, "cid", "csecret")
+
+    assert results == [
+        CommentaryResolved("random_gaming_yt", "game", "Grand Theft Auto VI", None, GTA_ID),
+        CommentaryResolved("random_gaming_yt", "game", "Fortnite", None, FORTNITE_ID),
+        CommentaryResolved("random_gaming_yt", "twitch", "kaicenat", None, KAI_ID),
+    ]
+    games_call = games_and_users.routes[1].calls[0].request
+    assert games_call.url.params.get_list("name") == ["Grand Theft Auto VI", "Fortnite"]
+    assert games_call.headers["Authorization"] == "Bearer tok123"
+
+
+def test_unknown_game_and_login_are_errors(commentary_dir: Path, helix: respx.MockRouter) -> None:
+    helix.get(twitch.GAMES_URL).mock(return_value=httpx.Response(200, json={"data": []}))
+    helix.get(twitch.USERS_URL).mock(return_value=httpx.Response(200, json={"data": []}))
+
+    with httpx.Client() as http:
+        results = resolve_commentary(_commentary(commentary_dir), http, "cid", "csecret")
+
+    assert [r.error for r in results] == [
+        "no Twitch game is named Grand Theft Auto VI",
+        "no Twitch game is named Fortnite",
+        "no Twitch user has the login kaicenat",
+    ]
+    assert not any(r.changed for r in results)
+
+
+def test_commentary_twitch_failure_is_reported_per_entry_without_the_secret(
+    commentary_dir: Path,
+) -> None:
+    with respx.mock:
+        respx.post(twitch.TOKEN_URL).mock(return_value=httpx.Response(403, text=COMMENTARY_SECRET))
+        with httpx.Client() as http:
+            results = resolve_commentary(
+                _commentary(commentary_dir), http, "cid", COMMENTARY_SECRET
+            )
+
+    assert len(results) == 3
+    for result in results:
+        assert result.error is not None
+        assert "HTTP 403" in result.error
+        assert COMMENTARY_SECRET not in result.error
+
+
+def test_commentary_with_nothing_on_twitch_makes_no_request() -> None:
+    with respx.mock, httpx.Client() as http:  # any request would fail: no route
+        assert resolve_commentary(CommentaryConfig(), http, "cid", "csecret") == []
+
+
+def test_commentary_ids_are_written_after_their_key_keeping_comments(
+    commentary_dir: Path, games_and_users: respx.MockRouter
+) -> None:
+    path = commentary_dir.parent / "commentary.yaml"
+    with httpx.Client() as http:
+        results = resolve_commentary(_commentary(commentary_dir), http, "cid", "csecret")
+
+    written = write_commentary_ids(path, results, _validate_commentary)
+
+    assert written == 3
+    text = path.read_text()
+    assert (
+        "      - name: Grand Theft Auto VI\n"
+        "        aliases: [GTA 6, GTA VI]   # keep me\n"
+        f'        game_id: "{GTA_ID}"\n'
+        "      - name: Fortnite\n"
+        f'        game_id: "{FORTNITE_ID}"\n'
+        "    # Pinned streamers.\n"
+    ) in text
+    assert f'        twitch: kaicenat\n        user_id: "{KAI_ID}"\n' in text
+    assert text.startswith("# Header comment.\n")
+    assert "  - account: random_gaming_yt   # Random Gaming\n" in text
+    cfg = _commentary(commentary_dir)
+    assert [g.game_id for g in cfg.channels[0].games] == [GTA_ID, FORTNITE_ID]
+    assert cfg.channels[0].streamers[0].user_id == KAI_ID
+
+
+def test_commentary_write_with_nothing_changed_leaves_the_file_alone(
+    commentary_dir: Path,
+) -> None:
+    path = commentary_dir.parent / "commentary.yaml"
+    before = path.read_bytes()
+    unchanged = [CommentaryResolved("random_gaming_yt", "game", "Fortnite", "1", "1")]
+
+    assert write_commentary_ids(path, unchanged, _validate_commentary) == 0
+    assert path.read_bytes() == before
+
+
+def test_commentary_write_replaces_a_changed_id_in_place(commentary_dir: Path) -> None:
+    path = commentary_dir.parent / "commentary.yaml"
+    path.write_text(
+        COMMENTARY.replace(
+            "      - name: Fortnite\n", '      - name: Fortnite\n        game_id: "1"\n'
+        )
+    )
+    change = [CommentaryResolved("random_gaming_yt", "game", "Fortnite", "1", FORTNITE_ID)]
+
+    assert write_commentary_ids(path, change, _validate_commentary) == 1
+    assert f'        game_id: "{FORTNITE_ID}"\n' in path.read_text()
+    assert 'game_id: "1"\n' not in path.read_text()
+
+
+def test_commentary_write_refuses_an_invalid_result(commentary_dir: Path) -> None:
+    path = commentary_dir.parent / "commentary.yaml"
+    before = path.read_bytes()
+    bad = [CommentaryResolved("random_gaming_yt", "game", "Fortnite", None, "not-an-id")]
+
+    with pytest.raises(ValueError, match="would be invalid"):
+        write_commentary_ids(path, bad, _validate_commentary)
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in path.parent.iterdir()) == [
+        "accounts.yaml",
+        "commentary.yaml",
+        "creators.yaml",
+    ]
+
+
+def test_cli_resolves_commentary_ids_when_credentials_are_set(
+    commentary_dir: Path,
+    provider: FakeProvider,
+    games_and_users: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TWITCH_CLIENT_ID", "cid")
+    monkeypatch.setenv("TWITCH_CLIENT_SECRET", "csecret")
+
+    first = runner.invoke(app, ["--config", str(commentary_dir), "resolve"])
+    second = runner.invoke(app, ["--config", str(commentary_dir), "resolve"])
+
+    assert first.exit_code == 0, first.output
+    assert f"random_gaming_yt: game Grand Theft Auto VI -> {GTA_ID} (new)" in first.output
+    assert f"random_gaming_yt: twitch kaicenat -> {KAI_ID} (new)" in first.output
+    commentary = commentary_dir.parent / "commentary.yaml"
+    assert f"wrote 3 id(s) to {commentary}" in first.output
+    assert _commentary(commentary_dir).channels[0].streamers[0].user_id == KAI_ID
+    assert second.exit_code == 0, second.output
+    assert f"random_gaming_yt: twitch kaicenat -> {KAI_ID} (unchanged)" in second.output
+    assert f"{commentary}: nothing to write" in second.output
+
+
+def test_cli_commentary_dry_run_writes_nothing(
+    commentary_dir: Path,
+    provider: FakeProvider,
+    games_and_users: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TWITCH_CLIENT_ID", "cid")
+    monkeypatch.setenv("TWITCH_CLIENT_SECRET", "csecret")
+    before = (commentary_dir.parent / "commentary.yaml").read_bytes()
+
+    result = runner.invoke(app, ["--config", str(commentary_dir), "resolve", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "dry run: 3 commentary id(s) would change" in result.output
+    assert (commentary_dir.parent / "commentary.yaml").read_bytes() == before
+
+
+def test_cli_commentary_without_credentials_is_skipped_with_a_note(
+    commentary_dir: Path, provider: FakeProvider
+) -> None:
+    result = runner.invoke(app, ["--config", str(commentary_dir), "resolve"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "commentary: skipped 2 game(s) and 1 pinned streamer(s)"
+        " (set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET to resolve them)"
+    ) in result.output
+
+
+def test_cli_commentary_unknown_game_fails_at_the_end(
+    commentary_dir: Path,
+    provider: FakeProvider,
+    helix: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TWITCH_CLIENT_ID", "cid")
+    monkeypatch.setenv("TWITCH_CLIENT_SECRET", "csecret")
+    helix.get(twitch.GAMES_URL).mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": GTA_ID, "name": "Grand Theft Auto VI"}]}
+        )
+    )
+    helix.get(twitch.USERS_URL).mock(
+        return_value=httpx.Response(200, json={"data": [{"id": KAI_ID, "login": "kaicenat"}]})
+    )
+
+    result = runner.invoke(app, ["--config", str(commentary_dir), "resolve"])
+
+    assert result.exit_code == 1
+    assert (
+        "random_gaming_yt: game Fortnite: error: no Twitch game is named Fortnite" in result.stderr
+    )
+    assert "wrote 2 id(s)" in result.output
+
+
+@pytest.mark.parametrize("broken", ["commentary.yaml", "accounts.yaml"])
+def test_a_broken_commentary_or_accounts_file_still_resolves_creators(
+    commentary_dir: Path, provider: FakeProvider, broken: str
+) -> None:
+    (commentary_dir.parent / broken).write_text("channels: [\n")
+
+    result = runner.invoke(app, ["--config", str(commentary_dir), "resolve"])
+
+    assert result.exit_code == 1
+    assert "commentary: skipped:" in result.stderr
+    assert "invalid YAML" in result.stderr
+    assert f"wrote 1 id(s) to {commentary_dir}" in result.output
+    assert load_config(commentary_dir).creator("MrBeast").youtube.channel_id == IDS["@MrBeast"]
+
+
+def test_cli_resolve_on_the_shipped_config_only_adds_user_ids_to_commentary_yaml(
+    tmp_path: Path,
+    provider: FakeProvider,
+    helix: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shipped_dir = SHIPPED_CONFIG.parent
+    for name in ("creators.yaml", "accounts.yaml", "commentary.yaml"):
+        (tmp_path / name).write_text((shipped_dir / name).read_text())
+    original = (tmp_path / "commentary.yaml").read_text()
+    logins = re.findall(r"(?m)^ +twitch: (\w+)$", original)
+    ids = {login: str(1000 + n) for n, login in enumerate(logins)}
+
+    def users(request: httpx.Request) -> httpx.Response:
+        asked = request.url.params.get_list("login")
+        return httpx.Response(
+            200, json={"data": [{"login": x, "id": ids.get(x, "641972806")} for x in asked]}
+        )
+
+    helix.get(twitch.USERS_URL).mock(side_effect=users)
+    helix.get(twitch.GAMES_URL).mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": GTA_ID, "name": "Grand Theft Auto VI"}]}
+        )
+    )
+    monkeypatch.setenv("TWITCH_CLIENT_ID", "cid")
+    monkeypatch.setenv("TWITCH_CLIENT_SECRET", "csecret")
+
+    result = runner.invoke(app, ["--config", str(tmp_path / "creators.yaml"), "resolve"])
+
+    assert result.exit_code == 0, result.output
+    assert f"random_gaming_yt: game Grand Theft Auto VI -> {GTA_ID} (unchanged)" in result.output
+    after = (tmp_path / "commentary.yaml").read_text()
+    added = [line for line in after.splitlines() if line not in original.splitlines()]
+    assert added == [f'        user_id: "{ids[login]}"' for login in logins]
+    assert [line for line in after.splitlines() if "user_id" not in line] == original.splitlines()
+    assert len(logins) == 10
+
+
+def test_game_names_match_whatever_case_twitch_returns(
+    commentary_dir: Path, helix: respx.MockRouter
+) -> None:
+    helix.get(twitch.GAMES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": GTA_ID, "name": "Grand Theft Auto vi"},
+                    {"id": FORTNITE_ID, "name": "FORTNITE"},
+                ]
+            },
+        )
+    )
+    helix.get(twitch.USERS_URL).mock(return_value=httpx.Response(200, json={"data": []}))
+
+    with httpx.Client() as http:
+        results = resolve_commentary(_commentary(commentary_dir), http, "cid", "csecret")
+
+    assert [(r.key, r.new) for r in results[:2]] == [
+        ("Grand Theft Auto VI", GTA_ID),
+        ("Fortnite", FORTNITE_ID),
+    ]

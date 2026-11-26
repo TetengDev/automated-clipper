@@ -463,7 +463,13 @@ def write_rows(conn: sqlite3.Connection, job: Job, result: Discovery, now: datet
             " view_count = excluded.view_count, duration_s = excluded.duration_s,"
             " clip_created_at = excluded.clip_created_at, trending = excluded.trending,"
             " pinned = excluded.pinned, score = excluded.score,"
-            " skip_reason = excluded.skip_reason, updated_at = excluded.updated_at"
+            " skip_reason = excluded.skip_reason, updated_at = excluded.updated_at,"
+            # The fetch and transcript fields (migration 0015) belong to the job that
+            # fetched the clip: its files live in that job's media dir. A clip that
+            # moves to a new day starts unfetched, so a drop on an earlier day does not
+            # follow it.
+            " source_path = NULL, source_kind = NULL, loudness_peaks = NULL,"
+            " transcript_path = NULL, drop_reason = NULL"
             " WHERE story_candidates.used_by_clip_id IS NULL"
             " AND (story_candidates.job_id = excluded.job_id"
             " OR story_candidates.skip_reason IS NOT NULL"

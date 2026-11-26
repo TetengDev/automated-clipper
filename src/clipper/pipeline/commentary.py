@@ -16,10 +16,9 @@ from collections.abc import Mapping
 from clipper.commentary import discovery
 from clipper.jobs.models import Job, JobStatus
 from clipper.jobs.stages import SkipJob, StageContext, StageDef
+from clipper.pipeline import commentary_sources
 
 NOT_BUILT: Mapping[JobStatus, tuple[str, str]] = {
-    JobStatus.FETCHING_SOURCES: ("source fetching", "CLP-145"),
-    JobStatus.TRANSCRIBING: ("transcription", "CLP-145"),
     JobStatus.SCRIPTING: ("scripting", "CLP-146"),
     JobStatus.VOICING: ("voicing", "CLP-147"),
     JobStatus.RENDERING: ("rendering", "CLP-148"),
@@ -34,7 +33,14 @@ def _not_built(what: str, issue: str) -> StageDef:
     return StageDef(run)
 
 
+BUILT: Mapping[JobStatus, StageDef] = {
+    JobStatus.DISCOVERING: discovery.STAGE,  # CLP-144
+    JobStatus.FETCHING_SOURCES: commentary_sources.FETCH_STAGE,  # CLP-145
+    JobStatus.TRANSCRIBING: commentary_sources.TRANSCRIBE_STAGE,  # CLP-145
+}
+"""Stages whose story has shipped."""
+
 STAGES: Mapping[JobStatus, StageDef] = {
-    JobStatus.DISCOVERING: discovery.STAGE,
     **{status: _not_built(what, issue) for status, (what, issue) in NOT_BUILT.items()},
+    **BUILT,
 }

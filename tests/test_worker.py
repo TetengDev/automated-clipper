@@ -31,7 +31,7 @@ from clipper.jobs.models import COMMENTARY_PIPELINE, TERMINAL
 from clipper.jobs.queue import DEFAULT_LEASE, JobConflict
 from clipper.jobs.stages import DEFAULT_STAGES
 from clipper.notify import NotifyError
-from clipper.pipeline import build_commentary_stages, build_stages
+from clipper.pipeline import build_commentary_stages, build_stages, commentary
 from clipper.urls import SourceRef
 
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -779,15 +779,8 @@ def test_a_commentary_day_reaches_the_real_discovery_stage(
     assert len(alerts) == 1
 
 
-@pytest.mark.parametrize(
-    "status",
-    [
-        s
-        for s in COMMENTARY_PIPELINE
-        if s not in TERMINAL and s not in (JobStatus.DETECTED, JobStatus.DISCOVERING)
-    ],
-)
-def test_every_commentary_status_has_a_placeholder_that_skips(
+@pytest.mark.parametrize("status", list(commentary.NOT_BUILT))
+def test_every_unbuilt_commentary_status_has_a_placeholder_that_skips(
     make_worker: MakeWorker, db: Path, status: JobStatus
 ) -> None:
     pipeline = StubPipeline()

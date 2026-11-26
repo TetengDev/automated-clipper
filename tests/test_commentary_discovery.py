@@ -864,6 +864,28 @@ def test_a_clip_seen_again_on_a_later_day_moves_to_that_day(harness: Harness) ->
     assert harness.row(day2.id)["status"] == "fetching_sources"
 
 
+def test_a_clip_moving_to_a_later_day_starts_unfetched(harness: Harness) -> None:
+    day1 = harness.enqueue(DAY1)
+    harness.worker.run_once()
+    with closing(connect(harness.db)) as c:
+        c.execute("UPDATE jobs SET status = 'skipped' WHERE id = ?", (day1.id,))
+        c.execute(
+            "UPDATE story_candidates SET source_path = 'candidates/1/source.mp4',"
+            " source_kind = 'vertical', loudness_peaks = '[]',"
+            " transcript_path = 'candidates/1/transcript.json', drop_reason = 'fetch: gone'"
+            " WHERE twitch_clip_id = 'viral'"
+        )
+    harness.clock.now = NOW + timedelta(hours=20)
+    day2 = harness.enqueue(DAY2)
+
+    harness.worker.run_once()
+
+    viral = {r["twitch_clip_id"]: r for r in harness.candidates()}["viral"]
+    assert viral["job_id"] == day2.id
+    fields = ("source_path", "source_kind", "loudness_peaks", "transcript_path", "drop_reason")
+    assert [viral[f] for f in fields] == [None] * 5
+
+
 def test_a_used_clip_is_never_a_candidate_again(harness: Harness) -> None:
     day1 = harness.enqueue(DAY1)
     harness.worker.run_once()

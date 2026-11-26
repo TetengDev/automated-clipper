@@ -779,6 +779,33 @@ def test_a_commentary_day_reaches_the_real_discovery_stage(
     assert len(alerts) == 1
 
 
+def test_a_commentary_day_reaches_the_real_scripting_stage(
+    make_worker: MakeWorker, db: Path
+) -> None:
+    """Scripting is built (CLP-146), but until voicing and rendering ship (CLP-147,
+    CLP-148) it skips the day before any `claude` call, storing nothing and sending no
+    alert. The stage itself is tested in test_commentary_script.py."""
+    pipeline = StubPipeline()
+    worker = make_worker(pipeline)
+    worker.commentary_stages = build_commentary_stages()
+    alerts: list[str] = []
+    worker.alert = alerts.append
+    with closing(connect(db)) as conn:
+        job, _ = enqueue(conn, DAY, T0, creator="random_gaming_yt")
+        conn.execute("UPDATE jobs SET status = 'scripting' WHERE id = ?", (job.id,))
+
+    assert worker.run_once()
+
+    row = _row(db, job.id)
+    assert row["status"] == "skipped"
+    assert (
+        row["skip_reason"]
+        == "commentary scripting waits for voicing and rendering (CLP-147, CLP-148)"
+    )
+    assert sum(pipeline.calls.values()) == 0
+    assert alerts == []
+
+
 @pytest.mark.parametrize("status", list(commentary.NOT_BUILT))
 def test_every_unbuilt_commentary_status_has_a_placeholder_that_skips(
     make_worker: MakeWorker, db: Path, status: JobStatus

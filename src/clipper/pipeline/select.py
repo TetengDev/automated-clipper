@@ -798,8 +798,13 @@ class _CliBackend:
     provider = CLI_PROVIDER
     billed = False
 
-    def __init__(self, runner: Callable[..., RunResult] | None) -> None:
+    def __init__(
+        self,
+        runner: Callable[..., RunResult] | None,
+        schema: Mapping[str, Any] = OUTPUT_SCHEMA,
+    ) -> None:
         self.runner = runner
+        self.schema = schema  # the commentary script (CLP-146) sends its own
 
     def estimate(self, system: list[dict[str, Any]], prompt: str) -> float:
         return 0.0
@@ -823,7 +828,7 @@ class _CliBackend:
             env |= _CLI_QUIET_ENV
             args = [
                 CLI_COMMAND, "-p", "--model", MODEL, "--max-turns", str(CLI_MAX_TURNS),
-                "--output-format", "json", "--json-schema", json.dumps(OUTPUT_SCHEMA),
+                "--output-format", "json", "--json-schema", json.dumps(self.schema),
                 "--system-prompt-file", str(root / "system.md"),
                 "--tools", "", "--strict-mcp-config", "--setting-sources", "",
                 "--disable-slash-commands", "--no-session-persistence",

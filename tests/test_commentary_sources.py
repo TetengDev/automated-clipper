@@ -1198,7 +1198,8 @@ def test_the_worker_runs_both_stages_under_its_lease(
     tmp_path: Path, ytdlp: FakeYtDlp, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The real stage map, claims, leases and fenced writes: a day goes from
-    fetching_sources through transcribing to the scripting placeholder (CLP-146)."""
+    fetching_sources through transcribing to scripting (CLP-146), which skips the day
+    until voicing and rendering ship (CLP-147, CLP-148)."""
     from clipper.jobs.queue import enqueue
     from clipper.jobs.worker import Worker
     from clipper.pipeline import build_stages
@@ -1230,7 +1231,10 @@ def test_the_worker_runs_both_stages_under_its_lease(
     status, reason = db.execute(
         "SELECT status, skip_reason FROM jobs WHERE id = ?", (job.id,)
     ).fetchone()
-    assert (status, reason) == ("skipped", "commentary scripting is not built yet (CLP-146)")
+    assert (status, reason) == (
+        "skipped",
+        "commentary scripting waits for voicing and rendering (CLP-147, CLP-148)",
+    )
     media = tmp_path / "media" / DAY.key
     for cid, kind in zip(ids, ("vertical", "landscape"), strict=True):
         row = _row(db, cid)

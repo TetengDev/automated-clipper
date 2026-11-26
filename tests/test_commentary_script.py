@@ -1104,6 +1104,15 @@ def test_an_empty_reply_skips_the_day_with_one_alert(conn, media, day):
     assert len(alerts) == 1
 
 
+def test_a_run_claimed_again_after_its_alert_does_not_alert_twice(conn, media, day):
+    alerts: list[str] = []
+    with pytest.raises(SkipJob):
+        run(conn, media, FakeCli(reply()), alerts=alerts)
+    with pytest.raises(SkipJob):  # the worker crashed before recording the skip
+        run(conn, media, FakeCli(reply()), alerts=alerts)
+    assert len(alerts) == 1
+
+
 def test_an_alert_that_cannot_be_sent_still_skips(conn, media, day):
     def broken(text: str) -> None:
         raise OSError("discord down")

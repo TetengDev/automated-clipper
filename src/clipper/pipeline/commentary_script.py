@@ -664,11 +664,11 @@ def _write_scripts(
             job, ctx, channel, settings, wanted=settings.stories_per_day, runner=runner
         )
     except _Refused:
-        _skip(job, "the model declined to write a script", alert)
+        _skip(job, ctx, "the model declined to write a script", alert)
     except InvalidReply as exc:
         if job.attempts < MAX_ATTEMPTS:
             raise RuntimeError(str(exc)) from None
-        _skip(job, str(exc), alert)
+        _skip(job, ctx, str(exc), alert)
     write_json_atomic(
         ctx.media_dir / ARTIFACT,
         {
@@ -684,10 +684,11 @@ def _write_scripts(
     )
     if not draft.kept:
         if not draft.raw:
-            _skip(job, "the script call returned no story", alert)
+            _skip(job, ctx, "the script call returned no story", alert)
         first = draft.dropped[0].reason if draft.dropped else ""
         _skip(
             job,
+            ctx,
             f"no story passed the checks ({len(draft.dropped)} dropped; first: {first})",
             alert,
         )
@@ -701,9 +702,10 @@ def _write_scripts(
     )
 
 
-def _skip(job: Job, reason: str, alert: Notify | None) -> NoReturn:
-    """Skip the day with one alert: candidates existed, but no Short came of them."""
-    _alert(job, reason, alert)
+def _skip(job: Job, ctx: StageContext, reason: str, alert: Notify | None) -> NoReturn:
+    """Skip the day with one alert: candidates existed, but no Short came of them. The
+    fetching stage's marker in the media dir keeps a re-claimed run from alerting twice."""
+    _alert(job, ctx.media_dir, reason, alert)
     raise SkipJob(reason)
 
 
